@@ -44,7 +44,7 @@ def check(profile: str | None) -> None:
     ok = True
     g = Gflow(profile=profile)
     if g.available():
-        click.echo(f"✔ gflow: {shutil.which(g.binary.split()[0])}")
+        click.echo(f"✔ gflow: {shutil.which(g.binary.split()[0]) or g.binary}")
         res = g.auth_status()
         click.echo(res.stdout.strip() or res.stderr.strip())
         if res.returncode != 0:

@@ -128,3 +128,22 @@ Các biến của gflow như `GFLOW_CLI_OUTPUT_DIR`, `GFLOW_CLI_FLOW_HOST` vẫn
 pip install -e '.[dev]'
 pytest            # dùng gflow giả (tests/fake_gflow.py), không cần tài khoản, cần ffmpeg
 ```
+
+## Cài môi trường local bằng một lệnh
+
+Script sẽ clone code vào `~/Desktop/Projects/film-maker-ai`, tạo `.venv`, cài `filmmaker`, gflow-cli và Chromium, rồi chạy test.
+Đổi thư mục bằng biến `TARGET`.
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/napro8509/film-maker-ai/claude/relaxed-bohr-q25gvh/scripts/setup_local.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/napro8509/film-maker-ai/claude/relaxed-bohr-q25gvh/scripts/setup_local.ps1 -OutFile setup_local.ps1; powershell -ExecutionPolicy Bypass -File setup_local.ps1
+```
+
+Repo private thì `curl` không tải được script: tải `scripts/setup_local.sh` (hoặc `.ps1`) từ GitHub về rồi chạy file đó.

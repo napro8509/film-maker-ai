@@ -59,6 +59,11 @@ def _extract_json(stdout: str) -> dict[str, Any] | None:
         i = end
 
 
+def _split(cmd: str) -> list[str]:
+    # Windows paths contain backslashes, which POSIX shell splitting would eat.
+    return shlex.split(cmd, posix=os.name != "nt")
+
+
 @dataclass
 class Gflow:
     binary: str = field(default_factory=lambda: os.environ.get("GFLOW_BIN", "gflow"))
@@ -68,10 +73,10 @@ class Gflow:
     log: Any = print
 
     def available(self) -> bool:
-        return shutil.which(shlex.split(self.binary)[0]) is not None
+        return shutil.which(_split(self.binary)[0]) is not None
 
     def _cmd(self, *args: str) -> list[str]:
-        cmd = [*shlex.split(self.binary), *args]
+        cmd = [*_split(self.binary), *args]
         if self.profile:
             cmd += ["--profile", self.profile]
         return cmd
