@@ -404,3 +404,18 @@ def test_no_text_rule_is_sent_but_does_not_change_fingerprints(env, tmp_path):
     pipe = make_pipe(sb_path, out)
     assert [pipe.scene_status(s) for s in pipe.sb.scenes] == ["done", "done", "done"]  # nothing to redo
     assert pipe.sb.for_flow("x") == "x"
+
+
+def test_interrupted_render_adopts_clip_downloaded_by_hand(env, tmp_path):
+    sb_path, calls = env
+    out = tmp_path / "out"
+    pipe = make_pipe(sb_path, out)
+    pipe.state.data["project_id"] = "proj-123"
+    pipe.state.update("s02", status="submitting")
+    clip = pipe.clip_path(pipe.sb.scenes[1])
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"\x00" * 20_000)  # the user saved the clip from Flow here
+    report = make_pipe(sb_path, out).run(RunOptions(pause=(0, 0)))
+    assert "s02" in report.skipped and "s02" not in report.failed
+    assert not any("s02.mp4" in " ".join(c) for c in calls())  # nothing resubmitted
+    assert make_pipe(sb_path, out).is_done(pipe.sb.scenes[1])
