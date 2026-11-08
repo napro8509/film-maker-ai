@@ -19,8 +19,10 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Prefer mode "keyframe": `image_prompt` describes the opening frame as a still photo (subject, setting, lighting, lens); `prompt` describes the motion from that frame.
 - Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
 - Put the shared visual look in `style` once instead of repeating it.
-- `narration` is an optional short subtitle line in the SAME language as the user's idea.
+- `narration` is an optional short subtitle line in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
+- If a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
+- Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) in the SAME language as the narration; `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id or image/end_image."""
 
 

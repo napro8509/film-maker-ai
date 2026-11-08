@@ -52,6 +52,7 @@ Giao diện có:
 - **Dự án**: tạo phim từ ý tưởng (Claude viết storyboard), từ mẫu, trống, hoặc nhập file `.yaml`; nhân bản; xoá (chuyển vào `.trash`, khôi phục được).
 - **Sửa từng cảnh**: đổi kiểu cảnh, prompt, độ dài, model, phụ đề; thêm/xoá/nhân bản/đổi thứ tự; tải ảnh lên cho kiểu Ảnh → Video; xem prompt thực tế gửi lên Flow. Tự động lưu.
 - **Nhân vật & phong cách**: mô tả nhân vật một lần, tự thêm vào mọi cảnh có tên nhân vật đó.
+- **Ảnh nhân vật (tham chiếu)**: tạo ảnh nhân vật trên Flow (miễn phí) hoặc tải ảnh lên. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
 - **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.
 - **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
 - **Log trực tiếp** và trạng thái từng cảnh (xong / đã sửa / bị ngắt / lỗi); thông báo trên máy khi xong.

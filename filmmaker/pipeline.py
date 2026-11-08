@@ -7,6 +7,7 @@ have been billed and we do not blindly resubmit it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -16,7 +17,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
-from .storyboard import Scene, Storyboard
+from .storyboard import Character, Scene, Storyboard
+from .thumbnail import render_cover
 
 DONE = "done"
 SUBMITTING = "submitting"
@@ -107,7 +109,11 @@ class Pipeline:
 
     def has_keyframe(self, s: Scene) -> bool:
         st = self.state.scene(s.id)
-        return st.get("keyframe_prompt") == self.sb.image_prompt(s) and self.keyframe_path(s).is_file()
+        return (
+            st.get("keyframe_prompt") == self.sb.image_prompt(s)
+            and (st.get("keyframe_refs") or []) == self.sb.refs_signature(s)
+            and self.keyframe_path(s).is_file()
+        )
 
     def scene_status(self, s: Scene) -> str:
         """done | changed | interrupted | failed | todo"""
@@ -193,7 +199,9 @@ class Pipeline:
                 video = self._render_scene(s, project, opts)
             except GflowError as exc:
                 if not self.g.dry_run:
-                    self.state.update(s.id, status=FAILED, error=str(exc), exit_code=exc.exit_code)
+                    # A request Flow may have billed stays "submitting" so it is not resent blindly.
+                    self.state.update(s.id, status=SUBMITTING if exc.spent else FAILED, error=str(exc),
+                                      exit_code=exc.exit_code)
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
                 if exc.fatal:
@@ -212,19 +220,70 @@ class Pipeline:
         if self.has_keyframe(s) and not remake:
             self.log(f"  dùng lại keyframe {kf}")
             return kf
-        # Images are free on Flow, so retrying them is safe.
-        img = self._with_retries(
-            "tạo keyframe",
-            lambda: self.g.text_to_image(self.sb.image_prompt(s), out=kf, aspect=self.sb.aspect,
-                                         model=self.sb.image_model, project=project),
-            opts.max_retries,
-        )
+        prompt = self.sb.image_prompt(s)
+        refs = self.sb.scene_refs(s)
+        kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
+        img = None
+        # Images are free on Flow, so retrying them (or falling back) is safe.
+        if refs:
+            self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+            try:
+                img = self._with_retries("tạo keyframe theo ảnh nhân vật",
+                                         lambda: self.g.image_to_image(self.sb.for_flow(prompt), [p for _, p in refs], **kw),
+                                         opts.max_retries)
+            except GflowError as exc:
+                if exc.fatal and exc.exit_code != EXIT_NOT_PORTED:
+                    raise
+                self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+        if img is None:
+            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw), opts.max_retries)
         if not self.g.dry_run:
             if Path(img) != kf and Path(img).is_file():  # keep the UI's preview path stable
                 kf.parent.mkdir(parents=True, exist_ok=True)
                 kf.write_bytes(Path(img).read_bytes())
-            self.state.update(s.id, keyframe=str(kf), keyframe_prompt=self.sb.image_prompt(s))
+            self.state.update(s.id, keyframe=str(kf), keyframe_prompt=prompt,
+                              keyframe_refs=self.sb.refs_signature(s))
         return kf
+
+    def generate_portraits(self, chars: list[tuple[Character, Path]], opts: RunOptions) -> RunReport:
+        """Make reference images for characters (free on Flow). `chars` pairs each character with its output file."""
+        report = RunReport()
+        if not chars:
+            self.log("Không có nhân vật nào cần tạo ảnh.")
+            return report
+        try:
+            project = self.ensure_project()
+        except GflowError as exc:
+            report.aborted = str(exc)
+            return report
+        for idx, (c, dest) in enumerate(chars):
+            if opts.should_stop():
+                report.stopped = True
+                self.log("Đã dừng theo yêu cầu.")
+                break
+            if idx > 0 and not self.g.dry_run:
+                self.sleep(random.uniform(*opts.pause))
+            prompt = self.sb.portrait_prompt(c)
+            self.log(f"[{c.name}] ảnh nhân vật: {prompt[:100]}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                img = self._with_retries(
+                    "tạo ảnh nhân vật",
+                    lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
+                                                 model=self.sb.image_model, project=project),
+                    opts.max_retries)
+            except GflowError as exc:
+                report.failed[c.name] = str(exc)
+                self.log(f"[{c.name}] LỖI: {exc}")
+                if exc.fatal:
+                    report.aborted = f"dừng vì lỗi nghiêm trọng (exit {exc.exit_code})"
+                    break
+                continue
+            if not self.g.dry_run and Path(img) != dest and Path(img).is_file():
+                dest.write_bytes(Path(img).read_bytes())
+            report.done.append(c.name)
+            self.log(f"[{c.name}] OK -> {dest}")
+        return report
 
     def _run_keyframes(self, scenes: list[Scene], opts: RunOptions, report: RunReport) -> RunReport:
         """Make only the keyframe stills (free on Flow) so they can be reviewed before paying for video."""
@@ -263,17 +322,38 @@ class Pipeline:
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {kf}")
         return report
 
+    def _text_video(self, s: Scene, prompt: str, common: dict, opts: RunOptions) -> tuple[Path, str | None, str]:
+        """Text-to-video, with the characters' reference images (r2v) when there are any."""
+        refs = self.sb.scene_refs(s)
+        if refs and not self.state.data.get("r2v_unsupported"):
+            self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+            try:
+                video, media_id = self._with_retries(
+                    "render video",
+                    lambda: self.g.reference_to_video(self.sb.for_flow(prompt), [p for _, p in refs], **common), opts.max_retries)
+                return video, media_id, "r2v"
+            except GflowError as exc:
+                if exc.exit_code != EXIT_NOT_PORTED:
+                    raise
+                # Refused before submit, so no credits were spent.
+                self.log("  ! Tài khoản Flow này chưa hỗ trợ video theo ảnh tham chiếu qua gflow (chưa trừ credit). "
+                         "Dùng Chữ → Video thường.")
+                self.state.data["r2v_unsupported"] = True
+                self.state.save()
+        video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(self.sb.for_flow(prompt), **common),
+                                             opts.max_retries)
+        return video, media_id, "t2v"
+
     def _render_text_only(self, s: Scene, common: dict, opts: RunOptions) -> Path:
         prompt = self.sb.text_only_prompt(s)
         self.log(f"  (Chữ → Video) {prompt[:120]}")
         if not self.g.dry_run:
             self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
-        video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(prompt, **common),
-                                             opts.max_retries)
+        video, media_id, how = self._text_video(s, prompt, common, opts)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
-            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="t2v")
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how)
         return Path(video)
 
     def _render_scene(self, s: Scene, project: str, opts: RunOptions) -> Path:
@@ -283,7 +363,8 @@ class Pipeline:
         common = dict(aspect=self.sb.aspect, model=model, duration=s.duration, project=project, out=out)
 
         start_image: Path | None = None
-        if s.mode == "keyframe" and self.i2v_unsupported:
+        ui = self.i2v_unsupported and self.g.ui_available()  # gflow can't: drive the Flow chat page instead
+        if s.mode == "keyframe" and self.i2v_unsupported and self.sb.fallback_t2v and not ui:
             return self._render_text_only(s, common, opts)
         if s.mode == "keyframe":
             start_image = self._keyframe(s, project, opts, remake=s.id in opts.force_keyframes)
@@ -297,28 +378,116 @@ class Pipeline:
 
         prompt = self.sb.video_prompt(s)
         if start_image is None:
-            call = lambda: self.g.text_to_video(prompt, **common)
-        else:
-            call = lambda: self.g.image_to_video(start_image, prompt, end_image=s.end_image, **common)
+            video, media_id, how = self._text_video(s, prompt, common, opts)
+            if not dry:
+                if not Path(video).is_file():
+                    raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
+                self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how)
+            return Path(video)
+        if ui:
+            return self._render_via_ui(s, start_image, prompt, common)
+        call = lambda: self.g.image_to_video(start_image, self.sb.for_flow(prompt), end_image=s.end_image, **common)
         try:
             video, media_id = self._with_retries("render video", call, opts.max_retries)
         except GflowError as exc:
             if exc.exit_code != EXIT_NOT_PORTED or start_image is None:
                 raise
-            # Refused before submit, so no credits were spent.
+            # Refused before submit, so no credits were spent: forget the "submitting" mark.
+            if not dry:
+                self.state.update(s.id, status=None, fingerprint=None)
+            self.log(f"  ! gflow từ chối Ảnh → Video trước khi gửi (chưa trừ credit): {exc}")
+            self.state.data["i2v_unsupported"] = True
+            self.state.data["i2v_error"] = str(exc)
+            self.state.save()
+            if self.g.ui_available():
+                self.log("  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).")
+                return self._render_via_ui(s, start_image, prompt, common)
             if s.mode == "i2v":
                 raise GflowError(
                     "tài khoản Flow của bạn (giao diện mới flow.google.com) chưa hỗ trợ tạo video từ ảnh qua gflow. "
                     "Đổi cảnh này sang kiểu “Chữ → Video” và mô tả ảnh trong prompt.",
                     exit_code=2, payload=exc.payload) from exc  # scene-specific: keep rendering the others
-            self.log("  ! Tài khoản Flow này chưa hỗ trợ Ảnh → Video qua gflow (chưa trừ credit). "
-                     "Chuyển sang Chữ → Video cho cảnh này và các cảnh sau.")
-            self.state.data["i2v_unsupported"] = True
-            self.state.save()
+            if not self.sb.fallback_t2v:
+                raise GflowError(
+                    "gflow chưa làm được Ảnh → Video trên tài khoản Flow này nên đã dừng (chưa trừ credit). "
+                    "Cập nhật gflow-cli rồi bấm “Thử lại Ảnh → Video”, hoặc bật “Tự chuyển sang Chữ → Video” "
+                    "trong tab Nhân vật & phong cách.",
+                    exit_code=EXIT_NOT_PORTED, payload=exc.payload) from exc  # fatal: stop the run
+            self.log("  → Đã bật “Tự chuyển sang Chữ → Video”: render cảnh này và các cảnh sau bằng Chữ → Video.")
             return self._render_text_only(s, common, opts)
 
         if not dry:
             if not Path(video).is_file():
                 raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
-            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id)
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=None)
         return Path(video)
+
+    def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict) -> Path:
+        """Image-to-video by driving the Flow chat page (flow_ui.py). Never retried: Flow may have billed it."""
+        if s.end_image:
+            self.log("  ! Ảnh kết thúc chưa dùng được qua giao diện chat; chỉ dùng ảnh bắt đầu.")
+        if not self.g.dry_run:
+            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
+        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow(prompt), **common)
+        if not self.g.dry_run:
+            if not Path(video).is_file():
+                raise GflowError(f"không thấy file video {video}", exit_code=1)
+            other = next((sid for sid, st in self.state.data["scenes"].items()
+                          if sid != s.id and media_id and st.get("media_id") == media_id), None)
+            if other:  # never accept a clip that already belongs to another scene
+                raise GflowError(f"video tải về trùng với cảnh {other} (media {media_id}); video mới có thể vẫn "
+                                 "đang tạo trên Flow — hãy kiểm tra trên Flow", exit_code=42,
+                                 payload={"error": {"spent": True}})
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="flow-ui")
+        return Path(video)
+
+    # --- thumbnail -------------------------------------------------------------
+
+    def thumbnail_paths(self) -> tuple[Path, Path]:
+        """(picture from Flow, finished cover with the title)."""
+        return self.out / "thumbnail_raw.png", self.out / "thumbnail.jpg"
+
+    def thumbnail_sig(self) -> dict:
+        refs = [f"{n}:{hashlib.sha256(p.read_bytes()).hexdigest()[:12]}" for n, p in self.sb.thumbnail_refs()]
+        return {"prompt": self.sb.thumbnail_prompt(), "refs": refs, "aspect": self.sb.aspect}
+
+    def has_thumbnail_image(self) -> bool:
+        raw, _ = self.thumbnail_paths()
+        return raw.is_file() and self.state.data.get("thumbnail") == self.thumbnail_sig()
+
+    def make_thumbnail(self, opts: RunOptions, *, remake: bool = False) -> Path:
+        """Cover picture on Flow (free; reused while its prompt is unchanged) + the title printed on it."""
+        raw, final = self.thumbnail_paths()
+        if remake or not self.has_thumbnail_image():
+            project = self.ensure_project()
+            prompt = self.sb.thumbnail_prompt()
+            refs = self.sb.thumbnail_refs()
+            self.log(f"[thumbnail] ảnh bìa: {prompt[:100]}")
+            kw = dict(out=raw, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
+            img = None
+            if refs:
+                self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+                try:
+                    img = self._with_retries("tạo ảnh bìa theo ảnh nhân vật",
+                                             lambda: self.g.image_to_image(self.sb.for_flow(prompt), [p for _, p in refs], **kw),
+                                             opts.max_retries)
+                except GflowError as exc:
+                    if exc.fatal and exc.exit_code != EXIT_NOT_PORTED:
+                        raise
+                    self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+            if img is None:
+                img = self._with_retries("tạo ảnh bìa", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw),
+                                         opts.max_retries)
+            if self.g.dry_run:
+                self.log(f"[thumbnail] (dry-run) sẽ lưu -> {final}")
+                return final
+            if Path(img) != raw and Path(img).is_file():
+                raw.parent.mkdir(parents=True, exist_ok=True)
+                raw.write_bytes(Path(img).read_bytes())
+            self.state.data["thumbnail"] = self.thumbnail_sig()
+            self.state.save()
+        else:
+            self.log("[thumbnail] dùng lại ảnh bìa đã có, chỉ in lại tiêu đề")
+        render_cover(raw, final, aspect=self.sb.aspect, text=self.sb.thumbnail.text or self.sb.title, log=self.log)
+        self.log(f"[thumbnail] OK -> {final}")
+        return final

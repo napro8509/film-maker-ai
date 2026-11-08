@@ -422,13 +422,25 @@ function projectMenu(anchor) {
 
 function renderErrors() {
   const errs = S.cur.errors || [];
+  const sb = S.cur.storyboard;
+  const fb = !!sb.fallback_t2v;
   const i2v = S.cur.i2v_unsupported ? h("div", { class: "banner warn" },
-    h("b", {}, "Tài khoản Flow của bạn chưa tạo được video từ ảnh qua gflow. "),
-    "Google đã chuyển tài khoản sang giao diện Flow mới, nơi gflow mới hỗ trợ Chữ → Video. Vì vậy các cảnh “Ảnh → Video” sẽ được render bằng Chữ → Video, ghép từ mô tả ảnh mở đầu + chuyển động + nhân vật + phong cách. Ảnh keyframe lúc này chỉ để tham khảo. Cảnh “Ảnh của bạn → Video” chưa làm được.",
-    h("div", { style: { marginTop: "8px" } }, h("button", { class: "btn sm", onclick: async () => {
-      try { const d = await api("POST", `/api/projects/${S.cur.id}/reset-i2v`); applyMeta(d); toast("Lần render sau sẽ thử lại Ảnh → Video (nếu vẫn chưa được thì tự chuyển lại, không tốn credit)."); }
-      catch (e) { toast(e.message, "error"); }
-    } }, "Thử lại Ảnh → Video"))) : null;
+    h("b", {}, "gflow chưa tạo được video từ ảnh trên tài khoản Flow này. "),
+    S.env?.flow_ui ? "Film Maker sẽ tự làm Ảnh → Video qua giao diện chat của Flow (tải ảnh lên, gõ prompt, bấm Approve) bằng trình duyệt đã đăng nhập của gflow." : fb ? "Bạn đã bật “Tự chuyển sang Chữ → Video”, nên các cảnh “Ảnh → Video” đang được render bằng Chữ → Video (ảnh keyframe chỉ để tham khảo)."
+      : "Các cảnh “Ảnh → Video” sẽ dừng lại thay vì tự chuyển sang Chữ → Video. Lần thử vừa rồi bị từ chối trước khi gửi nên chưa trừ credit.",
+    h("div", { class: "small", style: { marginTop: "6px" } },
+      "Thường là do Google đã chuyển tài khoản sang giao diện Flow mới (flow.google.com, chỉ có ô chat), nơi gflow mới hỗ trợ Chữ → Ảnh và Chữ → Video. Cách sửa: cập nhật gflow-cli (",
+      h("code", {}, "uv tool upgrade gflow-cli"), "), khởi động lại Film Maker rồi bấm “Thử lại Ảnh → Video”.",
+      S.env?.gflow_version ? ` Bản gflow đang dùng: ${S.env.gflow_version}.` : ""),
+    S.cur.i2v_error ? h("details", { style: { marginTop: "6px" } }, h("summary", { class: "small", style: { cursor: "pointer" } }, "Lỗi gốc từ gflow"),
+      h("pre", { class: "small", style: { whiteSpace: "pre-wrap" } }, S.cur.i2v_error)) : null,
+    h("div", { class: "row", style: { marginTop: "8px", gap: "8px", flexWrap: "wrap" } },
+      h("button", { class: "btn sm", onclick: async () => {
+        try { const d = await api("POST", `/api/projects/${S.cur.id}/reset-i2v`); applyMeta(d); renderMain(); toast("Lần render sau sẽ thử lại Ảnh → Video. Nếu vẫn bị từ chối thì dừng lại, không tốn credit."); }
+        catch (e) { toast(e.message, "error"); }
+      } }, "Thử lại Ảnh → Video"),
+      h("button", { class: "btn sm", onclick: () => { sb.fallback_t2v = fb ? undefined : true; changed(); renderMain(); } },
+        fb ? "Tắt tự chuyển sang Chữ → Video" : "Dùng Chữ → Video thay thế (tốn credit)"))) : null;
   if (!errs.length) return i2v || h("div");
   return h("div", {}, i2v, h("div", { class: "banner err" }, h("b", {}, "Storyboard còn lỗi, chưa chạy được:"),
     h("ul", {}, errs.map((e) => h("li", {}, prettyError(e))))));
@@ -509,7 +521,16 @@ function renderScene(sc, i) {
         zone(`chars-${i}`, () => {
           const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""}`;
           const found = (sb.characters || []).filter((c) => c.name && new RegExp(`\\b${c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text));
-          return found.length ? h("div", { class: "char-chips" }, h("span", { class: "small muted" }, "Nhân vật tự thêm mô tả:"), found.map((c) => h("span", { class: "char-chip", title: c.description }, c.name))) : h("div");
+          if (!found.length) return h("div");
+          const refsOn = sb.use_character_refs !== false && sc.mode !== "i2v";
+          let nRefs = 0;
+          return h("div", { class: "char-chips" }, h("span", { class: "small muted" }, refsOn ? "Nhân vật (mô tả + ảnh tham chiếu):" : "Nhân vật tự thêm mô tả:"),
+            found.map((c) => {
+              const url = refsOn && c.image && nRefs < 3 ? charImageUrl(c) : null;
+              if (url) nRefs++;
+              return h("span", { class: "char-chip" + (url ? " has-img" : ""), title: url ? `${c.description}\n(gửi kèm ảnh nhân vật)` : c.description },
+                url ? h("img", { src: url, alt: "" }) : null, c.name);
+            }));
         }),
         h("div", { class: "grid3" },
           h("label", { class: "field" }, h("span", { class: "lbl" }, "Độ dài"), durationSelect(sc)),
@@ -579,9 +600,11 @@ function renderSceneMedia(sc) {
   const startImg = sc.mode === "i2v" ? (assetUrl(sc.image) || st.image_url) : null;
   const stale = st.status === "changed";
   if (st.clip_url) {
-    box.append(h("video", { src: st.clip_url, controls: true, preload: "metadata", poster: st.rendered_as === "t2v" ? null : (kf || startImg || null), playsinline: true }));
+    box.append(h("video", { src: st.clip_url, controls: true, preload: "metadata", poster: st.rendered_as === "t2v" || st.rendered_as === "r2v" ? null : (kf || startImg || null), playsinline: true }));
     if (stale) box.append(h("span", { class: "tag warn" }, "Clip cũ · prompt đã đổi"));
     else if (st.rendered_as === "t2v" && sc.mode === "keyframe") box.append(h("span", { class: "tag" }, "Render bằng Chữ → Video"));
+    else if (st.rendered_as === "flow-ui") box.append(h("span", { class: "tag" }, "Render qua giao diện chat Flow"));
+    else if (st.rendered_as === "r2v") box.append(h("span", { class: "tag" }, sc.mode === "keyframe" ? "Render bằng Chữ → Video + ảnh nhân vật" : "Có ảnh nhân vật"));
   } else if (kf) {
     box.append(h("img", { src: kf, onclick: () => lightbox(kf), alt: "keyframe" }));
     box.append(h("span", { class: "tag" + (st.keyframe_stale ? " warn" : "") }, st.keyframe_stale ? "Ảnh cũ · prompt đã đổi" : "Keyframe · chưa có video"));
@@ -650,16 +673,89 @@ function renderStory() {
           h("label", { class: "field", style: { marginTop: "8px" } }, h("span", { class: "lbl" }, "Dùng lại project có sẵn trên Flow (project_id)"),
             h("input", { type: "text", value: sb.project_id || "", placeholder: S.cur.project_id ? `Đang dùng: ${S.cur.project_id}` : "Để trống: tự tạo project mới",
               oninput: (e) => set("project_id", e.target.value || undefined) }))))),
-    h("div", { class: "card card-pad section" },
-      h("div", { class: "row", style: { marginBottom: "10px" } }, h("h3", { style: { margin: 0 } }, "Nhân vật"), h("span", { class: "spacer" }),
-        h("button", { class: "btn sm", onclick: () => { sb.characters.push({ name: "", description: "" }); changed(); renderMain(); } }, "＋ Thêm nhân vật")),
-      h("p", { class: "small muted", style: { marginTop: 0 } }, "Mô tả ngoại hình cố định một lần. Khi tên nhân vật xuất hiện trong prompt một cảnh, mô tả sẽ được tự thêm vào, giúp nhân vật trông giống nhau ở mọi cảnh."),
-      sb.characters.length ? sb.characters.map((c, i) => h("div", { class: "char-row" },
-        h("input", { type: "text", value: c.name, placeholder: "Tên, ví dụ: Lan", oninput: (e) => { c.name = e.target.value; changed(); } }),
-        h("textarea", { rows: 2, value: c.description, placeholder: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt…",
-          oninput: (e) => { c.description = e.target.value; changed(); } }),
-        h("button", { class: "btn ghost icon danger", title: "Xoá", onclick: () => { sb.characters.splice(i, 1); changed(); renderMain(); } }, "🗑")))
-        : h("p", { class: "muted small" }, "Chưa có nhân vật.")));
+    renderCharacters(sb));
+}
+
+function charImageUrl(c) {
+  if (!c.image) return null;
+  const i = (S.cur.storyboard.characters || []).indexOf(c);
+  const cs = S.cur.characters_state?.[i];
+  return assetUrl(c.image) || (cs && cs.name === c.name ? cs.image_url : null);
+}
+
+async function makePortraits(names, force = false) {
+  await flushSave();
+  if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
+  if (!S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
+  try {
+    startJob(await api("POST", `/api/projects/${S.cur.id}/characters/portraits`, { names, force }));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderCharacters(sb) {
+  const busy = jobRunning();
+  const missing = sb.characters.filter((c) => c.name && c.description && !charImageUrl(c));
+  return h("div", { class: "card card-pad section" },
+    h("div", { class: "row", style: { marginBottom: "10px" } }, h("h3", { style: { margin: 0 } }, "Nhân vật"), h("span", { class: "spacer" }),
+      missing.length ? h("button", { class: "btn sm", disabled: busy, title: "Ảnh trên Flow miễn phí",
+        onclick: () => makePortraits([]) }, `🖼 Tạo ảnh cho ${missing.length} nhân vật chưa có ảnh`, h("span", { class: "free" }, "free")) : null,
+      h("button", { class: "btn sm", onclick: () => { sb.characters.push({ name: "", description: "" }); changed(); renderMain(); } }, "＋ Thêm nhân vật")),
+    h("p", { class: "small muted", style: { marginTop: 0 } }, "Mô tả ngoại hình cố định một lần, rồi tạo hoặc tải lên một ảnh nhân vật. Khi tên nhân vật xuất hiện trong prompt một cảnh, mô tả được tự thêm vào và ảnh nhân vật được gửi kèm làm ảnh tham chiếu (tối đa 3 nhân vật mỗi cảnh), giúp khuôn mặt giống nhau ở mọi cảnh."),
+    h("label", { class: "check", style: { marginBottom: "6px" } },
+      h("input", { type: "checkbox", checked: sb.no_text !== false,
+        onchange: (e) => { sb.no_text = e.target.checked ? undefined : false; changed(); } }),
+      h("span", {}, "Không cho Flow chèn chữ, phụ đề, watermark vào ảnh và video (phụ đề sẽ được thêm khi ghép phim)")),
+    h("label", { class: "check", style: { marginBottom: "6px" } },
+      h("input", { type: "checkbox", checked: !!sb.fallback_t2v,
+        onchange: (e) => { sb.fallback_t2v = e.target.checked ? true : undefined; changed(); renderMain(); } }),
+      h("span", {}, "Tự chuyển sang Chữ → Video khi tài khoản Flow không làm được Ảnh → Video (mặc định: dừng lại để bạn quyết định)")),
+    h("label", { class: "check", style: { marginBottom: "12px" } },
+      h("input", { type: "checkbox", checked: sb.use_character_refs !== false,
+        onchange: (e) => { sb.use_character_refs = e.target.checked ? undefined : false; changed(); renderMain(); } }),
+      h("span", {}, "Gửi ảnh nhân vật làm tham chiếu khi tạo keyframe và video")),
+    sb.characters.length ? sb.characters.map((c, i) => renderCharacter(sb, c, i, busy)) : h("p", { class: "muted small" }, "Chưa có nhân vật."));
+}
+
+function renderCharacter(sb, c, i, busy) {
+  const url = charImageUrl(c);
+  const cs = S.cur.characters_state?.[i];
+  const portrait = (sb.aspect || "16:9") === "9:16";
+  const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", class: "hidden", onchange: async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("file", f); fd.append("kind", "character");
+    try {
+      const r = await api("POST", `/api/projects/${S.cur.id}/upload`, fd, true);
+      S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`);
+      c.image = r.path; changed(); renderMain();
+    } catch (err) { toast(err.message, "error"); }
+  } });
+  const canMake = !!(c.name && c.description);
+  const isAsset = !c.image || S.assets.images.some((a) => a.path === c.image);
+  return h("div", { class: "char-row" },
+    h("div", { class: "char-img" + (portrait ? " portrait" : ""), style: url ? { backgroundImage: `url("${url}")` } : null,
+      title: url ? "Bấm để xem lớn" : "", onclick: () => { if (url) lightbox(url); } },
+      url ? null : h("span", {}, c.image && cs?.image_missing ? "⚠ Không thấy file ảnh" : "Chưa có ảnh")),
+    h("div", { class: "stack", style: { gap: "6px", minWidth: 0 } },
+      h("input", { type: "text", value: c.name, placeholder: "Tên, ví dụ: Lan", oninput: (e) => { c.name = e.target.value; changed(); } }),
+      h("textarea", { rows: 3, value: c.description, placeholder: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt…",
+        oninput: (e) => { c.description = e.target.value; changed(); } }),
+      h("div", { class: "row", style: { gap: "6px", flexWrap: "wrap" } },
+        h("button", { class: "btn sm" + (url ? "" : " primary"), disabled: busy || !canMake, title: canMake ? "Ảnh trên Flow miễn phí" : "Cần nhập tên và mô tả trước",
+          onclick: () => makePortraits([c.name], true) }, url ? "↻ Tạo lại ảnh" : "🖼 Tạo ảnh nhân vật", h("span", { class: "free" }, "free")),
+        h("button", { class: "btn sm", onclick: () => fileInput.click() }, "Tải ảnh lên"),
+        h("select", { class: "sm", value: c.image || "", title: "Chọn ảnh có sẵn trong dự án",
+          onchange: (e) => { c.image = e.target.value || undefined; changed(); renderMain(); } },
+          h("option", { value: "" }, "— không dùng ảnh —"),
+          isAsset ? null : h("option", { value: c.image }, c.image),
+          S.assets.images.map((a) => h("option", { value: a.path }, a.path.replace("assets/", "")))),
+        fileInput),
+      h("details", {}, h("summary", { class: "small muted", style: { cursor: "pointer" } }, "Prompt tạo ảnh nhân vật"),
+        h("textarea", { rows: 3, value: c.image_prompt || "", style: { marginTop: "6px" },
+          placeholder: cs?.portrait_prompt || "Để trống: tự tạo từ mô tả (toàn thân, nhìn thẳng, nền trơn)",
+          oninput: (e) => { c.image_prompt = e.target.value || undefined; changed(); } }),
+        h("p", { class: "small muted", style: { margin: "4px 0 0" } }, "Nên dùng ảnh rõ mặt, nền trơn. Đổi ảnh nhân vật sẽ làm các cảnh có nhân vật này cần tạo lại."))),
+    h("button", { class: "btn ghost icon danger", title: "Xoá nhân vật", onclick: () => { sb.characters.splice(i, 1); changed(); renderMain(); } }, "🗑"));
 }
 
 /* ---------- final tab ---------- */
@@ -730,10 +826,52 @@ function renderFinal() {
                 h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("stitch") }, "🎞 Ghép phim ", h("span", { class: "free" }, "miễn phí")),
                 h("button", { class: "btn", disabled: busy, onclick: () => runAction("make"), title: "Render các cảnh còn thiếu rồi ghép" }, "Render nốt + ghép ", h("span", { class: "paid" }, "credit"))));
           }))),
+      renderThumbnail(),
       h("div", { class: "card card-pad" }, h("h3", {}, "Lời dẫn / phụ đề"),
         (S.cur.storyboard.scenes || []).some((s) => s.narration)
           ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
           : h("p", { class: "small muted" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+}
+
+function renderThumbnail() {
+  const sb = S.cur.storyboard;
+  sb.thumbnail = sb.thumbnail || {};
+  const set = (k, v) => { sb.thumbnail[k] = v || undefined; changed(); };
+  return h("div", { class: "card card-pad" },
+    h("h3", {}, "🖼 Thumbnail"),
+    zone("thumb-view", thumbnailView),
+    h("div", { class: "stack", style: { marginTop: "10px" } },
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Tiêu đề in trên ảnh"),
+        h("input", { type: "text", value: sb.thumbnail.text || "", placeholder: sb.title || "Tiêu đề video", oninput: (e) => set("text", e.target.value) })),
+      h("details", {}, h("summary", { class: "small muted", style: { cursor: "pointer" } }, "Mô tả ảnh bìa (tiếng Anh, không cần ghi chữ)"),
+        h("textarea", { rows: 3, value: sb.thumbnail.prompt || "", style: { marginTop: "6px" },
+          placeholder: "Để trống: các nhân vật chính ở khoảnh khắc kịch tính nhất. Ví dụ: Mali crying while holding the gold necklace, Khun Ratana glaring behind her",
+          oninput: (e) => set("prompt", e.target.value) }),
+        zone("thumb-prompt", () => { const t = S.cur.thumbnail || {}; return t.prompt ? h("pre", { class: "small", style: { whiteSpace: "pre-wrap", marginTop: "6px" } }, t.prompt) : h("div"); })),
+      zone("thumb-actions", thumbnailActions),
+      h("p", { class: "small muted", style: { margin: 0 } }, "Ảnh bìa tạo trên Flow (miễn phí, không có chữ); tiêu đề được in sau nên luôn đúng chính tả và đổi được mà không cần tạo lại ảnh.")));
+}
+
+function thumbnailView() {
+  const t = S.cur.thumbnail || {};
+  const portrait = S.cur.storyboard.aspect === "9:16";
+  return h("div", { class: "thumb-box" + (portrait ? " portrait" : ""), style: t.url ? { backgroundImage: `url("${t.url}")`, cursor: "zoom-in" } : null,
+    onclick: () => { if (t.url) lightbox(t.url); } },
+    t.url ? null : h("span", {}, "Chưa có thumbnail"));
+}
+
+function thumbnailActions() {
+  const t = S.cur.thumbnail || {};
+  const busy = jobRunning();
+  const make = (remake) => runAction("thumbnail", { remake_thumbnail: remake });
+  return h("div", { class: "stack", style: { gap: "6px" } },
+    t.refs?.length ? h("div", { class: "small muted" }, "Gửi kèm ảnh nhân vật: " + t.refs.join(", ")) : null,
+    h("div", { class: "row", style: { flexWrap: "wrap", gap: "6px" } },
+      t.picture_ready
+        ? [h("button", { class: "btn sm primary", disabled: busy, title: "Dùng lại ảnh bìa, chỉ in lại tiêu đề", onclick: () => make(false) }, "✎ Cập nhật tiêu đề"),
+           h("button", { class: "btn sm", disabled: busy, onclick: () => make(true) }, "↻ Tạo ảnh bìa mới", h("span", { class: "free" }, "free"))]
+        : h("button", { class: "btn sm primary", disabled: busy || !S.env.gflow, onclick: () => make(false) }, "🖼 Tạo thumbnail", h("span", { class: "free" }, "free")),
+      t.url ? h("a", { class: "btn sm ghost", href: t.url.split("?")[0], download: `${S.cur.id}-thumbnail.jpg` }, "⬇ Tải JPG") : null));
 }
 
 function renderPlaylist() {
@@ -872,9 +1010,16 @@ async function onJobDone() {
   }
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
+  if (j.kind === "portraits" && S.cur && S.cur.id === j.project && j.result?.images) {
+    for (const c of S.cur.storyboard.characters || []) if (j.result.images[c.name]) c.image = j.result.images[c.name];
+    if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
+    try { S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`); } catch { /* ignore */ }
+  }
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
+    if (j.kind === "portraits" && S.tab === "story") renderMain();
     if (j.kind === "stitch" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
+    else if (j.kind === "thumbnail" && S.tab === "final") renderMain();
   }
   refreshZones();
 }
@@ -1012,6 +1157,12 @@ async function openSettings() {
   const pmin = h("input", { type: "number", min: 0, value: s.pause_min });
   const pmax = h("input", { type: "number", min: 0, value: s.pause_max });
   const retries = h("input", { type: "number", min: 0, max: 5, value: s.retries });
+  const flowUi = h("input", { type: "checkbox", checked: s.flow_ui !== false });
+  const maxCredits = h("input", { type: "number", min: 0, step: 10, value: s.flow_ui_max_credits || 0 });
+  const flowWin = h("select", { value: s.flow_ui_window || "hidden" },
+    h("option", { value: "hidden" }, "Chạy ngầm — trình duyệt thật nhưng giấu khỏi màn hình (khuyên dùng)"),
+    h("option", { value: "headless" }, "Ẩn hoàn toàn (headless) — có thể bị Google chặn"),
+    h("option", { value: "show" }, "Hiện cửa sổ — để xem nó thao tác"));
   let clearKey = false;
   const cc = S.env.claude_code || {};
   const planner = h("select", { value: s.planner || "auto" },
@@ -1029,7 +1180,11 @@ async function openSettings() {
           h("div", { class: "row" },
             h("button", { class: "btn sm", onclick: () => checkAuth() }, "Kiểm tra đăng nhập"),
             h("button", { class: "btn sm", onclick: () => startLogin() }, "Đăng nhập lại bằng Chrome"),
-            h("a", { class: "btn sm ghost", href: "https://flow.google.com/", target: "_blank", rel: "noopener" }, "Mở Google Flow ↗")))),
+            h("a", { class: "btn sm ghost", href: "https://flow.google.com/", target: "_blank", rel: "noopener" }, "Mở Google Flow ↗")),
+          h("label", { class: "check" }, flowUi, h("span", {}, "Làm Ảnh → Video qua giao diện chat của Flow khi gflow không làm được",
+            h("span", { class: "small muted", style: { display: "block" } }, S.env.flow_ui ? "Sẵn sàng: dùng trình duyệt và tài khoản đã đăng nhập của gflow." : "Chưa sẵn sàng: không tìm thấy Python hoặc profile trình duyệt của gflow-cli."))),
+          h("label", { class: "field" }, h("span", { class: "lbl" }, "Cửa sổ trình duyệt khi điều khiển Flow"), flowWin),
+          h("label", { class: "field" }, h("span", { class: "lbl" }, "Từ chối nếu Flow đòi quá số credit này cho 1 clip (0 = không giới hạn)"), maxCredits))),
       h("div", { class: "card card-pad" }, h("h3", {}, "An toàn khi render"),
         h("div", { class: "grid3" },
           h("label", { class: "field" }, h("span", { class: "lbl" }, "Nghỉ tối thiểu (giây)"), pmin),
@@ -1051,6 +1206,7 @@ async function openSettings() {
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
         await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
+          flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
         S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }

@@ -9,7 +9,8 @@ from pathlib import Path
 import click
 
 from .assemble import AssembleError, assemble
-from .gflow import Gflow
+from .gflow import Gflow, GflowError
+from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State
 from .storyboard import load_storyboard, save_storyboard
 
@@ -193,6 +194,33 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
     _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing)
+    try:
+        _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
+    except click.ClickException as exc:  # the film is done; a missing cover is not a failure
+        click.echo(f"⚠ Chưa làm được thumbnail: {exc.message}")
+
+
+def _do_thumbnail(sb, out_dir: Path, profile: str | None, *, remake: bool) -> Path:
+    g = Gflow(profile=profile, log=click.echo)
+    pipe = Pipeline(sb, out_dir, g, log=click.echo)
+    if (remake or not pipe.has_thumbnail_image()) and not g.available():
+        raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
+    try:
+        return pipe.make_thumbnail(RunOptions(), remake=remake)
+    except (GflowError, ThumbnailError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path))
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--remake", is_flag=True, help="Tạo lại ảnh bìa trên Flow (mặc định dùng lại ảnh đã có, chỉ in lại tiêu đề).")
+def thumbnail(storyboard: Path, out, profile, remake) -> None:
+    """Tạo thumbnail cho video: ảnh bìa trên Flow (miễn phí) + in tiêu đề `thumbnail.text`."""
+    sb = load_storyboard(storyboard)
+    path = _do_thumbnail(sb, _out_dir(storyboard, out), profile, remake=remake)
+    click.echo(f"🖼 Thumbnail: {path}")
 
 
 @main.command()

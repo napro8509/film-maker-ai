@@ -31,9 +31,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from ..assemble import AssembleError, assemble
-from ..gflow import Gflow, GflowError, _extract_json
+from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, SUBMITTING, Pipeline, RunOptions, State
 from ..storyboard import Storyboard, load_storyboard
+from ..thumbnail import ThumbnailError
 
 STATIC = Path(__file__).parent / "static"
 TEMPLATE = Path(__file__).parent.parent / "templates" / "storyboard.yaml"
@@ -57,7 +58,10 @@ FALLBACK_MODELS = {
 # --- settings -----------------------------------------------------------------
 
 DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": "",
-                    "planner": "auto"}  # auto | claude_code | api
+                    "planner": "auto",  # auto | claude_code | api
+                    "flow_ui": True,  # image-to-video through the Flow chat page when gflow refuses it
+                    "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
+                    "flow_ui_window": "hidden"}  # show | hidden | headless
 
 
 def load_settings() -> dict[str, Any]:
@@ -142,7 +146,7 @@ class Jobs:
                 job.status = "stopped"
             except Exception as exc:  # report anything to the UI instead of dying silently
                 job.log(f"LỖI: {exc}")
-                if not isinstance(exc, (GflowError, AssembleError, RuntimeError, ValueError)):
+                if not isinstance(exc, (GflowError, AssembleError, ThumbnailError, RuntimeError, ValueError)):
                     job.log(traceback.format_exc())
                 job.result = {"error": str(exc)}
                 job.status = "failed"
@@ -214,6 +218,12 @@ class RunBody(BaseModel):
     volume: float = 0.25
     burn_subtitles: bool = False
     allow_missing: bool = False
+    remake_thumbnail: bool = False  # action=thumbnail: new picture on Flow, not just the title
+
+
+class PortraitBody(BaseModel):
+    names: list[str] = []  # empty = every character without a reference image
+    force: bool = False  # remake even if the character already has one
 
 
 class FinalSettings(BaseModel):
@@ -329,7 +339,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     def gflow(dry_run: bool = False, log: Callable[[str], None] = lambda *_: None) -> Gflow:
         s = load_settings()
-        return Gflow(profile=s.get("profile") or None, dry_run=dry_run, log=log)
+        return Gflow(profile=s.get("profile") or None, dry_run=dry_run, log=log,
+                     ui_enabled=bool(s.get("flow_ui", True)), ui_max_credits=int(s.get("flow_ui_max_credits") or 0),
+                     ui_window=s.get("flow_ui_window") or "hidden")
 
     # ---- project summary / detail ----
 
@@ -362,7 +374,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         errors: list[str] = []
         scenes: dict[str, Any] = {}
         project_id = None
-        i2v_off = bool(State(out_dir(pid) / "state.json").data.get("i2v_unsupported"))
+        st_data = State(out_dir(pid) / "state.json").data
+        i2v_off = bool(st_data.get("i2v_unsupported"))
         try:
             Storyboard.model_validate(raw)
             sb = load_storyboard(sb_path(pid))
@@ -387,13 +400,20 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
-                    "video_prompt": sb.text_only_prompt(s) if (i2v_off and s.mode == "keyframe") else sb.video_prompt(s),
+                    "video_prompt": sb.for_flow(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s)),
                     "rendered_as": st.get("rendered_as"),
-                    "image_prompt": sb.image_prompt(s) if s.mode == "keyframe" else None,
+                    "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
+                    "refs": [n for n, _ in sb.scene_refs(s)],
                 }
         final = out_dir(pid) / "final.mp4"
         srt = final.with_suffix(".srt")
+        thumb_jpg = out_dir(pid) / "thumbnail.jpg"
+        thumb_info: dict[str, Any] = {"url": file_url(pid, thumb_jpg), "picture_ready": False, "prompt": None}
+        if sb:
+            tp = Pipeline(sb, out_dir(pid), gflow(True))
+            thumb_info.update(picture_ready=tp.has_thumbnail_image(), prompt=sb.for_flow(sb.thumbnail_prompt()),
+                              refs=[n for n, _ in sb.thumbnail_refs()])
         return {
             **summary(pid),
             "storyboard": raw,
@@ -406,8 +426,24 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "srt_url": file_url(pid, srt),
             "final_prefs": ui_prefs(pid).get("final", {}),
             "i2v_unsupported": i2v_off,
+            "i2v_error": st_data.get("i2v_error"),
+            "characters_state": characters_state(pid, raw, sb),
+            "thumbnail": thumb_info,
             "path": str(pdir(pid)),
         }
+
+    def characters_state(pid: str, raw: dict[str, Any], sb: Storyboard | None) -> list[dict[str, Any]]:
+        out = []
+        for i, c in enumerate(raw.get("characters") or []):
+            c = c if isinstance(c, dict) else {}
+            model = sb.characters[i] if sb and i < len(sb.characters) else None
+            out.append({
+                "name": c.get("name") or "",
+                "image_url": file_url(pid, c.get("image")) if c.get("image") else None,
+                "image_missing": bool(c.get("image")) and not file_url(pid, c.get("image")),
+                "portrait_prompt": sb.for_flow(sb.portrait_prompt(model)) if (sb and model and model.description.strip()) else None,
+            })
+        return out
 
     # ---- static page ----
 
@@ -425,12 +461,29 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     # ---- environment / settings ----
 
+    gflow_version: dict[str, Any] = {}
+
+    def gflow_ver(g: Gflow, refresh: bool) -> str | None:
+        if refresh or "v" not in gflow_version:
+            v = None
+            if g.available():
+                try:
+                    proc = subprocess.run([*_split(g.binary), "--version"], capture_output=True, text=True, timeout=30)
+                    m = re.search(r"\d+\.\d+[\w.]*", proc.stdout + proc.stderr)
+                    v = m.group(0) if m else None
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            gflow_version["v"] = v
+        return gflow_version["v"]
+
     @app.get("/api/env")
     def env(refresh: bool = False) -> dict[str, Any]:
         s = load_settings()
         g = gflow()
         return {
             "gflow": shutil.which(g.binary.split()[0]) if g.available() else None,
+            "gflow_version": gflow_ver(g, refresh),
+            "flow_ui": g.ui_available(),
             "ffmpeg": shutil.which("ffmpeg"),
             "ffprobe": shutil.which("ffprobe"),
             "anthropic_key": bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
@@ -511,7 +564,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s = load_settings()
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
-        for k in ("profile", "pause_min", "pause_max", "retries"):
+        for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window"):
             if k in body:
                 s[k] = body[k]
         if body.get("anthropic_api_key"):
@@ -521,6 +574,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s["pause_min"] = max(0.0, float(s.get("pause_min") or 0))
         s["pause_max"] = max(float(s["pause_min"]), float(s.get("pause_max") or 0))
         s["retries"] = max(0, min(5, int(s.get("retries") or 0)))
+        s["flow_ui"] = bool(s.get("flow_ui", True))
+        s["flow_ui_max_credits"] = max(0, int(s.get("flow_ui_max_credits") or 0))
+        if s.get("flow_ui_window") not in ("show", "hidden", "headless"):
+            s["flow_ui_window"] = "hidden"
         save_settings(s)
         return get_settings()
 
@@ -568,6 +625,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     dest = d / "assets" / Path(src).name
                     shutil.copy2(src, dest)
                     s[attr] = f"assets/{dest.name}"
+        for c in data.get("characters") or []:
+            src = c.get("image") if isinstance(c, dict) else None
+            if src and Path(src).is_absolute() and Path(src).is_file():
+                dest = d / "assets" / "characters" / Path(src).name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                c["image"] = f"assets/characters/{dest.name}"
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
 
@@ -643,11 +707,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects/{pid}/upload")
     async def upload(pid: str, file: UploadFile = File(...), kind: str = Form("image")) -> dict[str, Any]:
-        d = pdir(pid) / "assets"
-        d.mkdir(exist_ok=True)
+        d = pdir(pid) / "assets" / ("characters" if kind == "character" else "")
+        d.mkdir(parents=True, exist_ok=True)
         name = Path(file.filename or "file").name
         ext = Path(name).suffix.lower()
-        allowed = IMAGE_EXT if kind == "image" else AUDIO_EXT
+        allowed = IMAGE_EXT if kind in ("image", "character") else AUDIO_EXT
         if ext not in allowed:
             raise HTTPException(400, f"Chỉ nhận file {', '.join(sorted(allowed))}")
         stem = slugify(Path(name).stem)
@@ -658,15 +722,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         with dest.open("wb") as fh:
             while chunk := await file.read(1 << 20):
                 fh.write(chunk)
-        return {"path": f"assets/{dest.name}", "url": file_url(pid, dest)}
+        return {"path": dest.relative_to(pdir(pid)).as_posix(), "url": file_url(pid, dest)}
 
     @app.get("/api/projects/{pid}/assets")
     def assets(pid: str) -> dict[str, Any]:
-        d = pdir(pid) / "assets"
-        files = sorted(d.iterdir()) if d.is_dir() else []
+        base = pdir(pid)
+        d = base / "assets"
+        files = sorted(f for f in d.iterdir() if f.is_file()) if d.is_dir() else []
+        chars = d / "characters"
+        char_files = sorted(f for f in chars.iterdir() if f.is_file()) if chars.is_dir() else []
+        item = lambda f: {"path": f.relative_to(base).as_posix(), "url": file_url(pid, f)}
         return {
-            "images": [{"path": f"assets/{f.name}", "url": file_url(pid, f)} for f in files if f.suffix.lower() in IMAGE_EXT],
-            "audio": [{"path": f"assets/{f.name}", "url": file_url(pid, f)} for f in files if f.suffix.lower() in AUDIO_EXT],
+            "images": [item(f) for f in files + char_files if f.suffix.lower() in IMAGE_EXT],
+            "audio": [item(f) for f in files if f.suffix.lower() in AUDIO_EXT],
         }
 
     @app.get("/api/projects/{pid}/file/{rel:path}")
@@ -697,6 +765,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def reset_i2v(pid: str) -> dict[str, Any]:
         state = State(out_dir(pid) / "state.json")
         state.data.pop("i2v_unsupported", None)
+        state.data.pop("i2v_error", None)
         state.save()
         return detail(pid)
 
@@ -706,6 +775,67 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         prefs["final"] = body.model_dump()
         (pdir(pid) / "ui.json").write_text(json.dumps(prefs, indent=2), encoding="utf-8")
         return prefs["final"]
+
+    @app.post("/api/projects/{pid}/characters/portraits")
+    def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
+        """Generate reference images for characters (free on Flow) and store them in the storyboard."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        wanted = set(body.names)
+        unknown = wanted - {c.name for c in sb.characters}
+        if unknown:
+            raise HTTPException(400, f"Không có nhân vật: {', '.join(sorted(unknown))}")
+        picked: list[tuple[int, Any, Path]] = []
+        used: set[str] = set()
+        for i, c in enumerate(sb.characters):
+            if wanted and c.name not in wanted:
+                continue
+            if not wanted and c.image and Path(c.image).is_file() and not body.force:
+                continue
+            if not c.name.strip() or not c.description.strip():
+                raise HTTPException(400, f"Nhân vật #{i + 1} cần có tên và mô tả trước khi tạo ảnh.")
+            stem = slugify(c.name) if slugify(c.name) != "phim" else f"nhan-vat-{i + 1}"
+            while stem in used:
+                stem += f"-{i + 1}"
+            used.add(stem)
+            picked.append((i, c, pdir(pid) / "assets" / "characters" / f"{stem}.png"))
+        if not picked:
+            raise HTTPException(400, "Tất cả nhân vật đã có ảnh. Bấm “Tạo lại” ở từng nhân vật để làm lại.")
+        settings = load_settings()
+
+        def work(job: Job) -> dict[str, Any]:
+            g = gflow(log=job.log)
+            if not g.available():
+                raise RuntimeError("không thấy lệnh gflow")
+            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
+            report = pipe.generate_portraits([(c, dest) for _, c, dest in picked], RunOptions(
+                max_retries=int(settings.get("retries", 2)),
+                pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
+                should_stop=lambda: job.stop_requested))
+            images: dict[str, str] = {}
+            raw = read_raw(pid)
+            chars = raw.get("characters") or []
+            for i, c, dest in picked:
+                if c.name in report.done and i < len(chars) and isinstance(chars[i], dict) and chars[i].get("name") == c.name:
+                    rel = dest.relative_to(pdir(pid)).as_posix()
+                    chars[i]["image"] = rel
+                    images[c.name] = rel
+            if images:
+                write_raw(pid, raw)
+            job.log("")
+            job.log(f"Xong: {len(report.done)} ảnh nhân vật | Lỗi: {len(report.failed)}")
+            if report.aborted:
+                job.log(f"⚠ {report.aborted}")
+            res: dict[str, Any] = {"images": images, "failed": report.failed}
+            if report.aborted or report.failed:
+                res["error"] = report.aborted or f"{len(report.failed)} ảnh lỗi"
+            return res
+
+        title = "Tạo ảnh nhân vật" + (f" ({', '.join(c.name for _, c, _ in picked)})" if wanted else "")
+        return jobs.start("portraits", title, pid, work).public()
 
     # ---- run / estimate ----
 
@@ -751,7 +881,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         unknown = (set(body.only) | set(body.force)) - {s.id for s in sb.scenes}
         if unknown:
             raise HTTPException(400, f"Không có cảnh: {', '.join(sorted(unknown))}")
-        if body.action not in {"dry", "keyframes", "video", "stitch", "make"}:
+        if body.action not in {"dry", "keyframes", "video", "stitch", "make", "thumbnail"}:
             raise HTTPException(400, "action không hợp lệ")
         settings = load_settings()
         music = None
@@ -760,7 +890,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if pdir(pid).resolve() not in music.parents or not music.is_file():
                 raise HTTPException(400, "Không thấy file nhạc.")
         titles = {"dry": "Xem trước (không tốn credit)", "keyframes": "Tạo ảnh keyframe",
-                  "video": "Render video", "stitch": "Ghép phim", "make": "Render + ghép phim"}
+                  "video": "Render video", "stitch": "Ghép phim", "make": "Render + ghép phim",
+                  "thumbnail": "Tạo thumbnail"}
         scope = f" ({', '.join(body.only)})" if body.only else ""
 
         def do_run(job: Job, *, dry: bool, keyframes_only: bool) -> dict[str, Any]:
@@ -812,7 +943,17 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log(f"🎬 Phim hoàn chỉnh: {output}")
             return {"final": str(output)}
 
+        def do_thumbnail(job: Job, remake: bool) -> dict[str, Any]:
+            g = gflow(log=job.log)
+            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
+            if (remake or not pipe.has_thumbnail_image()) and not g.available():
+                raise RuntimeError("không thấy lệnh gflow")
+            path = pipe.make_thumbnail(RunOptions(max_retries=int(settings.get("retries", 2))), remake=remake)
+            return {"thumbnail": str(path)}
+
         def work(job: Job) -> dict[str, Any]:
+            if body.action == "thumbnail":
+                return do_thumbnail(job, body.remake_thumbnail)
             if body.action == "dry":
                 return do_run(job, dry=True, keyframes_only=False)
             if body.action == "keyframes":
@@ -825,6 +966,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     job.log("Có cảnh lỗi nên chưa ghép phim.")
                     return res
                 res.update(do_stitch(job))
+                if not (out_dir(pid) / "thumbnail.jpg").is_file():
+                    try:
+                        res.update(do_thumbnail(job, False))
+                    except Exception as exc:  # the film is done; a missing cover is not a failure
+                        job.log(f"⚠ Chưa làm được thumbnail: {exc}")
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()

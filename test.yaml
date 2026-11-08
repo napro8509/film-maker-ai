@@ -1,0 +1,38 @@
+# Storyboard mẫu cho filmmaker.
+# Mỗi scene = 1 clip ngắn (4-8 giây) trên Google Flow.
+# Nên viết prompt bằng tiếng Anh; narration (phụ đề) viết tiếng Việt được.
+
+title: "Ly cà phê đầu tiên"
+aspect: "16:9"          # 16:9 (ngang) hoặc 9:16 (dọc, TikTok/Shorts)
+model: veo-fast         # veo-lite | veo-fast | veo-quality | omni-flash ... (bỏ trống = mặc định của Flow)
+image_model: nano2      # model ảnh cho keyframe
+style: "cinematic, warm morning light, shallow depth of field, 35mm film grain"
+# project_id: "..."     # dùng lại project Flow có sẵn (tùy chọn)
+
+characters:
+  - name: Lan
+    description: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt, small silver earrings"
+
+scenes:
+  - id: s01
+    mode: keyframe       # tạo ảnh mở đầu rồi animate -> giữ nhân vật đồng nhất
+    image_prompt: "Wide shot of a small Hanoi street cafe at dawn, empty plastic stools, steam rising from a kettle"
+    prompt: "Slow dolly-in toward the cafe as the first motorbikes pass by, ambient street sounds"
+    narration: "Hà Nội, 5 giờ sáng."
+
+  - id: s02
+    mode: keyframe
+    image_prompt: "Close-up of Lan sitting at a low table, holding a glass of Vietnamese drip coffee"
+    prompt: "Lan lifts the glass and smiles softly, gentle handheld camera, coffee dripping in the foreground"
+    duration: 8
+    narration: "Ly cà phê đầu tiên của ngày mới."
+
+  - id: s03
+    mode: t2v            # tạo thẳng từ chữ
+    prompt: "Top-down macro shot of condensed milk swirling into dark coffee, slow motion"
+
+  # - id: s04
+  #   mode: i2v          # animate ảnh của bạn
+  #   image: assets/my_photo.png
+  #   end_image: assets/my_photo_end.png   # tùy chọn
+  #   prompt: "Camera slowly pulls back to reveal the whole street"

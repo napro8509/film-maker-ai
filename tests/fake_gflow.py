@@ -31,7 +31,7 @@ def out_path():
 
 if argv[:2] == ["project", "create"]:
     print(json.dumps({"status": "ok", "project_id": "proj-123", "title": "t"}))
-elif argv[:2] == ["image", "t2i"]:
+elif argv[:2] in (["image", "t2i"], ["image", "i2i"]):
     p = out_path(); p.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=blue:s=64x36",
                     "-frames:v", "1", str(p)], check=True)

@@ -12,6 +12,11 @@ style: "cinematic, warm morning light, shallow depth of field, 35mm film grain"
 characters:
   - name: Lan
     description: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt, small silver earrings"
+    # image: assets/characters/lan.png   # ảnh nhân vật, gửi kèm làm tham chiếu ở mọi cảnh có tên Lan
+
+thumbnail:               # ảnh bìa video: ảnh tạo trên Flow (miễn phí) + tiêu đề in bằng ffmpeg
+  text: "Ly cà phê đầu tiên"
+  prompt: "Lan holding a glass of Vietnamese drip coffee at a Hanoi street cafe at dawn, warm smile, steam rising"
 
 scenes:
   - id: s01

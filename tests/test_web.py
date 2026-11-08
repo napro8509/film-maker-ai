@@ -167,3 +167,72 @@ def test_plan_via_claude_code(client, tmp_path, monkeypatch):
     j = wait(client, client.post("/api/projects/plan", json={"idea": "mèo", "scenes": 1}).json())
     assert j["status"] == "done", j["lines"]
     assert client.get(f"/api/projects/{j['result']['project']}").json()["title"] == "Mèo"
+
+
+def test_character_portraits_and_references(client):
+    pid = client.post("/api/projects", json={"title": "Nhân vật", "source": "template"}).json()["id"]
+    d = client.get(f"/api/projects/{pid}").json()
+    sb = d["storyboard"]
+    assert sb["characters"], "template should have a character"
+    name = sb["characters"][0]["name"]
+    assert d["characters_state"][0]["image_url"] is None and d["characters_state"][0]["portrait_prompt"]
+
+    j = wait(client, client.post(f"/api/projects/{pid}/characters/portraits", json={}).json())
+    assert j["status"] == "done", j["lines"]
+    rel = j["result"]["images"][name]
+    assert rel.startswith("assets/characters/")
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["storyboard"]["characters"][0]["image"] == rel
+    assert d["characters_state"][0]["image_url"]
+    assert any(p["path"] == rel for p in client.get(f"/api/projects/{pid}/assets").json()["images"])
+    with_refs = [sid for sid, st in d["scene_state"].items() if st["refs"]]
+    assert with_refs, "scenes naming the character should use its image"
+
+    # Everyone has an image now: "all missing" has nothing to do; a named remake still works.
+    assert client.post(f"/api/projects/{pid}/characters/portraits", json={}).status_code == 400
+    assert client.post(f"/api/projects/{pid}/characters/portraits", json={"names": ["Nobody"]}).status_code == 400
+    j = wait(client, client.post(f"/api/projects/{pid}/characters/portraits", json={"names": [name], "force": True}).json())
+    assert j["status"] == "done"
+
+    n = len(client.calls())
+    j = run(client, pid, action="keyframes")
+    assert j["status"] == "done", j["lines"]
+    assert ["image", "i2i"] in [c[:2] for c in client.calls()[n:]]
+
+
+def test_upload_character_image(client):
+    pid = client.post("/api/projects", json={"title": "D"}).json()["id"]
+    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("Lan.png", b"x")}, data={"kind": "character"})
+    assert r.status_code == 200 and r.json()["path"] == "assets/characters/lan.png"
+
+
+def test_i2v_refusal_is_reported_and_resettable(client, monkeypatch):
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "video i2v:36:false")
+    pid = client.post("/api/projects", json={"title": "E", "source": "template"}).json()["id"]
+    j = run(client, pid, action="video")
+    assert j["status"] == "failed"
+    assert ["video", "t2v"] not in [c[:2] for c in client.calls()]
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["i2v_unsupported"] and "fake video i2v" in d["i2v_error"]
+    d = client.post(f"/api/projects/{pid}/reset-i2v").json()
+    assert not d["i2v_unsupported"] and d["i2v_error"] is None
+    assert "gflow_version" in client.get("/api/env").json()
+
+
+def test_thumbnail_action_and_make_adds_one(client):
+    pid = client.post("/api/projects", json={"title": "Bìa", "source": "template"}).json()["id"]
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["thumbnail"]["url"] is None and d["thumbnail"]["picture_ready"] is False and d["thumbnail"]["prompt"]
+    j = run(client, pid, action="thumbnail")
+    assert j["status"] == "done", j["lines"]
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["thumbnail"]["url"] and d["thumbnail"]["picture_ready"]
+    assert client.get(d["thumbnail"]["url"]).status_code == 200
+    n = len(client.calls())
+    assert run(client, pid, action="thumbnail")["status"] == "done"
+    assert len(client.calls()) == n  # title re-printed, picture reused
+
+    pid2 = client.post("/api/projects", json={"title": "Bìa 2", "source": "template"}).json()["id"]
+    j = run(client, pid2, action="make")
+    assert j["status"] == "done", j["lines"]
+    assert client.get(f"/api/projects/{pid2}").json()["thumbnail"]["url"]

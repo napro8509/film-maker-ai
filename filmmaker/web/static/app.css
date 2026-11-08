@@ -199,8 +199,14 @@ details.prompt-preview pre { white-space: pre-wrap; word-break: break-word; back
 .picker select { flex: 1; min-width: 0; }
 
 /* characters */
-.char-row { display: grid; grid-template-columns: 160px 1fr auto; gap: 8px; align-items: start; }
-.char-row + .char-row { margin-top: 8px; }
+.char-row { display: grid; grid-template-columns: 150px 1fr auto; gap: 12px; align-items: start; }
+.char-row + .char-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.char-img { width: 150px; aspect-ratio: 16 / 9; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2) center/contain no-repeat; display: grid; place-items: center; cursor: zoom-in; }
+.char-img.portrait { aspect-ratio: 9 / 16; }
+.char-img span { font-size: 11px; color: var(--muted); text-align: center; padding: 6px; }
+.char-row select.sm { max-width: 190px; padding-top: 3px; padding-bottom: 3px; font-size: 12px; }
+.char-chip.has-img { display: inline-flex; align-items: center; gap: 4px; padding-left: 2px; }
+.char-chip img { width: 16px; height: 16px; border-radius: 50%; object-fit: cover; }
 
 /* final */
 .final-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; align-items: start; }
@@ -291,3 +297,8 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--panel
   .chips { order: 3; flex-basis: 100%; }
   .layout { height: auto; }
 }
+
+/* thumbnail */
+.thumb-box { width: 100%; aspect-ratio: 16 / 9; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2) center/cover no-repeat; display: grid; place-items: center; }
+.thumb-box.portrait { aspect-ratio: 9 / 16; max-height: 420px; width: auto; margin: 0 auto; }
+.thumb-box span { font-size: 12px; color: var(--muted); }
