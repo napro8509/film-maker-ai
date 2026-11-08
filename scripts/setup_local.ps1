@@ -48,7 +48,10 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
   $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
 }
 if (Get-Command gflow -ErrorAction SilentlyContinue) { uv tool upgrade gflow-cli } else { Run uv @("tool", "install", "gflow-cli") }
-Run uv @("tool", "run", "--from", "gflow-cli", "playwright", "install", "chromium")
+$env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+uv tool update-shell 2>$null | Out-Null
+uv tool run --from gflow-cli playwright install chromium
+if ($LASTEXITCODE -ne 0) { Warn "Chưa tải được Chromium. Chạy lại sau: uv tool run --from gflow-cli playwright install chromium" }
 
 Step "Chạy test (dùng gflow giả, không tốn credit)"
 if (Get-Command ffmpeg -ErrorAction SilentlyContinue) { Run $VPy @("-m", "pytest", "-q") } else { Warn "Bỏ qua test vì chưa có ffmpeg" }

@@ -50,7 +50,10 @@ if command -v gflow >/dev/null; then
 else
   uv tool install gflow-cli
 fi
-uv tool run --from gflow-cli playwright install chromium
+export PATH="$HOME/.local/bin:$PATH"
+uv tool update-shell >/dev/null 2>&1 || true   # keep gflow on PATH in new terminals
+uv tool run --from gflow-cli playwright install chromium \
+  || warn "Chưa tải được Chromium. Chạy lại sau: uv tool run --from gflow-cli playwright install chromium"
 
 step "Chạy test (dùng gflow giả, không tốn credit)"
 if command -v ffmpeg >/dev/null; then .venv/bin/pytest -q; else warn "Bỏ qua test vì chưa có ffmpeg"; fi
