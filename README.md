@@ -31,11 +31,34 @@ gflow auth login --browser chrome      # đăng nhập Google một lần
 
 # 2. filmmaker
 git clone https://github.com/napro8509/film-maker-ai && cd film-maker-ai
-pip install -e '.[ai]'                 # bỏ [ai] nếu không dùng `plan`
+pip install -e '.[ai,ui]'              # [ai] cho `plan`, [ui] cho giao diện web
 
 # 3. kiểm tra mọi thứ
 filmmaker check
 ```
+
+## Giao diện web
+
+```bash
+filmmaker ui                 # mở http://127.0.0.1:8765 trong trình duyệt
+filmmaker ui --workspace ~/Phim --port 9000
+```
+
+Trên macOS có thể double-click `scripts/FilmMaker.command` (kéo vào Dock để mở nhanh).
+Các dự án được lưu ở `~/FilmMaker/<tên-phim>/` (storyboard.yaml, assets/, output/), nên vẫn dùng chung được với các lệnh CLI.
+
+Giao diện có:
+
+- **Dự án**: tạo phim từ ý tưởng (Claude viết storyboard), từ mẫu, trống, hoặc nhập file `.yaml`; nhân bản; xoá (chuyển vào `.trash`, khôi phục được).
+- **Sửa từng cảnh**: đổi kiểu cảnh, prompt, độ dài, model, phụ đề; thêm/xoá/nhân bản/đổi thứ tự; tải ảnh lên cho kiểu Ảnh → Video; xem prompt thực tế gửi lên Flow. Tự động lưu.
+- **Nhân vật & phong cách**: mô tả nhân vật một lần, tự thêm vào mọi cảnh có tên nhân vật đó.
+- **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.
+- **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
+- **Log trực tiếp** và trạng thái từng cảnh (xong / đã sửa / bị ngắt / lỗi); thông báo trên máy khi xong.
+- **Phim hoàn chỉnh**: xem nối tiếp các clip kèm phụ đề, chọn nhạc nền + âm lượng, in phụ đề lên hình, ghép, tải MP4 / .srt, mở trong Finder.
+- **Cài đặt**: tài khoản gflow, thời gian nghỉ giữa các lần gửi, số lần thử lại, Anthropic API key (lưu ở `~/.config/filmmaker/settings.json`), chế độ sáng/tối; kiểm tra đăng nhập Google, xem credit.
+
+Server chỉ nghe trên `127.0.0.1` và mỗi lần mở có một mã riêng, nên trang web khác không gọi được vào để render.
 
 ## Dùng nhanh
 
@@ -108,7 +131,7 @@ Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động + m�
 
 | Lệnh | Tuỳ chọn |
 |---|---|
-| `run` / `make` | `--dry-run`, `--only s02`, `--force s02`, `--retry-unknown`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
+| `run` / `make` | `--dry-run`, `--keyframes-only`, `--only s02`, `--force s02`, `--retry-unknown`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
 | `stitch` / `make` | `--music file.mp3`, `--music-volume 0.25`, `--burn-subtitles`, `--allow-missing`, `-o phim.mp4` |
 
 Biến môi trường: `GFLOW_BIN` (đường dẫn lệnh gflow khác), `ANTHROPIC_API_KEY` (cho `plan`).

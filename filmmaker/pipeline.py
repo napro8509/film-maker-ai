@@ -57,6 +57,9 @@ class RunOptions:
     max_retries: int = 2
     pause: tuple[float, float] = (8.0, 20.0)  # random pause between paid submissions
     fail_fast: bool = False
+    keyframes_only: bool = False  # only make the (free) keyframe stills, no paid video
+    force_keyframes: set[str] = field(default_factory=set)  # remake these keyframes even if they exist
+    should_stop: Callable[[], bool] = lambda: False  # checked between scenes (UI "stop" button)
 
 
 @dataclass
@@ -65,6 +68,7 @@ class RunReport:
     skipped: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     aborted: str | None = None
+    stopped: bool = False
 
     @property
     def ok(self) -> bool:
@@ -96,6 +100,19 @@ class Pipeline:
             and st.get("fingerprint") == self.sb.scene_fingerprint(s)
             and Path(st.get("video", "")).is_file()
         )
+
+    def has_keyframe(self, s: Scene) -> bool:
+        st = self.state.scene(s.id)
+        return st.get("keyframe_prompt") == self.sb.image_prompt(s) and self.keyframe_path(s).is_file()
+
+    def scene_status(self, s: Scene) -> str:
+        """done | changed | interrupted | failed | todo"""
+        st = self.state.scene(s.id)
+        if self.is_done(s):
+            return "done"
+        if st.get("status") == DONE:
+            return "changed"
+        return {SUBMITTING: "interrupted", FAILED: "failed"}.get(st.get("status"), "todo")
 
     def ensure_project(self) -> str:
         pid = self.sb.project_id or self.state.data.get("project_id")
@@ -129,6 +146,8 @@ class Pipeline:
         (self.out / "keyframes").mkdir(parents=True, exist_ok=True)
 
         scenes = [s for s in self.sb.scenes if not opts.only or s.id in opts.only]
+        if opts.keyframes_only:
+            return self._run_keyframes(scenes, opts, report)
         todo = []
         for s in scenes:
             st = self.state.scene(s.id)
@@ -157,6 +176,10 @@ class Pipeline:
         self.log(f"Project: {project}")
 
         for idx, s in enumerate(todo):
+            if opts.should_stop():
+                report.stopped = True
+                self.log("Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).")
+                break
             if idx > 0 and not self.g.dry_run:
                 pause = random.uniform(*opts.pause)
                 self.log(f"  (nghỉ {pause:.0f}s giữa các lần gửi)")
@@ -180,6 +203,62 @@ class Pipeline:
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {video}")
         return report
 
+    def _keyframe(self, s: Scene, project: str, opts: RunOptions, *, remake: bool) -> Path:
+        kf = self.keyframe_path(s)
+        if self.has_keyframe(s) and not remake:
+            self.log(f"  dùng lại keyframe {kf}")
+            return kf
+        # Images are free on Flow, so retrying them is safe.
+        img = self._with_retries(
+            "tạo keyframe",
+            lambda: self.g.text_to_image(self.sb.image_prompt(s), out=kf, aspect=self.sb.aspect,
+                                         model=self.sb.image_model, project=project),
+            opts.max_retries,
+        )
+        if not self.g.dry_run:
+            if Path(img) != kf and Path(img).is_file():  # keep the UI's preview path stable
+                kf.parent.mkdir(parents=True, exist_ok=True)
+                kf.write_bytes(Path(img).read_bytes())
+            self.state.update(s.id, keyframe=str(kf), keyframe_prompt=self.sb.image_prompt(s))
+        return kf
+
+    def _run_keyframes(self, scenes: list[Scene], opts: RunOptions, report: RunReport) -> RunReport:
+        """Make only the keyframe stills (free on Flow) so they can be reviewed before paying for video."""
+        todo = []
+        for s in scenes:
+            if s.mode != "keyframe" or (self.has_keyframe(s) and s.id not in opts.force_keyframes):
+                report.skipped.append(s.id)
+            else:
+                todo.append(s)
+        if not todo:
+            self.log("Không có keyframe nào cần tạo.")
+            return report
+        try:
+            project = self.ensure_project()
+        except GflowError as exc:
+            report.aborted = str(exc)
+            return report
+        for idx, s in enumerate(todo):
+            if opts.should_stop():
+                report.stopped = True
+                self.log("Đã dừng theo yêu cầu.")
+                break
+            if idx > 0 and not self.g.dry_run:
+                self.sleep(random.uniform(*opts.pause))
+            self.log(f"[{s.id}] keyframe: {(s.image_prompt or s.prompt)[:80]}")
+            try:
+                kf = self._keyframe(s, project, opts, remake=True)
+            except GflowError as exc:
+                report.failed[s.id] = str(exc)
+                self.log(f"[{s.id}] LỖI: {exc}")
+                if exc.fatal:
+                    report.aborted = f"dừng vì lỗi nghiêm trọng ở {s.id} (exit {exc.exit_code})"
+                    break
+                continue
+            report.done.append(s.id)
+            self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {kf}")
+        return report
+
     def _render_scene(self, s: Scene, project: str, opts: RunOptions) -> Path:
         dry = self.g.dry_run
         model = s.model or self.sb.model
@@ -188,22 +267,7 @@ class Pipeline:
 
         start_image: Path | None = None
         if s.mode == "keyframe":
-            kf = self.keyframe_path(s)
-            st = self.state.scene(s.id)
-            same_kf = st.get("keyframe_prompt") == self.sb.image_prompt(s) and kf.is_file()
-            if same_kf and s.id not in opts.force:
-                self.log(f"  dùng lại keyframe {kf}")
-                start_image = kf
-            else:
-                # Images are free on Flow, so retrying them is safe.
-                start_image = self._with_retries(
-                    "tạo keyframe",
-                    lambda: self.g.text_to_image(self.sb.image_prompt(s), out=kf, aspect=self.sb.aspect,
-                                                 model=self.sb.image_model, project=project),
-                    opts.max_retries,
-                )
-                if not dry:
-                    self.state.update(s.id, keyframe=str(start_image), keyframe_prompt=self.sb.image_prompt(s))
+            start_image = self._keyframe(s, project, opts, remake=s.id in opts.force_keyframes)
         elif s.mode == "i2v":
             start_image = Path(s.image)  # validated by the storyboard
             if not dry and not start_image.is_file():

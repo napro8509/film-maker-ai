@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="token" content="__TOKEN__">
+  <title>Film Maker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">🎬</span> Film Maker</div>
+    <div id="envchips" class="chips"></div>
+    <div class="top-actions">
+      <button id="btn-credits" class="btn ghost" title="Xem số credit còn lại trên Google Flow">💳 Credit</button>
+      <button id="btn-settings" class="btn ghost">⚙️ Cài đặt</button>
+    </div>
+  </header>
+  <div class="layout">
+    <aside id="sidebar"></aside>
+    <main id="main"></main>
+  </div>
+  <section id="jobbar" class="jobbar hidden"></section>
+  <div id="modal-root"></div>
+  <div id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

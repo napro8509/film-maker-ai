@@ -89,10 +89,12 @@ def _run_options(f):
     f = click.option("--retries", default=2, show_default=True, help="Số lần thử lại khi lỗi tạm thời.")(f)
     f = click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi, dạng MIN-MAX.")(f)
     f = click.option("--fail-fast", is_flag=True, help="Dừng ngay ở cảnh lỗi đầu tiên.")(f)
+    f = click.option("--keyframes-only", is_flag=True, help="Chỉ tạo ảnh keyframe (miễn phí) để duyệt trước khi render video.")(f)
     return f
 
 
-def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast):
+def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast,
+            keyframes_only=False):
     sb = load_storyboard(storyboard)
     out_dir = _out_dir(storyboard, out)
     g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
@@ -107,6 +109,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     report = pipe.run(RunOptions(
         only=set(only) or None, force=set(force), retry_unknown=retry_unknown,
         max_retries=retries, pause=_parse_pause(pause), fail_fast=fail_fast,
+        keyframes_only=keyframes_only, force_keyframes=set(force),
     ))
     click.echo("")
     if dry_run:
@@ -180,7 +183,7 @@ def stitch(storyboard: Path, out, output, music, volume, subtitles, allow_missin
 def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim."""
     sb, out_dir, report = _do_run(storyboard, **kw)
-    if kw["dry_run"]:
+    if kw["dry_run"] or kw["keyframes_only"]:
         return
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
@@ -218,6 +221,20 @@ def template(output: Path) -> None:
     src = Path(__file__).parent / "templates" / "storyboard.yaml"
     output.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     click.echo(f"✔ {output}")
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
+@click.option("--port", default=8765, show_default=True)
+@click.option("--no-browser", is_flag=True, help="Không tự mở trình duyệt.")
+def ui(workspace: Path | None, port: int, no_browser: bool) -> None:
+    """Mở giao diện web trên máy (http://127.0.0.1:8765)."""
+    try:
+        from .web.server import serve
+    except ImportError as exc:
+        raise click.ClickException("cần cài thêm: pip install -e '.[ui]'") from exc
+    serve(workspace or Path.home() / "FilmMaker", port=port, open_browser=not no_browser)
 
 
 if __name__ == "__main__":

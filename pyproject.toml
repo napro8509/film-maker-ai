@@ -14,7 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed for `filmmaker plan` (idea -> storyboard with Claude).
 ai = ["anthropic>=2.0"]
-dev = ["pytest>=8"]
+# Only needed for `filmmaker ui` (local web interface).
+ui = ["fastapi>=0.115", "uvicorn>=0.30", "python-multipart>=0.0.9"]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 filmmaker = "filmmaker.cli:main"
@@ -30,4 +32,4 @@ include = ["filmmaker*"]
 testpaths = ["tests"]
 
 [tool.setuptools.package-data]
-filmmaker = ["templates/*.yaml"]
+filmmaker = ["templates/*.yaml", "web/static/*"]
