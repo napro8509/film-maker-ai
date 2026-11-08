@@ -56,7 +56,14 @@ Giao diện có:
 - **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
 - **Log trực tiếp** và trạng thái từng cảnh (xong / đã sửa / bị ngắt / lỗi); thông báo trên máy khi xong.
 - **Phim hoàn chỉnh**: xem nối tiếp các clip kèm phụ đề, chọn nhạc nền + âm lượng, in phụ đề lên hình, ghép, tải MP4 / .srt, mở trong Finder.
-- **Cài đặt**: tài khoản gflow, thời gian nghỉ giữa các lần gửi, số lần thử lại, Anthropic API key (lưu ở `~/.config/filmmaker/settings.json`), chế độ sáng/tối; kiểm tra đăng nhập Google, xem credit.
+- **Cài đặt**: tài khoản gflow, thời gian nghỉ giữa các lần gửi, số lần thử lại, cách gọi Claude, Anthropic API key (lưu ở `~/.config/filmmaker/settings.json`), chế độ sáng/tối; kiểm tra đăng nhập Google, xem credit.
+
+### Viết storyboard bằng gói Claude (Pro/Max), không cần API key
+
+Gói Claude Pro/Max không dùng được cho API key (API tính phí riêng), nhưng dùng được qua Claude Code.
+Nếu máy có lệnh `claude` đã đăng nhập (`claude` rồi gõ `/login`), `filmmaker plan` và nút "Từ ý tưởng"
+sẽ tự gọi qua Claude Code. Muốn chọn rõ: `filmmaker plan "..." --backend claude_code` hoặc `--backend api`.
+Khi gọi Claude Code, `ANTHROPIC_API_KEY` được gỡ khỏi môi trường để không bị tính phí API.
 
 Server chỉ nghe trên `127.0.0.1` và mỗi lần mở có một mã riêng, nên trang web khác không gọi được vào để render.
 

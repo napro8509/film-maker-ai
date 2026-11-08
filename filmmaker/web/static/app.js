@@ -251,9 +251,31 @@ function renderTopbar() {
     h("span", { class: "chip " + (e.gflow ? "ok" : "bad"), title: e.gflow || "Chưa cài gflow-cli" }, e.gflow ? "✔ gflow" : "✘ gflow"),
     h("span", { class: "chip " + (e.ffmpeg ? "ok" : "bad"), title: e.ffmpeg || "Chưa cài ffmpeg" }, e.ffmpeg ? "✔ ffmpeg" : "✘ ffmpeg"),
     authChip(),
-    h("span", { class: "chip " + (e.anthropic_key ? "ok" : "warn"), title: "Dùng để viết storyboard bằng AI" },
-      e.anthropic_key ? "✔ Claude AI" : "Claude AI: chưa có key"),
+    claudeChip(),
   );
+}
+
+function claudeChip() {
+  const e = S.env, cc = e.claude_code || {};
+  if (e.planner === "claude_code" && cc.logged_in)
+    return h("span", { class: "chip ok", title: "Viết storyboard bằng Claude Code, dùng gói Claude của bạn (không cần API key)" }, "✔ Claude (gói của bạn)");
+  if (e.planner === "api") return h("span", { class: "chip ok", title: "Viết storyboard bằng Anthropic API key" }, "✔ Claude (API key)");
+  if (cc.available) return h("button", { class: "chip warn", onclick: claudeLoginHelp, title: "Claude Code chưa đăng nhập" }, "Claude: chưa đăng nhập");
+  return h("button", { class: "chip warn", onclick: openSettings }, "Claude AI: chưa thiết lập");
+}
+
+function claudeLoginHelp() {
+  modal({
+    title: "Đăng nhập Claude Code",
+    body: h("div", { class: "stack" },
+      h("p", {}, "Để viết storyboard bằng gói Claude (Pro/Max) của bạn mà không cần API key, Claude Code cần đăng nhập một lần:"),
+      h("pre", { class: "box" }, "claude\n/login"),
+      h("p", { class: "small muted" }, "Mở Terminal, gõ lệnh trên, chọn đăng nhập bằng tài khoản Claude. Xong thì bấm “Kiểm tra lại”.")),
+    buttons: [{ label: "Đóng" }, { label: "Kiểm tra lại", cls: "primary", onclick: async (c) => {
+      S.env = await api("GET", "/api/env?refresh=true"); renderTopbar(); c();
+      toast(S.env.planner ? "Đã sẵn sàng" : "Vẫn chưa đăng nhập", S.env.planner ? "ok" : "error");
+    } }],
+  });
 }
 
 function authChip() {
@@ -912,7 +934,7 @@ async function stopJob() {
 /* ---------- new project ---------- */
 
 function openNewProject() {
-  let mode = S.env.anthropic_key ? "ai" : "template";
+  let mode = S.env.planner ? "ai" : "template";
   const body = h("div");
   const render = () => {
     const choices = [["ai", "✨ Từ ý tưởng", "Claude viết storyboard cho bạn"], ["template", "📋 Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
@@ -933,8 +955,10 @@ function openNewProject() {
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, "Tạo dự án")));
   };
   const aiForm = () => {
-    if (!S.env.anthropic_key) return h("div", { class: "banner warn" }, "Cần Anthropic API key để dùng Claude. ",
-      h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Thêm key trong Cài đặt"), ".");
+    if (!S.env.planner) return h("div", { class: "banner warn" },
+      S.env.claude_code?.available ? "Claude Code chưa đăng nhập. Mở Terminal, chạy “claude” rồi gõ /login bằng tài khoản Claude của bạn. "
+        : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
+      h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".");
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
     const n = h("input", { type: "number", min: 1, max: 20, value: 6 });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
@@ -945,14 +969,15 @@ function openNewProject() {
       e.target.disabled = true;
       try {
         const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: lang.value });
-        close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–2 phút…", "", 6000);
+        close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–3 phút…", "", 6000);
       } catch (err) { toast(err.message, "error"); e.target.disabled = false; }
     };
     return h("div", { class: "stack" },
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Ý tưởng phim"), idea),
       h("div", { class: "grid3" }, h("label", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh"), n),
         h("label", { class: "field" }, h("span", { class: "lbl" }, "Khung hình"), aspect), h("label", { class: "field" }, h("span", { class: "lbl" }, "Ngôn ngữ phụ đề"), lang)),
-      h("p", { class: "small muted", style: { margin: 0 } }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì."),
+      h("p", { class: "small muted", style: { margin: 0 } }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
+        S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, "✨ Viết storyboard")));
   };
   const importForm = () => {
@@ -980,6 +1005,11 @@ async function openSettings() {
   const pmax = h("input", { type: "number", min: 0, value: s.pause_max });
   const retries = h("input", { type: "number", min: 0, max: 5, value: s.retries });
   let clearKey = false;
+  const cc = S.env.claude_code || {};
+  const planner = h("select", { value: s.planner || "auto" },
+    h("option", { value: "auto" }, "Tự động (ưu tiên Claude Code)"),
+    h("option", { value: "claude_code" }, "Claude Code — dùng gói Claude Pro/Max của bạn"),
+    h("option", { value: "api" }, "Anthropic API key — tính phí riêng"));
   const theme = h("select", { value: localGet("theme", "auto"), onchange: (e) => { localSet("theme", e.target.value); applyTheme(); } },
     h("option", { value: "auto" }, "Theo hệ thống"), h("option", { value: "light" }, "Sáng"), h("option", { value: "dark" }, "Tối"));
   modal({
@@ -999,7 +1029,12 @@ async function openSettings() {
           h("label", { class: "field" }, h("span", { class: "lbl" }, "Số lần thử lại khi lỗi tạm"), retries)),
         h("p", { class: "small muted", style: { marginBottom: 0 } }, "Nghỉ ngẫu nhiên giữa các lần gửi để Flow không coi là bot. Chỉ thử lại các lỗi mà gflow báo là tạm thời.")),
       h("div", { class: "card card-pad" }, h("h3", {}, "Claude AI (viết storyboard)"),
-        h("label", { class: "field" }, h("span", { class: "lbl" }, "Anthropic API key"), key),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Cách gọi Claude"), planner),
+        h("p", { class: "small", style: { margin: "6px 0 12px" } },
+          cc.available ? (cc.logged_in ? `✔ Claude Code đã đăng nhập (${cc.method === "claude.ai" ? "tài khoản Claude, dùng gói của bạn" : cc.method || "đã đăng nhập"}).`
+            : "⚠ Có Claude Code nhưng chưa đăng nhập: mở Terminal, chạy “claude” rồi gõ /login.")
+            : "Chưa cài Claude Code. Gói Claude Pro/Max chỉ dùng được qua Claude Code, không dùng cho API key."),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Anthropic API key (không bắt buộc nếu dùng Claude Code)"), key),
         h("div", { class: "row", style: { marginTop: "8px" } },
           s.anthropic_key_set ? h("label", { class: "check" }, h("input", { type: "checkbox", onchange: (e) => { clearKey = e.target.checked; } }), h("span", { class: "small" }, "Xoá key đã lưu")) : null,
           h("span", { class: "spacer" }), h("a", { class: "small", href: "https://console.anthropic.com/settings/keys", target: "_blank", rel: "noopener" }, "Lấy API key ↗")),
@@ -1007,7 +1042,7 @@ async function openSettings() {
       h("div", { class: "card card-pad" }, h("h3", {}, "Giao diện"), h("label", { class: "field" }, h("span", { class: "lbl" }, "Chế độ màu"), theme))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
-        await api("PUT", "/api/settings", { profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
+        await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
         S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }

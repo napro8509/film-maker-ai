@@ -67,14 +67,19 @@ def check(profile: str | None) -> None:
 @click.option("-n", "--scenes", default=6, show_default=True, help="Số cảnh.")
 @click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="16:9", show_default=True)
 @click.option("--lang", "language", default=None, help="Ngôn ngữ phụ đề, ví dụ: Vietnamese.")
-def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None) -> None:
-    """Viết storyboard từ một ý tưởng bằng Claude (cần ANTHROPIC_API_KEY)."""
-    from .planner import plan as make_plan
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
+              help="claude_code = dùng gói Claude (Pro/Max) qua lệnh `claude`; api = dùng ANTHROPIC_API_KEY.")
+def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, backend: str) -> None:
+    """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key)."""
+    from .planner import plan_auto
 
     if output.exists() and not click.confirm(f"{output} đã tồn tại. Ghi đè?"):
         return
     click.echo("Đang viết storyboard...")
-    sb = make_plan(idea, scenes=scenes, aspect=aspect, language_hint=language)
+    try:
+        sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
     save_storyboard(sb, output)
     click.echo(f"✔ {output}: {len(sb.scenes)} cảnh. Xem/sửa lại rồi chạy: filmmaker run {output} --dry-run")
 

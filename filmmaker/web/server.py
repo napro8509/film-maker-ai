@@ -56,7 +56,8 @@ FALLBACK_MODELS = {
 
 # --- settings -----------------------------------------------------------------
 
-DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": ""}
+DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": "",
+                    "planner": "auto"}  # auto | claude_code | api
 
 
 def load_settings() -> dict[str, Any]:
@@ -234,6 +235,28 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     app.state.token = token
     app.state.jobs = jobs
     models_cache: dict[str, Any] = {}
+    claude_cache: dict[str, Any] = {}
+
+    def claude_code(refresh: bool = False) -> dict[str, Any]:
+        from ..planner import claude_code_status
+
+        if refresh or not claude_cache:
+            claude_cache.clear()
+            claude_cache.update(claude_code_status())
+        return dict(claude_cache)
+
+    def planner_backend() -> str | None:
+        """Which backend `plan` will use right now, or None if neither works."""
+        s = load_settings()
+        has_key = bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+        cc = claude_code()
+        cc_ok = cc["available"] and cc["logged_in"]
+        choice = s.get("planner") or "auto"
+        if choice == "claude_code":
+            return "claude_code" if cc["available"] else None
+        if choice == "api":
+            return "api" if has_key else None
+        return "claude_code" if cc_ok else ("api" if has_key else ("claude_code" if cc["available"] else None))
 
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost", "testserver"}
 
@@ -400,7 +423,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     # ---- environment / settings ----
 
     @app.get("/api/env")
-    def env() -> dict[str, Any]:
+    def env(refresh: bool = False) -> dict[str, Any]:
         s = load_settings()
         g = gflow()
         return {
@@ -408,6 +431,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "ffmpeg": shutil.which("ffmpeg"),
             "ffprobe": shutil.which("ffprobe"),
             "anthropic_key": bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
+            "claude_code": claude_code(refresh=refresh),
+            "planner": planner_backend(),
             "workspace": str(workspace),
             "profile": s.get("profile") or None,
             "platform": sys.platform,
@@ -481,6 +506,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.put("/api/settings")
     def put_settings(body: dict[str, Any]) -> dict[str, Any]:
         s = load_settings()
+        if body.get("planner") in ("auto", "claude_code", "api"):
+            s["planner"] = body["planner"]
         for k in ("profile", "pause_min", "pause_max", "retries"):
             if k in body:
                 s[k] = body[k]
@@ -545,16 +572,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def plan_project(body: PlanBody) -> dict[str, Any]:
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
-        key = load_settings().get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
-        if not key:
-            raise HTTPException(400, "Chưa có Anthropic API key. Vào Cài đặt để thêm.")
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
 
         def work(job: Job) -> dict[str, Any]:
-            from ..planner import plan
+            from ..planner import plan_auto
 
-            os.environ["ANTHROPIC_API_KEY"] = key
-            job.log(f"Claude đang viết storyboard {body.scenes} cảnh cho: {body.idea[:200]}")
-            sb = plan(body.idea, scenes=max(1, min(20, body.scenes)), aspect=body.aspect, language_hint=body.language)
+            via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+            job.log(f"Claude đang viết storyboard {body.scenes} cảnh qua {via}…")
+            job.log(f"Ý tưởng: {body.idea[:300]}")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
+                              aspect=body.aspect, language_hint=body.language)
             pid, d = new_project_dir(sb.title)
             data = sb.model_dump(exclude_none=True)
             (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=100),

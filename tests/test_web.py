@@ -156,3 +156,14 @@ def test_settings_hide_api_key(client):
     s = client.put("/api/settings", json={"anthropic_api_key": "sk-ant-secret1234", "pause_min": 5, "pause_max": 1}).json()
     assert s["anthropic_api_key"] == "" and s["anthropic_key_set"] and s["anthropic_key_hint"] == "…1234"
     assert s["pause_max"] == 5  # max is never below min
+
+
+def test_plan_via_claude_code(client, tmp_path, monkeypatch):
+    from tests.test_planner import _fake
+
+    _fake(tmp_path, monkeypatch)
+    env = client.get("/api/env?refresh=true").json()
+    assert env["planner"] == "claude_code" and env["claude_code"]["logged_in"]
+    j = wait(client, client.post("/api/projects/plan", json={"idea": "mèo", "scenes": 1}).json())
+    assert j["status"] == "done", j["lines"]
+    assert client.get(f"/api/projects/{j['result']['project']}").json()["title"] == "Mèo"
