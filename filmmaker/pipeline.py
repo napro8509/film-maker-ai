@@ -164,9 +164,13 @@ class Pipeline:
             if s.id not in opts.force and self.is_done(s):
                 report.skipped.append(s.id)
                 continue
+            if st.get("status") == SUBMITTING and s.id not in opts.force and self._adopt_manual_clip(s):
+                report.skipped.append(s.id)
+                continue
             if st.get("status") == SUBMITTING and not opts.retry_unknown and s.id not in opts.force:
-                msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. "
-                       "Kiểm tra trên Flow rồi chạy lại với --retry-unknown hoặc --force " + s.id)
+                msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. Nếu video đã có trên Flow, "
+                       f"tải về và lưu thành {self.clip_path(s)} rồi chạy lại; nếu chưa có, chạy lại với "
+                       "--retry-unknown hoặc --force " + s.id)
                 self.log(f"[{s.id}] BỎ QUA: {msg}")
                 report.failed[s.id] = msg
                 continue
@@ -421,6 +425,17 @@ class Pipeline:
                 raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
             self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=None)
         return Path(video)
+
+    def _adopt_manual_clip(self, s: Scene) -> bool:
+        """A render was interrupted after Flow billed it, and the user downloaded the clip from Flow
+        by hand into clips/<id>.mp4: take that file instead of rendering (and paying) again."""
+        clip = self.clip_path(s)
+        if not clip.is_file() or clip.stat().st_size < 10_000:
+            return False
+        self.log(f"[{s.id}] dùng video bạn đã tải về: {clip}")
+        self.state.update(s.id, status=DONE, video=str(clip), fingerprint=self.sb.scene_fingerprint(s),
+                          error=None, rendered_as="manual")
+        return True
 
     def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict) -> Path:
         """Image-to-video by driving the Flow chat page (flow_ui.py). Never retried: Flow may have billed it."""

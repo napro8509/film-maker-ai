@@ -140,10 +140,24 @@ def _session(pw, profile: Path, channel: str | None, window: str, project: str):
     raise Fail(EXIT_USAGE, f"Không mở được trình duyệt: {last}")
 
 
+# Flow's grid and chat re-render all the time; a locator can briefly point at a replaced node.
+TRANSIENT_RE = re.compile(r"not attached to the DOM|element is not stable|is not visible|outside of the viewport|"
+                          r"Execution context was destroyed|frame was detached|Timeout \d+ms exceeded", re.I)
+
+
+def _transient(exc: Exception) -> bool:
+    return type(exc).__module__.startswith("playwright") and bool(TRANSIENT_RE.search(str(exc)))
+
+
 def _wait(fn, timeout: float, every: float = 0.5):
     end = time.time() + timeout
     while time.time() < end:
-        v = fn()
+        try:
+            v = fn()
+        except Exception as exc:
+            if not _transient(exc):
+                raise
+            v = None
         if v:
             return v
         time.sleep(every)
@@ -225,30 +239,39 @@ def _stable_titles(page, settle: float = 4.0, limit: float = 30.0) -> list[str]:
     return last or []
 
 
-def _new_tile(page, before: list[str]):
-    """The newest video tile, if its title was not there before (Flow names each new video and
+def _new_tile(page, before: list[str]) -> str | None:
+    """Title of the newest video tile, if it was not there before (Flow names each new video and
     puts it first). Anything else is ignored, so an older clip is never taken for the new one."""
     _scroll_grid_top(page)
-    tiles = page.locator(GRID_TILE).filter(has=page.locator(VIDEO_TILE))
-    if not tiles.count():
-        return None
-    first = tiles.first
-    title = first.get_attribute("aria-label") or ""
     now = _video_titles(page)
+    if not now:
+        return None
+    title = now[0]
     if title not in before or now.count(title) > before.count(title):
-        return first
+        return title
     return None
 
 
-def _try_download(page, tile, out: Path) -> str:
+def _tile(page, title: str):
+    """Locator for the video tile with this title. Looked up again on every use, because the
+    virtual grid swaps tile nodes while it scrolls and re-renders."""
+    return (page.locator(f"{GRID_TILE}[aria-label={json.dumps(title)}]")
+            .filter(has=page.locator(VIDEO_TILE)).first)
+
+
+def _try_download(page, title: str, out: Path) -> str:
     """Click Download > Original size and keep the video bytes the page fetches.
     Returns "ok", or "pending" if the clip is not ready yet. The browser's own file download is
     suppressed (it is what closed the browser before); the bytes come from the page's request."""
-    tile.scroll_into_view_if_needed()
+    tile = _tile(page, title)
+    if not tile.count():
+        return "pending"
     try:
+        tile.scroll_into_view_if_needed(timeout=5_000)
         tile.hover(timeout=5_000)
-    except Exception:
-        pass
+    except Exception as exc:
+        if not _transient(exc):
+            raise
     more = tile.locator('button[aria-label="More options"]').first
     if not more.count():
         return "pending"
@@ -288,6 +311,33 @@ def _try_download(page, tile, out: Path) -> str:
     m = re.search(r"/video/([0-9a-f-]{36})", r.url)
     LAST_MEDIA["id"] = m.group(1) if m else None
     return "ok"
+
+
+class PollTried(Exception):
+    """A download was attempted but the clip is not ready yet."""
+
+
+def _close_menus(page) -> None:
+    try:
+        for _ in range(2):
+            if page.locator(".cdk-overlay-container [role=menu]").count():
+                page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+def _poll_download(page, titles_before: list[str], out: Path, last_try: float, every: float = 20) -> bool:
+    """One check of the grid: True once the new clip is saved to `out`.
+    Raises PollTried after an attempt that found the clip not ready (at most every `every` seconds)."""
+    title = _new_tile(page, titles_before)
+    if title is None:
+        return False
+    busy = _tile(page, title).locator("[role=progressbar], mat-progress-spinner, mat-progress-bar").count()
+    if busy or time.time() - last_try <= every:
+        return False
+    if _try_download(page, title, out) == "ok":
+        return True
+    raise PollTried()
 
 
 def _bubble_texts(page) -> list[str]:
@@ -392,14 +442,18 @@ def run_i2v(args) -> dict:
                 if time.time() - last_note > 60:
                     last_note = time.time()
                     log(f"  đang chờ Flow render… {int(time.time() - started)}s")
-                tile = _new_tile(page, titles_before)
-                busy = tile is not None and tile.locator('[role=progressbar], mat-progress-spinner, mat-progress-bar').count()
-                # Try to fetch the clip at most every 20 s; a clip that is still rendering is refused.
-                if tile is not None and not busy and time.time() - last_try > 20:
-                    last_try = time.time()
-                    if _try_download(page, tile, out) == "ok":
+                try:
+                    if _poll_download(page, titles_before, out, last_try):
                         res = "ok"
                         break
+                except PollTried:
+                    last_try = time.time()
+                except Exception as exc:
+                    # Credits are already spent, so a re-rendering page must not end the wait.
+                    if not _transient(exc):
+                        raise
+                    log(f"  (trang Flow đang vẽ lại, thử lại: {str(exc).splitlines()[0][:120]})")
+                    _close_menus(page)
                 time.sleep(5)
             if res == "failed":
                 texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]

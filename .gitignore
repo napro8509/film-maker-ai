@@ -5,3 +5,4 @@ __pycache__/
 output/
 dist/
 build/
+.DS_Store
