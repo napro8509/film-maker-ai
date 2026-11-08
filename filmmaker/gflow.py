@@ -23,6 +23,7 @@ EXIT_BROWSER_CLOSED = 15
 EXIT_UI_DRIFT = 23
 EXIT_NO_CREDITS = 37
 EXIT_NO_FLOW_ACCESS = 39
+EXIT_NOT_PORTED = 36  # request type not supported on this account's Flow frontend (checked before submit)
 
 # Errors where carrying on with the next scene is pointless.
 FATAL_EXIT_CODES = {EXIT_AUTH_MISSING, EXIT_UI_DRIFT, EXIT_NO_CREDITS, EXIT_NO_FLOW_ACCESS, 12, 14, 36, 38}

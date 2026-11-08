@@ -83,6 +83,13 @@ class Storyboard(BaseModel):
             return self._compose(scene.prompt)
         return scene.prompt.strip()
 
+    def text_only_prompt(self, scene: Scene) -> str:
+        """Text-to-video prompt for a keyframe scene when image-to-video is unavailable:
+        the opening-frame description plus the motion, with characters and style."""
+        if scene.image_prompt and scene.image_prompt.strip():
+            return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}")
+        return self._compose(scene.prompt)
+
     def image_prompt(self, scene: Scene) -> str:
         return self._compose(scene.image_prompt or scene.prompt)
 

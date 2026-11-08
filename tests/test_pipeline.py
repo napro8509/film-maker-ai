@@ -141,3 +141,22 @@ def test_cli_dry_run_spends_nothing(env, tmp_path):
     assert res.exit_code == 0, res.output
     assert "gflow" in res.output or "fake_gflow" in res.output
     assert calls() == []
+
+
+def test_i2v_not_ported_falls_back_to_text_to_video(env, tmp_path, monkeypatch):
+    sb_path, calls = env
+    # Agent-only flow.google.com accounts refuse i2v before submit (exit 36).
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "video i2v:36:false")
+    out = tmp_path / "out"
+    report = make_pipe(sb_path, out).run(RunOptions())
+    assert report.done == ["s01", "s02"]  # keyframe scene rendered as t2v
+    assert "s03" in report.failed and "Chữ → Video" in report.failed["s03"]  # user's own image cannot work
+    assert report.aborted is None
+    t2v = [c for c in calls() if c[:2] == ["video", "t2v"]]
+    assert any("Lan at a cafe" in c[2] and "slow push-in" in c[2] and "red scarf" in c[2] for c in t2v)
+    pipe = make_pipe(sb_path, out)
+    assert pipe.i2v_unsupported and pipe.state.scene("s01")["rendered_as"] == "t2v"
+    # Next time the flag is remembered: no keyframe image, straight to t2v.
+    n = len(calls())
+    pipe.run(RunOptions(only={"s01"}, force={"s01"}))
+    assert [c[:2] for c in calls()[n:]] == [["video", "t2v"]]

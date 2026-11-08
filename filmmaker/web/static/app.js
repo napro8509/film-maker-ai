@@ -422,9 +422,16 @@ function projectMenu(anchor) {
 
 function renderErrors() {
   const errs = S.cur.errors || [];
-  if (!errs.length) return h("div");
-  return h("div", { class: "banner err" }, h("b", {}, "Storyboard còn lỗi, chưa chạy được:"),
-    h("ul", {}, errs.map((e) => h("li", {}, prettyError(e)))));
+  const i2v = S.cur.i2v_unsupported ? h("div", { class: "banner warn" },
+    h("b", {}, "Tài khoản Flow của bạn chưa tạo được video từ ảnh qua gflow. "),
+    "Google đã chuyển tài khoản sang giao diện Flow mới, nơi gflow mới hỗ trợ Chữ → Video. Vì vậy các cảnh “Ảnh → Video” sẽ được render bằng Chữ → Video, ghép từ mô tả ảnh mở đầu + chuyển động + nhân vật + phong cách. Ảnh keyframe lúc này chỉ để tham khảo. Cảnh “Ảnh của bạn → Video” chưa làm được.",
+    h("div", { style: { marginTop: "8px" } }, h("button", { class: "btn sm", onclick: async () => {
+      try { const d = await api("POST", `/api/projects/${S.cur.id}/reset-i2v`); applyMeta(d); toast("Lần render sau sẽ thử lại Ảnh → Video (nếu vẫn chưa được thì tự chuyển lại, không tốn credit)."); }
+      catch (e) { toast(e.message, "error"); }
+    } }, "Thử lại Ảnh → Video"))) : null;
+  if (!errs.length) return i2v || h("div");
+  return h("div", {}, i2v, h("div", { class: "banner err" }, h("b", {}, "Storyboard còn lỗi, chưa chạy được:"),
+    h("ul", {}, errs.map((e) => h("li", {}, prettyError(e))))));
 }
 function prettyError(e) {
   return e.replace(/^scenes\.(\d+)\./, (_, i) => `Cảnh ${+i + 1}: `).replace("Field required", "chưa điền")
@@ -572,8 +579,9 @@ function renderSceneMedia(sc) {
   const startImg = sc.mode === "i2v" ? (assetUrl(sc.image) || st.image_url) : null;
   const stale = st.status === "changed";
   if (st.clip_url) {
-    box.append(h("video", { src: st.clip_url, controls: true, preload: "metadata", poster: kf || startImg || null, playsinline: true }));
+    box.append(h("video", { src: st.clip_url, controls: true, preload: "metadata", poster: st.rendered_as === "t2v" ? null : (kf || startImg || null), playsinline: true }));
     if (stale) box.append(h("span", { class: "tag warn" }, "Clip cũ · prompt đã đổi"));
+    else if (st.rendered_as === "t2v" && sc.mode === "keyframe") box.append(h("span", { class: "tag" }, "Render bằng Chữ → Video"));
   } else if (kf) {
     box.append(h("img", { src: kf, onclick: () => lightbox(kf), alt: "keyframe" }));
     box.append(h("span", { class: "tag" + (st.keyframe_stale ? " warn" : "") }, st.keyframe_stale ? "Ảnh cũ · prompt đã đổi" : "Keyframe · chưa có video"));

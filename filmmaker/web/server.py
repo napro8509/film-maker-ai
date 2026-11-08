@@ -362,6 +362,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         errors: list[str] = []
         scenes: dict[str, Any] = {}
         project_id = None
+        i2v_off = bool(State(out_dir(pid) / "state.json").data.get("i2v_unsupported"))
         try:
             Storyboard.model_validate(raw)
             sb = load_storyboard(sb_path(pid))
@@ -386,7 +387,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
-                    "video_prompt": sb.video_prompt(s),
+                    "video_prompt": sb.text_only_prompt(s) if (i2v_off and s.mode == "keyframe") else sb.video_prompt(s),
+                    "rendered_as": st.get("rendered_as"),
                     "image_prompt": sb.image_prompt(s) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
                 }
@@ -403,6 +405,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "final_size": final.stat().st_size if final.is_file() else None,
             "srt_url": file_url(pid, srt),
             "final_prefs": ui_prefs(pid).get("final", {}),
+            "i2v_unsupported": i2v_off,
             "path": str(pdir(pid)),
         }
 
@@ -689,6 +692,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         else:
             subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
         return {"ok": True}
+
+    @app.post("/api/projects/{pid}/reset-i2v")
+    def reset_i2v(pid: str) -> dict[str, Any]:
+        state = State(out_dir(pid) / "state.json")
+        state.data.pop("i2v_unsupported", None)
+        state.save()
+        return detail(pid)
 
     @app.put("/api/projects/{pid}/final-settings")
     def final_settings(pid: str, body: FinalSettings) -> dict[str, Any]:

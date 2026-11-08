@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .gflow import Gflow, GflowError
+from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Scene, Storyboard
 
 DONE = "done"
@@ -100,6 +100,10 @@ class Pipeline:
             and st.get("fingerprint") == self.sb.scene_fingerprint(s)
             and Path(st.get("video", "")).is_file()
         )
+
+    @property
+    def i2v_unsupported(self) -> bool:
+        return bool(self.state.data.get("i2v_unsupported"))
 
     def has_keyframe(self, s: Scene) -> bool:
         st = self.state.scene(s.id)
@@ -259,6 +263,19 @@ class Pipeline:
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {kf}")
         return report
 
+    def _render_text_only(self, s: Scene, common: dict, opts: RunOptions) -> Path:
+        prompt = self.sb.text_only_prompt(s)
+        self.log(f"  (Chữ → Video) {prompt[:120]}")
+        if not self.g.dry_run:
+            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
+        video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(prompt, **common),
+                                             opts.max_retries)
+        if not self.g.dry_run:
+            if not Path(video).is_file():
+                raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="t2v")
+        return Path(video)
+
     def _render_scene(self, s: Scene, project: str, opts: RunOptions) -> Path:
         dry = self.g.dry_run
         model = s.model or self.sb.model
@@ -266,6 +283,8 @@ class Pipeline:
         common = dict(aspect=self.sb.aspect, model=model, duration=s.duration, project=project, out=out)
 
         start_image: Path | None = None
+        if s.mode == "keyframe" and self.i2v_unsupported:
+            return self._render_text_only(s, common, opts)
         if s.mode == "keyframe":
             start_image = self._keyframe(s, project, opts, remake=s.id in opts.force_keyframes)
         elif s.mode == "i2v":
@@ -281,7 +300,22 @@ class Pipeline:
             call = lambda: self.g.text_to_video(prompt, **common)
         else:
             call = lambda: self.g.image_to_video(start_image, prompt, end_image=s.end_image, **common)
-        video, media_id = self._with_retries("render video", call, opts.max_retries)
+        try:
+            video, media_id = self._with_retries("render video", call, opts.max_retries)
+        except GflowError as exc:
+            if exc.exit_code != EXIT_NOT_PORTED or start_image is None:
+                raise
+            # Refused before submit, so no credits were spent.
+            if s.mode == "i2v":
+                raise GflowError(
+                    "tài khoản Flow của bạn (giao diện mới flow.google.com) chưa hỗ trợ tạo video từ ảnh qua gflow. "
+                    "Đổi cảnh này sang kiểu “Chữ → Video” và mô tả ảnh trong prompt.",
+                    exit_code=2, payload=exc.payload) from exc  # scene-specific: keep rendering the others
+            self.log("  ! Tài khoản Flow này chưa hỗ trợ Ảnh → Video qua gflow (chưa trừ credit). "
+                     "Chuyển sang Chữ → Video cho cảnh này và các cảnh sau.")
+            self.state.data["i2v_unsupported"] = True
+            self.state.save()
+            return self._render_text_only(s, common, opts)
 
         if not dry:
             if not Path(video).is_file():
