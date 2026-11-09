@@ -30,11 +30,12 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
+from .. import model_change, model_meta, retirement
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
 from ..settings import DEFAULT_BACKUP_REMOTE
 from ..gflow import Gflow, GflowError, _extract_json, _split
-from ..pipeline import DONE, SUBMITTING, Pipeline, RunOptions, State
+from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import Storyboard, load_storyboard
 from ..thumbnail import ThumbnailError
 
@@ -43,18 +44,6 @@ TEMPLATE = Path(__file__).parent.parent / "templates" / "storyboard.yaml"
 SETTINGS_PATH = Path(os.environ.get("FILMMAKER_SETTINGS", Path.home() / ".config" / "filmmaker" / "settings.json"))
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac"}
-
-FALLBACK_MODELS = {
-    "video": [
-        {"alias": "veo-fast", "max_duration": 8}, {"alias": "veo-quality", "max_duration": 8},
-        {"alias": "veo-lite", "max_duration": 8}, {"alias": "veo-lite-lp", "max_duration": 8},
-        {"alias": "omni-flash", "max_duration": 10}, {"alias": "omni-1.2-flash", "max_duration": 15},
-    ],
-    "image": [
-        {"alias": "nano2", "label": "Nano Banana 2"}, {"alias": "nano-pro", "label": "Nano Banana Pro"},
-        {"alias": "imagen4", "label": "Imagen 4"}, {"alias": "nano2-lite", "label": "Nano Banana 2 Lite"},
-    ],
-}
 
 
 # --- settings -----------------------------------------------------------------
@@ -234,6 +223,14 @@ class PortraitBody(BaseModel):
     force: bool = False  # remake even if the character already has one
 
 
+class ModelChangeBody(BaseModel):
+    target: str
+    scenes: list[str] | None = None  # set = single-scene mode
+    include: list[str] = []  # project mode: also switch these scenes, whatever their group
+    rounding: str | None = None  # up | down | empty
+    base: str | None = None  # content hash from the preview (required to apply)
+
+
 class FinalSettings(BaseModel):
     music: str | None = None
     volume: float = 0.25
@@ -253,6 +250,15 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     app.state.token = token
     app.state.jobs = jobs
     models_cache: dict[str, Any] = {}
+    sb_locks: dict[str, threading.RLock] = {}
+    sb_locks_guard = threading.Lock()
+
+    def sb_lock(pid: str) -> threading.RLock:
+        """Per-project lock around writes to storyboard.yaml (endpoints run in a threadpool)."""
+        with sb_locks_guard:
+            return sb_locks.setdefault(pid, threading.RLock())
+
+    app.state.sb_lock = sb_lock
     claude_cache: dict[str, Any] = {}
 
     def claude_code(refresh: bool = False) -> dict[str, Any]:
@@ -321,9 +327,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     def write_raw(pid: str, data: dict[str, Any]) -> None:
         text = yaml.safe_dump(_clean(data), allow_unicode=True, sort_keys=False, width=100)
-        tmp = sb_path(pid).with_suffix(".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(sb_path(pid))
+        with sb_lock(pid):
+            tmp = sb_path(pid).with_suffix(".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(sb_path(pid))
 
     def ui_prefs(pid: str) -> dict[str, Any]:
         try:
@@ -382,6 +389,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         errors: list[str] = []
         scenes: dict[str, Any] = {}
         project_id = None
+        model_info: dict[str, Any] = {"model_warning": None, "model_note": None, "models_used": {}}
         st_data = State(out_dir(pid) / "state.json").data
         i2v_off = bool(st_data.get("i2v_unsupported"))
         try:
@@ -396,6 +404,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if sb:
             pipe = Pipeline(sb, out_dir(pid), gflow(True))
             project_id = sb.project_id or pipe.state.data.get("project_id")
+            meta = model_meta.load()
+            model_info = {"model_warning": retirement.model_warning(pipe, meta),
+                          "model_note": retirement.model_note(pipe),
+                          "models_used": retirement.models_used(pipe, meta)}
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
@@ -412,6 +424,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "rendered_as": st.get("rendered_as"),
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
+                    "model_status": meta.status(retirement.effective_model(sb, s)),
+                    "model_retires_label": meta.retires_label(retirement.effective_model(sb, s)),
                     "refs": [n for n, _ in sb.scene_refs(s)],
                 }
         final = out_dir(pid) / "final.mp4"
@@ -439,6 +453,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "characters_state": characters_state(pid, raw, sb),
             "thumbnail": thumb_info,
             "backup": last_backup(out_dir(pid)),
+            **model_info,
             "path": str(pdir(pid)),
         }
 
@@ -538,26 +553,47 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"ok": False, "error": str(exc), "hint": hint}
         return {"ok": True, "data": payload}
 
-    @app.get("/api/models")
-    def models() -> dict[str, Any]:
+    def raw_models() -> dict[str, Any] | None:
+        """`gflow models --json`, cached for the process. None (and nothing cached) if gflow fails."""
         if models_cache:
             return models_cache
-        out = FALLBACK_MODELS
         g = gflow()
-        if g.available():
-            try:
-                proc = subprocess.run(g._cmd("models", "--json"), capture_output=True, text=True, timeout=30)
-                data = _extract_json(proc.stdout) or {}
-                video = [{"alias": m["aliases"][0], "max_duration": m.get("max_duration")}
-                         for m in data.get("video", {}).get("models", []) if m.get("aliases")]
-                image = [{"alias": m["aliases"][0], "label": m.get("label", "").split(" (")[0]}
-                         for m in data.get("image", {}).get("models", []) if m.get("aliases")]
-                if video and image:
-                    out = {"video": video, "image": image}
-            except (OSError, subprocess.TimeoutExpired, KeyError, TypeError):
-                pass
-        models_cache.update(out)
-        return out
+        if not g.available():
+            return None
+        try:
+            proc = subprocess.run(g._cmd("models", "--json"), capture_output=True, text=True, timeout=10)
+            data = _extract_json(proc.stdout) or {}
+            video = [{"alias": m["aliases"][0], "max_duration": m.get("max_duration")}
+                     for m in data.get("video", {}).get("models", []) if m.get("aliases")]
+            image = [{"alias": m["aliases"][0], "label": m.get("label", "").split(" (")[0]}
+                     for m in data.get("image", {}).get("models", []) if m.get("aliases")]
+        except (OSError, subprocess.TimeoutExpired, KeyError, TypeError, AttributeError, IndexError):
+            return None
+        if not (video and image):
+            return None
+        models_cache.update({"video": video, "image": image})
+        return models_cache
+
+    @app.get("/api/models")
+    def models() -> dict[str, Any]:
+        # The metadata is merged after the cache and re-read on every call, so edits show at once.
+        raw = raw_models()
+        meta = model_meta.load()
+        src = raw if raw is not None else meta.fallback
+        video = []
+        for m in src.get("video") or []:
+            alias = m.get("alias")
+            video.append({**m, "info": meta.info(alias), "status": meta.status(alias),
+                          "retires_label": meta.retires_label(alias)})
+        return {
+            "video": video,
+            "image": [dict(m) for m in src.get("image") or []],
+            "source": "gflow" if raw is not None else "fallback",
+            "today": meta.today.isoformat(),
+            "plan": meta.plan,
+            "default_video_model": meta.default_video_model,
+            "metadata_error": meta.error_text,
+        }
 
     @app.get("/api/settings")
     def get_settings() -> dict[str, Any]:
@@ -620,8 +656,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             data = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
             data["title"] = title if body.title.strip() else data["title"]
         else:
-            data = {"title": title, "aspect": "16:9", "model": "veo-fast", "image_model": "nano2", "style": "",
+            data = {"title": title, "aspect": "16:9", "model": None, "image_model": "nano2", "style": "",
                     "characters": [], "scenes": [{"id": "s01", "mode": "keyframe", "image_prompt": "", "prompt": ""}]}
+        data["model"] = model_meta.load().default_video_model  # new projects never start on a retiring model
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
 
@@ -696,7 +733,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, f"YAML lỗi: {exc}")
         if not isinstance(data, dict):
             raise HTTPException(400, "YAML phải là một bảng (title, scenes, ...).")
-        sb_path(pid).write_text(body.text, encoding="utf-8")
+        with sb_lock(pid):
+            sb_path(pid).write_text(body.text, encoding="utf-8")
         return detail(pid)
 
     @app.post("/api/projects/{pid}/duplicate")
@@ -866,15 +904,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
                 should_stop=lambda: job.stop_requested))
             images: dict[str, str] = {}
-            raw = read_raw(pid)
-            chars = raw.get("characters") or []
-            for i, c, dest in picked:
-                if c.name in report.done and i < len(chars) and isinstance(chars[i], dict) and chars[i].get("name") == c.name:
-                    rel = dest.relative_to(pdir(pid)).as_posix()
-                    chars[i]["image"] = rel
-                    images[c.name] = rel
-            if images:
-                write_raw(pid, raw)
+            with sb_lock(pid):  # read-modify-write: a model change must not land in between
+                raw = read_raw(pid)
+                chars = raw.get("characters") or []
+                for i, c, dest in picked:
+                    if c.name in report.done and i < len(chars) and isinstance(chars[i], dict) and chars[i].get("name") == c.name:
+                        rel = dest.relative_to(pdir(pid)).as_posix()
+                        chars[i]["image"] = rel
+                        images[c.name] = rel
+                if images:
+                    write_raw(pid, raw)
             job.log("")
             job.log(f"Xong: {len(report.done)} ảnh nhân vật | Lỗi: {len(report.failed)}")
             if report.aborted:
@@ -887,20 +926,58 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         title = "Tạo ảnh nhân vật" + (f" ({', '.join(c.name for _, c, _ in picked)})" if wanted else "")
         return jobs.start("portraits", title, pid, work).public()
 
+    # ---- model change ----
+
+    def model_change_plan(pid: str, body: ModelChangeBody) -> model_change.ChangePlan:
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        try:
+            return model_change.plan_change(Pipeline(sb, out_dir(pid), gflow(True)), model_meta.load(), body.target,
+                                            scenes=body.scenes, include=body.include, rounding=body.rounding)
+        except model_change.ChangeError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post("/api/projects/{pid}/model-change/preview")
+    def model_change_preview(pid: str, body: ModelChangeBody) -> dict[str, Any]:
+        pdir(pid)  # check pid before creating a lock for it
+        with sb_lock(pid):  # hash and plan from the same file contents
+            base = model_change.content_hash(sb_path(pid))
+            plan = model_change_plan(pid, body)
+        return plan.public(base)
+
+    @app.post("/api/projects/{pid}/model-change")
+    def model_change_apply(pid: str, body: ModelChangeBody) -> dict[str, Any]:
+        """Only rewrites storyboard.yaml: no job, nothing sent to Flow (AC35)."""
+        pdir(pid)  # check pid before creating a lock for it
+        if jobs.current and jobs.current.status == "running" and jobs.current.project == pid:
+            # a running video job keeps the storyboard it read at start: changing now could cost credits twice
+            raise HTTPException(409, detail={"message": "Đang có job chạy, đợi xong rồi đổi model.",
+                                             "reason": "job_running"})
+        with sb_lock(pid):
+            base = model_change.content_hash(sb_path(pid))  # before planning: the plan is made from these bytes
+            plan = model_change_plan(pid, body)
+            if not body.base:
+                raise HTTPException(400, "Thiếu base (lấy từ bản xem trước).")
+            if body.base != base:
+                raise HTTPException(409, "Storyboard đã thay đổi từ lúc xem trước. Hãy xem trước lại.")
+            if plan.bad_duration and not body.rounding:
+                raise HTTPException(400, "Có cảnh có độ dài model mới không nhận: chọn làm tròn lên hoặc xuống.")
+            changed = plan.has_changes()
+            if changed:
+                write_raw(pid, model_change.apply_to_raw(read_raw(pid), plan))
+        if not changed:
+            return {"changed": False, "message": "Không có gì thay đổi", "project": detail(pid)}
+        return {"changed": True, "preview": plan.public(base), "project": detail(pid)}
+
     # ---- run / estimate ----
 
-    def video_todo(pipe: Pipeline, sb: Storyboard, only: set[str], force: set[str], retry_unknown: bool):
-        todo, blocked = [], []
-        for s in sb.scenes:
-            if only and s.id not in only:
-                continue
-            if s.id not in force and pipe.is_done(s):
-                continue
-            if pipe.state.scene(s.id).get("status") == SUBMITTING and not retry_unknown and s.id not in force:
-                blocked.append(s.id)
-                continue
-            todo.append(s)
-        return todo, blocked
+    def retired_to_send(pipe: Pipeline, body: RunBody) -> list[dict[str, Any]]:
+        """Scenes this video run would send to Flow whose model is already retired (blocks the run)."""
+        send = [s for s, kind in pipe.video_plan(set(body.only), set(body.force), body.retry_unknown) if kind == "send"]
+        return retirement.retired_of(pipe, model_meta.load(), send)
 
     @app.post("/api/projects/{pid}/estimate")
     def estimate(pid: str, body: RunBody) -> dict[str, Any]:
@@ -910,7 +987,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
         pipe = Pipeline(sb, out_dir(pid), gflow(True))
-        todo, blocked = video_todo(pipe, sb, set(body.only), set(body.force), body.retry_unknown)
+        plan = pipe.video_plan(set(body.only), set(body.force), body.retry_unknown)  # empty `only` = every scene
+        todo = [s for s, kind in plan if kind == "send"]
+        blocked = [s.id for s, kind in plan if kind == "blocked"]
         kf_new = [s.id for s in todo if s.mode == "keyframe" and (not pipe.has_keyframe(s) or s.id in body.force_keyframes)]
         return {
             "renders": [{"id": s.id, "mode": s.mode, "model": s.model or sb.model or "mặc định",
@@ -918,6 +997,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "blocked": blocked,
             "new_keyframes": kf_new,
             "done": [s.id for s in sb.scenes if pipe.is_done(s)],
+            "retired": retirement.retired_of(pipe, model_meta.load(), todo),
         }
 
     @app.post("/api/projects/{pid}/run")
@@ -933,6 +1013,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, f"Không có cảnh: {', '.join(sorted(unknown))}")
         if body.action not in {"dry", "keyframes", "video", "stitch", "make", "thumbnail"}:
             raise HTTPException(400, "action không hợp lệ")
+        if body.action in ("video", "make"):
+            retired = retired_to_send(Pipeline(sb, out_dir(pid), gflow(True)), body)
+            if retired:  # before jobs.start: no job, no backup, nothing sent to Flow
+                raise HTTPException(409, detail={"message": f"Không thể render: {len(retired)} cảnh dùng model đã ngừng",
+                                                 "retired": retired})
         settings = load_settings()
         music = None
         if body.music:
@@ -959,6 +1044,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 force_keyframes=set(body.force_keyframes),
                 should_stop=lambda: job.stop_requested,
                 after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
+                refuse=retirement.refuse_retired(sb) if not dry else (lambda _s: None),
             ))
             job.log("")
             if dry:
@@ -1001,13 +1087,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     titles = saved_titles(pid) or suggest_titles_for(pid, sb, job.log)
                     title = titles[0]["text"]
                     sb.thumbnail.text = title
-                    raw = read_raw(pid)
-                    if not ((raw.get("thumbnail") or {}).get("text") or "").strip():
-                        raw.setdefault("thumbnail", {})
-                        if not isinstance(raw["thumbnail"], dict):
-                            raw["thumbnail"] = {}
-                        raw["thumbnail"]["text"] = title
-                        write_raw(pid, raw)
+                    with sb_lock(pid):  # read-modify-write: a model change must not land in between
+                        raw = read_raw(pid)
+                        if not ((raw.get("thumbnail") or {}).get("text") or "").strip():
+                            raw.setdefault("thumbnail", {})
+                            if not isinstance(raw["thumbnail"], dict):
+                                raw["thumbnail"] = {}
+                            raw["thumbnail"]["text"] = title
+                            write_raw(pid, raw)
                     vi = f" ({titles[0]['vi']})" if titles[0]["vi"] else ""
                     job.log(f"Tiêu đề (Claude gợi ý, sửa được): {title}{vi}")
                     res["title"] = title

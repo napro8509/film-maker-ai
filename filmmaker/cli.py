@@ -10,12 +10,13 @@ from typing import Any
 
 import click
 
+from . import model_meta, retirement
 from . import settings as user_settings
 from .assemble import AssembleError, assemble
 from .backup import AutoBackup, BackupError, Rclone, last_backup
 from .gflow import Gflow, GflowError
 from .thumbnail import ThumbnailError
-from .pipeline import DONE, Pipeline, RunOptions, State
+from .pipeline import DONE, Pipeline, RunOptions, State, send_list
 from .storyboard import load_storyboard, save_storyboard
 
 
@@ -43,9 +44,14 @@ def main() -> None:
 
 
 @main.command()
+@click.argument("storyboard", required=False, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
 @click.option("--profile", help="gflow profile (tài khoản Google).")
-def check(profile: str | None) -> None:
-    """Kiểm tra gflow, phiên đăng nhập và ffmpeg."""
+def check(storyboard: Path | None, out: Path | None, profile: str | None) -> None:
+    """Kiểm tra gflow, phiên đăng nhập và ffmpeg.
+
+    Có STORYBOARD thì liệt kê thêm cảnh dùng model sắp ngừng/đã ngừng.
+    """
     ok = True
     g = Gflow(profile=profile)
     if g.available():
@@ -63,7 +69,48 @@ def check(profile: str | None) -> None:
         found = shutil.which(tool)
         click.echo(f"{'✔' if found else '✘'} {tool}: {found or 'chưa cài (cần cho bước ghép phim)'}")
         ok = ok and bool(found)
+    if storyboard is not None:
+        ok = _check_models(storyboard, out) and ok
     sys.exit(0 if ok else 1)
+
+
+_GROUP_ORDER = (("todo", "Chưa có clip"), ("interrupted", "Bị ngắt"), ("done", "Đã có clip"))
+
+
+def _retire_text(row: dict) -> str:
+    when = "đã ngừng từ" if row["status"] == "retired" else "ngừng ngày"
+    return f"{when} {row['retires_label']}"
+
+
+def _check_models(storyboard: Path, out: Path | None) -> bool:
+    """`check STORYBOARD`: scenes on retiring/retired models. False if a scene without a clip uses a retired one."""
+    meta = model_meta.load()
+    warning = model_meta.cli_warning(meta)
+    if warning:
+        click.echo(warning)
+    try:
+        sb = load_storyboard(storyboard)
+    except Exception as exc:  # pydantic/yaml errors: report, don't crash
+        click.echo(f"✘ Storyboard lỗi: {exc}")
+        return False
+    pipe = Pipeline(sb, _out_dir(storyboard, out), Gflow(dry_run=True, log=lambda *_: None),
+                    log=lambda *_: None)
+    rows = retirement.old_scenes(pipe, meta, sb.scenes)
+    if not rows:
+        click.echo("✔ Không cảnh nào dùng model sắp/đã ngừng")
+        return True
+    for group, title in _GROUP_ORDER:
+        picked = [r for r in rows if r["group"] == group]
+        if not picked:
+            continue
+        click.echo(f"⚠ {title} ({len(picked)} cảnh) dùng model sắp/đã ngừng:")
+        for r in picked:
+            click.echo(f"  {r['id']}  {r['model']}  {_retire_text(r)}")
+    blocked = [r for r in rows if r["group"] == "todo" and r["status"] == "retired"]
+    if blocked:
+        click.echo(f"✘ {len(blocked)} cảnh chưa có clip dùng model đã ngừng: đổi model trong UI "
+                   "hoặc sửa `model:` trong storyboard.")
+    return not blocked
 
 
 @main.command()
@@ -122,6 +169,25 @@ def _auto_backup(storyboard: Path, out_dir: Path, enabled: bool | None) -> AutoB
     return AutoBackup(lambda: r.backup(storyboard, out_dir), log=click.echo)
 
 
+def _check_run_models(pipe: Pipeline, only, force, retry_unknown: bool, *, warn_only: bool) -> None:
+    """Before sending anything: stop if a scene to send uses a retired model, warn about retiring ones."""
+    meta = model_meta.load()
+    warning = model_meta.cli_warning(meta)
+    if warning:
+        click.echo(warning)
+    send = send_list(pipe, set(only) or None, set(force), retry_unknown)
+    old = retirement.old_scenes(pipe, meta, send)
+    retired = [r for r in old if r["status"] == "retired"]
+    if retired and not warn_only:
+        lines = "\n".join(f"  {r['id']}: {r['model']} ({_retire_text(r)})" for r in retired)
+        raise click.ClickException(
+            f"{len(retired)} cảnh dùng model đã ngừng, không gửi gì lên Flow:\n{lines}\n"
+            "Cách sửa: đổi model trong UI hoặc sửa `model:` trong storyboard.")
+    if old:
+        click.echo("⚠ Model sắp ngừng/đã ngừng: "
+                   + ", ".join(f"{r['id']} ({r['model']}, {_retire_text(r)})" for r in old))
+
+
 def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast,
             keyframes_only=False, auto_backup=None):
     sb = load_storyboard(storyboard)
@@ -135,6 +201,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     if dry_run:
         click.echo("== DRY RUN: không gửi gì lên Flow ==")
     pipe = Pipeline(sb, out_dir, g, log=click.echo)
+    _check_run_models(pipe, only, force, retry_unknown, warn_only=dry_run or keyframes_only)
     ab = None if dry_run else _auto_backup(storyboard, out_dir, auto_backup)
     try:
         report = pipe.run(RunOptions(
@@ -143,6 +210,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
             # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
             keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
             after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
+            refuse=retirement.refuse_retired(sb) if not dry_run else (lambda _s: None),
         ))
     finally:
         if ab:
@@ -163,7 +231,11 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @_run_options
 def run(storyboard: Path, **kw) -> None:
-    """Tạo tất cả clip trên Google Flow. Chạy lại an toàn: cảnh đã xong sẽ được bỏ qua."""
+    """Tạo tất cả clip trên Google Flow. Chạy lại an toàn: cảnh đã xong sẽ được bỏ qua.
+
+    Từ ngày model ngừng, cảnh sắp gửi dùng model đã ngừng bị chặn (không gửi gì, exit 1);
+    --dry-run và --keyframes-only chỉ cảnh báo.
+    """
     _, _, report = _do_run(storyboard, **kw)
     sys.exit(0 if report.ok else 1)
 
@@ -217,7 +289,10 @@ def stitch(storyboard: Path, out, output, music, volume, subtitles, allow_missin
 @_run_options
 @_stitch_options
 def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw) -> None:
-    """run + stitch: từ storyboard ra thẳng phim."""
+    """run + stitch: từ storyboard ra thẳng phim.
+
+    Chặn cảnh dùng model đã ngừng giống `run`.
+    """
     sb, out_dir, report = _do_run(storyboard, **kw)
     if kw["dry_run"] or kw["keyframes_only"]:
         return

@@ -4,7 +4,7 @@
 
 title: "Ly cà phê đầu tiên"
 aspect: "16:9"          # 16:9 (ngang) hoặc 9:16 (dọc, TikTok/Shorts)
-model: veo-fast         # veo-lite | veo-fast | veo-quality | omni-flash ... (bỏ trống = mặc định của Flow)
+model: veo-lite         # veo-lite | veo-lite-lp | omni-1.2-flash ... (gflow models; bỏ trống = mặc định của Flow)
 image_model: nano2      # model ảnh cho keyframe
 style: "cinematic, warm morning light, shallow depth of field, 35mm film grain"
 # project_id: "..."     # dùng lại project Flow có sẵn (tùy chọn)

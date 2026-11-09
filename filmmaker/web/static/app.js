@@ -87,7 +87,11 @@ async function api(method, url, body, isForm) {
   try { data = await r.json(); } catch { /* empty */ }
   if (!r.ok) {
     const d = data && data.detail;
-    throw new Error(typeof d === "string" ? d : d ? JSON.stringify(d) : `Lỗi máy chủ (HTTP ${r.status})`);
+    // detail may be a string, or an object such as {message, retired} (409 when render is blocked)
+    const msg = typeof d === "string" ? d : d && typeof d.message === "string" ? d.message : d ? JSON.stringify(d) : `Lỗi máy chủ (HTTP ${r.status})`;
+    const err = new Error(msg);
+    err.status = r.status; err.detail = d;
+    throw err;
   }
   return data;
 }
@@ -270,11 +274,10 @@ async function init() {
   }
   S.auth = localGet("auth");
   renderTopbar();
-  api("GET", "/api/models").then((m) => { S.models = m; if (S.cur && S.tab === "story") renderMain(); }).catch(() => {});
   await loadProjects();
   const want = decodeURIComponent(location.hash.slice(1)) || localGet("lastProject");
   const pick = S.projects.some((p) => p.id === want) ? want : S.projects[0]?.id;
-  if (pick) await openProject(pick); else renderMain();
+  if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
   const j = await api("GET", "/api/jobs/current").catch(() => null);
   if (j) { S.job = { ...j, lines: [] }; S.jobSince = 0; S.jobOpen = j.status === "running"; renderJobbar(); pollJob(); }
   setInterval(tickElapsed, 1000);
@@ -292,6 +295,7 @@ async function loadProjects() {
 
 async function openProject(id) {
   await flushSave();
+  loadModels(id); // in the background, not awaited
   try {
     const [d, a] = await Promise.all([api("GET", `/api/projects/${id}`), api("GET", `/api/projects/${id}/assets`)]);
     S.cur = d; S.assets = a; S.playIdx = 0;
@@ -302,6 +306,17 @@ async function openProject(id) {
   S.saveState = "saved";
   renderSidebar();
   renderMain();
+}
+
+/* Refresh /api/models in the background (gflow may be slow): never delays drawing the project. */
+function loadModels(id) {
+  api("GET", "/api/models").then((m) => {
+    S.models = m;
+    if (!S.cur || S.cur.id !== id) return;
+    const a = document.activeElement;
+    if (a && a.closest && a.closest("#main") && a.matches("input, textarea, select")) return; // don't steal focus while typing
+    renderMain();
+  }).catch(() => { /* keep the previous S.models */ });
 }
 
 async function refreshCurrent() {
@@ -479,6 +494,7 @@ function renderMain() {
   put(m, h("div", { class: "main-inner" },
     renderHeader(),
     zone("errors-zone", renderErrors),
+    zone("model-zone", renderModelWarning),
     h("div", { class: "tabs", role: "tablist" },
       tabs.map(([k, ic, l, n]) => h("button", { class: S.tab === k ? "on" : "", role: "tab", "aria-selected": String(S.tab === k), onclick: () => switchTab(k) },
         icon(ic), l, n != null ? h("span", { class: "count" }, n) : null))),
@@ -588,6 +604,18 @@ function renderErrors() {
   return h("div", {}, i2v, h("div", { class: "banner err", role: "alert" }, icon("alert"), h("div", { class: "b-body" }, h("b", {}, "Storyboard còn lỗi, chưa chạy được:"),
     h("ul", {}, errs.map((e) => h("li", {}, prettyError(e)))))));
 }
+/* Retiring/retired models used by this project. Sentences are built by the server (model_warning.lines). */
+function renderModelWarning() {
+  const w = S.cur.model_warning;
+  const metaErr = S.models.metadata_error;
+  if (!w?.lines?.length && !metaErr) return h("div");
+  const retired = (w?.models || []).some((m) => m.status === "retired");
+  return h("div", {},
+    w?.lines?.length ? h("div", { class: "banner " + (retired ? "err" : "warn"), role: retired ? "alert" : null }, icon("alert"),
+      h("div", { class: "b-body" }, w.lines.map((l) => h("div", {}, l)),
+        h("div", {}, h("button", { class: "btn sm", disabled: jobRunning(), onclick: () => openModelChange() }, icon("refresh"), MODEL_CHANGE_LABEL)))) : null,
+    metaErr ? h("p", { class: "help", style: { marginBottom: "var(--sp-4)" } }, "File metadata model lỗi: " + metaErr) : null);
+}
 function prettyError(e) {
   return e.replace(/^scenes\.(\d+)(?:\.|:\s*(?:scene [^:]+:\s*)?)/, (_, i) => `Cảnh ${+i + 1}: `).replace("Field required", "chưa điền")
     .replace("mode=i2v needs 'image'", "kiểu “Ảnh của bạn → Video” cần chọn ảnh");
@@ -678,8 +706,8 @@ function renderScene(sc, i) {
           field("Độ dài", durationSelect(sc)),
           field("Model video",
             h("select", { value: sc.model || "", onchange: (e) => { sc.model = e.target.value || undefined; changed(); renderMain(); } },
-              h("option", { value: "" }, `Theo phim (${sb.model || "mặc định"})`),
-              videoModels().map((m) => h("option", { value: m }, m)))),
+              h("option", { value: "" }, `Theo phim (${sb.model ? modelLabel(sb.model) : "mặc định"})`),
+              videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label)))),
           field("Phụ đề / lời dẫn",
             h("input", { type: "text", value: sc.narration || "", placeholder: "Không bắt buộc", oninput: (e) => { sc.narration = e.target.value; changed(); } }))),
         zone(`preview-${i}`, () => {
@@ -693,20 +721,49 @@ function renderScene(sc, i) {
       )));
 }
 
-function videoModels() {
-  const list = (S.models.video || []).map((m) => m.alias);
-  return list.length ? list : ["veo-fast", "veo-quality", "veo-lite", "omni-flash"];
+/* Model status comes from the server (/api/models, or models_used for aliases gflow no longer lists). */
+function modelStatus(alias) {
+  if (!alias) return null;
+  const m = (S.models.video || []).find((x) => x.alias === alias);
+  if (m) return { status: m.status, retires_label: m.retires_label, known: m.info !== null };
+  return S.cur?.models_used?.[alias] || null;
+}
+function modelLabel(alias) {
+  const m = modelStatus(alias);
+  if (!m) return alias;
+  if (m.status === "retired") return `${alias} · đã ngừng`;
+  if (m.status === "retiring") return `${alias} · sắp ngừng ${m.retires_label || ""}`.trim();
+  if (m.known === false) return `${alias} · chưa có thông tin`;
+  return alias;
+}
+function videoModelOptions(current) {
+  let list = (S.models.video || []).map((m) => m.alias);
+  if (!list.length) list = [S.models.default_video_model || "veo-lite"];
+  if (current && !list.includes(current)) list = [...list, current];
+  return list.map((alias) => ({ alias, label: modelLabel(alias) }));
+}
+function modelInfo(model) {
+  return (S.models.video || []).find((x) => x.alias === model) || null;
 }
 function maxDuration(model) {
-  const m = (S.models.video || []).find((x) => x.alias === model);
-  return m?.max_duration || 8;
+  return modelInfo(model)?.max_duration || 8;
 }
 function durationSelect(sc) {
-  const max = maxDuration(sc.model || S.cur.storyboard.model);
-  const opts = [4, 6, 8, 10, 12, 15].filter((d) => d <= max);
-  if (sc.duration && !opts.includes(+sc.duration)) opts.push(+sc.duration);
-  return h("select", { value: sc.duration ? String(sc.duration) : "", onchange: (e) => { sc.duration = e.target.value ? +e.target.value : undefined; changed(); refreshZone("stats-zone"); } },
-    h("option", { value: "" }, "Mặc định"), opts.map((d) => h("option", { value: String(d) }, `${d} giây${d > max ? " (quá giới hạn model)" : ""}`)));
+  const model = sc.model || S.cur.storyboard.model;
+  const allowed = modelInfo(model)?.info?.durations;
+  const cur = sc.duration ? +sc.duration : null;
+  let opts, note;
+  if (allowed && allowed.length) {
+    opts = [...allowed];
+    note = (d) => (allowed.includes(d) ? "" : " (model không nhận)");
+  } else {
+    const max = maxDuration(model);
+    opts = [4, 6, 8, 10, 12, 15].filter((d) => d <= max);
+    note = (d) => (d > max ? " (quá giới hạn model)" : "");
+  }
+  if (cur && !opts.includes(cur)) opts.push(cur);
+  return h("select", { value: cur ? String(cur) : "", onchange: (e) => { sc.duration = e.target.value ? +e.target.value : undefined; changed(); refreshZone("stats-zone"); } },
+    h("option", { value: "" }, "Mặc định"), opts.map((d) => h("option", { value: String(d) }, `${d} giây${note(d)}`)));
 }
 
 function assetUrl(path) { return S.assets.images.find((a) => a.path === path)?.url || null; }
@@ -768,6 +825,11 @@ function renderSceneActions(sc) {
   if (st.status === "interrupted") {
     kids.push(h("div", { class: "scene-msg warn" }, "Lần trước bị ngắt khi đang render, có thể Flow đã trừ credit. Hãy mở Flow xem clip đã có chưa trước khi gửi lại."));
   }
+  if (st.status === "done" && st.model_status === "retiring") {
+    kids.push(h("div", { class: "scene-msg warn" }, `Model này ngừng ngày ${st.model_retires_label}. Clip hiện tại vẫn dùng được, nhưng Render lại sau ngày đó sẽ lỗi; nên đổi model trước khi render lại (sẽ tốn credit).`));
+  } else if (st.status === "done" && st.model_status === "retired") {
+    kids.push(h("div", { class: "scene-msg warn" }, `Model này đã ngừng từ ${st.model_retires_label}. Clip hiện tại vẫn dùng được; muốn render lại phải đổi model.`));
+  }
   const row = h("div", { class: "row" });
   if (sc.mode === "keyframe") {
     const hasKf = !!st.keyframe_url && !st.keyframe_stale;
@@ -777,7 +839,7 @@ function renderSceneActions(sc) {
   const done = st.status === "done";
   const label = done ? "Render lại" : st.status === "interrupted" ? "Gửi lại" : "Render";
   row.append(h("button", { class: "btn sm", disabled: busy,
-    onclick: () => runAction("video", { only: [sc.id], force: done || st.status === "interrupted" ? [sc.id] : [] }) },
+    onclick: () => runAction("video", { only: [sc.id], force: done || st.status === "interrupted" ? [sc.id] : [] }, { scene: sc.id }) },
   icon(done ? "refresh" : "video"), label, PAID()));
   if (st.clip_url && st.keyframe_url) row.append(h("button", { class: "btn sm ghost icon", title: "Xem ảnh keyframe", "aria-label": "Xem ảnh keyframe", onclick: () => lightbox(st.keyframe_url) }, icon("image")));
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
@@ -802,13 +864,17 @@ function renderStory() {
           h("div", { class: "field" }, h("span", { class: "lbl" }, "Khung hình"),
             h("div", { class: "seg", role: "group", "aria-label": "Khung hình" }, [["16:9", "Ngang 16:9"], ["9:16", "Dọc 9:16"]].map(([v, l]) =>
               h("button", { class: (sb.aspect || "16:9") === v ? "on" : "", "aria-pressed": String((sb.aspect || "16:9") === v), onclick: () => { set("aspect", v); renderMain(); } }, l)))),
-          field("Model video",
-            h("select", { value: sb.model || "", onchange: (e) => { set("model", e.target.value || undefined); } },
-              h("option", { value: "" }, "Mặc định của Flow"), videoModels().map((m) => h("option", { value: m }, m)))),
+          h("div", { class: "field" }, h("label", { class: "lbl", for: "sb-model" }, "Model video"),
+            h("select", { id: "sb-model", value: sb.model || "", onchange: (e) => { set("model", e.target.value || undefined); } },
+              h("option", { value: "" }, "Mặc định của Flow"), videoModelOptions(sb.model).map((m) => h("option", { value: m.alias }, m.label))),
+            zone("model-note", () => h("span", { class: "help", hidden: !S.cur.model_note }, S.cur.model_note || ""))),
           field("Model ảnh (keyframe)",
             h("select", { value: sb.image_model || "nano2", onchange: (e) => set("image_model", e.target.value) },
               imageModels.map((m) => h("option", { value: m.alias }, m.label ? `${m.label} (${m.alias})` : m.alias))))),
-        h("p", { class: "help" }, "Mẹo: veo-fast rẻ và nhanh để thử; chuyển sang veo-quality khi đã ưng kịch bản. Đổi model sẽ làm các cảnh cần render lại."),
+        h("div", { class: "row" },
+          h("p", { class: "help", style: { flex: "1 1 320px" } }, "Mẹo: tạo keyframe (miễn phí) và duyệt trước khi render. Đổi model ở đây làm các cảnh đã xong phải render lại; muốn giữ clip đã có thì dùng “Đổi model cho các cảnh chưa render”."),
+          zone("model-change-btn", () => h("button", { class: "btn sm", disabled: jobRunning(), title: "Chỉ đổi cảnh chưa có clip dùng model sắp/đã ngừng; không render, không tốn credit",
+            onclick: () => openModelChange() }, icon("refresh"), MODEL_CHANGE_LABEL))),
         field("Phong cách hình ảnh",
           h("textarea", { rows: 2, value: sb.style || "", placeholder: "cinematic, warm morning light, shallow depth of field, 35mm film grain",
             oninput: (e) => set("style", e.target.value) }), "thêm vào mọi prompt"),
@@ -1119,9 +1185,147 @@ function renderYaml() {
       h("button", { class: "btn ghost", onclick: () => { ta.value = S.cur.yaml; } }, "Hoàn tác")));
 }
 
+/* ---------- model change (retiring/retired models) ---------- */
+
+const MODEL_CHANGE_LABEL = "Đổi model cho các cảnh chưa render";
+const INTERRUPTED_NOTE = "Đổi model không xoá trạng thái bị ngắt: khi render cảnh này, bạn vẫn phải tick “Tôi đã kiểm tra, gửi lại các cảnh này” hoặc bấm “Gửi lại” trên cảnh.";
+
+/* Replace the whole project (storyboard included) with the server copy, so the next autosave cannot undo a model change. */
+function reloadProject(d) {
+  if (!S.cur || !d || S.cur.id !== d.id) return;
+  clearTimeout(S.saveTimer);
+  S.pendingSave = false;
+  Object.assign(S.cur, d);
+  S.saveState = "saved"; S.saveError = "";
+  const p = S.projects.find((x) => x.id === d.id);
+  if (p) { Object.assign(p, { title: d.title, scenes: d.scenes, done: d.done, has_final: d.has_final, thumb: d.thumb }); renderSidebar(); }
+  renderMain();
+}
+
+function activeVideoModels() {
+  return (S.models.video || []).filter((m) => m.status === "active" && m.info != null).map((m) => m.alias);
+}
+function creditText(pv) {
+  if (pv.credits == null) return "chưa có thông tin giá";
+  const n = Math.round(pv.credits * 10) / 10;
+  return `${pv.credits_approx ? "~" : ""}${n.toLocaleString("vi-VN")} credit khi render`;
+}
+
+/* scenes: [id] → one-scene mode (from a scene button). Otherwise project mode; include = ids blocked at render time. */
+async function openModelChange({ scenes = null, include = [], blockedCount = 0 } = {}) {
+  if (!S.cur) return;
+  await flushSave();
+  if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  const targets = activeVideoModels();
+  if (!targets.length) { toast("Chưa có model video nào đang hoạt động để đổi sang. Thử mở lại dự án sau.", "error", 7000); return; }
+  const pid = S.cur.id, one = !!(scenes && scenes.length);
+  const st = { target: targets.includes(S.models.default_video_model) ? S.models.default_video_model : targets[0],
+    rounding: null, pv: null, loading: false, error: "", seq: 0, applying: false };
+  const reqBody = () => ({ target: st.target, rounding: st.rounding, ...(one ? { scenes } : { include }) });
+  const box = h("div", { class: "stack" });
+  const okBtn = () => document.getElementById("mc-ok");
+  const canApply = () => !!st.pv && !st.loading && !st.applying && st.pv.has_changes && !jobRunning() && !(st.pv.bad_duration.length && !st.rounding);
+  const syncBtn = () => { const b = okBtn(); if (b) { b.disabled = !canApply(); b.textContent = st.applying ? "Đang đổi…" : "Đổi model"; } };
+
+  const draw = () => {
+    const pv = st.pv;
+    if (st.loading && !pv) { put(box, h("div", { class: "row muted small" }, h("span", { class: "spinner" }), "Đang tính các cảnh sẽ đổi…")); syncBtn(); return; }
+    if (st.error) {
+      put(box, h("div", { class: "banner err flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" },
+        h("div", {}, "Không xem trước được: " + st.error), h("div", {}, h("button", { class: "btn sm", onclick: preview }, icon("refresh"), "Thử lại")))));
+      syncBtn(); return;
+    }
+    if (!pv) { put(box); syncBtn(); return; }
+    const n = pv.change.length;
+    const lines = [];
+    if (one) {
+      if (pv.redo.length) lines.push(h("div", {}, `Cảnh này sẽ phải render lại, ${creditText(pv)}.`));
+      else if (n) lines.push(h("div", {}, `Cảnh ${pv.change.join(", ")} sẽ đổi sang ${pv.target}, ${creditText(pv)}.`));
+    } else {
+      lines.push(h("div", {}, h("b", {}, `${n} cảnh sẽ đổi sang ${pv.target}`), `, ${creditText(pv)}.`,
+        n ? h("span", { class: "mono" }, " (" + pv.change.join(", ") + ")") : null));
+      if (pv.redo.length) lines.push(h("div", {}, `Trong đó ${pv.redo.length} cảnh đã có clip sẽ phải render lại: `, h("span", { class: "mono" }, pv.redo.join(", "))));
+      if (pv.keep.length) lines.push(h("div", {}, `${pv.keep.length} cảnh đã có clip hoặc bị ngắt giữ nguyên clip và model cũ`,
+        pv.pin.length ? ` (ghim model cũ cho ${pv.pin.length} cảnh)` : "", "."));
+      if (pv.storyboard_model) lines.push(h("div", {}, "storyboard.model: ", h("span", { class: "mono" }, `${pv.storyboard_model.from} → ${pv.storyboard_model.to}`)));
+    }
+    if (!pv.has_changes) lines.push(h("div", { class: "muted" }, "Không có gì cần đổi."));
+    const round = pv.bad_duration.length ? h("div", { class: "stack tight" },
+      h("div", { class: "row" }, h("span", { class: "lbl" }, `${pv.bad_duration.length} cảnh có độ dài ${pv.target} không nhận:`),
+        h("div", { class: "seg", role: "group", "aria-label": "Làm tròn độ dài" }, [["up", "Làm tròn lên"], ["down", "Làm tròn xuống"]].map(([v, l]) =>
+          h("button", { class: st.rounding === v ? "on" : "", "aria-pressed": String(st.rounding === v), disabled: st.loading,
+            onclick: () => { st.rounding = v; preview(); } }, l)))),
+      h("table", { class: "list" },
+        h("tr", {}, h("th", {}, "Cảnh"), h("th", {}, "Độ dài hiện tại"), h("th", {}, "Sau khi đổi")),
+        pv.bad_duration.map((b) => h("tr", {}, h("td", { class: "mono" }, b.id), h("td", {}, b.duration + " giây"),
+          h("td", {}, st.rounding ? `${st.rounding === "up" ? b.up : b.down} giây` : h("span", { class: "muted" }, `lên ${b.up} giây / xuống ${b.down} giây`))))),
+      !st.rounding ? h("p", { class: "help" }, "Chọn làm tròn lên hoặc xuống thì mới đổi được.") : null) : null;
+    const intr = pv.interrupted.length ? h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" },
+      h("div", {}, `Cảnh ${pv.interrupted.join(", ")} bị ngắt, có thể đã trừ credit, kiểm tra trên Flow trước.`),
+      h("div", {}, INTERRUPTED_NOTE))) : null;
+    put(box,
+      h("div", { class: "stack tight" + (st.loading ? " muted" : "") }, lines),
+      round, intr,
+      jobRunning() ? h("p", { class: "help" }, "Đang có job chạy. Đợi job xong rồi mới đổi model.") : null,
+      h("p", { class: "help" }, "Chỉ ghi storyboard, không render, không tốn credit. Muốn render thì bấm Render sau khi đổi."));
+    syncBtn();
+  };
+
+  async function preview() {
+    const my = ++st.seq;
+    st.loading = true; st.error = ""; draw();
+    await flushSave(); // AC44: preview what is on disk
+    if (S.saveState === "error") { st.loading = false; st.error = "chưa lưu được storyboard: " + S.saveError; draw(); return; }
+    try {
+      const pv = await api("POST", `/api/projects/${pid}/model-change/preview`, reqBody());
+      if (my !== st.seq) return;
+      st.pv = pv;
+    } catch (e) {
+      if (my !== st.seq) return;
+      st.pv = null; st.error = e.message;
+    }
+    st.loading = false; draw();
+  }
+
+  async function apply(close) {
+    if (!canApply()) { if (jobRunning()) toast("Đang có job chạy. Đợi job xong rồi mới đổi model.", "error"); return; }
+    st.applying = true; syncBtn();
+    try {
+      await flushSave();
+      if (S.saveState === "error") throw new Error("Chưa lưu được storyboard: " + S.saveError);
+      const r = await api("POST", `/api/projects/${pid}/model-change`, { ...reqBody(), base: st.pv.base });
+      close();
+      reloadProject(r.project);
+      if (r.changed) toast("Đã đổi model. Bấm Render khi sẵn sàng.", "ok", 6000);
+      else toast(r.message || "Không có gì thay đổi");
+    } catch (e) {
+      st.applying = false; syncBtn();
+      if (e.status === 409) { close(); toast("Storyboard vừa bị sửa ở nơi khác, mở lại để xem trước lại", "error", 8000); return; }
+      toast(e.message, "error", 7000);
+    }
+  }
+
+  const sel = h("select", { id: "mc-target", value: st.target, onchange: (e) => { st.target = e.target.value; preview(); } },
+    targets.map((a) => h("option", { value: a }, a)));
+  const body = h("div", { class: "stack" },
+    blockedCount ? h("div", { class: "banner err flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" }, `Không thể render: ${blockedCount} cảnh dùng model đã ngừng`)) : null,
+    h("p", { class: "help" }, one
+      ? `Chỉ đổi model của cảnh ${scenes.join(", ")}. Model chung của dự án và các cảnh khác giữ nguyên.`
+      : "Chỉ đổi các cảnh chưa có clip đang dùng model sắp/đã ngừng" + (include.length ? ", cùng các cảnh vừa bị chặn khi render" : "") + ". Cảnh đã chọn model còn hoạt động giữ nguyên."),
+    h("div", { class: "field" }, h("label", { class: "lbl", for: "mc-target" }, "Đổi sang model"), sel,
+      h("span", { class: "help" }, "Chỉ có các model đang hoạt động.")),
+    box);
+  modal({
+    title: one ? `Đổi model cho cảnh ${scenes.join(", ")}` : MODEL_CHANGE_LABEL, body, wide: true,
+    onClose: () => { st.seq++; },
+    buttons: [{ label: "Huỷ" }, { label: "Đổi model", id: "mc-ok", cls: "primary", disabled: true, onclick: apply }],
+  });
+  preview();
+}
+
 /* ---------- run & jobs ---------- */
 
-async function runAction(action, extra = {}) {
+async function runAction(action, extra = {}, ctx = {}) {
   if (!S.cur) return;
   await flushSave();
   if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
@@ -1131,7 +1335,7 @@ async function runAction(action, extra = {}) {
   const body = { action, only: [], force: [], force_keyframes: [], ...extra };
   if (action === "stitch" || action === "make") Object.assign(body, finalPrefs());
   if (action === "video" || action === "make") {
-    const ok = await confirmPaid(body);
+    const ok = await confirmPaid(body, ctx);
     if (!ok) return;
   }
   if (action === "keyframes" && !extra.only) {
@@ -1142,12 +1346,26 @@ async function runAction(action, extra = {}) {
     const j = await api("POST", `/api/projects/${S.cur.id}/run`, body);
     startJob(j);
     if (!NATIVE() && "Notification" in window && Notification.permission === "default" && action !== "dry") Notification.requestPermission();
-  } catch (e) { toast(e.message, "error"); }
+  } catch (e) {
+    // The server re-checks retired models (e.g. ticking "gửi lại" added an interrupted scene after /estimate).
+    if (e.status === 409 && Array.isArray(e.detail?.retired)) { openBlockedModelChange(e.detail.retired, ctx); return; }
+    toast(e.message, "error");
+  }
 }
 
-async function confirmPaid(body) {
+function openBlockedModelChange(retired, ctx = {}) {
+  const ids = retired.map((r) => r.id);
+  if (ctx.scene) openModelChange({ scenes: [ctx.scene], blockedCount: ids.length });
+  else openModelChange({ include: ids, blockedCount: ids.length });
+}
+
+async function confirmPaid(body, ctx = {}) {
   let est;
   try { est = await api("POST", `/api/projects/${S.cur.id}/estimate`, body); } catch (e) { toast(e.message, "error"); return false; }
+  if (est.retired?.length) { // never send a retired model to Flow: offer the model change instead
+    openBlockedModelChange(est.retired, ctx);
+    return false;
+  }
   if (!est.renders.length && !est.blocked.length) {
     if (body.action === "make") return true; // nothing to render: go straight to stitching
     toast("Tất cả cảnh đã render xong. Muốn làm lại cảnh nào thì bấm “Render lại” ở cảnh đó.");

@@ -3,6 +3,7 @@
 FAKE_GFLOW_LOG: file where each call's argv is appended (JSON lines).
 FAKE_GFLOW_FAIL: comma list of "<substring>:<exit_code>:<retryable>[:<times>]";
   a call whose argv contains <substring> fails that many times (default always).
+FAKE_GFLOW_MODELS: JSON file printed by `models --json` instead of the default list (6 video, 2 image).
 """
 import json, os, subprocess, sys
 from pathlib import Path
@@ -48,5 +49,15 @@ elif argv[0] == "video":
     print(json.dumps({"status": "ok", "media_id": "m-" + p.stem, "local_path": str(p), "succeeded": True}))
 elif argv[:2] == ["auth", "status"]:
     print("logged in")
+elif argv[0] == "models":
+    models_file = os.environ.get("FAKE_GFLOW_MODELS")
+    if models_file:
+        print(Path(models_file).read_text())
+    else:
+        video = [("veo-fast", 8), ("veo-quality", 8), ("veo-lite", 8), ("veo-lite-lp", 8),
+                 ("omni-flash", 10), ("omni-1.2-flash", 15)]
+        print(json.dumps({"video": {"models": [{"aliases": [a], "max_duration": d} for a, d in video]},
+                          "image": {"models": [{"aliases": ["nano2"], "label": "Nano Banana 2 (default)"},
+                                               {"aliases": ["nano-pro"], "label": "Nano Banana Pro"}]}}))
 else:
     print(json.dumps({"status": "fail", "error": {"detail": "unknown", "exit_code": 2}})); sys.exit(2)

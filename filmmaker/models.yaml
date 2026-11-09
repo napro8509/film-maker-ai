@@ -1,0 +1,79 @@
+# Metadata model video của Film Maker. Danh sách alias vẫn lấy từ `gflow models --json`;
+# file này chỉ bổ sung thông tin. Ghi đè: $FILMMAKER_MODELS hoặc <thư mục settings>/models.yaml.
+#
+# Ghi đè ghép theo từng trường của mỗi alias (trường có trong file ghi đè thay trường ở đây);
+# khoá cấp trên `plan`, `default_video_model`, `fallback` có trong file ghi đè thì thay hẳn.
+# Để trống một trường trong file ghi đè (vd `retires:`) là bỏ giá trị ở đây.
+# Nguồn: trang trợ giúp Flow 16526234 (đọc ngày 2026-11-09).
+
+plan: ultra                     # gói đang dùng, chọn giá `price.<plan>` (không có thì `price.default`)
+default_video_model: veo-lite   # model cho dự án mới
+
+fallback:                       # dùng khi gflow không chạy được
+  video:
+    - {alias: veo-fast, max_duration: 8}
+    - {alias: veo-quality, max_duration: 8}
+    - {alias: veo-lite, max_duration: 8}
+    - {alias: veo-lite-lp, max_duration: 8}
+    - {alias: omni-flash, max_duration: 10}
+    - {alias: omni-1.2-flash, max_duration: 15}
+  image:
+    - {alias: nano2, label: Nano Banana 2}
+    - {alias: nano-pro, label: Nano Banana Pro}
+    - {alias: imagen4, label: Imagen 4}
+    - {alias: nano2-lite, label: Nano Banana 2 Lite}
+
+models:
+  veo-lite:
+    retires:
+    durations: [4, 6, 8]
+    price:
+      unit: clip
+      ultra: 5
+      default: 10
+    plan_required:
+    checked: 2026-11-09
+
+  veo-lite-lp:
+    retires:
+    durations: [4, 6, 8]
+    price:
+    plan_required:
+    checked: 2026-11-09
+
+  veo-fast:
+    retires: 2026-12-05
+    durations:
+    price:
+      unit: clip
+      ultra: 10
+      default: 20
+    plan_required:
+    checked: 2026-11-09
+
+  veo-quality:
+    retires: 2026-12-05
+    durations:
+    price:
+      unit: clip
+      default: 100
+    plan_required:
+    checked: 2026-11-09
+
+  omni-flash:
+    retires: 2026-12-05
+    durations:
+    price:
+    plan_required:
+    checked: 2026-11-09
+    note: "Omni Flash 1.1"
+
+  omni-1.2-flash:
+    retires:
+    durations:
+    price:
+      unit: second
+      default: 3            # mức 720p
+    plan_required:
+    checked: 2026-11-09
+    note: "360p: 1 credit/giây; 11–15 giây cần gói trả phí"

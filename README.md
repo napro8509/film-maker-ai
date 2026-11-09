@@ -67,6 +67,7 @@ Giao diện có:
 - **Ảnh nhân vật (tham chiếu)**: tạo ảnh nhân vật trên Flow (miễn phí) hoặc tải ảnh lên. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
 - **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.
 - **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
+- **Model sắp/đã ngừng**: banner đầu dự án báo cảnh nào dùng model sắp ngừng; dropdown "Model video" gắn nhãn "sắp ngừng dd/mm" hoặc "đã ngừng"; nút "Đổi model cho các cảnh chưa render" (xem mục "Model video và ngày ngừng").
 - **Log trực tiếp** và trạng thái từng cảnh (xong / đã sửa / bị ngắt / lỗi); thông báo trên máy khi xong.
 - **Phim hoàn chỉnh**: xem nối tiếp các clip kèm phụ đề, chọn nhạc nền + âm lượng, in phụ đề lên hình, ghép, tải MP4 / .srt, mở trong Finder.
 - **Cài đặt**: tài khoản gflow, thời gian nghỉ giữa các lần gửi, số lần thử lại, cách gọi Claude, Anthropic API key (lưu ở `~/.config/filmmaker/settings.json`), chế độ sáng/tối; kiểm tra đăng nhập Google, xem credit.
@@ -94,6 +95,9 @@ filmmaker run cafe.yaml --dry-run
 
 # Tạo clip + ghép phim
 filmmaker make cafe.yaml --music nhac.mp3 --burn-subtitles
+
+# Kiểm tra công cụ + cảnh dùng model sắp ngừng/đã ngừng
+filmmaker check cafe.yaml            # [--out DIR], mặc định output/<tên storyboard>
 
 # Xem tiến độ / làm lại một cảnh / ghép lại
 filmmaker status cafe.yaml
@@ -154,7 +158,7 @@ filmmaker run cafe.yaml --backup      # tự backup sau mỗi clip render xong
 ```yaml
 title: "Ly cà phê đầu tiên"
 aspect: "16:9"            # hoặc 9:16 cho TikTok/Shorts
-model: veo-fast           # veo-lite | veo-fast | veo-quality | omni-flash | ... (gflow models)
+model: veo-lite           # veo-lite | veo-lite-lp | omni-1.2-flash | ... (gflow models; bỏ trống = Flow tự chọn)
 image_model: nano2
 style: "cinematic, warm morning light, 35mm film grain"   # nối vào mọi prompt
 # project_id: "..."       # dùng lại project Flow có sẵn
@@ -183,6 +187,34 @@ scenes:
 ```
 
 Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động + một chuyển động máy quay.
+
+### Model video và ngày ngừng
+
+Dự án mới dùng `veo-lite` (Veo 3.1 Lite). Google ngừng `veo-fast`, `veo-quality` và `omni-flash` từ **05/12/2026**.
+Ngày ngừng, độ dài cho phép và giá credit theo gói nằm trong `filmmaker/models.yaml`. Muốn sửa mà không đổi code,
+tạo file ghi đè `~/.config/filmmaker/models.yaml` (cùng thư mục với `settings.json`, hoặc đặt `$FILMMAKER_MODELS`),
+chỉ ghi các trường cần đổi; sửa là có hiệu lực ngay:
+
+```yaml
+models:
+  veo-fast: {retires: 2026-12-20}   # Google lùi ngày ngừng
+```
+
+- `filmmaker check cafe.yaml` liệt kê cảnh dùng model sắp/đã ngừng theo nhóm chưa có clip / bị ngắt / đã có clip;
+  thoát mã 1 nếu có cảnh chưa có clip dùng model đã ngừng.
+- `run`/`make`: trước ngày ngừng chỉ cảnh báo; từ ngày ngừng, cảnh sắp gửi lên Flow dùng model đã ngừng bị chặn
+  (không gửi gì, thoát mã ≠ 0). `--dry-run` và `--keyframes-only` chỉ cảnh báo. Không có cờ bỏ qua chặn:
+  đổi model trong giao diện hoặc sửa `model:` trong storyboard.
+- Giao diện: banner ở đầu dự án (và nút cùng tên ở tab Cốt truyện) có nút **Đổi model cho các cảnh chưa render**.
+  Hộp thoại xem trước cho biết bao nhiêu cảnh sẽ đổi sang model mới (mặc định `veo-lite`), ước tính credit khi render,
+  và cảnh có độ dài model mới không nhận (chọn "Làm tròn lên"/"Làm tròn xuống"). Chỉ cảnh **chưa có clip** dùng model
+  sắp/đã ngừng bị đổi; cảnh đã có clip, cảnh bị ngắt và cảnh cố ý ghim model còn hoạt động giữ nguyên (clip đã trả tiền
+  không bị đánh dấu render lại). Nút chỉ ghi storyboard, không render, không tốn credit; bấm Render sau đó như thường lệ.
+  Nút khoá khi đang có job chạy.
+- Từ ngày ngừng, bấm Render mà có cảnh sắp gửi dùng model đã ngừng thì giao diện không gửi gì mà mở thẳng hộp thoại đổi
+  model (nút Render/"Render lại"/"Gửi lại" trên một cảnh thì mở bản đổi model cho riêng cảnh đó); gọi thẳng API `/run` trả 409.
+  Cảnh bị ngắt vẫn cần kiểm tra trên Flow rồi mới "Gửi lại", đổi model không xoá trạng thái bị ngắt.
+- Thử trước hành vi "đã ngừng": trong file ghi đè đặt `retires` của model đó là một ngày đã qua, xoá dòng đó để quay lại.
 
 ## Đội AI làm phim tự động (Claude Code)
 

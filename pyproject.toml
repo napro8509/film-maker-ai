@@ -34,4 +34,4 @@ include = ["filmmaker*"]
 testpaths = ["tests"]
 
 [tool.setuptools.package-data]
-filmmaker = ["templates/*.yaml", "web/static/*"]
+filmmaker = ["templates/*.yaml", "web/static/*", "models.yaml"]

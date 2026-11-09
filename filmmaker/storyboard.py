@@ -47,7 +47,10 @@ class Scene(BaseModel):
     image: str | None = Field(default=None, description="Start frame path for mode=i2v.")
     end_image: str | None = Field(default=None, description="Optional end frame path for mode=i2v.")
     duration: int | None = Field(default=None, description="Seconds; omit for Flow's default.")
-    model: str | None = None
+    model: str | None = Field(
+        default=None,
+        description="Optional video model alias for this scene only; normally leave empty to use the storyboard model.",
+    )
     narration: str | None = Field(default=None, description="Optional line shown as a subtitle in the final film.")
 
     @model_validator(mode="after")
@@ -62,7 +65,7 @@ class Scene(BaseModel):
 class Storyboard(BaseModel):
     title: str
     aspect: Aspect = "16:9"
-    model: str | None = Field(default=None, description="Default gflow video model, e.g. veo-fast, veo-quality.")
+    model: str | None = Field(default=None, description="Default gflow video model alias for all scenes, e.g. veo-lite. Empty = Flow picks.")
     image_model: str = "nano2"
     style: str = Field(default="", description="Visual style appended to every prompt.")
     project_id: str | None = Field(default=None, description="Reuse an existing Flow project.")

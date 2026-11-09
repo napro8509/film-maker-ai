@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 
+from . import model_meta
 from .storyboard import Storyboard
 
 MODEL = "claude-opus-5-5"
@@ -93,12 +94,15 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, *
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     if backend == "claude_code":
-        return plan_with_claude_code(idea, **kw), "claude_code"
-    if api_key:
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
-    return plan(idea, **kw), "api"
+        sb, used = plan_with_claude_code(idea, **kw), "claude_code"
+    else:
+        if api_key:
+            os.environ["ANTHROPIC_API_KEY"] = api_key
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+        sb, used = plan(idea, **kw), "api"
+    # New projects never start on a model Flow is retiring (default: veo-lite).
+    return model_meta.normalize_new_storyboard(sb, model_meta.load()), used
 
 
 def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None) -> Storyboard:
