@@ -65,6 +65,7 @@ Giao diện có:
 - **Sửa từng cảnh**: đổi kiểu cảnh, prompt, độ dài, model, phụ đề; thêm/xoá/nhân bản/đổi thứ tự; tải ảnh lên cho kiểu Ảnh → Video; xem prompt thực tế gửi lên Flow. Tự động lưu.
 - **Nhân vật & phong cách**: mô tả nhân vật một lần, tự thêm vào mọi cảnh có tên nhân vật đó.
 - **Ảnh nhân vật (tham chiếu)**: tạo ảnh nhân vật trên Flow (miễn phí) hoặc tải ảnh lên. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
+- **Tab "Bảng"**: xem cả phim như một bảng card: nhân vật → keyframe → video của từng cảnh. Kéo nối mũi tên để chọn nhân vật xuất hiện trong cảnh; tạo ảnh nhân vật và keyframe ngay trên card (miễn phí); render video có hộp xác nhận credit. Xem mục "Nhân vật trong từng cảnh".
 - **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.
 - **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
 - **Model sắp/đã ngừng**: banner đầu dự án báo cảnh nào dùng model sắp ngừng; dropdown "Model video" gắn nhãn "sắp ngừng dd/mm" hoặc "đã ngừng"; nút "Đổi model cho các cảnh chưa render" (xem mục "Model video và ngày ngừng").
@@ -192,6 +193,30 @@ scenes:
 ```
 
 Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động; góc máy và chuyển động đặt trong `camera`.
+
+### Nhân vật trong từng cảnh (`characters`)
+
+Mặc định tool dò tên nhân vật trong prompt của cảnh. Muốn chỉ định rõ, thêm `characters` (tuỳ chọn) vào cảnh:
+
+```yaml
+characters:
+  - {name: Lan, description: "..."}
+  - {name: Minh, description: "..."}
+
+scenes:
+  - id: s01
+    prompt: "Lan and Minh share coffee"
+    characters: [Lan, Minh]   # chỉ đúng hai người này
+  - id: s02
+    prompt: "Empty street at dawn"
+    characters: []            # cảnh không có nhân vật
+  - id: s03
+    prompt: "Lan walks home"  # bỏ trống characters: dò tên như cũ
+```
+
+- Bỏ trống: dò tên trong prompt như cũ. Có `characters`: dùng đúng danh sách đó cho phần mô tả và ảnh tham chiếu (tối đa 3 ảnh mỗi cảnh); `[]` = không nhân vật.
+- Tên không phân biệt hoa thường, phải có trong `characters` cấp trên và không trùng nhau, nếu không storyboard bị báo lỗi.
+- Tab "Bảng" ghi trường này khi bạn kéo/xoá mũi tên nhân vật → cảnh.
 
 ### Chỉ đạo hình ảnh (`camera`)
 

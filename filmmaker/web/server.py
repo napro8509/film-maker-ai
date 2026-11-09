@@ -29,6 +29,7 @@ import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from .. import manual_clip, model_change, model_meta, retirement
 from ..assemble import AssembleError, assemble
@@ -38,12 +39,14 @@ from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import CAMERA_PRESETS, Scene, Storyboard, load_storyboard
 from ..thumbnail import ThumbnailError
+from . import ui_prefs
 
 STATIC = Path(__file__).parent / "static"
 TEMPLATE = Path(__file__).parent.parent / "templates" / "storyboard.yaml"
 SETTINGS_PATH = Path(os.environ.get("FILMMAKER_SETTINGS", Path.home() / ".config" / "filmmaker" / "settings.json"))
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac"}
+BOARD_MAX_BYTES = 256 * 1024  # PUT /board body limit
 
 
 # --- settings -----------------------------------------------------------------
@@ -338,12 +341,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             tmp.write_text(text, encoding="utf-8")
             tmp.replace(sb_path(pid))
 
-    def ui_prefs(pid: str) -> dict[str, Any]:
-        try:
-            return json.loads((pdir(pid) / "ui.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-
     def file_url(pid: str, path: Path | str | None) -> str | None:
         if not path:
             return None
@@ -437,6 +434,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "model_status": meta.status(retirement.effective_model(sb, s)),
                     "model_retires_label": meta.retires_label(retirement.effective_model(sb, s)),
                     "refs": [n for n, _ in sb.scene_refs(s)],
+                    "characters": [c.name for c in sb.scene_characters(s)],
+                    "characters_explicit": s.characters is not None,
                     # ffprobe only for "submitting" scenes with a file, never while a job runs here
                     "manual_clip": None if busy else pipe.manual_clip_state(s),
                 }
@@ -459,7 +458,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "final_url": file_url(pid, final),
             "final_size": final.stat().st_size if final.is_file() else None,
             "srt_url": file_url(pid, srt),
-            "final_prefs": ui_prefs(pid).get("final", {}),
+            "final_prefs": ui_prefs.read(pdir(pid)).get("final", {}),
             "i2v_unsupported": i2v_off,
             "i2v_error": st_data.get("i2v_error"),
             "characters_state": characters_state(pid, raw, sb),
@@ -760,7 +759,44 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         raw["title"] = title
         raw.pop("project_id", None)
         (d / "storyboard.yaml").write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        src_prefs = ui_prefs.read(src)
+        if "board" in src_prefs:
+            src_board = src_prefs["board"]
+            ui_prefs.update(d, lambda p: p.__setitem__("board", src_board))
         return {"id": new_id}
+
+    @app.get("/api/projects/{pid}/board")
+    def get_board(pid: str) -> dict[str, Any]:
+        return ui_prefs.board_of(ui_prefs.read(pdir(pid)))
+
+    @app.put("/api/projects/{pid}/board")
+    async def put_board(pid: str, request: Request) -> dict[str, Any]:
+        """Board layout (card positions, video links, view). Only ui.json: never the storyboard, never a job."""
+        d = pdir(pid)
+        too_big = HTTPException(413, f"Bố cục bảng quá lớn (tối đa {BOARD_MAX_BYTES // 1024} KB)")
+        try:
+            declared = int(request.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > BOARD_MAX_BYTES:
+            raise too_big
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():  # stop early even without Content-Length (chunked)
+            size += len(chunk)
+            if size > BOARD_MAX_BYTES:
+                raise too_big
+            chunks.append(chunk)
+        try:
+            data = json.loads(b"".join(chunks))
+        except ValueError:
+            raise HTTPException(400, "Bố cục bảng không phải JSON hợp lệ")
+        try:
+            board = ui_prefs.validate_board(data)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        await run_in_threadpool(ui_prefs.update, d, lambda p: p.__setitem__("board", board))
+        return board
 
     @app.delete("/api/projects/{pid}")
     def delete(pid: str) -> dict[str, Any]:
@@ -839,15 +875,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.put("/api/projects/{pid}/final-settings")
     def final_settings(pid: str, body: FinalSettings) -> dict[str, Any]:
-        prefs = ui_prefs(pid)
-        prefs["final"] = body.model_dump()
-        (pdir(pid) / "ui.json").write_text(json.dumps(prefs, indent=2), encoding="utf-8")
-        return prefs["final"]
+        def put(prefs: dict[str, Any]) -> dict[str, Any]:
+            prefs["final"] = body.model_dump()
+            return prefs["final"]
+
+        return ui_prefs.update(pdir(pid), put)
 
     def saved_titles(pid: str) -> list[dict[str, str]]:
         from ..planner import _clean_titles
 
-        return _clean_titles(ui_prefs(pid).get("thumbnail_titles"), 20)  # old projects stored plain strings
+        return _clean_titles(ui_prefs.read(pdir(pid)).get("thumbnail_titles"), 20)  # old projects stored plain strings
 
     def suggest_titles_for(pid: str, sb: Storyboard, log: Callable[[str], None] = lambda *_: None) -> list[dict[str, str]]:
         from ..planner import suggest_titles
@@ -859,9 +896,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         titles = suggest_titles(sb, backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
         if not titles:
             raise RuntimeError("Claude không trả về tiêu đề nào.")
-        prefs = ui_prefs(pid)
-        prefs["thumbnail_titles"] = titles
-        (pdir(pid) / "ui.json").write_text(json.dumps(prefs, indent=2, ensure_ascii=False), encoding="utf-8")
+        ui_prefs.update(pdir(pid), lambda p: p.__setitem__("thumbnail_titles", titles))
         return titles
 
     @app.post("/api/projects/{pid}/thumbnail/titles")

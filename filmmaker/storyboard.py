@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Aspect = Literal["16:9", "9:16"]
 Mode = Literal["t2v", "i2v", "keyframe"]
@@ -185,7 +185,10 @@ class Camera(BaseModel):
         return " ".join(parts)
 
 
-class Scene(BaseModel):
+class SceneDraft(BaseModel):
+    """A scene without `characters`: the schema the planner sends to Claude (still titled "Scene")."""
+    model_config = ConfigDict(title="Scene")
+
     id: str = Field(description="Short unique id, e.g. s01")
     mode: Mode = Field(
         default="keyframe",
@@ -205,7 +208,7 @@ class Scene(BaseModel):
                                   "lens, focus, composition, lighting, speed. Added to the prompts automatically.")
 
     @model_validator(mode="after")
-    def _check(self) -> "Scene":
+    def _check(self) -> "SceneDraft":
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.id):
             raise ValueError(f"scene id '{self.id}' may only contain letters, digits, - and _")
         if self.mode == "i2v" and not self.image:
@@ -213,7 +216,29 @@ class Scene(BaseModel):
         return self
 
 
-class Storyboard(BaseModel):
+class Scene(SceneDraft):
+    characters: list[str] | None = Field(
+        default=None, description="Names of characters in this scene (overrides name detection).")
+
+    @field_validator("characters")
+    @classmethod
+    def _dedupe_characters(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        out: list[str] = []
+        seen: set[str] = set()
+        for name in v:
+            name = name.strip()
+            if name.casefold() not in seen:
+                seen.add(name.casefold())
+                out.append(name)
+        return out
+
+
+class StoryboardDraft(BaseModel):
+    """A storyboard whose scenes have no `characters`: the planner's output schema (still titled "Storyboard")."""
+    model_config = ConfigDict(title="Storyboard")
+
     title: str
     aspect: Aspect = "16:9"
     model: str | None = Field(default=None, description="Default gflow video model alias for all scenes, e.g. veo-lite. Empty = Flow picks.")
@@ -227,10 +252,10 @@ class Storyboard(BaseModel):
                           "images and videos (subtitles come from `narration` when the film is assembled).")
     fallback_t2v: bool = Field(default=False, description="If the Flow account cannot do image-to-video, render "
                                "keyframe scenes as text-to-video instead of stopping.")
-    scenes: list[Scene]
+    scenes: list[SceneDraft]
 
     @model_validator(mode="after")
-    def _unique_ids(self) -> "Storyboard":
+    def _unique_ids(self) -> "StoryboardDraft":
         ids = [s.id for s in self.scenes]
         dupes = {i for i in ids if ids.count(i) > 1}
         if dupes:
@@ -239,16 +264,45 @@ class Storyboard(BaseModel):
             raise ValueError("storyboard has no scenes")
         return self
 
+
+class Storyboard(StoryboardDraft):
+    scenes: list[Scene]  # same position as in StoryboardDraft
+
+    @model_validator(mode="after")
+    def _check_scene_characters(self) -> "Storyboard":
+        if all(s.characters is None for s in self.scenes):
+            return self  # old storyboards: duplicate / empty names stay allowed
+        bad: list[str] = []
+        seen: set[str] = set()
+        for c in self.characters:
+            key = c.name.strip().casefold()
+            if not key or key in seen:
+                label = repr(c.name.strip()) if not key else repr(next(
+                    o.name for o in self.characters if o.name.strip().casefold() == key))
+                if label not in bad:
+                    bad.append(label)
+            seen.add(key)
+        if bad:
+            raise ValueError("character names must be unique and non-empty when scenes list characters: "
+                             + ", ".join(bad))
+        for s in self.scenes:
+            for name in s.characters or []:
+                if name.casefold() not in seen:
+                    raise ValueError(f"scene {s.id}: unknown character '{name}' in characters")
+        return self
+
     # --- prompt building -------------------------------------------------
 
     def _characters_in(self, text: str) -> list[Character]:
         return [c for c in self.characters if re.search(rf"\b{re.escape(c.name)}\b", text, re.IGNORECASE)]
 
-    def _compose(self, text: str, direction: str = "") -> str:
+    def _compose(self, text: str, direction: str = "", chars: list[Character] | None = None) -> str:
+        """`chars` = characters whose description is added; None = those named in `text`."""
         parts = [text.strip().rstrip(".") + "."]
         if direction:
             parts.append(direction)
-        chars = self._characters_in(text)
+        if chars is None:
+            chars = self._characters_in(text)
         if chars:
             parts.append(" ".join(f"{c.name}: {c.description.strip()}." for c in chars))
         if self.style.strip():
@@ -297,11 +351,26 @@ class Storyboard(BaseModel):
         """Text whose character names decide which references a scene gets."""
         return f"{scene.image_prompt or ''} {scene.prompt}" if scene.mode == "keyframe" else scene.prompt
 
+    def auto_characters(self, scene: Scene) -> list[Character]:
+        """Characters found by name in the scene text (what an old storyboard gets)."""
+        return self._characters_in(self.scene_text(scene))
+
+    def scene_characters(self, scene: Scene) -> list[Character]:
+        """Characters of a scene: its `characters` list if set (in storyboard order), else the detected ones."""
+        if scene.characters is None:
+            return self.auto_characters(scene)
+        wanted = {n.casefold() for n in scene.characters}
+        return [c for c in self.characters if c.name.strip().casefold() in wanted]
+
+    def _prompt_characters(self, scene: Scene) -> list[Character] | None:
+        """Characters to describe in the scene's prompts; None = detect names in each prompt text (old behaviour)."""
+        return None if scene.characters is None else self.scene_characters(scene)
+
     def scene_refs(self, scene: Scene) -> list[tuple[str, Path]]:
         """(name, image) of characters in this scene that have a reference image on disk."""
         if not self.use_character_refs or scene.mode == "i2v":
             return []
-        refs = [(c.name, Path(c.image)) for c in self._characters_in(self.scene_text(scene))
+        refs = [(c.name, Path(c.image)) for c in self.scene_characters(scene)
                 if c.image and Path(c.image).is_file()]
         return refs[:MAX_REFS]
 
@@ -316,7 +385,7 @@ class Storyboard(BaseModel):
 
     def video_prompt(self, scene: Scene) -> str:
         if scene.mode == "t2v":
-            return self._compose(scene.prompt, self.direction(scene))
+            return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
         # In keyframe/i2v mode the look and framing are already in the image; keep the prompt on the motion.
         motion = self.direction(scene, MOTION_FIELDS + ("focus",))
         action = scene.prompt.strip().rstrip(".")
@@ -329,12 +398,13 @@ class Storyboard(BaseModel):
         the opening-frame description plus the motion, with characters and style."""
         if scene.image_prompt and scene.image_prompt.strip():
             return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
-                                 self.direction(scene))
-        return self._compose(scene.prompt, self.direction(scene))
+                                 self.direction(scene), self._prompt_characters(scene))
+        return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
 
     def image_prompt(self, scene: Scene) -> str:
         # A still has no motion: only the framing, lens, focus, composition and lighting apply.
-        return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS))
+        return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS),
+                             self._prompt_characters(scene))
 
     def scene_fingerprint(self, scene: Scene) -> str:
         """Changes whenever anything that affects the generated clip changes."""

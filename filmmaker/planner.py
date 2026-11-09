@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import tempfile
 
 from . import model_meta
-from .storyboard import Storyboard
+from .storyboard import Storyboard, StoryboardDraft
 
 MODEL = "claude-opus-5-5"
 
@@ -30,6 +31,16 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Scene ids: s01, s02, ...
 - Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id or image/end_image."""
+
+
+def _to_storyboard(data: dict) -> Storyboard:
+    """Planner output -> Storyboard. Claude does not pick scene `characters` (detection by name stays the default),
+    so drop any it invents in a scene; the storyboard's own `characters` list is kept."""
+    data = copy.deepcopy(data)
+    for scene in data.get("scenes") or []:
+        if isinstance(scene, dict):
+            scene.pop("characters", None)
+    return Storyboard.model_validate(data)
 
 
 def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None) -> str:
@@ -69,7 +80,7 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
-    schema = json.dumps(Storyboard.model_json_schema())
+    schema = json.dumps(StoryboardDraft.model_json_schema())
     cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint),
            "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
@@ -89,7 +100,7 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
         if "login" in msg.lower() or "auth" in msg.lower():
             msg += " — chạy `claude` trong Terminal và đăng nhập (/login) bằng tài khoản Claude của bạn."
         raise RuntimeError(f"Claude Code không viết được storyboard: {msg}")
-    sb = Storyboard.model_validate(data["structured_output"])
+    sb = _to_storyboard(data["structured_output"])
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 
@@ -124,7 +135,7 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
         max_tokens=16000,
         system=SYSTEM,
         messages=[{"role": "user", "content": user}],
-        output_format=Storyboard,
+        output_format=StoryboardDraft,
         output_config={"effort": "medium"},
         # If a safety classifier declines, let the API retry on a fallback model.
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
@@ -134,7 +145,7 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
         raise RuntimeError("Claude từ chối ý tưởng này; hãy thử diễn đạt lại.")
     if response.stop_reason == "max_tokens":
         raise RuntimeError("Kịch bản quá dài; hãy giảm số cảnh.")
-    sb = response.parsed_output
+    sb = _to_storyboard(response.parsed_output.model_dump(exclude_none=True))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 

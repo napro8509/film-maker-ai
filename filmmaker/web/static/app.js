@@ -7,6 +7,7 @@ const S = {
   assets: { images: [], audio: [] }, job: null, jobSince: 0, jobOpen: false, pollT: null,
   saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", auth: null,
   zones: new Map(), playIdx: 0,
+  charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
 };
 const MODES = [
   ["keyframe", "Ảnh → Video", "Tạo ảnh mở đầu trước (miễn phí), duyệt rồi mới render. Giữ nhân vật đồng nhất nhất."],
@@ -56,6 +57,11 @@ const ICONS = {
   music: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
   cloud: '<path d="M7 18a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 8.5a4.8 4.8 0 0 1-.5 9.5z"/>',
+  board: '<rect x="3" y="4" width="7" height="6" rx="1.5"/><rect x="14" y="14" width="7" height="6" rx="1.5"/><path d="M10 7h2a2 2 0 0 1 2 2v6a2 2 0 0 0 2 2"/>',
+  layout: '<rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="7" rx="1.5"/><rect x="10" y="13" width="5" height="7" rx="1.5"/><rect x="17" y="4" width="4" height="7" rx="1.5"/>',
+  fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  minus: '<path d="M5 12h14"/>',
+  arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
 };
 function icon(name, cls = "") {
   const t = document.createElement("template");
@@ -262,7 +268,9 @@ async function init() {
   window.addEventListener("beforeunload", (e) => { if (S.pendingSave || S.saving) { save(); e.preventDefault(); e.returnValue = ""; } });
   window.addEventListener("hashchange", () => {
     const id = decodeURIComponent(location.hash.slice(1));
-    if (id && (!S.cur || S.cur.id !== id) && S.projects.some((p) => p.id === id)) openProject(id);
+    if (id && (!S.cur || S.cur.id !== id) && S.projects.some((p) => p.id === id)) openProject(id).then((ok) => {
+      if (ok === false && S.cur) history.replaceState(null, "", "#" + S.cur.id); // user chose to stay
+    });
   });
 
   try {
@@ -295,17 +303,25 @@ async function loadProjects() {
 
 async function openProject(id) {
   await flushSave();
+  // Edits that could not be saved (blocked by an empty/duplicate character name, or a save error) would be lost silently.
+  if (S.cur && S.cur.id !== id && S.pendingSave && saveFailed()) {
+    const why = S.saveState === "blocked" ? "Có nhân vật tên trống hoặc trùng nên thay đổi gần đây chưa được lưu." : "Thay đổi gần đây chưa lưu được: " + S.saveError;
+    if (!(await confirmModal("Bỏ thay đổi chưa lưu?", why + " Mở dự án khác thì các thay đổi này sẽ mất.", "Bỏ thay đổi và mở", true))) return false;
+    clearTimeout(S.saveTimer); S.pendingSave = false;
+  }
   loadModels(id); // in the background, not awaited
   try {
     const [d, a] = await Promise.all([api("GET", `/api/projects/${id}`), api("GET", `/api/projects/${id}/assets`)]);
     S.cur = d; S.assets = a; S.playIdx = 0;
-  } catch (e) { toast(e.message, "error"); return; }
+  } catch (e) { toast(e.message, "error"); return false; }
+  rememberCharNames();
   localSet("lastProject", id);
   toggleSidebar(false);
   if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
   S.saveState = "saved";
   renderSidebar();
   renderMain();
+  return true;
 }
 
 /* Refresh /api/models in the background (gflow may be slow): never delays drawing the project. */
@@ -348,11 +364,23 @@ function changed() {
 async function save() {
   if (!S.cur || !S.pendingSave) return;
   if (S.saving) { clearTimeout(S.saveTimer); S.saveTimer = setTimeout(save, 300); return; }
+  const sb = S.cur.storyboard;
+  const listed = (sb.scenes || []).some((s) => Array.isArray(s.characters));
+  // (a) The server rejects empty/duplicate names once a scene lists characters: wait until the name is fixed.
+  // pendingSave stays true; the next changed() tries again.
+  if (listed && charsLocked(sb)) { clearTimeout(S.saveTimer); setSaveState("blocked", "tên nhân vật trống/trùng"); return; }
+  // (b) Carry renamed characters into scenes[].characters, so typing a new name never breaks the links.
+  if (listed) renameInScenes(sb);
+  const sent = charNamePairs(sb);
   S.saving = true; S.pendingSave = false; setSaveState("saving");
   const pid = S.cur.id;
   try {
-    const d = await api("PUT", `/api/projects/${pid}`, { storyboard: S.cur.storyboard });
-    if (S.cur && S.cur.id === pid) applyMeta(d);
+    const d = await api("PUT", `/api/projects/${pid}`, { storyboard: sb });
+    if (S.cur && S.cur.id === pid) {
+      if (S.cur.storyboard === sb) rememberCharNames(sent);
+      applyMeta(d);
+      if (typeof boardAfterSave === "function") { try { boardAfterSave(); } catch (err) { console.error(err); } }
+    }
     setSaveState(S.pendingSave ? "pending" : "saved");
   } catch (e) {
     S.pendingSave = true;
@@ -372,9 +400,96 @@ function setSaveState(st, err = "") {
   if (el) { const n = renderSaveState(); n.id = "savestate"; el.replaceWith(n); }
 }
 function renderSaveState() {
-  const t = { saved: "Đã lưu", pending: "Chưa lưu…", saving: "Đang lưu…", error: "Lỗi lưu: " + S.saveError }[S.saveState];
-  return h("span", { class: "savestate" + (S.saveState === "error" ? " error" : ""), title: "Tự lưu khi bạn sửa · ⌘S để lưu ngay" },
-    S.saveState === "saved" ? icon("check") : S.saveState === "error" ? icon("alert") : S.saveState === "saving" ? h("span", { class: "spinner" }) : null, t);
+  const t = { saved: "Đã lưu", pending: "Chưa lưu…", saving: "Đang lưu…", error: "Lỗi lưu: " + S.saveError, blocked: "Chưa lưu: " + S.saveError }[S.saveState];
+  const bad = saveFailed();
+  return h("span", { class: "savestate" + (bad ? " error" : ""), role: bad ? "alert" : null,
+    title: S.saveState === "blocked" ? "Có cảnh đang chọn nhân vật, nên tên nhân vật phải khác rỗng và không trùng. Sửa tên để lưu tiếp." : "Tự lưu khi bạn sửa · ⌘S để lưu ngay" },
+    S.saveState === "saved" ? icon("check") : bad ? icon("alert") : S.saveState === "saving" ? h("span", { class: "spinner" }) : null, t);
+}
+/* The last save did not reach the disk: a server error, or blocked by an empty/duplicate character name. */
+function saveFailed() { return S.saveState === "error" || S.saveState === "blocked"; }
+
+/* ---------- character names (shared with board.js) ---------- */
+
+/* Names match without case, like the server (casefold). */
+function nameKey(n) { return String(n ?? "").trim().toLowerCase(); }
+function charKey(c) { return nameKey(c && c.name); }
+/* Indexes of characters whose name is empty or used by another character. */
+function charNameProblems(sb) {
+  const chars = (sb && sb.characters) || [], seen = new Map(), bad = new Set();
+  chars.forEach((c, i) => {
+    const k = charKey(c);
+    if (!k) { bad.add(i); return; }
+    if (seen.has(k)) { bad.add(i); bad.add(seen.get(k)); } else seen.set(k, i);
+  });
+  return bad;
+}
+function charsLocked(sb) { return charNameProblems(sb).size > 0; }
+/* [character object, name] for every character whose name is valid right now. */
+function charNamePairs(sb) {
+  const bad = charNameProblems(sb);
+  return ((sb && sb.characters) || []).map((c, i) => [c, c.name, i]).filter(([, , i]) => !bad.has(i)).map(([c, n]) => [c, n]);
+}
+/* Remember the names scenes[].characters refer to. Characters with an empty/duplicate name are not remembered,
+   so they are never "renamed" in the scenes (they cannot be listed there anyway). */
+function rememberCharNames(pairs) {
+  S.charSaved = new WeakMap();
+  const sb = S.cur && S.cur.storyboard;
+  if (!sb) return;
+  for (const [c, n] of pairs || charNamePairs(sb)) S.charSaved.set(c, n);
+}
+/* Replace old names with the new ones in every scenes[].characters (all at once, so swapping two names works). */
+function renameInScenes(sb) {
+  const map = new Map();
+  for (const c of sb.characters || []) {
+    if (!S.charSaved.has(c)) continue; // added since the last save: nothing refers to it yet
+    const old = S.charSaved.get(c);
+    if (!nameKey(old) || old === c.name) continue;
+    map.set(nameKey(old), c.name.trim());
+  }
+  if (!map.size) return;
+  for (const sc of sb.scenes || []) {
+    if (!Array.isArray(sc.characters)) continue;
+    const out = [], seen = new Set();
+    for (const n of sc.characters) {
+      const v = map.has(nameKey(n)) ? map.get(nameKey(n)) : n;
+      if (seen.has(nameKey(v))) continue;
+      seen.add(nameKey(v)); out.push(v);
+    }
+    sc.characters = out;
+  }
+  // The scenes now use the new names, even if this save fails.
+  for (const c of sb.characters || []) if (S.charSaved.has(c) && map.has(nameKey(S.charSaved.get(c)))) S.charSaved.set(c, c.name.trim());
+}
+/* Scenes linked to a character: listed in scenes[].characters, or picked up from the prompts (server). */
+function scenesWithChar(c) {
+  const k = charKey(c);
+  if (!k) return [];
+  return (S.cur.storyboard.scenes || []).filter((sc) => {
+    const names = Array.isArray(sc.characters) ? sc.characters : S.cur.scene_state?.[sc.id]?.characters || [];
+    return names.some((n) => nameKey(n) === k);
+  });
+}
+/* Delete character i (asks first). Its image files stay in assets/. Returns true when deleted. */
+async function removeCharacter(i) {
+  const sb = S.cur.storyboard, c = (sb.characters || [])[i];
+  if (!c) return false;
+  const twin = sb.characters.some((x) => x !== c && charKey(x) && charKey(x) === charKey(c)); // same name: links stay
+  const n = twin ? 0 : scenesWithChar(c).length;
+  if (c.name || c.description || n) {
+    const text = `Xoá “${c.name || "nhân vật chưa đặt tên"}” khỏi storyboard. ` + (n ? `Đang nối vào ${n} cảnh; nhân vật sẽ được bỏ khỏi các cảnh đó. ` : "") + "File ảnh vẫn nằm trong thư mục assets.";
+    if (!(await confirmModal("Xoá nhân vật?", text, "Xoá", true))) return false;
+  }
+  const at = sb.characters.indexOf(c); // the list may have changed while the dialog was open
+  if (at < 0) return false;
+  sb.characters.splice(at, 1);
+  const k = charKey(c);
+  // Another character with the same name keeps its links.
+  if (k && !sb.characters.some((x) => charKey(x) === k)) {
+    for (const sc of sb.scenes || []) if (Array.isArray(sc.characters)) sc.characters = sc.characters.filter((x) => nameKey(x) !== k);
+  }
+  changed();
+  return true;
 }
 
 /* ---------- top bar ---------- */
@@ -489,6 +604,7 @@ function renderMain() {
   if (!S.cur) { put(m, renderEmpty()); return; }
   // Tabs follow the workflow: set up the look & cast → build scenes → finish the film. YAML is the escape hatch.
   const tabs = [["story", "users", "Phong cách & nhân vật", (S.cur.storyboard.characters || []).length],
+    ["board", "board", "Bảng"],
     ["scenes", "video", "Cảnh", S.cur.storyboard.scenes?.length || 0],
     ["final", "stitch", "Ghép phim & ảnh bìa"], ["yaml", "code", "YAML"]];
   put(m, h("div", { class: "main-inner" },
@@ -498,12 +614,23 @@ function renderMain() {
     h("div", { class: "tabs", role: "tablist" },
       tabs.map(([k, ic, l, n]) => h("button", { class: S.tab === k ? "on" : "", role: "tab", "aria-selected": String(S.tab === k), onclick: () => switchTab(k) },
         icon(ic), l, n != null ? h("span", { class: "count" }, n) : null))),
-    h("div", { role: "tabpanel" }, S.tab === "scenes" ? renderScenes() : S.tab === "story" ? renderStory() : S.tab === "final" ? renderFinal() : renderYaml()),
+    h("div", { role: "tabpanel" }, S.tab === "scenes" ? renderScenes() : S.tab === "story" ? renderStory() : S.tab === "board" ? renderBoardTab()
+      : S.tab === "final" ? renderFinal() : renderYaml()),
   ));
 }
 
+/* The board lives in board.js (loaded before this file). */
+function renderBoardTab() {
+  if (typeof renderBoard !== "function") return h("div", { class: "banner err flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" }, "Không tải được tab Bảng (thiếu board.js). Tải lại trang thử lại."));
+  try { return renderBoard(); }
+  catch (e) {
+    console.error(e);
+    return h("div", { class: "banner err flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" }, "Không vẽ được bảng: " + e.message));
+  }
+}
+
 async function switchTab(k) {
-  if (k === "yaml") { await flushSave(); await refreshCurrent(); }
+  if (k === "yaml" || k === "board") { await flushSave(); await refreshCurrent(); }
   S.tab = k;
   renderMain();
 }
@@ -617,7 +744,9 @@ function renderModelWarning() {
     metaErr ? h("p", { class: "help", style: { marginBottom: "var(--sp-4)" } }, "File metadata model lỗi: " + metaErr) : null);
 }
 function prettyError(e) {
-  return e.replace(/^scenes\.(\d+)(?:\.|:\s*(?:scene [^:]+:\s*)?)/, (_, i) => `Cảnh ${+i + 1}: `).replace("Field required", "chưa điền")
+  return e.replace(/scene (\S+): unknown character '(.*)' in characters/, "Cảnh $1: không có nhân vật “$2” (mục nhân vật của cảnh)")
+    .replace(/character names must be unique and non-empty when scenes list characters: (.*)/, "Tên nhân vật phải khác rỗng và không trùng khi cảnh có danh sách nhân vật: $1")
+    .replace(/^scenes\.(\d+)(?:\.|:\s*(?:scene [^:]+:\s*)?)/, (_, i) => `Cảnh ${+i + 1}: `).replace("Field required", "chưa điền")
     .replace("mode=i2v needs 'image'", "kiểu “Ảnh của bạn → Video” cần chọn ảnh");
 }
 
@@ -716,7 +845,7 @@ function renderScene(sc, i) {
       h("div", { class: "scene-tools" },
       h("button", { class: "btn ghost icon sm", title: "Chuyển lên", "aria-label": "Chuyển lên", disabled: i === 0, onclick: () => move(-1) }, icon("up")),
       h("button", { class: "btn ghost icon sm", title: "Chuyển xuống", "aria-label": "Chuyển xuống", disabled: i === sb.scenes.length - 1, onclick: () => move(1) }, icon("down")),
-      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
+      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, characters: Array.isArray(sc.characters) ? [...sc.characters] : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
       h("button", { class: "btn ghost icon sm danger", title: "Xoá cảnh", "aria-label": "Xoá cảnh", onclick: async () => {
         if (sb.scenes.length === 1) { toast("Phim cần ít nhất một cảnh", "error"); return; }
         const hasWork = S.cur.scene_state?.[sc.id]?.clip_url;
@@ -732,11 +861,14 @@ function renderScene(sc, i) {
         renderCamera(sc),
         zone(`chars-${i}`, () => {
           const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""}`;
-          const found = (sb.characters || []).filter((c) => c.name && new RegExp(`\\b${c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text));
+          // A list picked on the board (scenes[].characters) replaces finding names in the prompt.
+          const picked = Array.isArray(sc.characters) ? new Set(sc.characters.map(nameKey)) : null;
+          const found = (sb.characters || []).filter((c) => c.name && (picked ? picked.has(charKey(c))
+            : new RegExp(`\\b${c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text)));
           if (!found.length) return h("div");
           const refsOn = sb.use_character_refs !== false && sc.mode !== "i2v";
           let nRefs = 0;
-          return h("div", { class: "char-chips" }, h("span", { class: "small muted", title: refsOn ? "Mô tả nhân vật được tự thêm vào prompt và ảnh nhân vật được gửi kèm làm tham chiếu" : "Mô tả nhân vật được tự thêm vào prompt" }, refsOn ? "Nhân vật · mô tả + ảnh:" : "Nhân vật · mô tả:"),
+          return h("div", { class: "char-chips" }, h("span", { class: "small muted", title: refsOn ? "Mô tả nhân vật được tự thêm vào prompt và ảnh nhân vật được gửi kèm làm tham chiếu" : "Mô tả nhân vật được tự thêm vào prompt" }, (refsOn ? "Nhân vật · mô tả + ảnh" : "Nhân vật · mô tả") + (picked ? " (chọn trên Bảng):" : ":")),
             found.map((c) => {
               const url = refsOn && c.image && nRefs < 3 ? charImageUrl(c) : null;
               if (url) nRefs++;
@@ -833,7 +965,8 @@ function imagePicker(sc, attr, label, optional = false) {
       h("button", { class: "btn sm", onclick: (e) => { e.preventDefault(); fileInput.click(); } }, icon("upload"), "Tải lên"), fileInput));
 }
 
-function renderSceneMedia(sc) {
+/* opts.kfHint: placeholder for a keyframe scene with no picture yet (the board points at its own button). */
+function renderSceneMedia(sc, { kfHint = null } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const portrait = S.cur.storyboard.aspect === "9:16";
   const box = h("div", { class: "media" + (portrait ? " portrait" : "") });
@@ -848,18 +981,19 @@ function renderSceneMedia(sc) {
     else if (st.rendered_as === "r2v") box.append(h("span", { class: "tag" }, sc.mode === "keyframe" ? "Render bằng Chữ → Video + ảnh nhân vật" : "Có ảnh nhân vật"));
   } else if (kf) {
     box.append(h("img", { src: kf, onclick: () => lightbox(kf), alt: "keyframe" }));
-    box.append(h("span", { class: "tag" + (st.keyframe_stale ? " warn" : "") }, st.keyframe_stale ? "Ảnh cũ · prompt đã đổi" : "Keyframe · chưa có video"));
+    box.append(h("span", { class: "tag" + (st.keyframe_stale ? " warn" : ""), title: st.keyframe_stale ? "Prompt, nhân vật hoặc ảnh nhân vật đã đổi từ khi tạo ảnh này" : null }, st.keyframe_stale ? "Ảnh cũ · cần tạo lại" : "Keyframe · chưa có video"));
   } else if (startImg) {
     box.append(h("img", { src: startImg, onclick: () => lightbox(startImg), alt: "ảnh bắt đầu" }));
     box.append(h("span", { class: "tag" }, "Ảnh của bạn"));
   } else {
     box.append(h("div", { class: "ph" }, icon(sc.mode === "t2v" ? "video" : "image"),
-      h("span", {}, sc.mode === "keyframe" ? "Bấm “Tạo ảnh” để xem trước khung hình (miễn phí)" : sc.mode === "i2v" ? "Chọn hoặc tải ảnh bắt đầu" : "Video sẽ hiện ở đây sau khi render")));
+      h("span", {}, sc.mode === "keyframe" ? (kfHint || "Bấm “Tạo ảnh” để xem trước khung hình (miễn phí)") : sc.mode === "i2v" ? "Chọn hoặc tải ảnh bắt đầu" : "Video sẽ hiện ở đây sau khi render")));
   }
   return h("div", { class: "stack tight" }, box);
 }
 
-function renderSceneActions(sc) {
+/* retry: a failed render shows "Thử lại" (board, AC40). blocked: reason the render button is off (storyboard invalid). */
+function renderSceneActions(sc, { keyframe = true, video = true, retry = false, blocked = "" } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const busy = jobRunning();
   const kids = [];
@@ -875,16 +1009,17 @@ function renderSceneActions(sc) {
     kids.push(h("div", { class: "scene-msg warn" }, `Model này đã ngừng từ ${st.model_retires_label}. Clip hiện tại vẫn dùng được; muốn render lại phải đổi model.`));
   }
   const row = h("div", { class: "row" });
-  if (sc.mode === "keyframe") {
+  if (keyframe && sc.mode === "keyframe") {
     const hasKf = !!st.keyframe_url && !st.keyframe_stale;
     row.append(h("button", { class: "btn sm", disabled: busy, title: "Ảnh trên Flow miễn phí",
       onclick: () => runAction("keyframes", { only: [sc.id], force_keyframes: [sc.id] }) }, icon(hasKf ? "refresh" : "image"), hasKf ? "Tạo lại ảnh" : "Tạo ảnh", FREE()));
   }
   const done = st.status === "done";
-  const label = done ? "Render lại" : st.status === "interrupted" ? "Gửi lại" : "Render";
-  row.append(h("button", { class: "btn sm", disabled: busy,
+  const failed = retry && st.status === "failed";
+  const label = done ? "Render lại" : st.status === "interrupted" ? "Gửi lại" : failed ? "Thử lại" : "Render";
+  if (video) row.append(h("button", { class: "btn sm", disabled: busy || !!blocked, title: busy ? "Đang có việc chạy" : blocked || null,
     onclick: () => runAction("video", { only: [sc.id], force: done || st.status === "interrupted" ? [sc.id] : [] }, { scene: sc.id }) },
-  icon(done ? "refresh" : "video"), label, PAID()));
+  icon(done || failed ? "refresh" : "video"), label, PAID()));
   if (st.clip_url && st.keyframe_url) row.append(h("button", { class: "btn sm ghost icon", title: "Xem ảnh keyframe", "aria-label": "Xem ảnh keyframe", onclick: () => lightbox(st.keyframe_url) }, icon("image")));
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
   kids.push(row);
@@ -979,7 +1114,7 @@ function charImageUrl(c) {
 
 async function makePortraits(names, force = false) {
   await flushSave();
-  if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
   if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
   if (!S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
   try {
@@ -1020,12 +1155,15 @@ function renderCharacter(sb, c, i, busy) {
   } });
   const canMake = !!(c.name && c.description);
   const isAsset = !c.image || S.assets.images.some((a) => a.path === c.image);
+  const badName = charNameProblems(sb).has(i);
   return h("div", { class: "char-row" },
     h("div", { class: "char-img" + (portrait ? " portrait" : ""), style: url ? { backgroundImage: `url("${url}")` } : { cursor: "default" },
       title: url ? "Bấm để xem lớn" : "", onclick: () => { if (url) lightbox(url); } },
       url ? null : h("span", {}, c.image && cs?.image_missing ? "Không thấy file ảnh" : "Chưa có ảnh")),
     h("div", { class: "stack tight", style: { minWidth: 0 } },
-      h("input", { type: "text", value: c.name, placeholder: "Tên, ví dụ: Lan", "aria-label": "Tên nhân vật", oninput: (e) => { c.name = e.target.value; changed(); } }),
+      h("input", { type: "text", value: c.name, placeholder: "Tên, ví dụ: Lan", "aria-label": "Tên nhân vật", "data-char": i,
+        "aria-invalid": badName ? "true" : null, title: badName ? "Tên trống hoặc trùng với nhân vật khác" : null,
+        oninput: (e) => { c.name = e.target.value; markCharNames(); changed(); } }),
       h("textarea", { rows: 3, value: c.description, "aria-label": "Mô tả ngoại hình", placeholder: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt…",
         oninput: (e) => { c.description = e.target.value; changed(); } }),
       h("div", { class: "row" },
@@ -1044,9 +1182,17 @@ function renderCharacter(sb, c, i, busy) {
           oninput: (e) => { c.image_prompt = e.target.value || undefined; changed(); } }),
         h("p", { class: "help" }, "Nên dùng ảnh rõ mặt, nền trơn. Đổi ảnh nhân vật sẽ làm các cảnh có nhân vật này cần tạo lại."))),
     h("button", { class: "btn ghost icon sm danger", title: "Xoá nhân vật", "aria-label": "Xoá nhân vật " + (c.name || ""), onclick: async () => {
-      if ((c.name || c.description) && !(await confirmModal("Xoá nhân vật?", `Xoá “${c.name || "nhân vật chưa đặt tên"}” khỏi storyboard. File ảnh vẫn nằm trong thư mục assets.`, "Xoá", true))) return;
-      sb.characters.splice(i, 1); changed(); renderMain();
+      if (await removeCharacter(i)) renderMain();
     } }, icon("trash")));
+}
+/* Mark empty/duplicate names while typing, without re-rendering the inputs. */
+function markCharNames() {
+  const bad = charNameProblems(S.cur.storyboard);
+  for (const el of document.querySelectorAll(".char-row input[data-char]")) {
+    const on = bad.has(+el.dataset.char);
+    if (on) { el.setAttribute("aria-invalid", "true"); el.title = "Tên trống hoặc trùng với nhân vật khác"; }
+    else { el.removeAttribute("aria-invalid"); el.removeAttribute("title"); }
+  }
 }
 
 /* ---------- final tab ---------- */
@@ -1349,7 +1495,7 @@ function renderYaml() {
       h("button", { class: "btn primary", onclick: async () => {
         try {
           const d = await api("PUT", `/api/projects/${S.cur.id}/yaml`, { text: ta.value });
-          S.cur = d; toast(d.errors.length ? "Đã lưu, nhưng storyboard còn lỗi" : "Đã lưu YAML", d.errors.length ? "error" : "ok");
+          S.cur = d; rememberCharNames(); toast(d.errors.length ? "Đã lưu, nhưng storyboard còn lỗi" : "Đã lưu YAML", d.errors.length ? "error" : "ok");
           renderMain(); loadProjects();
         } catch (e) { toast(e.message, "error"); }
       } }, "Lưu YAML"),
@@ -1367,6 +1513,7 @@ function reloadProject(d) {
   clearTimeout(S.saveTimer);
   S.pendingSave = false;
   Object.assign(S.cur, d);
+  rememberCharNames();
   S.saveState = "saved"; S.saveError = "";
   const p = S.projects.find((x) => x.id === d.id);
   if (p) { Object.assign(p, { title: d.title, scenes: d.scenes, done: d.done, has_final: d.has_final, thumb: d.thumb }); renderSidebar(); }
@@ -1386,7 +1533,7 @@ function creditText(pv) {
 async function openModelChange({ scenes = null, include = [], blockedCount = 0 } = {}) {
   if (!S.cur) return;
   await flushSave();
-  if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
   const targets = activeVideoModels();
   if (!targets.length) { toast("Chưa có model video nào đang hoạt động để đổi sang. Thử mở lại dự án sau.", "error", 7000); return; }
   const pid = S.cur.id, one = !!(scenes && scenes.length);
@@ -1446,7 +1593,7 @@ async function openModelChange({ scenes = null, include = [], blockedCount = 0 }
     const my = ++st.seq;
     st.loading = true; st.error = ""; draw();
     await flushSave(); // AC44: preview what is on disk
-    if (S.saveState === "error") { st.loading = false; st.error = "chưa lưu được storyboard: " + S.saveError; draw(); return; }
+    if (saveFailed()) { st.loading = false; st.error = "chưa lưu được storyboard: " + S.saveError; draw(); return; }
     try {
       const pv = await api("POST", `/api/projects/${pid}/model-change/preview`, reqBody());
       if (my !== st.seq) return;
@@ -1463,7 +1610,7 @@ async function openModelChange({ scenes = null, include = [], blockedCount = 0 }
     st.applying = true; syncBtn();
     try {
       await flushSave();
-      if (S.saveState === "error") throw new Error("Chưa lưu được storyboard: " + S.saveError);
+      if (saveFailed()) throw new Error("Chưa lưu được storyboard: " + S.saveError);
       const r = await api("POST", `/api/projects/${pid}/model-change`, { ...reqBody(), base: st.pv.base });
       close();
       reloadProject(r.project);
@@ -1499,7 +1646,7 @@ async function openModelChange({ scenes = null, include = [], blockedCount = 0 }
 async function runAction(action, extra = {}, ctx = {}) {
   if (!S.cur) return;
   await flushSave();
-  if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
   if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
   if (action !== "dry" && action !== "stitch" && action !== "edit" && !S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
   if ((action === "stitch" || action === "edit" || action === "make") && !S.env.ffmpeg) { toast("Chưa cài ffmpeg nên không ghép phim được", "error"); return; }
@@ -1638,7 +1785,7 @@ async function onJobDone() {
   }
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
-    if (j.kind === "portraits" && S.tab === "story") renderMain();
+    if (j.kind === "portraits" && (S.tab === "story" || S.tab === "board")) renderMain();
     if (j.kind === "edit" || j.kind === "make") await loadEditPlan(true);
     if (j.kind === "stitch" || j.kind === "edit" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
     else if (j.kind === "thumbnail" && S.tab === "final") renderMain();

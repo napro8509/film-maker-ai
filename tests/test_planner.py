@@ -14,11 +14,16 @@ if sys.argv[1:3] == ["auth", "status"]:
 assert "-p" in sys.argv and "--json-schema" in sys.argv
 open(os.environ["FAKE_CLAUDE_ENV"], "w").write(json.dumps(sorted(os.environ)))
 schema = sys.argv[sys.argv.index("--json-schema") + 1]
+if os.environ.get("FAKE_CLAUDE_SCHEMA"):
+    open(os.environ["FAKE_CLAUDE_SCHEMA"], "w").write(schema)
 if '"titles"' in schema:
     out = {{"titles": [{{"text": "“ความลับของกำไล”.", "vi": "Bí mật chiếc vòng"}}, {{"text": "ความลับของกำไล", "vi": "x"}},
                        {{"text": "  Mẹ chồng   ác độc ", "vi": "Mẹ chồng ác độc"}}, {{"text": "", "vi": ""}}]}}
 else:
     out = {{"title": "Mèo", "scenes": [{{"id": "s01", "prompt": "a cat walks"}}]}}
+    if os.environ.get("FAKE_CLAUDE_SCENE_CHARS"):
+        out["characters"] = [{{"name": "Lan", "description": "a girl"}}]
+        out["scenes"][0]["characters"] = ["Bao"]  # unknown name: must be dropped, not fail validation
 print(json.dumps({{"type": "result", "is_error": False, "structured_output": out}}))
 """
 
@@ -61,3 +66,56 @@ def test_suggest_titles_via_claude_code_are_cleaned(tmp_path, monkeypatch):
         {"text": "ความลับของกำไล", "vi": "Bí mật chiếc vòng"}, {"text": "Mẹ chồng ác độc", "vi": ""}]
     assert planner._clean_titles(["Cũ"], 5) == [{"text": "Cũ", "vi": ""}]  # old saved format
     assert "Mẹ ơi" in planner._story_summary(sb)
+
+
+def _scene_def(schema: dict) -> dict:
+    defs = schema.get("$defs", {})
+    found = [d for k, d in defs.items() if k == "SceneDraft" or d.get("title") == "Scene"]
+    assert found, f"no Scene def in schema: {sorted(defs)}"
+    return found[0]
+
+
+def test_claude_code_schema_has_no_scene_characters_and_strips_them(tmp_path, monkeypatch):
+    _fake(tmp_path, monkeypatch)
+    schema_dump = tmp_path / "schema.json"
+    monkeypatch.setenv("FAKE_CLAUDE_SCHEMA", str(schema_dump))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENE_CHARS", "1")
+    sb = planner.plan_with_claude_code("con mèo", scenes=1, aspect="9:16")
+    scene = _scene_def(json.loads(schema_dump.read_text()))
+    assert "prompt" in scene["properties"] and "characters" not in scene["properties"]
+    assert [c.name for c in sb.characters] == ["Lan"]  # storyboard characters are kept
+    assert all(s.characters is None for s in sb.scenes)
+    assert sb.aspect == "9:16"
+
+
+def test_api_plan_uses_draft_model_and_strips(monkeypatch):
+    import types
+
+    from filmmaker.storyboard import StoryboardDraft
+
+    raw = {"title": "Mèo", "characters": [{"name": "Lan", "description": "a girl"}],
+           "scenes": [{"id": "s01", "prompt": "a cat walks", "characters": ["Bao"]},
+                      {"id": "s02", "prompt": "Lan smiles", "characters": []}]}
+    calls = []
+
+    class Parsed:  # what the SDK hands back; may carry keys the draft model does not know
+        def model_dump(self, **kw):
+            return json.loads(json.dumps(raw))
+
+    class Messages:
+        def parse(self, **kw):
+            calls.append(kw)
+            return types.SimpleNamespace(stop_reason="end_turn", parsed_output=Parsed())
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = lambda: types.SimpleNamespace(messages=Messages())
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    sb = planner.plan("con mèo", scenes=2, aspect="9:16")
+    fmt = calls[0]["output_format"]
+    assert fmt is StoryboardDraft
+    scene = _scene_def(fmt.model_json_schema())
+    assert "prompt" in scene["properties"] and "characters" not in scene["properties"]
+    assert fmt.model_validate(raw).scenes[0].model_dump().get("characters") is None  # SDK side ignores the key
+    assert all(s.characters is None for s in sb.scenes)
+    assert [c.name for c in sb.characters] == ["Lan"] and sb.aspect == "9:16"
