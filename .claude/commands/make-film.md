@@ -52,8 +52,10 @@ Công đoạn (tạo → review):
    Có clip REVISE: không `--auto` thì DỪNG, liệt kê cảnh + lý do và hỏi có render lại không.
    Có `--auto`: LOẠI prompt → director sửa cảnh đó trước; rồi producer render lại đúng các cảnh đó (`--force <id>`), mỗi cảnh tối đa 1 lần.
    Lỗi credit / đăng nhập / Flow đổi giao diện / cảnh bị ngắt khi render: DỪNG và báo tôi, kể cả khi có `--auto`.
-7. Hoàn thiện: producer chạy stitch (`--burn-subtitles`, thêm `--music` nếu brief có nhạc) và thumbnail
-   → visual-reviewer chế độ final. REVISE vì phụ đề/ảnh bìa → director sửa narration/thumbnail rồi producer ghép lại (miễn phí).
+7. Hoàn thiện: editor dựng phim bằng `filmmaker edit` (chuyển cảnh, cắt thừa, cân âm, `--burn-subtitles`, thêm `--music`
+   nếu brief có nhạc), producer chạy thumbnail → visual-reviewer chế độ final.
+   REVISE vì nhịp dựng / chuyển cảnh / âm thanh → editor sửa edit.json theo review rồi xuất lại (miễn phí).
+   REVISE vì phụ đề/ảnh bìa → director sửa narration/thumbnail rồi editor xuất lại (miễn phí).
    REVISE vì một clip → coi như bước 6.
 8. Báo cáo: ghi FILM/report.md và trả lời tôi: đường dẫn final.mp4 và ảnh bìa, số clip đã render (gồm render lại),
    cảnh còn lỗi, các file trong reviews/.

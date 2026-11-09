@@ -18,6 +18,7 @@ Chỉ chạy đúng bước được giao (SB = FILM/storyboard.yaml):
   Chỉ chạy lệnh tốn credit khi lời giao việc có câu "người dùng đã xác nhận render" VÀ liệt kê đúng các cảnh được phép.
   Trước đó chạy cùng lệnh với --dry-run để chắc chỉ những cảnh đó sẽ được gửi; nếu nhiều hơn thì dừng và báo lại.
 - ghép phim:                .venv/bin/filmmaker stitch SB --burn-subtitles   (thêm --music <file> nếu được giao)
+  (dựng phim liền mạch có chuyển cảnh/cân âm là việc của agent editor: `filmmaker edit`)
 - ảnh bìa:                  .venv/bin/filmmaker thumbnail SB
 - tiến độ:                  .venv/bin/filmmaker status SB
 

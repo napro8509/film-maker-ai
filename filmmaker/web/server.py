@@ -212,6 +212,9 @@ class RunBody(BaseModel):
     burn_subtitles: bool = False
     allow_missing: bool = False
     remake_thumbnail: bool = False  # action=thumbnail: new picture on Flow, not just the title
+    engine: str = "auto"  # action=edit: auto | ai | rules
+    replan: bool = False  # action=edit: ignore the saved edit plan, let the agent make a new one
+    smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
 
 
 class RestoreBody(BaseModel):
@@ -236,6 +239,7 @@ class FinalSettings(BaseModel):
     volume: float = 0.25
     burn_subtitles: bool = False
     allow_missing: bool = False
+    smart_edit: bool = True
 
 
 # --- app ----------------------------------------------------------------------
@@ -1001,6 +1005,59 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "retired": retirement.retired_of(pipe, model_meta.load(), todo),
         }
 
+    # ---- editor agent: edit plan (edit.json) ----
+
+    def edit_view(pid: str) -> dict[str, Any]:
+        from ..editor import ClipInfo, load_plan, timeline, transition_catalog
+
+        od = out_dir(pid)
+        infos: dict[str, ClipInfo] = {}
+        try:
+            cache = json.loads((od / "edit_analysis.json").read_text(encoding="utf-8"))
+            infos = {k: ClipInfo.model_validate(v["info"]) for k, v in cache.items()}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        plan = load_plan(od)
+        total = None
+        if plan and all(c.id in infos for c in plan.clips) and plan.clips:
+            total = round(timeline(plan, infos)[1], 2)
+        return {"plan": plan.model_dump() if plan else None, "transitions": transition_catalog(),
+                "clips": {k: {"duration": v.duration, "has_audio": v.has_audio} for k, v in infos.items()},
+                "total": total}
+
+    @app.get("/api/projects/{pid}/edit-plan")
+    def get_edit_plan(pid: str) -> dict[str, Any]:
+        pdir(pid)
+        return edit_view(pid)
+
+    @app.put("/api/projects/{pid}/edit-plan")
+    def put_edit_plan(pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Save a hand-tuned edit plan; the next “AI dựng phim” renders it as is (free)."""
+        from ..editor import ClipInfo, EditPlan, sanitize, save_plan
+
+        try:
+            plan = EditPlan.model_validate({**body, "source": "manual"})
+        except ValidationError as exc:
+            raise HTTPException(400, "Kế hoạch dựng không hợp lệ: " + "; ".join(_validation_errors(exc)))
+        od = out_dir(pid)
+        try:
+            cache = json.loads((od / "edit_analysis.json").read_text(encoding="utf-8"))
+            infos = {k: ClipInfo.model_validate(v["info"]) for k, v in cache.items()}
+        except (OSError, ValueError, KeyError, TypeError):
+            infos = {}
+        order = [c.id for c in plan.clips]
+        if order and all(i in infos for i in order):
+            plan = sanitize(plan, infos, order)
+        save_plan(plan, od)
+        return edit_view(pid)
+
+    @app.delete("/api/projects/{pid}/edit-plan")
+    def delete_edit_plan(pid: str) -> dict[str, Any]:
+        from ..editor import plan_path
+
+        plan_path(out_dir(pid)).unlink(missing_ok=True)
+        return edit_view(pid)
+
     @app.post("/api/projects/{pid}/run")
     def run(pid: str, body: RunBody) -> dict[str, Any]:
         path = sb_path(pid)
@@ -1012,7 +1069,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         unknown = (set(body.only) | set(body.force)) - {s.id for s in sb.scenes}
         if unknown:
             raise HTTPException(400, f"Không có cảnh: {', '.join(sorted(unknown))}")
-        if body.action not in {"dry", "keyframes", "video", "stitch", "make", "thumbnail"}:
+        if body.action not in {"dry", "keyframes", "video", "stitch", "edit", "make", "thumbnail"}:
+            raise HTTPException(400, "action không hợp lệ")
+        if body.engine not in {"auto", "ai", "rules"}:
             raise HTTPException(400, "action không hợp lệ")
         if body.action in ("video", "make"):
             retired = retired_to_send(Pipeline(sb, out_dir(pid), gflow(True)), body)
@@ -1026,7 +1085,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if pdir(pid).resolve() not in music.parents or not music.is_file():
                 raise HTTPException(400, "Không thấy file nhạc.")
         titles = {"dry": "Xem trước (không tốn credit)", "keyframes": "Tạo ảnh keyframe",
-                  "video": "Render video", "stitch": "Ghép phim", "make": "Render + ghép phim",
+                  "video": "Render video", "stitch": "Ghép phim", "edit": "AI dựng phim", "make": "Render + ghép phim",
                   "thumbnail": "Tạo thumbnail"}
         scope = f" ({', '.join(body.only)})" if body.only else ""
 
@@ -1061,7 +1120,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 res["error"] = report.aborted or f"{len(report.failed)} cảnh lỗi"
             return res
 
-        def do_stitch(job: Job) -> dict[str, Any]:
+        def ready_clips(job: Job) -> list[tuple[str, Path]]:
             state = State(out_dir(pid) / "state.json")
             pipe = Pipeline(sb, out_dir(pid), gflow(True))
             clips, missing = [], []
@@ -1075,6 +1134,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 raise RuntimeError(f"còn thiếu cảnh: {', '.join(missing)} (bật “Ghép cả khi thiếu cảnh” để ghép phần đã có)")
             if missing:
                 job.log(f"Bỏ qua cảnh chưa có: {', '.join(missing)}")
+            return clips
+
+        def do_edit(job: Job) -> dict[str, Any]:
+            from ..editor import edit_film
+
+            clips = ready_clips(job)
+            backend = planner_backend()
+            output, plan = edit_film(
+                sb, clips, out_dir(pid), music=music, music_volume=body.volume, burn_subtitles=body.burn_subtitles,
+                engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
+                api_key=settings.get("anthropic_api_key") or None, log=job.log)
+            job.log(f"🎬 Phim đã dựng: {output}")
+            return {"final": str(output), "edit_source": plan.source}
+
+        def do_stitch(job: Job) -> dict[str, Any]:
+            clips = ready_clips(job)
             output = out_dir(pid) / "final.mp4"
             assemble(sb, clips, output, music=music, music_volume=body.volume,
                      burn_subtitles=body.burn_subtitles, log=job.log)
@@ -1130,12 +1205,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 return do_run(job, dry=False, keyframes_only=True)
             if body.action == "stitch":
                 return do_stitch(job)
+            if body.action == "edit":
+                return do_edit(job)
             res = do_run(job, dry=False, keyframes_only=False)
             if body.action == "make" and not job.stop_requested:
                 if res.get("error") and not body.allow_missing:
                     job.log("Có cảnh lỗi nên chưa ghép phim.")
                     return res
-                res.update(do_stitch(job))
+                res.update(do_edit(job) if body.smart_edit else do_stitch(job))
                 if not (out_dir(pid) / "thumbnail.jpg").is_file():
                     try:
                         res.update(do_thumbnail(job, False))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ def main() -> None:
     Quy trình:  plan (ý tưởng -> storyboard.yaml)
                 run  (tạo keyframe + clip trên Flow, chạy lại được)
                 stitch (ghép thành phim bằng ffmpeg)
+                edit (agent dựng phim: chuyển cảnh, cân âm, nhạc -> liền mạch)
                 make (run + stitch một lần)
     """
 
@@ -284,11 +286,72 @@ def stitch(storyboard: Path, out, output, music, volume, subtitles, allow_missin
     _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing)
 
 
+def _ai_ready(backend: str) -> bool:
+    from .planner import claude_code_binary
+
+    has_key = bool(user_settings.load().get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+    if backend == "claude_code":
+        return bool(claude_code_binary())
+    if backend == "api":
+        return has_key
+    return bool(claude_code_binary()) or has_key
+
+
+def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
+             engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
+    from .editor import edit_film, make_plan, plan_path
+
+    clips, missing = _clips(sb, out_dir)
+    if missing and not allow_missing:
+        raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
+    kw = dict(engine=engine, replan=replan, backend=backend, ai_available=_ai_ready(backend),
+              api_key=user_settings.load().get("anthropic_api_key") or None, log=click.echo)
+    try:
+        if plan_only:
+            make_plan(sb, clips, out_dir, has_music=bool(music), **kw)
+            click.echo(f"✔ Kế hoạch dựng: {plan_path(out_dir)} (sửa được, rồi chạy `filmmaker edit` để xuất phim)")
+            return
+        output, _ = edit_film(sb, clips, out_dir, output, music=music, music_volume=volume,
+                              burn_subtitles=subtitles, **kw)
+    except (AssembleError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"🎬 Phim đã dựng: {output}")
+
+
+def _edit_options(f):
+    f = click.option("--engine", type=click.Choice(["auto", "ai", "rules"]), default="auto", show_default=True,
+                     help="ai = agent Claude lập kế hoạch dựng; rules = luật mặc định; auto = AI nếu có.")(f)
+    f = click.option("--replan", is_flag=True, help="Bỏ kế hoạch dựng đã lưu (edit.json), làm bản mới.")(f)
+    f = click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True)(f)
+    return f
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path))
+@_stitch_options
+@_edit_options
+@click.option("--plan-only", is_flag=True, help="Chỉ lập kế hoạch dựng (edit.json), chưa xuất phim.")
+def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing, engine, replan, backend,
+         plan_only) -> None:
+    """Agent dựng phim: cắt thừa, chuyển cảnh, cân âm, nhạc nền -> phim liền mạch (không tốn credit).
+
+    \b
+    Lần đầu agent (Claude) xem kịch bản + phân tích từng clip rồi lập kế hoạch dựng, lưu ở
+    <out>/edit.json. Sửa file đó rồi chạy lại để xuất theo ý mình; --replan để agent làm bản mới.
+    """
+    sb = load_storyboard(storyboard)
+    _do_edit(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing,
+             engine=engine, replan=replan, backend=backend, plan_only=plan_only)
+
+
 @main.command()
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @_run_options
 @_stitch_options
-def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw) -> None:
+@click.option("--edit/--no-edit", "smart_edit", default=False,
+              help="Dựng bằng agent dựng phim (chuyển cảnh, cân âm) thay vì nối thẳng.")
+def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smart_edit, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim.
 
     Chặn cảnh dùng model đã ngừng giống `run`.
@@ -298,7 +361,10 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw
         return
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
-    _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing)
+    if smart_edit:
+        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing)
+    else:
+        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing)
     try:
         _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
     except click.ClickException as exc:  # the film is done; a missing cover is not a failure

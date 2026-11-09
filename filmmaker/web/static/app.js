@@ -1018,7 +1018,7 @@ function renderCharacter(sb, c, i, busy) {
 /* ---------- final tab ---------- */
 
 function finalPrefs() {
-  return { music: null, volume: 0.25, burn_subtitles: false, allow_missing: false, ...(S.cur.final_prefs || {}) };
+  return { music: null, volume: 0.25, burn_subtitles: false, allow_missing: false, smart_edit: true, ...(S.cur.final_prefs || {}) };
 }
 function saveFinalPrefs(p) {
   S.cur.final_prefs = p;
@@ -1080,15 +1080,110 @@ function renderFinal() {
             return h("div", { class: "stack tight" },
               h("div", { class: "divider" }),
               h("div", { class: "row" },
-                h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("stitch") }, icon("stitch"), "Ghép phim", FREE()),
-                h("button", { class: "btn", disabled: busy, onclick: () => runAction("make"), title: "Render các cảnh còn thiếu rồi ghép" }, "Render nốt + ghép", PAID())),
+                h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("edit"), title: "Agent dựng phim: cắt phần thừa, chuyển cảnh, cân âm lượng, nhạc nền → phim liền mạch" }, icon("sparkle"), "AI dựng phim", FREE()),
+                h("button", { class: "btn", disabled: busy || !n, onclick: () => runAction("stitch"), title: "Nối thẳng các clip, không chuyển cảnh" }, icon("stitch"), "Ghép thẳng"),
+                h("button", { class: "btn", disabled: busy, onclick: () => runAction("make"), title: "Render các cảnh còn thiếu rồi dựng phim" }, "Render nốt + dựng", PAID())),
               h("div", { class: "help" }, `${n}/${total} cảnh đã có clip.`));
           }))),
+      renderEditPlan(),
       renderThumbnail(),
       h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề")),
         (S.cur.storyboard.scenes || []).some((s) => s.narration)
           ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
           : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+}
+
+/* ---------- editor agent (edit plan) ---------- */
+
+async function loadEditPlan(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.edit && S.edit.pid === pid) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/edit-plan`);
+    if (S.cur?.id !== pid) return;
+    S.edit = { pid, data, dirty: false };
+  } catch (e) { S.edit = { pid, data: null, error: e.message }; }
+  refreshZone("edit-zone");
+}
+
+function renderEditPlan() {
+  if (!S.edit || S.edit.pid !== S.cur.id) setTimeout(() => loadEditPlan(), 0);
+  return h("div", { class: "card card-pad" },
+    h("div", { class: "card-head" }, h("h3", {}, "Bản dựng của agent"), h("span", { class: "spacer" }),
+      h("span", { class: "help" }, "Agent xem kịch bản và phân tích từng clip (khung đen, đứng hình, âm lượng) rồi chọn chỗ cắt, kiểu chuyển cảnh và cách trộn âm để phim liền mạch. Sửa được từng chuyển cảnh rồi xuất lại miễn phí.")),
+    zone("edit-zone", editPlanView));
+}
+
+function editPlanView() {
+  const busy = jobRunning();
+  const E = S.edit && S.edit.pid === S.cur.id ? S.edit : null;
+  const plan = E?.data?.plan;
+  if (!E) return h("div", { class: "help" }, "Đang tải…");
+  if (!plan) return h("div", { class: "stack tight" },
+    h("p", { class: "help" }, "Chưa có bản dựng. Bấm “AI dựng phim” để agent dựng phim từ các clip đã render."));
+  const catalog = E.data.transitions || [];
+  const scenes = Object.fromEntries((S.cur.storyboard.scenes || []).map((s) => [s.id, s]));
+  const clipLen = (c) => { const d = E.data.clips?.[c.id]?.duration; return d ? Math.max(0, d - c.trim_start - c.trim_end) : null; };
+  const touch = () => { E.dirty = true; refreshZone("edit-zone"); };
+  const num = (val, min, max, step, onset, label) => h("input", { type: "number", min, max, step, value: val, "aria-label": label,
+    style: { width: "68px" }, onchange: (e) => { onset(Math.min(max, Math.max(min, +e.target.value || 0))); touch(); } });
+  const src = { ai: "Agent AI", rules: "Luật tự động", manual: "Bạn đã chỉnh" }[plan.source] || plan.source;
+  const rows = [];
+  plan.clips.forEach((c, i) => {
+    const len = clipLen(c);
+    rows.push(h("tr", {},
+      h("td", { class: "mono" }, c.id),
+      h("td", { class: "small muted", title: scenes[c.id]?.prompt || "" }, (scenes[c.id]?.narration || scenes[c.id]?.prompt || "").slice(0, 48)),
+      h("td", {}, num(c.trim_start, 0, 3, 0.1, (v) => { c.trim_start = v; }, `Cắt đầu ${c.id}`)),
+      h("td", {}, num(c.trim_end, 0, 3, 0.1, (v) => { c.trim_end = v; }, `Cắt cuối ${c.id}`)),
+      h("td", {}, num(c.volume, 0, 2, 0.1, (v) => { c.volume = v; }, `Âm lượng ${c.id}`)),
+      h("td", { class: "small muted" }, len != null ? len.toFixed(1) + "s" : "")));
+    const t = plan.transitions[i];
+    if (!t) return;
+    rows.push(h("tr", { class: "edit-tr" },
+      h("td", { colspan: 6 },
+        h("div", { class: "row", style: { flexWrap: "nowrap", gap: "8px" } },
+          h("span", { class: "muted" }, "↳"),
+          h("select", { "aria-label": `Chuyển cảnh sau ${t.after}`, value: t.type, onchange: (e) => { t.type = e.target.value; if (t.type !== "cut" && !t.duration) t.duration = 0.5; t.reason = ""; touch(); } },
+            catalog.map((o) => h("option", { value: o.id }, o.label))),
+          t.type !== "cut" ? num(t.duration, 0.2, 2, 0.1, (v) => { t.duration = v; }, `Độ dài chuyển cảnh sau ${t.after}`) : null,
+          t.type !== "cut" ? h("span", { class: "small muted" }, "s") : null,
+          t.reason ? h("span", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: t.reason }, t.reason) : null))));
+  });
+  const save = async (render) => {
+    try {
+      const data = await api("PUT", `/api/projects/${S.cur.id}/edit-plan`, plan);
+      S.edit = { pid: S.cur.id, data, dirty: false };
+      refreshZone("edit-zone");
+      if (render) runAction("edit");
+      else toast("Đã lưu bản dựng");
+    } catch (e) { toast(e.message, "error"); }
+  };
+  return h("div", { class: "stack" },
+    h("div", { class: "row" }, h("span", { class: "badge film" }, src),
+      E.data.total ? h("span", { class: "small muted" }, "Độ dài phim · " + fmtDur(E.data.total)) : null,
+      E.dirty ? h("span", { class: "badge changed" }, "Chưa lưu") : null),
+    plan.notes ? h("p", { class: "small" }, plan.notes) : null,
+    h("div", { style: { overflowX: "auto" } },
+      h("table", { class: "list edit-table" },
+        h("tr", {}, h("th", {}, "Cảnh"), h("th", {}, "Nội dung"), h("th", {}, "Cắt đầu"), h("th", {}, "Cắt cuối"), h("th", {}, "Âm lượng"), h("th", {}, "Còn")),
+        rows)),
+    h("div", { class: "row" },
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Mở đầu mờ (s)"), num(plan.fade_in, 0, 3, 0.1, (v) => { plan.fade_in = v; }, "Mở đầu mờ")),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Kết mờ (s)"), num(plan.fade_out, 0, 4, 0.1, (v) => { plan.fade_out = v; }, "Kết mờ"))),
+    h("label", { class: "check" }, h("input", { type: "checkbox", checked: plan.even_loudness, onchange: (e) => { plan.even_loudness = e.target.checked; touch(); } }),
+      h("span", {}, "Cân bằng âm lượng giữa các clip", h("span", { class: "sub" }, "Clip to/nhỏ khác nhau sẽ được kéo về cùng mức."))),
+    h("label", { class: "check" }, h("input", { type: "checkbox", checked: plan.duck_music, onchange: (e) => { plan.duck_music = e.target.checked; touch(); } }),
+      h("span", {}, "Tự hạ nhạc nền khi có thoại", h("span", { class: "sub" }, "Chỉ có tác dụng khi chọn nhạc nền."))),
+    h("label", { class: "check" }, h("input", { type: "checkbox", checked: plan.normalize, onchange: (e) => { plan.normalize = e.target.checked; touch(); } }),
+      h("span", {}, "Chuẩn hoá độ lớn cho mạng xã hội", h("span", { class: "sub" }, "-14 LUFS, như YouTube / TikTok / Facebook."))),
+    h("div", { class: "row" },
+      h("button", { class: "btn primary sm", disabled: busy, onclick: () => save(true) }, icon("film"), E.dirty ? "Lưu & xuất lại" : "Xuất lại theo bản này", FREE()),
+      E.dirty ? h("button", { class: "btn sm", onclick: () => save(false) }, icon("check"), "Chỉ lưu") : null,
+      E.dirty ? h("button", { class: "btn sm ghost", onclick: () => loadEditPlan(true) }, "Bỏ thay đổi") : null,
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn sm ghost", disabled: busy, title: "Agent bỏ bản này và dựng lại từ đầu", onclick: () => runAction("edit", { replan: true }) }, icon("refresh"), "Dựng lại từ đầu")));
 }
 
 function renderThumbnail() {
@@ -1372,10 +1467,11 @@ async function runAction(action, extra = {}, ctx = {}) {
   await flushSave();
   if (S.saveState === "error") { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
   if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
-  if (action !== "dry" && action !== "stitch" && !S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
-  if ((action === "stitch" || action === "make") && !S.env.ffmpeg) { toast("Chưa cài ffmpeg nên không ghép phim được", "error"); return; }
+  if (action !== "dry" && action !== "stitch" && action !== "edit" && !S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
+  if ((action === "stitch" || action === "edit" || action === "make") && !S.env.ffmpeg) { toast("Chưa cài ffmpeg nên không ghép phim được", "error"); return; }
+  if (action === "edit" && S.edit?.dirty && !extra.replan && !(await confirmModal("Bỏ thay đổi chưa lưu?", "Bản dựng có chỉnh sửa chưa lưu. Bấm “Lưu & xuất lại” để giữ chúng.", "Vẫn dựng"))) return;
   const body = { action, only: [], force: [], force_keyframes: [], ...extra };
-  if (action === "stitch" || action === "make") Object.assign(body, finalPrefs());
+  if (action === "stitch" || action === "edit" || action === "make") Object.assign(body, finalPrefs(), extra);
   if (action === "video" || action === "make") {
     const ok = await confirmPaid(body, ctx);
     if (!ok) return;
@@ -1493,7 +1589,8 @@ async function onJobDone() {
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
     if (j.kind === "portraits" && S.tab === "story") renderMain();
-    if (j.kind === "stitch" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
+    if (j.kind === "edit" || j.kind === "make") await loadEditPlan(true);
+    if (j.kind === "stitch" || j.kind === "edit" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
     else if (j.kind === "thumbnail" && S.tab === "final") renderMain();
   }
   refreshZones();
