@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Collection, Literal
 
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Character, Scene, Storyboard
@@ -23,6 +23,7 @@ from .thumbnail import render_cover
 DONE = "done"
 SUBMITTING = "submitting"
 FAILED = "failed"
+MANUAL_CLIP_MIN_BYTES = 10_000  # a hand-downloaded clips/<id>.mp4 smaller than this is not adopted
 
 
 def _now() -> str:
@@ -62,6 +63,10 @@ class RunOptions:
     keyframes_only: bool = False  # only make the (free) keyframe stills, no paid video
     force_keyframes: set[str] = field(default_factory=set)  # remake these keyframes even if they exist
     should_stop: Callable[[], bool] = lambda: False  # checked between scenes (UI "stop" button)
+    after_scene: Callable[[str], None] = lambda _sid: None  # a clip was rendered and saved (e.g. back it up)
+    # checked right before each paid video submission; a returned reason means "do not send this scene"
+    # (e.g. its model was retired, even if the run started before midnight of the retirement day)
+    refuse: Callable[[Scene], str | None] = lambda _s: None
 
 
 @dataclass
@@ -124,6 +129,40 @@ class Pipeline:
             return "changed"
         return {SUBMITTING: "interrupted", FAILED: "failed"}.get(st.get("status"), "todo")
 
+    def has_manual_clip(self, s: Scene) -> bool:
+        """clips/<id>.mp4 exists and is big enough to be a real clip (no state is written)."""
+        clip = self.clip_path(s)
+        return clip.is_file() and clip.stat().st_size >= MANUAL_CLIP_MIN_BYTES
+
+    def scene_group(self, s: Scene) -> Literal["done", "interrupted", "todo"]:
+        """done (has a valid clip) | interrupted (left in "submitting") | todo (todo/failed/changed)"""
+        if self.is_done(s):
+            return "done"
+        if self.state.scene(s.id).get("status") == SUBMITTING:
+            return "interrupted"
+        return "todo"
+
+    def video_plan(self, only: Collection[str] | None, force: Collection[str],
+                   retry_unknown: bool) -> list[tuple[Scene, str]]:
+        """What a video run would do with each scene: done | adopt | blocked | send. No side effects.
+
+        `only` None or empty means every scene. Same rules, in the same order, as `run`."""
+        plan: list[tuple[Scene, str]] = []
+        for s in self.sb.scenes:
+            if only and s.id not in only:
+                continue
+            submitting = self.state.scene(s.id).get("status") == SUBMITTING
+            if s.id not in force and self.is_done(s):
+                kind = "done"
+            elif submitting and s.id not in force and self.has_manual_clip(s):
+                kind = "adopt"
+            elif submitting and not retry_unknown and s.id not in force:
+                kind = "blocked"
+            else:
+                kind = "send"
+            plan.append((s, kind))
+        return plan
+
     def ensure_project(self) -> str:
         pid = self.sb.project_id or self.state.data.get("project_id")
         if pid:
@@ -159,15 +198,17 @@ class Pipeline:
         if opts.keyframes_only:
             return self._run_keyframes(scenes, opts, report)
         todo = []
-        for s in scenes:
-            st = self.state.scene(s.id)
-            if s.id not in opts.force and self.is_done(s):
+        for s, kind in self.video_plan(opts.only, opts.force, opts.retry_unknown):
+            if kind == "done":
                 report.skipped.append(s.id)
                 continue
-            if st.get("status") == SUBMITTING and s.id not in opts.force and self._adopt_manual_clip(s):
-                report.skipped.append(s.id)
-                continue
-            if st.get("status") == SUBMITTING and not opts.retry_unknown and s.id not in opts.force:
+            if kind == "adopt":
+                if self._adopt_manual_clip(s):
+                    report.skipped.append(s.id)
+                    continue
+                # the file vanished between the two checks: decide as if there were no clip
+                kind = "send" if opts.retry_unknown else "blocked"
+            if kind == "blocked":
                 msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. Nếu video đã có trên Flow, "
                        f"tải về và lưu thành {self.clip_path(s)} rồi chạy lại; nếu chưa có, chạy lại với "
                        "--retry-unknown hoặc --force " + s.id)
@@ -189,15 +230,24 @@ class Pipeline:
             return report
         self.log(f"Project: {project}")
 
-        for idx, s in enumerate(todo):
+        sent = False  # pause only between real submissions, not after a scene `refuse` skipped
+        for s in todo:
             if opts.should_stop():
                 report.stopped = True
                 self.log("Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).")
                 break
-            if idx > 0 and not self.g.dry_run:
+            if sent and not self.g.dry_run:
                 pause = random.uniform(*opts.pause)
                 self.log(f"  (nghỉ {pause:.0f}s giữa các lần gửi)")
                 self.sleep(pause)
+            # Checked after the pause, which may cross midnight. Not re-checked inside _render_scene
+            # (keyframe, retries, i2v->t2v fallback): a long scene can still cross it; the next run is blocked.
+            reason = opts.refuse(s)
+            if reason:
+                report.failed[s.id] = reason
+                self.log(f"[{s.id}] KHÔNG GỬI: {reason}")
+                continue
+            sent = True
             self.log(f"[{s.id}] {s.mode}: {s.prompt[:80]}")
             try:
                 video = self._render_scene(s, project, opts)
@@ -217,6 +267,8 @@ class Pipeline:
                 continue
             report.done.append(s.id)
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {video}")
+            if not self.g.dry_run:
+                opts.after_scene(s.id)
         return report
 
     def _keyframe(self, s: Scene, project: str, opts: RunOptions, *, remake: bool) -> Path:
@@ -430,7 +482,7 @@ class Pipeline:
         """A render was interrupted after Flow billed it, and the user downloaded the clip from Flow
         by hand into clips/<id>.mp4: take that file instead of rendering (and paying) again."""
         clip = self.clip_path(s)
-        if not clip.is_file() or clip.stat().st_size < 10_000:
+        if not self.has_manual_clip(s):
             return False
         self.log(f"[{s.id}] dùng video bạn đã tải về: {clip}")
         self.state.update(s.id, status=DONE, video=str(clip), fingerprint=self.sb.scene_fingerprint(s),
@@ -506,3 +558,9 @@ class Pipeline:
         render_cover(raw, final, aspect=self.sb.aspect, text=self.sb.thumbnail.text or self.sb.title, log=self.log)
         self.log(f"[thumbnail] OK -> {final}")
         return final
+
+
+def send_list(pipe: Pipeline, only: Collection[str] | None, force: Collection[str],
+              retry_unknown: bool) -> list[Scene]:
+    """Scenes a video run would actually submit to Flow (kind "send" of `Pipeline.video_plan`)."""
+    return [s for s, kind in pipe.video_plan(only, force, retry_unknown) if kind == "send"]

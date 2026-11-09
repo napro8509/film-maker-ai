@@ -121,6 +121,34 @@ output/cafe/
 └── final.srt
 ```
 
+## Backup lên Google Drive
+
+Clip Veo tốn credit, nên nên có bản sao trên Drive (gói Google AI Pro/Ultra có sẵn nhiều dung lượng).
+Tool dùng [rclone](https://rclone.org) để gửi file lên.
+
+```bash
+brew install rclone
+rclone config        # n (new remote) → tên: gdrive → chọn "Google Drive" → đăng nhập Google trong trình duyệt
+```
+
+```bash
+filmmaker backup cafe.yaml            # gửi lên gdrive:FilmMaker/cafe/
+filmmaker backup --list               # các dự án đã backup
+filmmaker restore cafe --to ~/Phim    # tải về máy khác / sau khi mất máy
+filmmaker run cafe.yaml --backup      # tự backup sau mỗi clip render xong
+```
+
+- Chỉ gửi file mới hoặc đã đổi, **không bao giờ xoá gì trên Drive**. Clip bị render lại thì bản cũ được chuyển vào
+  `gdrive:FilmMaker/.versions/<dự án>/<thời điểm>/`.
+- Dự án của giao diện (`~/FilmMaker/<phim>/`) được backup cả thư mục (storyboard, ảnh, nhạc, `output/`).
+  Storyboard dùng bằng CLI thì backup file storyboard, ảnh mà nó dùng và thư mục `output/<tên>/` của nó.
+- Khi khôi phục, đường dẫn trong `state.json` được sửa theo chỗ mới, nên các cảnh đã xong **không bị render lại**.
+- Trong giao diện: **Cài đặt → Backup lên Google Drive** (đổi nơi lưu, bật "Tự backup"), menu **⋯ → Backup lên Drive**,
+  và **Phim mới → Từ Drive** để khôi phục. Tự backup chạy ngầm; nếu lỗi (mất mạng, hết hạn đăng nhập) chỉ báo trong log,
+  việc render vẫn tiếp tục.
+- Đổi nơi lưu: `--remote gdrive:ThuMucKhac` hoặc trong Cài đặt (`backup_remote` trong `~/.config/filmmaker/settings.json`).
+  Phiên Drive hết hạn thì chạy `rclone config reconnect gdrive:`.
+
 ## Định dạng storyboard
 
 ```yaml

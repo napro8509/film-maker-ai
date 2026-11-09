@@ -253,3 +253,55 @@ def test_thumbnail_titles_are_suggested_and_used_when_empty(client, tmp_path, mo
     j = run(client, pid, action="thumbnail")
     assert j["status"] == "done", j["lines"] and j["result"]["title"] == "ความลับของกำไล"
     assert client.get(f"/api/projects/{pid}").json()["storyboard"]["thumbnail"]["text"] == "ความลับของกำไล"
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="needs rclone")
+def test_backup_auto_backup_and_restore(client, tmp_path):
+    remote = str(tmp_path / "drive" / "FilmMaker")
+    st = client.put("/api/settings", json={"backup_remote": remote, "auto_backup": True}).json()
+    assert st["backup_remote"] == remote and st["auto_backup"] is True
+    assert client.put("/api/settings", json={"backup_remote": "--config=/x"}).status_code == 400
+    info = client.get("/api/backup").json()
+    assert info["available"] and info["configured"] and info["auto"]
+
+    pid = client.post("/api/projects", json={"title": "Ly cà phê", "source": "template"}).json()["id"]
+    assert client.get("/api/backups").json()["items"] == []
+
+    j = run(client, pid, action="dry")  # previews never back up
+    assert not any("☁" in l for l in j["lines"])
+
+    j = run(client, pid, action="video")
+    assert j["status"] == "done", j["lines"]
+    assert any("Đã backup xong" in l for l in j["lines"])
+    cloud = Path(remote) / pid
+    assert sorted(p.name for p in (cloud / "output/storyboard/clips").iterdir()) == ["s01.mp4", "s02.mp4", "s03.mp4"]
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["backup"]["remote"].endswith(pid)
+
+    j = wait(client, client.post(f"/api/projects/{pid}/backup").json())
+    assert j["status"] == "done", j["lines"]
+    assert client.get("/api/backups").json()["items"] == [{"name": pid, "local": True}]
+
+    # A project that is still on this machine is not overwritten.
+    assert client.post("/api/backups/restore", json={"name": pid}).status_code == 409
+    assert client.post("/api/backups/restore", json={"name": "../x"}).status_code == 400
+
+    # Delete it (to .trash), then bring it back from Drive: all scenes are still done.
+    client.delete(f"/api/projects/{pid}")
+    j = wait(client, client.post("/api/backups/restore", json={"name": pid}).json())
+    assert j["status"] == "done", j["lines"]
+    d = client.get(f"/api/projects/{pid}").json()
+    assert d["done"] == 3 and all(s["status"] == "done" for s in d["scene_state"].values())
+    n = len(client.calls())
+    j = run(client, pid, action="video")
+    assert len(client.calls()) == n  # nothing re-rendered
+
+
+@pytest.mark.skipif(not shutil.which("rclone"), reason="needs rclone")
+def test_failed_auto_backup_does_not_fail_the_render(client, tmp_path):
+    client.put("/api/settings", json={"backup_remote": "nosuchremote:FilmMaker", "auto_backup": True})
+    pid = client.post("/api/projects", json={"title": "Ly cà phê", "source": "template"}).json()["id"]
+    j = run(client, pid, action="video")
+    assert j["status"] == "done", j["lines"]
+    assert any("Backup lỗi" in l and "rclone config" in l for l in j["lines"])
+    assert client.get(f"/api/projects/{pid}").json()["done"] == 3

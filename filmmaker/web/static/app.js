@@ -55,6 +55,7 @@ const ICONS = {
   external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   music: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
+  cloud: '<path d="M7 18a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 8.5a4.8 4.8 0 0 1-.5 9.5z"/>',
 };
 function icon(name, cls = "") {
   const t = document.createElement("template");
@@ -539,6 +540,7 @@ function projectMenu(anchor) {
   popMenu(anchor, [
     { label: "Xem trước lệnh gửi Flow", icon: "eye", extra: FREE(), disabled: jobRunning(), onclick: () => runAction("dry") },
     "-",
+    { label: "Backup lên Drive", icon: "cloud", disabled: jobRunning(), onclick: backupProject },
     { label: "Mở thư mục dự án", icon: "folder", onclick: () => api("POST", `/api/projects/${id}/reveal`, {}).catch((e) => toast(e.message, "error")) },
     { label: "Nhân bản dự án", icon: "copy", onclick: async () => {
       try { await flushSave(); const r = await api("POST", `/api/projects/${id}/duplicate`); await loadProjects(); openProject(r.id); toast("Đã nhân bản (không gồm video đã render)"); }
@@ -551,7 +553,13 @@ function projectMenu(anchor) {
       try { await api("DELETE", `/api/projects/${id}`); S.cur = null; await loadProjects(); if (S.projects[0]) openProject(S.projects[0].id); else renderMain(); toast("Đã chuyển vào .trash"); }
       catch (e) { toast(e.message, "error"); }
     } },
-  ], [S.cur.path, S.cur.project_id ? "Flow: " + S.cur.project_id : null].filter(Boolean).join("\n"));
+  ], [S.cur.path, S.cur.project_id ? "Flow: " + S.cur.project_id : null,
+    S.cur.backup?.at ? "Backup: " + ago(Date.parse(S.cur.backup.at) / 1000) : "Chưa backup lên Drive"].filter(Boolean).join("\n"));
+}
+
+async function backupProject() {
+  try { await flushSave(); startJob(await api("POST", `/api/projects/${S.cur.id}/backup`)); }
+  catch (e) { toast(e.message, "error"); }
 }
 
 function renderErrors() {
@@ -1211,6 +1219,7 @@ async function onJobDone() {
   }
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
+  if (j.kind === "restore" && j.status === "done" && j.result?.id) { await openProject(j.result.id); return; }
   if (j.kind === "portraits" && S.cur && S.cur.id === j.project && j.result?.images) {
     for (const c of S.cur.storyboard.characters || []) if (j.result.images[c.name]) c.image = j.result.images[c.name];
     if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
@@ -1299,8 +1308,9 @@ function openNewProject() {
   const body = h("div");
   const render = () => {
     const choices = [["ai", "sparkle", "Từ ý tưởng", "Claude viết storyboard cho bạn"], ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
-      ["blank", "file", "Trống", "Tự viết từng cảnh"], ["import", "import", "Nhập file", "Mở file storyboard .yaml có sẵn"]];
-    const form = { ai: aiForm, template: () => titleForm("Ly cà phê đầu tiên"), blank: () => titleForm(""), import: importForm }[mode]();
+      ["blank", "file", "Trống", "Tự viết từng cảnh"], ["import", "import", "Nhập file", "Mở file storyboard .yaml có sẵn"],
+      ["drive", "cloud", "Từ Drive", "Khôi phục dự án đã backup"]];
+    const form = { ai: aiForm, template: () => titleForm("Ly cà phê đầu tiên"), blank: () => titleForm(""), import: importForm, drive: driveForm }[mode]();
     put(body, h("div", { class: "choice", role: "radiogroup", "aria-label": "Cách tạo phim" }, choices.map(([k, ic, t, d]) => h("button", { class: mode === k ? "on" : "", role: "radio", "aria-checked": String(mode === k), onclick: () => { mode = k; render(); } }, icon(ic), h("b", {}, t), h("span", {}, d)))), form);
   };
   let close;
@@ -1350,6 +1360,23 @@ function openNewProject() {
         catch (e) { toast(e.message, "error"); }
       } }, "Nhập")));
   };
+  const driveForm = () => {
+    const box = h("div", { class: "stack" }, h("p", { class: "row muted" }, h("span", { class: "spinner" }), "Đang đọc danh sách backup trên Drive…"));
+    api("GET", "/api/backups").then((r) => {
+      if (!r.items.length) { put(box, h("p", { class: "muted" }, `Chưa có bản backup nào ở ${r.remote}.`)); return; }
+      put(box, h("p", { class: "help" }, `Các dự án ở ${r.remote}. Clip đã render được tải về, không phải render lại.`),
+        h("div", { class: "stack", style: { gap: "6px" } }, r.items.map((it) => h("div", { class: "row" },
+          icon("film"), h("span", { class: "mono" }, it.name), h("span", { class: "spacer" }),
+          it.local ? h("span", { class: "muted small" }, "Đã có trên máy")
+            : h("button", { class: "btn sm", onclick: async (e) => {
+              e.target.disabled = true;
+              try { startJob(await api("POST", "/api/backups/restore", { name: it.name })); close(); toast("Đang tải dự án từ Drive…"); }
+              catch (err) { toast(err.message, "error"); e.target.disabled = false; }
+            } }, icon("download"), "Khôi phục")))));
+    }).catch((e) => put(box, h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {}, e.message, " ",
+      h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")))));
+    return box;
+  };
   render();
   close = modal({ title: "Phim mới", body, wide: true });
 }
@@ -1376,6 +1403,18 @@ async function openSettings() {
     h("option", { value: "auto" }, "Tự động (ưu tiên Claude Code)"),
     h("option", { value: "claude_code" }, "Claude Code — dùng gói Claude Pro/Max của bạn"),
     h("option", { value: "api" }, "Anthropic API key — tính phí riêng"));
+  const remote = h("input", { type: "text", value: s.backup_remote || "gdrive:FilmMaker", placeholder: "gdrive:FilmMaker" });
+  const autoBackup = h("input", { type: "checkbox", checked: !!s.auto_backup });
+  const backupState = h("div", { class: "row small" }, h("span", { class: "spinner" }), h("span", { class: "muted" }, "Đang kiểm tra rclone…"));
+  const checkBackup = () => api("GET", "/api/backup").then((b) => {
+    const name = (b.remote.split(":")[0] || "gdrive");
+    put(backupState,
+      h("span", { class: "pill " + (b.available && b.configured ? "ok" : "warn") },
+        !b.available ? "Chưa cài rclone" : b.configured ? "Sẵn sàng" : `Chưa có remote “${name}”`),
+      h("span", { class: "muted" }, !b.available ? "Mở Terminal, chạy: brew install rclone"
+        : b.configured ? (b.version || "rclone") : `Mở Terminal, chạy: rclone config → n → tên ${name} → Google Drive → đăng nhập Google.`));
+  }).catch((e) => put(backupState, h("span", { class: "pill bad" }, "Lỗi"), h("span", { class: "muted" }, e.message)));
+  checkBackup();
   const theme = h("select", { value: localGet("theme", "auto"), onchange: (e) => { localSet("theme", e.target.value); applyTheme(); } },
     h("option", { value: "auto" }, "Theo hệ thống"), h("option", { value: "light" }, "Sáng"), h("option", { value: "dark" }, "Tối"));
   modal({
@@ -1412,11 +1451,20 @@ async function openSettings() {
             s.anthropic_key_set ? h("label", { class: "check" }, h("input", { type: "checkbox", onchange: (e) => { clearKey = e.target.checked; } }), h("span", { class: "small" }, "Xoá key đã lưu")) : null,
             h("span", { class: "spacer" }), h("a", { class: "small", href: "https://console.anthropic.com/settings/keys", target: "_blank", rel: "noopener" }, "Lấy API key ↗")),
           h("p", { class: "help" }, "Key được lưu trên máy này ở ~/.config/filmmaker/settings.json (chỉ tài khoản của bạn đọc được)."))),
+      h("section", { class: "settings-sec" }, h("h3", {}, "Backup lên Google Drive"),
+        h("div", { class: "stack" },
+          backupState,
+          h("div", { class: "row", style: { alignItems: "flex-end" } }, h("div", { style: { flex: "1" } }, field("Nơi lưu (rclone remote:thư mục)", remote, "mặc định gdrive:FilmMaker")),
+            h("button", { class: "btn sm", onclick: checkBackup }, "Kiểm tra lại")),
+          h("label", { class: "check" }, autoBackup, h("span", {}, "Tự backup sau mỗi clip render xong và khi ghép phim",
+            h("span", { class: "sub" }, "Chạy ngầm, không làm chậm việc render. Backup lỗi thì chỉ báo, video vẫn an toàn trên máy."))),
+          h("p", { class: "help" }, "Chỉ gửi file mới hoặc đã đổi, không bao giờ xoá gì trên Drive. Clip bị render lại thì bản cũ được giữ trong thư mục .versions. Khôi phục: Phim mới → Từ Drive."))),
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
         await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
+          backup_remote: remote.value.trim(), auto_backup: autoBackup.checked,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
         S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }

@@ -10,7 +10,9 @@ from typing import Any
 
 import click
 
+from . import settings as user_settings
 from .assemble import AssembleError, assemble
+from .backup import AutoBackup, BackupError, Rclone, last_backup
 from .gflow import Gflow, GflowError
 from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State
@@ -98,11 +100,30 @@ def _run_options(f):
     f = click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi, dạng MIN-MAX.")(f)
     f = click.option("--fail-fast", is_flag=True, help="Dừng ngay ở cảnh lỗi đầu tiên.")(f)
     f = click.option("--keyframes-only", is_flag=True, help="Chỉ tạo ảnh keyframe (miễn phí) để duyệt trước khi render video.")(f)
+    f = click.option("--backup/--no-backup", "auto_backup", default=None,
+                     help="Backup lên Drive sau mỗi clip (mặc định theo Cài đặt “Tự backup”).")(f)
     return f
 
 
+def _rclone(remote: str | None = None) -> Rclone:
+    s = user_settings.load()
+    return Rclone(remote or s.get("backup_remote") or user_settings.DEFAULT_BACKUP_REMOTE, log=click.echo)
+
+
+def _auto_backup(storyboard: Path, out_dir: Path, enabled: bool | None) -> AutoBackup | None:
+    if enabled is None:
+        enabled = bool(user_settings.load().get("auto_backup"))
+    if not enabled:
+        return None
+    r = _rclone()
+    if not r.available():
+        click.echo("⚠ Tự backup đang bật nhưng chưa cài rclone (brew install rclone) — bỏ qua backup.")
+        return None
+    return AutoBackup(lambda: r.backup(storyboard, out_dir), log=click.echo)
+
+
 def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast,
-            keyframes_only=False):
+            keyframes_only=False, auto_backup=None):
     sb = load_storyboard(storyboard)
     out_dir = _out_dir(storyboard, out)
     g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
@@ -114,12 +135,18 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     if dry_run:
         click.echo("== DRY RUN: không gửi gì lên Flow ==")
     pipe = Pipeline(sb, out_dir, g, log=click.echo)
-    report = pipe.run(RunOptions(
-        only=set(only) or None, force=set(force), retry_unknown=retry_unknown,
-        max_retries=retries, pause=_parse_pause(pause), fail_fast=fail_fast,
-        # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
-        keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
-    ))
+    ab = None if dry_run else _auto_backup(storyboard, out_dir, auto_backup)
+    try:
+        report = pipe.run(RunOptions(
+            only=set(only) or None, force=set(force), retry_unknown=retry_unknown,
+            max_retries=retries, pause=_parse_pause(pause), fail_fast=fail_fast,
+            # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
+            keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
+            after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
+        ))
+    finally:
+        if ab:
+            ab.finish()
     click.echo("")
     if dry_run:
         click.echo(f"DRY RUN: {len(report.done)} cảnh sẽ được tạo, {len(report.skipped)} cảnh đã có. Chưa gửi gì lên Flow.")
@@ -201,6 +228,9 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, **kw
         _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
     except click.ClickException as exc:  # the film is done; a missing cover is not a failure
         click.echo(f"⚠ Chưa làm được thumbnail: {exc.message}")
+    ab = _auto_backup(storyboard, out_dir, kw.get("auto_backup"))
+    if ab:
+        ab.finish()  # final.mp4 + thumbnail
 
 
 def _do_thumbnail(sb, out_dir: Path, profile: str | None, *, remake: bool) -> Path:
@@ -346,6 +376,55 @@ def status(storyboard: Path, out, as_json: bool) -> None:
         click.echo(f"  {s.id:<6} {s.mode:<8} {label}  {s.prompt[:60]}")
         if st.get("status") == "failed" and st.get("error"):
             click.echo(f"         {st['error'][:200]}")
+
+
+@main.command()
+@click.argument("storyboard", required=False, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path))
+@click.option("--remote", help="Nơi lưu trên rclone (mặc định theo Cài đặt, gdrive:FilmMaker).")
+@click.option("--list", "list_", is_flag=True, help="Liệt kê các bản backup trên Drive.")
+def backup(storyboard: Path | None, out, remote, list_) -> None:
+    """Backup dự án lên Google Drive bằng rclone (chỉ gửi file mới/đã đổi, không xoá gì trên Drive).
+
+    \b
+    Lần đầu: brew install rclone, rồi rclone config -> tạo remote tên "gdrive" (Google Drive).
+    File bị thay (ví dụ clip render lại) được giữ bản cũ ở <remote>/.versions/.
+    """
+    r = _rclone(remote)
+    try:
+        if list_:
+            names = r.list_backups()
+            click.echo("\n".join(names) if names else f"Chưa có bản backup nào trên {r.remote}.")
+            return
+        if not storyboard:
+            raise click.UsageError("cần STORYBOARD (hoặc --list)")
+        out_dir = _out_dir(storyboard, out)
+        prev = last_backup(out_dir)
+        if prev:
+            click.echo(f"Lần backup trước: {prev.get('at')} -> {prev.get('remote')}")
+        r.backup(storyboard, out_dir)
+    except BackupError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command()
+@click.argument("name")
+@click.option("--to", "target", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục đích (mặc định ~/FilmMaker/<name>, dùng được ngay trong giao diện).")
+@click.option("--remote", help="Nơi lưu trên rclone (mặc định theo Cài đặt, gdrive:FilmMaker).")
+@click.option("--overwrite", is_flag=True, help="Ghi đè nếu dự án đã có trên máy.")
+def restore(name: str, target: Path | None, remote, overwrite) -> None:
+    """Tải dự án NAME từ Drive về máy (xem tên bằng `filmmaker backup --list`).
+
+    Đường dẫn trong state.json được sửa theo chỗ mới, nên các cảnh đã render không bị render lại.
+    """
+    r = _rclone(remote)
+    target = target or Path.home() / "FilmMaker" / name
+    try:
+        m = r.restore(name, target, overwrite=overwrite)
+    except BackupError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Xem tiến độ: filmmaker status {target / m['storyboard']}")
 
 
 @main.command()

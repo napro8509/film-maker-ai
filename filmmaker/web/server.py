@@ -31,6 +31,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
 from ..assemble import AssembleError, assemble
+from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
+from ..settings import DEFAULT_BACKUP_REMOTE
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, SUBMITTING, Pipeline, RunOptions, State
 from ..storyboard import Storyboard, load_storyboard
@@ -61,7 +63,9 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "planner": "auto",  # auto | claude_code | api
                     "flow_ui": True,  # image-to-video through the Flow chat page when gflow refuses it
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
-                    "flow_ui_window": "hidden"}  # show | hidden | headless
+                    "flow_ui_window": "hidden",  # show | hidden | headless
+                    "backup_remote": DEFAULT_BACKUP_REMOTE,  # rclone remote:folder (Google Drive)
+                    "auto_backup": False}  # back up after every rendered clip and at the end of each job
 
 
 def load_settings() -> dict[str, Any]:
@@ -146,7 +150,7 @@ class Jobs:
                 job.status = "stopped"
             except Exception as exc:  # report anything to the UI instead of dying silently
                 job.log(f"LỖI: {exc}")
-                if not isinstance(exc, (GflowError, AssembleError, ThumbnailError, RuntimeError, ValueError)):
+                if not isinstance(exc, (GflowError, AssembleError, ThumbnailError, BackupError, RuntimeError, ValueError)):
                     job.log(traceback.format_exc())
                 job.result = {"error": str(exc)}
                 job.status = "failed"
@@ -219,6 +223,10 @@ class RunBody(BaseModel):
     burn_subtitles: bool = False
     allow_missing: bool = False
     remake_thumbnail: bool = False  # action=thumbnail: new picture on Flow, not just the title
+
+
+class RestoreBody(BaseModel):
+    name: str
 
 
 class PortraitBody(BaseModel):
@@ -430,6 +438,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "i2v_error": st_data.get("i2v_error"),
             "characters_state": characters_state(pid, raw, sb),
             "thumbnail": thumb_info,
+            "backup": last_backup(out_dir(pid)),
             "path": str(pdir(pid)),
         }
 
@@ -565,9 +574,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s = load_settings()
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
-        for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window"):
+        for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
+                  "auto_backup"):
             if k in body:
                 s[k] = body[k]
+        if "backup_remote" in body:
+            try:
+                s["backup_remote"] = check_remote(str(body["backup_remote"] or DEFAULT_BACKUP_REMOTE))
+            except BackupError as exc:
+                raise HTTPException(400, str(exc))
+        s["auto_backup"] = bool(s.get("auto_backup"))
         if body.get("anthropic_api_key"):
             s["anthropic_api_key"] = body["anthropic_api_key"].strip()
         if body.get("clear_anthropic_key"):
@@ -942,6 +958,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 fail_fast=body.fail_fast, keyframes_only=keyframes_only,
                 force_keyframes=set(body.force_keyframes),
                 should_stop=lambda: job.stop_requested,
+                after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
             ))
             job.log("")
             if dry:
@@ -1004,7 +1021,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             res["thumbnail"] = str(path)
             return res
 
+        ab: AutoBackup | None = None
+
         def work(job: Job) -> dict[str, Any]:
+            nonlocal ab
+            if body.action != "dry":
+                ab = auto_backup(pid, job)
+            try:
+                return steps(job)
+            finally:
+                if ab:
+                    ab.finish()  # whatever was made (clips, final.mp4, cover) goes to Drive
+
+        def steps(job: Job) -> dict[str, Any]:
             if body.action == "thumbnail":
                 return do_thumbnail(job, body.remake_thumbnail)
             if body.action == "dry":
@@ -1027,6 +1056,82 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
+
+    # ---- backup (Google Drive via rclone) ----
+
+    def rclone(log: Callable[[str], None] = lambda *_: None) -> Rclone:
+        return Rclone(load_settings().get("backup_remote") or DEFAULT_BACKUP_REMOTE, log=log)
+
+    def auto_backup(pid: str, job: Job) -> AutoBackup | None:
+        if not load_settings().get("auto_backup"):
+            return None
+        r = rclone(job.log)
+        if not r.available():
+            job.log("⚠ Tự backup đang bật nhưng chưa cài rclone (brew install rclone) — bỏ qua backup.")
+            return None
+        return AutoBackup(lambda: r.backup(sb_path(pid), out_dir(pid)), log=job.log)
+
+    @app.get("/api/backup")
+    def backup_status() -> dict[str, Any]:
+        r = rclone()
+        out: dict[str, Any] = {"remote": r.remote, "auto": bool(load_settings().get("auto_backup")),
+                               "available": r.available(), "version": None, "remotes": [], "configured": False}
+        if out["available"]:
+            out["version"] = r.version()
+            try:
+                out["remotes"] = r.remotes()
+            except BackupError as exc:
+                out["error"] = str(exc)
+            name = r.remote.split(":", 1)[0] + ":" if ":" in r.remote else None
+            out["configured"] = name is None or name in out["remotes"]  # a plain local folder needs no remote
+        return out
+
+    @app.get("/api/backups")
+    def backups() -> dict[str, Any]:
+        r = rclone()
+        try:
+            names = r.list_backups()
+        except BackupError as exc:
+            raise HTTPException(400, str(exc))
+        local = {d.name for d in workspace.iterdir() if d.is_dir()} if workspace.is_dir() else set()
+        return {"remote": r.remote, "items": [{"name": n, "local": n in local} for n in names]}
+
+    @app.post("/api/projects/{pid}/backup")
+    def backup_project(pid: str) -> dict[str, Any]:
+        sb_path(pid)  # 404 for unknown projects
+
+        def work(job: Job) -> dict[str, Any]:
+            return {"backup": rclone(job.log).backup(sb_path(pid), out_dir(pid))}
+
+        return jobs.start("backup", "Backup lên Drive", pid, work).public()
+
+    @app.post("/api/backups/restore")
+    def restore_backup(body: RestoreBody) -> dict[str, Any]:
+        try:
+            name = check_name(body.name)
+        except BackupError as exc:
+            raise HTTPException(400, str(exc))
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+            raise HTTPException(400, "Bản backup này không phải dự án của giao diện; khôi phục bằng lệnh "
+                                     f"`filmmaker restore {name}`.")
+        if (workspace / name).exists():
+            raise HTTPException(409, f"Đã có dự án “{name}” trên máy. Xoá hoặc đổi tên dự án đó trước khi khôi phục.")
+
+        def work(job: Job) -> dict[str, Any]:
+            r = rclone(job.log)
+            m = r.manifest(name)
+            if m.get("storyboard") != "storyboard.yaml":
+                raise BackupError(f"bản backup {name} được tạo từ CLI; khôi phục bằng lệnh `filmmaker restore {name}`")
+            target = workspace / name
+            try:
+                r.restore(name, target)
+            except BaseException:
+                if target.exists() and not (target / "storyboard.yaml").is_file():
+                    shutil.rmtree(target, ignore_errors=True)  # do not leave half a project behind
+                raise
+            return {"id": name}
+
+        return jobs.start("restore", f"Khôi phục {name} từ Drive", name, work).public()
 
     # ---- jobs ----
 

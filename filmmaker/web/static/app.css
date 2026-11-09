@@ -396,7 +396,7 @@ textarea.yaml { font-family: var(--mono); font-size: var(--fs-1); min-height: 60
 .modal-body { padding: var(--sp-4) var(--sp-5); overflow-y: auto; }
 .modal-foot { padding: var(--sp-3) var(--sp-5); display: flex; gap: var(--sp-2); justify-content: flex-end; border-top: 1px solid var(--border); }
 .lightbox img { max-width: 92vw; max-height: 88vh; border-radius: var(--r-2); display: block; box-shadow: var(--sh-3); }
-.choice { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.choice { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: var(--sp-2); margin-bottom: var(--sp-4); }
 .choice button { text-align: left; padding: var(--sp-3); border-radius: var(--r-2); border: 1px solid var(--border); background: var(--surface); cursor: pointer; display: flex; flex-direction: column; gap: var(--sp-1); }
 .choice button:hover { border-color: var(--border-strong); background: var(--surface-2); }
 .choice button.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-soft); }
