@@ -657,6 +657,47 @@ function sceneStatusKey(sc) {
   return S.cur.scene_state?.[sc.id]?.status || "todo";
 }
 
+/* Visual direction (scene.camera). Values are English film terms; the datalists suggest the usual ones
+   (from /api/env camera_presets) but any text is accepted. The server adds them to the prompts. */
+const CAMERA_FIELDS = [
+  ["shot", "Cỡ cảnh", "close-up"], ["angle", "Góc máy", "low angle"],
+  ["movement", "Chuyển động máy", "slow dolly-in"], ["lens", "Ống kính", "85mm portrait lens"],
+  ["focus", "Lấy nét / độ sâu", "shallow depth of field"], ["composition", "Bố cục", "rule of thirds"],
+  ["lighting", "Ánh sáng", "golden hour backlight"], ["speed", "Tốc độ", "slow motion"],
+];
+const CAMERA_MORE = ["focus", "composition", "lighting", "speed", "notes"];
+function ensureCameraLists() {
+  const presets = S.env?.camera_presets || {};
+  for (const [k] of CAMERA_FIELDS) {
+    if (document.getElementById("cam-" + k)) continue;
+    document.body.append(h("datalist", { id: "cam-" + k }, (presets[k] || []).map((o) => h("option", { value: o.value }, o.label))));
+  }
+}
+function renderCamera(sc) {
+  ensureCameraLists();
+  const cam = sc.camera || {};
+  const set = (k, v) => {
+    const c = { ...(sc.camera || {}) };
+    if (v.trim()) c[k] = v; else delete c[k];
+    sc.camera = Object.keys(c).length ? c : undefined;
+    changed();
+  };
+  const input = (k, label, ph) => field(label, h("input", { type: "text", list: "cam-" + k, value: cam[k] || "", placeholder: ph,
+    oninput: (e) => set(k, e.target.value) }));
+  const main = CAMERA_FIELDS.filter(([k]) => !CAMERA_MORE.includes(k));
+  const more = CAMERA_FIELDS.filter(([k]) => CAMERA_MORE.includes(k));
+  const hint = sc.mode === "t2v" ? "tự thêm vào prompt video"
+    : "cỡ cảnh, góc, ống kính, nét, bố cục, ánh sáng → ảnh mở đầu; chuyển động, tốc độ, nét → video";
+  return h("div", { class: "camera-box" },
+    h("div", { class: "lbl" }, "Chỉ đạo hình ảnh", h("span", { class: "hint" }, " · " + hint)),
+    h("div", { class: "grid2" }, main.map(([k, l, ph]) => input(k, l, ph))),
+    h("details", { open: CAMERA_MORE.some((k) => cam[k]) || null },
+      h("summary", {}, "Lấy nét, bố cục, ánh sáng, tốc độ, ghi chú"),
+      h("div", { class: "grid2" }, more.map(([k, l, ph]) => input(k, l, ph))),
+      field("Ghi chú đạo diễn", h("textarea", { rows: 2, value: cam.notes || "", placeholder: "Ví dụ: camera stays behind her shoulder the whole time",
+        oninput: (e) => set("notes", e.target.value) }), "tiếng Anh")));
+}
+
 function renderScene(sc, i) {
   const sb = S.cur.storyboard;
   const move = (d) => { const j = i + d; if (j < 0 || j >= sb.scenes.length) return; [sb.scenes[i], sb.scenes[j]] = [sb.scenes[j], sb.scenes[i]]; changed(); renderMain(); };
@@ -675,7 +716,7 @@ function renderScene(sc, i) {
       h("div", { class: "scene-tools" },
       h("button", { class: "btn ghost icon sm", title: "Chuyển lên", "aria-label": "Chuyển lên", disabled: i === 0, onclick: () => move(-1) }, icon("up")),
       h("button", { class: "btn ghost icon sm", title: "Chuyển xuống", "aria-label": "Chuyển xuống", disabled: i === sb.scenes.length - 1, onclick: () => move(1) }, icon("down")),
-      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
+      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
       h("button", { class: "btn ghost icon sm danger", title: "Xoá cảnh", "aria-label": "Xoá cảnh", onclick: async () => {
         if (sb.scenes.length === 1) { toast("Phim cần ít nhất một cảnh", "error"); return; }
         const hasWork = S.cur.scene_state?.[sc.id]?.clip_url;
@@ -685,9 +726,10 @@ function renderScene(sc, i) {
     h("div", { class: "scene-body" },
       h("div", { class: "media-col" }, zone(`media-${i}`, () => renderSceneMedia(sc)), zone(`sactions-${i}`, () => renderSceneActions(sc))),
       h("div", { class: "scene-fields" },
-        sc.mode === "keyframe" ? text("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, bối cảnh, ánh sáng, góc máy…", 3, "nên viết tiếng Anh") : null,
+        sc.mode === "keyframe" ? text("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, ai đứng đâu, bối cảnh…", 3, "nên viết tiếng Anh") : null,
         sc.mode === "i2v" ? h("div", { class: "grid2" }, imagePicker(sc, "image", "Ảnh bắt đầu"), imagePicker(sc, "end_image", "Ảnh kết thúc (tuỳ chọn)", true)) : null,
-        text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Chuyển động / hành động", "Một hành động + một chuyển động máy quay, ví dụ: slow dolly-in, she smiles…", 3, "nên viết tiếng Anh"),
+        text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles… (góc máy chọn ở mục Chỉ đạo hình ảnh)", 3, "nên viết tiếng Anh"),
+        renderCamera(sc),
         zone(`chars-${i}`, () => {
           const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""}`;
           const found = (sb.characters || []).filter((c) => c.name && new RegExp(`\\b${c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text));

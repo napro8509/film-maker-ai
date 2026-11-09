@@ -12,7 +12,10 @@ Kiểm tra từng cảnh:
 - Tên nhân vật trong image_prompt/prompt khớp đúng `name` trong characters (tool so tên để chèn mô tả và ảnh)?
   Có cảnh nào quá 3 nhân vật?
 - Prompt có tự chép lại mô tả nhân vật (thừa, dễ mâu thuẫn) hoặc đòi chữ trong hình không?
-- prompt chỉ một hành động + một chuyển động máy; duration ≤ 8; aspect đúng brief; narration đúng ngôn ngữ phụ đề.
+- prompt chỉ một hành động; duration ≤ 8; aspect đúng brief; narration đúng ngôn ngữ phụ đề.
+- Chỉ đạo hình ảnh: mỗi cảnh có camera.shot, camera.angle, camera.movement (đúng MỘT chuyển động)?
+  Cỡ cảnh có thay đổi hợp lý giữa các cảnh liền nhau (không jump cut cùng cỡ + cùng góc), mở bằng establishing/wide,
+  góc máy và chuyển động hợp cảm xúc, hội thoại giữ quy tắc 180°? Không lặp lại camera trong prompt/image_prompt.
 - Bối cảnh, ánh sáng, trang phục nhất quán giữa các cảnh cùng bối cảnh.
 - Lệnh sau chạy không lỗi (không tốn credit), chạy từ thư mục gốc repo film-maker-ai:
     .venv/bin/filmmaker run FILM/storyboard.yaml --dry-run

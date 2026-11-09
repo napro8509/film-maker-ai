@@ -36,13 +36,162 @@ class Thumbnail(BaseModel):
     text: str | None = Field(default=None, description="Title printed on the cover (any language, short).")
 
 
+# Camera direction vocabulary: (English phrase sent to Flow, Vietnamese label for the UI).
+# Any other text is accepted too; these are just the usual film terms.
+CAMERA_PRESETS: dict[str, list[tuple[str, str]]] = {
+    "shot": [
+        ("extreme wide shot", "Toàn cảnh rất rộng (EWS)"),
+        ("wide shot", "Toàn cảnh (WS)"),
+        ("full shot", "Toàn thân (FS)"),
+        ("medium wide shot", "Trung toàn (MWS)"),
+        ("medium shot", "Trung cảnh (MS)"),
+        ("medium close-up", "Cận trung (MCU)"),
+        ("close-up", "Cận cảnh (CU)"),
+        ("extreme close-up", "Đặc tả (ECU)"),
+        ("over-the-shoulder shot", "Qua vai (OTS)"),
+        ("two shot", "Hai người trong khung"),
+        ("point-of-view shot", "Góc nhìn nhân vật (POV)"),
+        ("insert shot", "Cận vật (insert)"),
+        ("establishing shot", "Cảnh giới thiệu bối cảnh"),
+    ],
+    "angle": [
+        ("eye-level angle", "Ngang tầm mắt"),
+        ("low angle", "Góc thấp (hất lên)"),
+        ("high angle", "Góc cao (chúc xuống)"),
+        ("bird's-eye view, top-down", "Từ trên xuống (bird's-eye)"),
+        ("worm's-eye view", "Sát đất nhìn lên (worm's-eye)"),
+        ("dutch angle, tilted horizon", "Nghiêng khung (dutch)"),
+        ("overhead shot", "Trên đầu (overhead)"),
+        ("profile view", "Nhìn ngang (profile)"),
+        ("aerial drone view", "Flycam trên cao"),
+    ],
+    "movement": [
+        ("static locked-off camera", "Máy đứng yên"),
+        ("slow dolly-in", "Dolly tiến chậm"),
+        ("slow dolly-out", "Dolly lùi chậm"),
+        ("slow push-in", "Đẩy vào nhẹ (push-in)"),
+        ("pull-back reveal", "Lùi ra để lộ bối cảnh"),
+        ("tracking shot following the subject", "Bám theo chủ thể (tracking)"),
+        ("pan left to right", "Lia ngang (pan)"),
+        ("tilt up", "Ngửa máy lên (tilt up)"),
+        ("tilt down", "Chúc máy xuống (tilt down)"),
+        ("orbit around the subject", "Xoay vòng quanh chủ thể (orbit)"),
+        ("crane up", "Cẩu lên (crane up)"),
+        ("crane down", "Cẩu xuống (crane down)"),
+        ("handheld camera, subtle shake", "Cầm tay, rung nhẹ"),
+        ("smooth steadicam", "Steadicam mượt"),
+        ("slow zoom in", "Zoom vào chậm"),
+        ("dolly zoom (vertigo effect)", "Dolly zoom (hiệu ứng vertigo)"),
+        ("whip pan", "Lia nhanh (whip pan)"),
+        ("drone flyover", "Flycam bay qua"),
+    ],
+    "lens": [
+        ("16mm ultra-wide lens", "16mm siêu rộng"),
+        ("24mm wide-angle lens", "24mm góc rộng"),
+        ("35mm lens", "35mm (tự nhiên, kể chuyện)"),
+        ("50mm lens", "50mm (gần mắt người)"),
+        ("85mm portrait lens", "85mm (chân dung)"),
+        ("135mm telephoto lens, compressed background", "135mm tele (nén hậu cảnh)"),
+        ("macro lens", "Macro (siêu cận)"),
+        ("anamorphic lens, oval bokeh, horizontal flares", "Anamorphic (điện ảnh)"),
+        ("fisheye lens", "Mắt cá (fisheye)"),
+    ],
+    "focus": [
+        ("shallow depth of field, soft bokeh background", "Xoá phông (DOF mỏng)"),
+        ("deep focus, everything sharp", "Nét sâu, nét toàn khung"),
+        ("rack focus from foreground to background", "Chuyển nét trước → sau"),
+        ("rack focus from background to foreground", "Chuyển nét sau → trước"),
+        ("soft focus, dreamy", "Nét mềm, mơ màng"),
+    ],
+    "composition": [
+        ("rule of thirds", "Bố cục 1/3"),
+        ("centered symmetrical composition", "Đối xứng chính giữa"),
+        ("foreground framing through a doorway or objects", "Khung trong khung (tiền cảnh)"),
+        ("leading lines toward the subject", "Đường dẫn hướng"),
+        ("negative space around the subject", "Nhiều khoảng trống"),
+        ("silhouette against the light", "Bóng đổ ngược sáng (silhouette)"),
+        ("reflection in a mirror or water", "Qua phản chiếu (gương, nước)"),
+    ],
+    "lighting": [
+        ("soft natural window light", "Ánh sáng cửa sổ tự nhiên"),
+        ("golden hour backlight", "Ngược sáng giờ vàng"),
+        ("low-key lighting, deep shadows", "Low-key, nhiều bóng tối"),
+        ("high-key lighting, bright and airy", "High-key, sáng trong"),
+        ("hard side light, strong contrast", "Sáng gắt một bên, tương phản"),
+        ("rim light outlining the subject", "Viền sáng (rim light)"),
+        ("neon practical lights, colored glow", "Đèn neon, ánh màu"),
+        ("moonlight, cool blue tones", "Ánh trăng, tông xanh lạnh"),
+        ("candlelight, warm flicker", "Ánh nến ấm, chập chờn"),
+    ],
+    "speed": [
+        ("real-time speed", "Tốc độ thật"),
+        ("slow motion", "Quay chậm (slow motion)"),
+        ("time-lapse", "Tua nhanh (time-lapse)"),
+        ("speed ramp", "Đổi tốc độ (speed ramp)"),
+    ],
+}
+
+# Which camera fields describe the still frame and which describe what happens over time.
+FRAME_FIELDS = ("shot", "angle", "lens", "focus", "composition", "lighting")
+MOTION_FIELDS = ("movement", "speed")
+_CAMERA_LABELS = {
+    "shot": "Shot", "angle": "Angle", "movement": "Camera movement", "speed": "Speed", "lens": "Lens",
+    "focus": "Focus", "composition": "Composition", "lighting": "Lighting", "notes": "Direction",
+}
+
+
+class Camera(BaseModel):
+    """Visual direction for one scene: how the camera frames and moves. Every field is optional English text."""
+    shot: str | None = Field(default=None, description="Shot size, e.g. wide shot, medium shot, close-up, "
+                             "extreme close-up, over-the-shoulder shot, point-of-view shot.")
+    angle: str | None = Field(default=None, description="Camera angle, e.g. eye-level angle, low angle, high angle, "
+                              "bird's-eye view, dutch angle.")
+    movement: str | None = Field(default=None, description="ONE camera move, e.g. static locked-off camera, slow "
+                                 "dolly-in, tracking shot following the subject, pan, tilt up, orbit, crane up, handheld.")
+    lens: str | None = Field(default=None, description="Lens / focal length, e.g. 24mm wide-angle lens, 85mm portrait "
+                             "lens, macro lens, anamorphic lens.")
+    focus: str | None = Field(default=None, description="Depth of field / focus, e.g. shallow depth of field, deep "
+                              "focus, rack focus from foreground to background.")
+    composition: str | None = Field(default=None, description="Framing, e.g. rule of thirds, centered symmetrical "
+                                    "composition, foreground framing, leading lines, silhouette.")
+    lighting: str | None = Field(default=None, description="Lighting for this shot, e.g. golden hour backlight, "
+                                 "low-key lighting, rim light, soft window light.")
+    speed: str | None = Field(default=None, description="Playback speed, e.g. slow motion, time-lapse, real-time speed.")
+    notes: str | None = Field(default=None, description="Any other direction for the shot (English), e.g. "
+                              "the camera stays behind her shoulder the whole time.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _blank_to_none(cls, data):
+        if isinstance(data, dict):
+            return {k: (v.strip() or None) if isinstance(v, str) else v for k, v in data.items()}
+        return data
+
+    def is_empty(self) -> bool:
+        return not any(getattr(self, f) for f in _CAMERA_LABELS)
+
+    def describe(self, fields: tuple[str, ...] | None = None) -> str:
+        """Labelled sentences such as "Shot: close-up, low angle. Camera movement: slow dolly-in.".
+        `fields` picks a subset (the free-form notes are always included)."""
+        wanted = [f for f in _CAMERA_LABELS if f != "notes" and (fields is None or f in fields)]
+        vals = {f: getattr(self, f).strip().rstrip(".") for f in wanted if getattr(self, f)}
+        parts: list[str] = []
+        framing = ", ".join(vals.pop(f) for f in ("shot", "angle") if f in vals)
+        if framing:
+            parts.append(f"Shot: {framing}.")
+        parts += [f"{_CAMERA_LABELS[f]}: {v}." for f, v in vals.items()]
+        if self.notes:
+            parts.append(f"Direction: {self.notes.strip().rstrip('.')}.")
+        return " ".join(parts)
+
+
 class Scene(BaseModel):
     id: str = Field(description="Short unique id, e.g. s01")
     mode: Mode = Field(
         default="keyframe",
         description="t2v = text-to-video; i2v = animate a local image; keyframe = generate a still with Imagen first, then animate it (best consistency).",
     )
-    prompt: str = Field(description="What happens in the clip: action + camera motion.")
+    prompt: str = Field(description="What happens in the clip: the action (put camera work in `camera`).")
     image_prompt: str | None = Field(default=None, description="Still image prompt for mode=keyframe (defaults to prompt).")
     image: str | None = Field(default=None, description="Start frame path for mode=i2v.")
     end_image: str | None = Field(default=None, description="Optional end frame path for mode=i2v.")
@@ -52,6 +201,8 @@ class Scene(BaseModel):
         description="Optional video model alias for this scene only; normally leave empty to use the storyboard model.",
     )
     narration: str | None = Field(default=None, description="Optional line shown as a subtitle in the final film.")
+    camera: Camera | None = Field(default=None, description="Visual direction: shot size, angle, camera movement, "
+                                  "lens, focus, composition, lighting, speed. Added to the prompts automatically.")
 
     @model_validator(mode="after")
     def _check(self) -> "Scene":
@@ -93,8 +244,10 @@ class Storyboard(BaseModel):
     def _characters_in(self, text: str) -> list[Character]:
         return [c for c in self.characters if re.search(rf"\b{re.escape(c.name)}\b", text, re.IGNORECASE)]
 
-    def _compose(self, text: str) -> str:
+    def _compose(self, text: str, direction: str = "") -> str:
         parts = [text.strip().rstrip(".") + "."]
+        if direction:
+            parts.append(direction)
         chars = self._characters_in(text)
         if chars:
             parts.append(" ".join(f"{c.name}: {c.description.strip()}." for c in chars))
@@ -156,21 +309,32 @@ class Storyboard(BaseModel):
         """Changes when a reference image is added, removed or regenerated."""
         return [f"{n}:{hashlib.sha256(p.read_bytes()).hexdigest()[:12]}" for n, p in self.scene_refs(scene)]
 
+    @staticmethod
+    def direction(scene: Scene, fields: tuple[str, ...] | None = None) -> str:
+        """The scene's camera direction as prompt text ("" when it has none)."""
+        return scene.camera.describe(fields) if scene.camera and not scene.camera.is_empty() else ""
+
     def video_prompt(self, scene: Scene) -> str:
-        # In keyframe/i2v mode the look is already in the image; keep the motion prompt focused.
         if scene.mode == "t2v":
-            return self._compose(scene.prompt)
-        return scene.prompt.strip()
+            return self._compose(scene.prompt, self.direction(scene))
+        # In keyframe/i2v mode the look and framing are already in the image; keep the prompt on the motion.
+        motion = self.direction(scene, MOTION_FIELDS + ("focus",))
+        action = scene.prompt.strip().rstrip(".")
+        if not motion:
+            return scene.prompt.strip()
+        return f"{action}. {motion}" if action else motion
 
     def text_only_prompt(self, scene: Scene) -> str:
         """Text-to-video prompt for a keyframe scene when image-to-video is unavailable:
         the opening-frame description plus the motion, with characters and style."""
         if scene.image_prompt and scene.image_prompt.strip():
-            return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}")
-        return self._compose(scene.prompt)
+            return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
+                                 self.direction(scene))
+        return self._compose(scene.prompt, self.direction(scene))
 
     def image_prompt(self, scene: Scene) -> str:
-        return self._compose(scene.image_prompt or scene.prompt)
+        # A still has no motion: only the framing, lens, focus, composition and lighting apply.
+        return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS))
 
     def scene_fingerprint(self, scene: Scene) -> str:
         """Changes whenever anything that affects the generated clip changes."""

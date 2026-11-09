@@ -21,20 +21,39 @@ thumbnail:               # ảnh bìa video: ảnh tạo trên Flow (miễn phí
 scenes:
   - id: s01
     mode: keyframe       # tạo ảnh mở đầu rồi animate -> giữ nhân vật đồng nhất
-    image_prompt: "Wide shot of a small Hanoi street cafe at dawn, empty plastic stools, steam rising from a kettle"
-    prompt: "Slow dolly-in toward the cafe as the first motorbikes pass by, ambient street sounds"
+    image_prompt: "A small Hanoi street cafe at dawn, empty plastic stools, steam rising from a kettle"
+    prompt: "The first motorbikes pass by the cafe, ambient street sounds"
+    camera:              # chỉ đạo hình ảnh (tiếng Anh), tool tự ghép vào prompt
+      shot: establishing shot     # cỡ cảnh: wide shot, medium shot, close-up, extreme close-up...
+      angle: high angle           # góc máy: eye-level angle, low angle, bird's-eye view, dutch angle...
+      movement: slow dolly-in     # MỘT chuyển động máy: static, pan, tilt, tracking, orbit, crane up, handheld...
+      lens: 24mm wide-angle lens  # ống kính
+      lighting: soft blue dawn light
     narration: "Hà Nội, 5 giờ sáng."
 
   - id: s02
     mode: keyframe
-    image_prompt: "Close-up of Lan sitting at a low table, holding a glass of Vietnamese drip coffee"
-    prompt: "Lan lifts the glass and smiles softly, gentle handheld camera, coffee dripping in the foreground"
+    image_prompt: "Lan sitting at a low table, holding a glass of Vietnamese drip coffee, coffee dripping in the foreground"
+    prompt: "Lan lifts the glass and smiles softly"
+    camera:
+      shot: medium close-up
+      angle: eye-level angle
+      movement: handheld camera, subtle shake
+      lens: 85mm portrait lens
+      focus: rack focus from foreground to background   # nét từ phin cà phê sang mặt Lan
+      composition: rule of thirds
     duration: 8
     narration: "Ly cà phê đầu tiên của ngày mới."
 
   - id: s03
     mode: t2v            # tạo thẳng từ chữ
-    prompt: "Top-down macro shot of condensed milk swirling into dark coffee, slow motion"
+    prompt: "Condensed milk swirling into dark coffee"
+    camera:
+      shot: extreme close-up
+      angle: bird's-eye view, top-down
+      movement: static locked-off camera
+      lens: macro lens
+      speed: slow motion
 
   # - id: s04
   #   mode: i2v          # animate ảnh của bạn

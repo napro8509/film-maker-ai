@@ -36,7 +36,7 @@ from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, 
 from ..settings import DEFAULT_BACKUP_REMOTE
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
-from ..storyboard import Storyboard, load_storyboard
+from ..storyboard import CAMERA_PRESETS, Storyboard, load_storyboard
 from ..thumbnail import ThumbnailError
 
 STATIC = Path(__file__).parent / "static"
@@ -517,6 +517,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "workspace": str(workspace),
             "profile": s.get("profile") or None,
             "platform": sys.platform,
+            "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
         }
 
     @app.post("/api/env/auth")

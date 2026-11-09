@@ -170,8 +170,13 @@ characters:
 scenes:
   - id: s01
     mode: keyframe        # ảnh mở đầu (Imagen, miễn phí) -> animate (Veo)
-    image_prompt: "Close-up of Lan at a street cafe at dawn"
-    prompt: "Lan lifts the glass and smiles, slow dolly-in"
+    image_prompt: "Lan at a street cafe at dawn"
+    prompt: "Lan lifts the glass and smiles"
+    camera:               # chỉ đạo hình ảnh (tuỳ chọn, tiếng Anh) - xem mục dưới
+      shot: close-up
+      angle: eye-level angle
+      movement: slow dolly-in
+      lens: 85mm portrait lens
     duration: 8
     narration: "Hà Nội, 5 giờ sáng."   # phụ đề
 
@@ -186,7 +191,31 @@ scenes:
     prompt: "Camera pulls back to reveal the street"
 ```
 
-Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động + một chuyển động máy quay.
+Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động; góc máy và chuyển động đặt trong `camera`.
+
+### Chỉ đạo hình ảnh (`camera`)
+
+Mỗi cảnh có thể có khối `camera` mô tả cách quay. Mọi trường đều tuỳ chọn, viết bằng thuật ngữ điện ảnh tiếng Anh:
+
+| Trường | Ý nghĩa | Ví dụ |
+|---|---|---|
+| `shot` | cỡ cảnh | `establishing shot`, `wide shot`, `medium shot`, `close-up`, `extreme close-up`, `over-the-shoulder shot`, `point-of-view shot` |
+| `angle` | góc máy | `eye-level angle`, `low angle`, `high angle`, `bird's-eye view, top-down`, `dutch angle, tilted horizon` |
+| `movement` | chuyển động máy (một cái) | `static locked-off camera`, `slow dolly-in`, `tracking shot following the subject`, `pan left to right`, `orbit around the subject`, `crane up`, `handheld camera, subtle shake` |
+| `lens` | ống kính | `24mm wide-angle lens`, `50mm lens`, `85mm portrait lens`, `macro lens`, `anamorphic lens, oval bokeh, horizontal flares` |
+| `focus` | lấy nét, độ sâu | `shallow depth of field, soft bokeh background`, `deep focus, everything sharp`, `rack focus from foreground to background` |
+| `composition` | bố cục | `rule of thirds`, `centered symmetrical composition`, `foreground framing through a doorway or objects`, `silhouette against the light` |
+| `lighting` | ánh sáng riêng của cảnh | `golden hour backlight`, `low-key lighting, deep shadows`, `rim light outlining the subject` |
+| `speed` | tốc độ | `slow motion`, `time-lapse`, `speed ramp` |
+| `notes` | ghi chú đạo diễn khác | `camera stays behind her shoulder the whole time` |
+
+Tool tự ghép vào prompt gửi lên Flow (xem "Prompt thực tế gửi lên Flow" ở mỗi cảnh):
+- Cảnh `keyframe`: cỡ cảnh, góc, ống kính, nét, bố cục, ánh sáng vào **ảnh mở đầu**; chuyển động, tốc độ, nét vào **video**.
+- Cảnh `t2v` (và khi tự chuyển sang Chữ → Video): tất cả vào prompt video. Cảnh `i2v`: chuyển động, tốc độ, nét.
+- Đổi `camera` thì cảnh đó cần render lại. Cảnh không có `camera` giữ nguyên prompt như trước.
+- Giao diện: mục **Chỉ đạo hình ảnh** dưới ô Hành động của mỗi cảnh, có danh sách gợi ý (nhãn tiếng Việt) nhưng gõ tự do được.
+  "Viết kịch bản bằng AI" và agent đạo diễn (`/make-film`) tự điền mục này theo ngữ pháp dựng phim
+  (mở bằng toàn cảnh, đổi cỡ cảnh giữa các cảnh liền nhau, quy tắc 180° khi hội thoại...).
 
 ### Model video và ngày ngừng
 
