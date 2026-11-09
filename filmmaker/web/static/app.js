@@ -233,14 +233,22 @@ function refreshZones() {
     if (v && !v.paused) continue;
     const el = fn();
     el.id = id;
-    if (old.outerHTML !== el.outerHTML) old.replaceWith(el);
+    if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
   }
 }
 function refreshZone(id) {
   const fn = S.zones.get(id), old = document.getElementById(id);
   if (!fn || !old) return;
   const el = fn(); el.id = id;
-  if (old.outerHTML !== el.outerHTML) old.replaceWith(el);
+  if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
+}
+/* A clip opened from lazyVideo() stays open (even paused) while the zone would only show it again as a poster. */
+function keepsOpenedClip(old, el) {
+  const v = old.querySelector("video[data-lazy-src]"), b = el.querySelector(".lazy-video");
+  if (!v || !b || b.dataset.src !== v.dataset.lazySrc) return false;
+  const a = old.cloneNode(true), c = el.cloneNode(true);
+  a.querySelector("video[data-lazy-src]").replaceWith(c.querySelector(".lazy-video").cloneNode(true));
+  return a.outerHTML === c.outerHTML; // nothing else in the zone changed
 }
 
 /* ---------- boot ---------- */
@@ -965,8 +973,24 @@ function imagePicker(sc, attr, label, optional = false) {
       h("button", { class: "btn sm", onclick: (e) => { e.preventDefault(); fileInput.click(); } }, icon("upload"), "Tải lên"), fileInput));
 }
 
-/* opts.kfHint: placeholder for a keyframe scene with no picture yet (the board points at its own button). */
-function renderSceneMedia(sc, { kfHint = null } = {}) {
+/* A poster with a play button; the real <video> is made on click. Each <video> costs ~15 ms to insert in WebKit
+   (the desktop app), so a board with 20 clips spent ~300 ms on every redraw. */
+function lazyVideo(src, poster) {
+  const btn = h("button", { type: "button", class: "lazy-video", title: "Phát clip", "aria-label": "Phát clip", "data-src": src },
+    poster ? h("img", { src: poster, alt: "", loading: "lazy", decoding: "async" }) : null,
+    h("span", { class: "lazy-play" }, icon("play")));
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const v = h("video", { src, controls: true, autoplay: true, playsinline: true, poster: poster || null, "data-lazy-src": src });
+    btn.replaceWith(v);
+    v.play?.().catch(() => { /* autoplay refused: the controls are there */ });
+  });
+  return btn;
+}
+
+/* opts.kfHint: placeholder for a keyframe scene with no picture yet (the board points at its own button).
+   opts.lazy: show clips as a poster + play button (board). */
+function renderSceneMedia(sc, { kfHint = null, lazy = false } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const portrait = S.cur.storyboard.aspect === "9:16";
   const box = h("div", { class: "media" + (portrait ? " portrait" : "") });
@@ -974,7 +998,9 @@ function renderSceneMedia(sc, { kfHint = null } = {}) {
   const startImg = sc.mode === "i2v" ? (assetUrl(sc.image) || st.image_url) : null;
   const stale = st.status === "changed";
   if (st.clip_url) {
-    box.append(h("video", { src: st.clip_url, controls: true, preload: "metadata", poster: st.rendered_as === "t2v" || st.rendered_as === "r2v" ? null : (kf || startImg || null), playsinline: true }));
+    const poster = st.rendered_as === "t2v" || st.rendered_as === "r2v" ? null : (kf || startImg || null);
+    box.append(lazy ? lazyVideo(st.clip_url, poster)
+      : h("video", { src: st.clip_url, controls: true, preload: "metadata", poster, playsinline: true }));
     if (stale) box.append(h("span", { class: "tag warn" }, "Clip cũ · prompt đã đổi"));
     else if (st.rendered_as === "t2v" && sc.mode === "keyframe") box.append(h("span", { class: "tag" }, "Render bằng Chữ → Video"));
     else if (st.rendered_as === "flow-ui") box.append(h("span", { class: "tag" }, "Render qua giao diện chat Flow"));

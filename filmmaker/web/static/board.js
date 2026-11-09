@@ -384,7 +384,6 @@ function renderBoard() {
     vp.append(h("div", { class: "loading" }, h("span", { class: "spinner" }), "Đang tải bảng…"));
     return root;
   }
-  bApplyView(vp);
   const model = boardModel();
   B.sig = model.cards.map((c) => c.key).join(",");
   const world = h("div", { class: "board-world" });
@@ -400,6 +399,7 @@ function renderBoard() {
   bEmpties(world, model);
   world.append(svgEl("svg", { class: "board-draft", "aria-hidden": "true" }, svgEl("path", { class: "board-link draft", d: "" })));
   vp.append(world);
+  bApplyView(vp);
   vp.addEventListener("pointerdown", bOnPointerDown);
   vp.addEventListener("pointermove", bOnPointerMove);
   vp.addEventListener("pointerup", bOnPointerUp);
@@ -438,9 +438,12 @@ function bAfterMount(root, unplaced) {
 function bApplyView(vp = document.querySelector(".board-viewport")) {
   if (!vp) return;
   const v = B.view || { x: 0, y: 0, zoom: 1 };
-  vp.style.setProperty("--px", v.x + "px");
-  vp.style.setProperty("--py", v.y + "px");
-  vp.style.setProperty("--z", String(v.zoom));
+  // Set the values directly, not as inherited custom properties: changing a variable on the viewport makes
+  // WebKit (the desktop app) restyle every card on each wheel/pan event (~230 ms with 20 scenes).
+  const world = vp.querySelector(".board-world");
+  if (world) world.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.zoom})`;
+  vp.style.backgroundSize = `${16 * v.zoom}px ${16 * v.zoom}px`;
+  vp.style.backgroundPosition = `${v.x}px ${v.y}px`;
   const lbl = document.querySelector(".board-zoom-val");
   if (lbl) lbl.textContent = Math.round(v.zoom * 100) + "%";
 }
@@ -606,6 +609,21 @@ function bLinksSvg() {
   return svg;
 }
 
+/* Card drag starts: move the arrows touching it into a small SVG of their own, so the big one stays untouched.
+   Changing any path in the big SVG makes WebKit (the desktop app) repaint every arrow (~200 ms a frame
+   with 20 scenes when they were dashed). The drop rebuilds "board-links" and removes this one. */
+function bLiftLinks(key) {
+  const base = document.getElementById("board-links");
+  if (!base) return;
+  const live = base.cloneNode(false);
+  live.removeAttribute("id");
+  live.removeAttribute("aria-label");
+  live.setAttribute("aria-hidden", "true");
+  live.classList.add("live");
+  base.querySelectorAll(`.board-link[data-from="${CSS.escape(key)}"], .board-link[data-to="${CSS.escape(key)}"]`).forEach((g) => live.append(g));
+  base.after(live);
+}
+
 /* While dragging a card: update only the paths touching it (no re-render). */
 function bUpdateLinksFor(key) {
   document.querySelectorAll(`.board-links .board-link[data-from="${CSS.escape(key)}"], .board-links .board-link[data-to="${CSS.escape(key)}"]`).forEach((g) => {
@@ -682,7 +700,7 @@ function bCharCard(cd) {
       const missing = !!(c.image && cs && cs.name === c.name && cs.image_missing);
       const box = h("div", { class: "media board-char-media" });
       if (bCharRunning(c)) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo ảnh…")));
-      else if (url) box.append(h("img", { src: url, alt: c.name || "", onclick: () => lightbox(url) }));
+      else if (url) box.append(h("img", { src: url, alt: c.name || "", decoding: "async", onclick: () => lightbox(url) }));
       else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có ảnh")));
       if (missing) box.append(h("span", { class: "tag warn" }, "Không thấy file ảnh"));
       return box;
@@ -780,7 +798,7 @@ function bKfCard(cd) {
       const s = st(), box = h("div", { class: "media" + (bScenePortrait() ? " portrait" : "") });
       if (bSceneRunning(sc, "kf") && !s.keyframe_url) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo keyframe…")));
       else if (s.keyframe_url) {
-        box.append(h("img", { src: s.keyframe_url, alt: "keyframe " + sid, onclick: () => lightbox(s.keyframe_url) }));
+        box.append(h("img", { src: s.keyframe_url, alt: "keyframe " + sid, decoding: "async", onclick: () => lightbox(s.keyframe_url) }));
         if (s.keyframe_stale) box.append(h("span", { class: "tag warn", title: "Prompt, nhân vật nối vào hoặc ảnh nhân vật đã đổi từ khi tạo ảnh này" }, "Ảnh cũ · cần tạo lại"));
       } else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Bấm “Tạo keyframe” để xem trước (miễn phí)")));
       return box;
@@ -840,7 +858,7 @@ function bVidCard(cd) {
       return h("div", { class: "small muted board-meta" }, parts.join(" · "));
     }),
     zone(z("media"), () => {
-      const el = renderSceneMedia(sc, { kfHint: "Bấm “Tạo keyframe” trên card keyframe để xem trước (miễn phí)" });
+      const el = renderSceneMedia(sc, { kfHint: "Bấm “Tạo keyframe” trên card keyframe để xem trước (miễn phí)", lazy: true });
       if (!st().clip_url) el.classList.add("board-vid-pending");
       return el;
     }),
@@ -1062,7 +1080,7 @@ function bOnPointerMove(e) {
   } else if (d.kind === "card") {
     const z = B.view?.zoom || 1, dx = (e.clientX - d.sx) / z, dy = (e.clientY - d.sy) / z;
     if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 4) return;
-    if (!d.moved) { d.moved = true; d.el.classList.add("dragging"); e.currentTarget.classList.add("is-dragging"); }
+    if (!d.moved) { d.moved = true; d.el.classList.add("dragging"); e.currentTarget.classList.add("is-dragging"); bLiftLinks(d.key); }
     d.nx = bSnap(d.ox + dx); d.ny = bSnap(d.oy + dy);
     if (!d.raf) d.raf = requestAnimationFrame(() => {
       d.raf = 0;
@@ -1100,6 +1118,7 @@ function bOnPointerUp(e) {
       bSetPos(d.key, { x: d.nx, y: d.ny });
       d.el.style.left = d.nx + "px"; d.el.style.top = d.ny + "px";
       refreshZone("board-links");
+      document.querySelectorAll("#main svg.board-links.live").forEach((el) => el.remove());
       saveBoard(); // once, after the drop (AC22)
     } else if (d.focus) { d.focus.focus(); const n = d.focus.value.length; try { d.focus.setSelectionRange(n, n); } catch { /* ignore */ } }
   } else if (d.kind === "link") {

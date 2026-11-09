@@ -32,7 +32,7 @@
 .board-legend-sample { flex: none; overflow: visible; }
 .menu .m-item .board-legend-sample { margin-left: auto; }
 .board-legend-sample .line { fill: none; stroke: var(--link); stroke-width: 2; }
-.board-legend-sample .auto .line { stroke-dasharray: 4 3; }
+.board-legend-sample .auto .line { stroke-opacity: .45; stroke-width: 1.5; }
 .board-legend-sample .desc .line { stroke: var(--link-desc); }
 .board-legend-sample .head { fill: var(--link); }
 .board-legend-sample .head-open { fill: var(--surface); stroke: var(--link-desc); stroke-width: 1.5; }
@@ -53,8 +53,7 @@
   position: relative; flex: 1; min-height: 0; overflow: hidden; outline: none;
   background-color: var(--board-bg);
   background-image: radial-gradient(var(--board-dot) 1px, transparent 1px);
-  background-size: calc(16px * var(--z, 1)) calc(16px * var(--z, 1));
-  background-position: var(--px, 0px) var(--py, 0px);
+  background-size: 16px 16px; /* pan/zoom: set inline by bApplyView() */
   touch-action: none; cursor: grab;
 }
 .board-viewport.is-panning { cursor: grabbing; }
@@ -62,19 +61,22 @@
 .board-viewport > .loading { position: absolute; inset: 0; padding: 0; cursor: default; }
 .board-world {
   position: absolute; left: 0; top: 0; width: 0; height: 0; transform-origin: 0 0;
-  transform: translate(var(--px, 0px), var(--py, 0px)) scale(var(--z, 1));
+  /* transform set inline by bApplyView() */
 }
-svg.board-links { position: absolute; overflow: visible; pointer-events: none; }
+/* Own layer: WebKit (desktop app) draws dashed arrows slowly, so they must not repaint with the cards when the
+   view pans. The arrows of the card being dragged go to a second one (bLiftLinks). */
+svg.board-links { position: absolute; overflow: visible; pointer-events: none; will-change: transform; }
 svg.board-draft { position: absolute; left: 0; top: 0; width: 1px; height: 1px; overflow: visible; pointer-events: none; z-index: 5; }
 
 /* ---------- arrows ---------- */
 .board-link .line { fill: none; stroke: var(--link); stroke-width: 2; }
 .board-link .hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
 .board-link .halo { fill: none; stroke: transparent; stroke-width: 8; }
-.board-link.auto .line { stroke-dasharray: 6 5; }
+/* auto: faint solid line, not dashed: WebKit (desktop app) draws dashed curves very slowly (~340 ms a redraw) */
+.board-link.auto .line { stroke-opacity: .45; stroke-width: 1.5; }
 .board-link.desc .line { stroke: var(--link-desc); }
-.board-link:hover .line { stroke-width: 3; }
-.board-link.selected .line { stroke: var(--link-sel); stroke-width: 3; }
+.board-link:hover .line { stroke-width: 3; stroke-opacity: 1; }
+.board-link.selected .line { stroke: var(--link-sel); stroke-width: 3; stroke-opacity: 1; }
 .board-link.selected .halo { stroke: var(--link-halo); }
 .board-link:focus { outline: none; }
 .board-link:focus-visible .halo { stroke: var(--link-halo); }
