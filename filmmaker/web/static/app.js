@@ -87,7 +87,7 @@ async function api(method, url, body, isForm) {
   try { data = await r.json(); } catch { /* empty */ }
   if (!r.ok) {
     const d = data && data.detail;
-    // detail may be a string, or an object such as {message, retired} (409 when render is blocked)
+    // detail may be a string, or an object {message, reason, ...} (409/428, e.g. reason "model_retired" carries retired, "needs_confirm" carries scenes)
     const msg = typeof d === "string" ? d : d && typeof d.message === "string" ? d.message : d ? JSON.stringify(d) : `Lỗi máy chủ (HTTP ${r.status})`;
     const err = new Error(msg);
     err.status = r.status; err.detail = d;
@@ -866,6 +866,8 @@ function renderSceneActions(sc) {
   if (st.status === "failed" && st.error) kids.push(h("div", { class: "scene-msg err" }, st.error));
   if (st.status === "interrupted") {
     kids.push(h("div", { class: "scene-msg warn" }, "Lần trước bị ngắt khi đang render, có thể Flow đã trừ credit. Hãy mở Flow xem clip đã có chưa trước khi gửi lại."));
+    const clipMsg = manualClipMsg(sc, st, busy);
+    if (clipMsg) kids.push(clipMsg);
   }
   if (st.status === "done" && st.model_status === "retiring") {
     kids.push(h("div", { class: "scene-msg warn" }, `Model này ngừng ngày ${st.model_retires_label}. Clip hiện tại vẫn dùng được, nhưng Render lại sau ngày đó sẽ lỗi; nên đổi model trước khi render lại (sẽ tốn credit).`));
@@ -887,6 +889,38 @@ function renderSceneActions(sc) {
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
   kids.push(row);
   return h("div", { class: "stack tight" }, kids);
+}
+
+// What we know about the clip the user may have downloaded by hand into clips/<id>.mp4 (st.manual_clip from the server).
+function manualClipMsg(sc, st, busy) {
+  const texts = {
+    ok: "Đã thấy clip bạn tải về; lần render tới sẽ dùng clip này, không tốn credit.",
+    stale: ["Clip trong thư mục cũ hơn lần gửi, sẽ không được dùng. Nếu chắc đây là bản vừa tải từ Flow, chạy ", h("code", {}, `touch clips/${sc.id}.mp4`), " rồi tải lại trang."],
+    invalid: "Clip trong thư mục không đọc được trọn (có thể tải dở).",
+    unchecked: "Chưa cài ffprobe nên không kiểm được clip bạn tải về.",
+  };
+  if (texts[st.manual_clip]) return h("div", { class: "scene-msg" + (st.manual_clip === "ok" ? "" : " warn") }, texts[st.manual_clip]);
+  if (st.manual_clip !== "unverified") return null;
+  const pid = S.cur.id, skipKey = `adoptSkip.${pid}.${sc.id}`, stamp = st.updated_at || "none";
+  if (localGet(skipKey) === stamp) return null; // skipped on this browser; shows again once the state changes
+  let adopting = false;
+  const adoptBtn = h("button", { class: "btn sm", disabled: busy, title: "Đánh dấu cảnh xong bằng clip trong thư mục (không gửi lên Flow)",
+    onclick: async () => {
+      if (adopting) return;
+      adopting = true; adoptBtn.disabled = true;
+      try {
+        const d = await api("POST", `/api/projects/${pid}/scenes/${sc.id}/adopt-clip`);
+        if (S.cur && S.cur.id === pid) { if (d && d.id === pid) applyMeta(d); else refreshCurrent(); }
+        toast("Đã dùng clip bạn tải về", "ok");
+      } catch (e) {
+        toast(e.message, "error");
+        adopting = false; adoptBtn.disabled = jobRunning();
+      }
+    } }, icon("check"), "Dùng clip này");
+  return h("div", { class: "scene-msg warn" },
+    h("div", {}, "Có clip trong thư mục nhưng chưa rõ là bản mới hay cũ."),
+    h("div", { class: "row", style: { marginTop: "6px" } }, adoptBtn,
+      h("button", { class: "btn sm ghost", onclick: () => { localSet(skipKey, stamp); refreshZones(); } }, "Bỏ qua")));
 }
 
 /* ---------- story tab ---------- */
@@ -1325,7 +1359,7 @@ function renderYaml() {
 /* ---------- model change (retiring/retired models) ---------- */
 
 const MODEL_CHANGE_LABEL = "Đổi model cho các cảnh chưa render";
-const INTERRUPTED_NOTE = "Đổi model không xoá trạng thái bị ngắt: khi render cảnh này, bạn vẫn phải tick “Tôi đã kiểm tra, gửi lại các cảnh này” hoặc bấm “Gửi lại” trên cảnh.";
+const INTERRUPTED_NOTE = "Đổi model không xoá trạng thái bị ngắt: khi render cảnh này, bạn vẫn phải tick “Tôi đã kiểm tra, gửi lại các cảnh này” trong hộp xác nhận, kể cả khi bấm “Gửi lại” trên cảnh.";
 
 /* Replace the whole project (storyboard included) with the server copy, so the next autosave cannot undo a model change. */
 function reloadProject(d) {
@@ -1486,7 +1520,9 @@ async function runAction(action, extra = {}, ctx = {}) {
     if (!NATIVE() && "Notification" in window && Notification.permission === "default" && action !== "dry") Notification.requestPermission();
   } catch (e) {
     // The server re-checks retired models (e.g. ticking "gửi lại" added an interrupted scene after /estimate).
-    if (e.status === 409 && Array.isArray(e.detail?.retired)) { openBlockedModelChange(e.detail.retired, ctx); return; }
+    if (e.status === 409 && e.detail?.reason === "model_retired" && Array.isArray(e.detail.retired)) { openBlockedModelChange(e.detail.retired, ctx); return; }
+    // An interrupted scene (Flow may have billed it) was not confirmed: show why and reload, never resend on our own.
+    if (e.status === 428 && e.detail?.reason === "needs_confirm") { toast(e.message, "error", 8000); refreshCurrent(); return; }
     toast(e.message, "error");
   }
 }
@@ -1499,10 +1535,19 @@ function openBlockedModelChange(retired, ctx = {}) {
 
 async function confirmPaid(body, ctx = {}) {
   let est;
+  // Only scenes the user ticks below are resent; retry_unknown is never sent from the web.
+  delete body.retry_unknown;
+  body.confirm_resend = [];
   try { est = await api("POST", `/api/projects/${S.cur.id}/estimate`, body); } catch (e) { toast(e.message, "error"); return false; }
   if (est.retired?.length) { // never send a retired model to Flow: offer the model change instead
     openBlockedModelChange(est.retired, ctx);
     return false;
+  }
+  const adopt = est.adopt || [], unverified = est.unverified_clip || [];
+  if (!est.renders.length && !est.blocked.length && adopt.length) {
+    // Only hand-downloaded clips to take in: no credit spent, so no confirmation needed.
+    adopt.forEach((id, i) => toast(est.adopt_lines?.[i] || `Cảnh ${id}: dùng clip bạn đã tải về clips/${id}.mp4 (không tốn credit)`, "ok", 6000));
+    return true;
   }
   if (!est.renders.length && !est.blocked.length) {
     if (body.action === "make") return true; // nothing to render: go straight to stitching
@@ -1512,7 +1557,8 @@ async function confirmPaid(body, ctx = {}) {
   return new Promise((resolve) => {
     let done = false, retry = false;
     const count = () => est.renders.length + (retry ? est.blocked.length : 0);
-    const okBtnLabel = () => `Render ${count()} clip`;
+    const okBtnLabel = () => count() || !adopt.length ? `Render ${count()} clip` : "Dùng clip đã tải về";
+    const okEnabled = () => count() > 0 || adopt.length > 0; // adopt-only runs spend no credit
     const body2 = h("div", { class: "stack" },
       est.renders.length ? h("table", { class: "list" },
         h("tr", {}, h("th", {}, "Cảnh"), h("th", {}, "Kiểu"), h("th", {}, "Model"), h("th", {}, "Độ dài"), h("th", {}, "Nội dung")),
@@ -1521,13 +1567,17 @@ async function confirmPaid(body, ctx = {}) {
       est.new_keyframes.length ? h("p", { class: "help" }, `Sẽ tạo trước ${est.new_keyframes.length} ảnh keyframe chưa có (miễn phí): ${est.new_keyframes.join(", ")}. Muốn duyệt ảnh trước thì bấm Huỷ rồi dùng “Tạo keyframe”.`) : null,
       est.blocked.length ? h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" },
         h("div", {}, `Cảnh ${est.blocked.join(", ")} bị ngắt khi render lần trước, có thể Flow đã trừ credit. Hãy kiểm tra trên Flow trước.`),
-        h("label", { class: "check", style: { marginTop: "8px" } }, h("input", { type: "checkbox", onchange: (e) => { retry = e.target.checked; body.retry_unknown = retry; document.getElementById("paid-ok").textContent = okBtnLabel(); document.getElementById("paid-ok").disabled = !count(); } }),
+        est.blocked.filter((id) => unverified.includes(id)).map((id) =>
+          h("div", { class: "small", style: { marginTop: "4px" } }, `Cảnh ${id}: có clip trong thư mục — dùng [Dùng clip này] trên thẻ cảnh thay vì gửi lại`)),
+        h("label", { class: "check", style: { marginTop: "8px" } }, h("input", { type: "checkbox", onchange: (e) => { retry = e.target.checked; body.confirm_resend = retry ? [...est.blocked] : []; document.getElementById("paid-ok").textContent = okBtnLabel(); document.getElementById("paid-ok").disabled = !okEnabled(); } }),
           h("span", {}, "Tôi đã kiểm tra, gửi lại các cảnh này")))) : null,
+      adopt.length ? h("div", { class: "banner info flush" }, icon("check"), h("div", { class: "b-body" },
+        adopt.map((id) => h("div", {}, `Cảnh ${id} sẽ dùng clip bạn đã tải về (không tốn credit)`)))) : null,
       h("div", { class: "banner info flush" }, icon("coins"), h("div", { class: "b-body" }, "Mỗi clip sẽ trừ credit trên tài khoản Google Flow của bạn. Có thể bấm Dừng bất cứ lúc nào; cảnh đang render sẽ được làm nốt.")),
     );
     modal({
       title: "Xác nhận render video", body: body2, wide: true, onClose: () => { if (!done) resolve(false); },
-      buttons: [{ label: "Huỷ" }, { label: okBtnLabel(), id: "paid-ok", cls: "primary", disabled: !count(), onclick: (c) => { done = true; resolve(true); c(); } }],
+      buttons: [{ label: "Huỷ" }, { label: okBtnLabel(), id: "paid-ok", cls: "primary", disabled: !okEnabled(), onclick: (c) => { done = true; resolve(true); c(); } }],
     });
   });
 }

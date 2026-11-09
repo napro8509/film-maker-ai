@@ -276,7 +276,7 @@ Tạo ảnh nhân vật bằng CLI: `filmmaker characters storyboard.yaml [--nam
 
 | Lệnh | Tuỳ chọn |
 |---|---|
-| `run` / `make` | `--dry-run`, `--keyframes-only`, `--only s02`, `--force s02`, `--retry-unknown`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
+| `run` / `make` | `--dry-run`, `--keyframes-only`, `--only s02`, `--force s02`, `--retry-unknown`, `--adopt s02`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
 | `stitch` / `make` | `--music file.mp3`, `--music-volume 0.25`, `--burn-subtitles`, `--allow-missing`, `-o phim.mp4` |
 
 Biến môi trường: `GFLOW_BIN` (đường dẫn lệnh gflow khác), `ANTHROPIC_API_KEY` (cho `plan`).
@@ -288,6 +288,19 @@ Các biến của gflow như `GFLOW_CLI_OUTPUT_DIR`, `GFLOW_CLI_FLOW_HOST` vẫn
   Việc tự động hoá chịu điều khoản của Google; đọc [DISCLAIMER](https://github.com/ffroliva/gflow-cli/blob/main/DISCLAIMER.md)
   và [ACCOUNT_SAFETY](https://github.com/ffroliva/gflow-cli/blob/main/docs/ACCOUNT_SAFETY.md) của gflow-cli.
 - Chỉ render **video** tốn credit; tạo ảnh keyframe và ghép phim thì miễn phí. Luôn chạy `--dry-run` trước.
+- Cảnh bị ngắt khi render có thể đã bị Flow trừ credit. Nếu clip đã có trên Flow, tải về và lưu thành
+  `clips/<id>.mp4`: lần chạy sau tool dùng clip đó thay vì gửi lại, nhưng chỉ khi file được tải **sau** lần gửi bị ngắt
+  và `ffprobe` (đi kèm ffmpeg) đọc được trọn. Không có ffprobe thì tool không tự nhận clip nào.
+  Trên web, thẻ cảnh báo tình trạng clip: `ok` (sẽ được dùng), `stale` (file cũ hơn lần gửi, không dùng),
+  `invalid` (đọc không trọn, có thể tải dở), `unverified` (cảnh bị ngắt từ bản cũ, chưa rõ mới hay cũ),
+  `unchecked` (chưa cài ffprobe). Clip copy từ nơi khác còn giữ ngày cũ (`stale`) mà chắc là bản mới thì chạy
+  `touch clips/<id>.mp4`.
+- Cảnh bị ngắt từ bản cũ của tool (chưa ghi lúc gửi) không được tự nhận: dùng `--adopt <id>` (hoặc nút "Dùng clip này"
+  trên web). `--adopt <id> --force <id>` bị cấm vì sẽ gửi lại ngay sau khi nhận clip. Clip không dùng được thì cảnh đó
+  không bị gửi trong lần chạy này, kể cả khi có `--retry-unknown`.
+- `--force <id>` / `--retry-unknown` vẫn gửi lại được, kèm dòng cảnh báo credit. Trên web, kể cả nút "Gửi lại" trên
+  thẻ cảnh cũng mở hộp xác nhận và phải tick "Tôi đã kiểm tra, gửi lại các cảnh này"; ô tick chỉ áp dụng cho
+  đúng các cảnh được liệt kê trong hộp.
 - Flow thay đổi giao diện thường xuyên. Nếu gặp lỗi exit 23 (selector drift) hoặc 36, hãy `gflow update`.
 
 ## Phát triển

@@ -16,7 +16,7 @@ from filmmaker.pipeline import Pipeline  # noqa: E402
 from filmmaker.storyboard import Storyboard  # noqa: E402
 from filmmaker.web import server  # noqa: E402
 from tests.model_helpers import (  # noqa: E402
-    four_groups, set_scene, set_today, ui_out_dir, write_override, write_project,
+    four_groups, set_scene, set_today, stamp, ui_out_dir, write_override, write_project,
 )
 
 FAKE = Path(__file__).parent / "fake_gflow.py"
@@ -351,11 +351,11 @@ def test_model_note_only_for_todo_null_model(client):
 
 # --- /estimate ---------------------------------------------------------------
 
-def test_estimate_retired_and_manual_clip(client, monkeypatch):
+def test_estimate_retired_and_manual_clip(client, monkeypatch, fake_clip_check):
     p = write_project(client.ws, "film", "veo-fast", [{"id": "s01"}, {"id": "s02"}])
-    set_scene(p, "s01", "interrupted", manual_clip=True)
+    set_scene(p, "s01", "interrupted", manual_clip=True, submitted_at=stamp(-60))
     set_scene(p, "s02", "interrupted")
-    body = {"action": "video", "retry_unknown": True}
+    body = {"action": "video", "confirm_resend": ["s02"]}
     assert client.post("/api/projects/film/estimate", json=body).json()["retired"] == []  # before 05/12
     set_today(monkeypatch, 2026, 12, 6)
     est = client.post("/api/projects/film/estimate", json=body).json()
@@ -375,22 +375,22 @@ def test_estimate_retired_follows_only_and_force(client, monkeypatch):
     assert [r["id"] for r in est["retired"]] == ["s01"]
 
 
-def test_estimate_excludes_interrupted_with_manual_clip(client):
+def test_estimate_excludes_interrupted_with_manual_clip(client, fake_clip_check):
     p = write_project(client.ws, "film", "veo-lite", [{"id": "s01"}, {"id": "s02"}, {"id": "s03"}])
-    set_scene(p, "s01", "interrupted", manual_clip=True)
+    set_scene(p, "s01", "interrupted", manual_clip=True, submitted_at=stamp(-60))
     set_scene(p, "s02", "interrupted")
     est = client.post("/api/projects/film/estimate", json={"action": "video"}).json()
     assert est["blocked"] == ["s02"]
     assert [r["id"] for r in est["renders"]] == ["s03"]  # s01 will be adopted, not rendered
 
 
-def test_video_plan_has_no_side_effects(client):
+def test_video_plan_has_no_side_effects(client, fake_clip_check):
     p = write_project(client.ws, "film", "veo-fast", [{"id": "s01"}, {"id": "s02"}])
-    pipe = set_scene(p, "s01", "interrupted", manual_clip=True)
+    pipe = set_scene(p, "s01", "interrupted", manual_clip=True, submitted_at=stamp(-60))
     state = ui_out_dir(p) / "state.json"
     before = state.read_bytes()
     pipe.video_plan(None, set(), True)
-    client.post("/api/projects/film/estimate", json={"action": "video", "retry_unknown": True})
+    client.post("/api/projects/film/estimate", json={"action": "video", "confirm_resend": ["s01"]})
     client.get("/api/projects/film")
     assert state.read_bytes() == before
 
@@ -431,14 +431,14 @@ def test_run_other_actions_not_blocked(client, monkeypatch):
 
 
 @needs_ffmpeg
-def test_run_not_blocked_by_scenes_not_sent(client, monkeypatch):
+def test_run_not_blocked_by_scenes_not_sent(client, monkeypatch, fake_clip_check):
     p = write_project(client.ws, "film", "veo-fast",
                       [{"id": "s01"}, {"id": "s02"}, {"id": "s03", "model": "veo-lite"}, {"id": "s04"}])
     set_scene(p, "s01", "done")                        # done: not sent
-    set_scene(p, "s02", "interrupted", manual_clip=True)  # adopted: not sent
+    set_scene(p, "s02", "interrupted", manual_clip=True, submitted_at=stamp(-60))  # adopted: not sent
     set_today(monkeypatch, 2026, 12, 6)
     r = client.post("/api/projects/film/run",
-                    json={"action": "video", "only": ["s01", "s02", "s03"], "retry_unknown": True})  # s04 outside only
+                    json={"action": "video", "only": ["s01", "s02", "s03"]})  # s04 outside only
     assert r.status_code == 200, r.text
     j = wait(client, r.json())
     assert j["status"] == "done", j["lines"]

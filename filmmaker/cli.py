@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,8 @@ def _run_options(f):
     f = click.option("--only", multiple=True, help="Chỉ chạy cảnh này (lặp lại được).")(f)
     f = click.option("--force", multiple=True, help="Tạo lại cảnh này dù đã xong (lặp lại được).")(f)
     f = click.option("--retry-unknown", is_flag=True, help="Gửi lại cảnh bị ngắt giữa chừng lần trước (có thể tốn credit 2 lần).")(f)
+    f = click.option("--adopt", multiple=True,
+                     help="Dùng clip bạn đã tải về clips/<id>.mp4 cho cảnh bị ngắt từ bản cũ (lặp lại được).")(f)
     f = click.option("--retries", default=2, show_default=True, help="Số lần thử lại khi lỗi tạm thời.")(f)
     f = click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi, dạng MIN-MAX.")(f)
     f = click.option("--fail-fast", is_flag=True, help="Dừng ngay ở cảnh lỗi đầu tiên.")(f)
@@ -171,13 +174,15 @@ def _auto_backup(storyboard: Path, out_dir: Path, enabled: bool | None) -> AutoB
     return AutoBackup(lambda: r.backup(storyboard, out_dir), log=click.echo)
 
 
-def _check_run_models(pipe: Pipeline, only, force, retry_unknown: bool, *, warn_only: bool) -> None:
-    """Before sending anything: stop if a scene to send uses a retired model, warn about retiring ones."""
+def _check_run_models(pipe: Pipeline, only, force, retry_unknown: bool, *, warn_only: bool,
+                      skip: Collection[str] = ()) -> None:
+    """Before sending anything: stop if a scene to send uses a retired model, warn about retiring ones.
+    `skip`: scenes this run will not send whatever the plan says (a failed --adopt)."""
     meta = model_meta.load()
     warning = model_meta.cli_warning(meta)
     if warning:
         click.echo(warning)
-    send = send_list(pipe, set(only) or None, set(force), retry_unknown)
+    send = [s for s in send_list(pipe, set(only) or None, set(force), retry_unknown) if s.id not in skip]
     old = retirement.old_scenes(pipe, meta, send)
     retired = [r for r in old if r["status"] == "retired"]
     if retired and not warn_only:
@@ -190,20 +195,51 @@ def _check_run_models(pipe: Pipeline, only, force, retry_unknown: bool, *, warn_
                    + ", ".join(f"{r['id']} ({r['model']}, {_retire_text(r)})" for r in old))
 
 
+def _adopt_clips(pipe: Pipeline, adopt, dry_run: bool) -> dict[str, str]:
+    """`--adopt`: take clips/<id>.mp4 of legacy interrupted scenes. Returns {id: reason} of clips not usable."""
+    failed: dict[str, str] = {}
+    scenes = {s.id: s for s in pipe.sb.scenes}
+    for sid in dict.fromkeys(adopt):
+        if dry_run:
+            click.echo(f"--adopt {sid}: (dry-run) không ghi gì")
+            continue
+        reason, msg = pipe.adopt_legacy_clip(scenes[sid])
+        if reason == "not_adoptable":
+            click.echo(f"--adopt {sid}: bỏ qua ({msg})")
+        elif reason:
+            click.echo(f"--adopt {sid}: không dùng được clip ({msg})")
+            failed[sid] = f"--adopt: không dùng được clip ({msg})"
+    return failed
+
+
 def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast,
-            keyframes_only=False, auto_backup=None):
+            keyframes_only=False, auto_backup=None, adopt=()):
     sb = load_storyboard(storyboard)
     out_dir = _out_dir(storyboard, out)
     g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
     if not dry_run and not g.available():
         raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
-    unknown = set(only) - {s.id for s in sb.scenes}
+    unknown = (set(only) | set(adopt)) - {s.id for s in sb.scenes}
     if unknown:
         raise click.ClickException(f"không có cảnh: {', '.join(sorted(unknown))}")
+    both = sorted(set(adopt) & set(force))
+    if both:  # adopting then forcing would pay Flow again right after taking the clip
+        raise click.ClickException(
+            f"không dùng cùng lúc --adopt và --force cho {', '.join(both)}: "
+            "--adopt dùng clip đã tải về, --force gửi lại (có thể tốn credit); chọn một")
     if dry_run:
         click.echo("== DRY RUN: không gửi gì lên Flow ==")
     pipe = Pipeline(sb, out_dir, g, log=click.echo)
-    _check_run_models(pipe, only, force, retry_unknown, warn_only=dry_run or keyframes_only)
+    adopt_failed = _adopt_clips(pipe, adopt, dry_run)
+    _check_run_models(pipe, only, force, retry_unknown, warn_only=dry_run or keyframes_only, skip=adopt_failed)
+    retired = retirement.refuse_retired(sb) if not dry_run else (lambda _s: None)
+
+    def refuse(s):
+        # A scene whose --adopt clip was unusable is never sent in this run, even with --retry-unknown
+        # (its clip is "invalid"/"unchecked", which --retry-unknown would resend: maybe billed twice).
+        # --force <id> would be the way to resend, but --adopt and --force on one scene are refused above.
+        return adopt_failed.get(s.id) or retired(s)
+
     ab = None if dry_run else _auto_backup(storyboard, out_dir, auto_backup)
     try:
         report = pipe.run(RunOptions(
@@ -212,11 +248,12 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
             # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
             keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
             after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
-            refuse=retirement.refuse_retired(sb) if not dry_run else (lambda _s: None),
+            refuse=refuse,
         ))
     finally:
         if ab:
             ab.finish()
+    report.failed.update(adopt_failed)
     click.echo("")
     if dry_run:
         click.echo(f"DRY RUN: {len(report.done)} cảnh sẽ được tạo, {len(report.skipped)} cảnh đã có. Chưa gửi gì lên Flow.")
@@ -237,6 +274,8 @@ def run(storyboard: Path, **kw) -> None:
 
     Từ ngày model ngừng, cảnh sắp gửi dùng model đã ngừng bị chặn (không gửi gì, exit 1);
     --dry-run và --keyframes-only chỉ cảnh báo.
+
+    Cảnh bị ngắt từ bản cũ có clip tải tay trong clips/: --adopt <id> để dùng clip đó (không tốn credit).
     """
     _, _, report = _do_run(storyboard, **kw)
     sys.exit(0 if report.ok else 1)

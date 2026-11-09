@@ -406,12 +406,14 @@ def test_no_text_rule_is_sent_but_does_not_change_fingerprints(env, tmp_path):
     assert pipe.sb.for_flow("x") == "x"
 
 
-def test_interrupted_render_adopts_clip_downloaded_by_hand(env, tmp_path):
+def test_interrupted_render_adopts_clip_downloaded_by_hand(env, tmp_path, fake_clip_check):
+    from filmmaker import manual_clip
+
     sb_path, calls = env
     out = tmp_path / "out"
     pipe = make_pipe(sb_path, out)
     pipe.state.data["project_id"] = "proj-123"
-    pipe.state.update("s02", status="submitting")
+    pipe.state.update("s02", status="submitting", submitted_at=manual_clip.stamp_now())  # clip written after it
     clip = pipe.clip_path(pipe.sb.scenes[1])
     clip.parent.mkdir(parents=True, exist_ok=True)
     clip.write_bytes(b"\x00" * 20_000)  # the user saved the clip from Flow here

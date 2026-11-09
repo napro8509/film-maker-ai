@@ -268,7 +268,7 @@ def test_escape_block_loop_three_cases(client, monkeypatch, case):
         body = {"action": "video", "force": ["s01"]}
     elif case == "retry_interrupted":
         set_scene(p, "s01", "interrupted")
-        body = {"action": "video", "retry_unknown": True}
+        body = {"action": "video", "confirm_resend": ["s01"]}
     else:
         body = {"action": "video"}
     set_today(monkeypatch, 2026, 12, 6)

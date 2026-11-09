@@ -1,5 +1,6 @@
 """Pipeline.video_plan / scene groups / RunOptions.refuse and filmmaker.retirement (model-retirement T2)."""
 import json
+import os
 import shutil
 import sys
 from datetime import date
@@ -7,10 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from filmmaker import model_meta, retirement
+from filmmaker import manual_clip, model_meta, retirement
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import DONE, FAILED, SUBMITTING, Pipeline, RunOptions, send_list
 from filmmaker.storyboard import load_storyboard
+from tests.model_helpers import stamp
 
 FAKE = Path(__file__).parent / "fake_gflow.py"
 needs_ffmpeg = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
@@ -59,15 +61,20 @@ def set_today(monkeypatch, y, m, d):
     monkeypatch.setattr(model_meta, "today", lambda: date(y, m, d))
 
 
-def put_state(pipe, sid, status, *, good_fp=True, clip_bytes=None):
+def put_state(pipe, sid, status, *, good_fp=True, clip_bytes=None, submitted_at=None):
     s = next(x for x in pipe.sb.scenes if x.id == sid)
     clip = pipe.clip_path(s)
     if clip_bytes is not None:
         clip.parent.mkdir(parents=True, exist_ok=True)
         clip.write_bytes(b"\0" * clip_bytes)
+        t = manual_clip.parse_stamp(submitted_at)
+        if t is not None:  # saved after the submission
+            os.utime(clip, (t + 5, t + 5))
     if status is None:
         return s
     fields = {"status": status}
+    if submitted_at is not None:
+        fields["submitted_at"] = submitted_at
     if status == DONE:
         video = pipe.out / "done" / f"{sid}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +90,7 @@ def put_state(pipe, sid, status, *, good_fp=True, clip_bytes=None):
     (DONE, True, None, False, False, "done"),
     (DONE, True, None, True, False, "send"),
     (SUBMITTING, True, 20_000, False, False, "adopt"),
-    (SUBMITTING, True, 20_000, True, False, "send"),
+    (SUBMITTING, True, 20_000, True, False, "adopt"),  # a fresh clip is adopted even when forced
     (SUBMITTING, True, 20_000, False, True, "adopt"),
     (SUBMITTING, True, None, False, False, "blocked"),
     (SUBMITTING, True, None, False, True, "send"),
@@ -93,10 +100,11 @@ def put_state(pipe, sid, status, *, good_fp=True, clip_bytes=None):
     (None, True, None, False, False, "send"),       # todo
 ], ids=["done", "done+force", "adopt", "adopt+force", "adopt+retry", "blocked", "blocked+retry",
         "small-clip", "changed", "failed", "todo"])
-def test_video_plan_kinds(env, tmp_path, status, good_fp, clip, force, retry, kind):
+def test_video_plan_kinds(env, tmp_path, fake_clip_check, status, good_fp, clip, force, retry, kind):
     sb_path, _ = env
     pipe = make_pipe(sb_path, tmp_path / "out")
-    put_state(pipe, "s01", status, good_fp=good_fp, clip_bytes=clip)
+    sent = stamp(-60) if status == SUBMITTING and clip else None
+    put_state(pipe, "s01", status, good_fp=good_fp, clip_bytes=clip, submitted_at=sent)
     plan = pipe.video_plan({"s01"}, {"s01"} if force else set(), retry)
     assert [(s.id, k) for s, k in plan] == [("s01", kind)]
 
@@ -114,21 +122,21 @@ def test_video_plan_only_empty_or_none_means_all(env, tmp_path):
     assert [s.id for s in send_list(pipe, None, set(), True)] == ["s02", "s03"]
 
 
-def test_video_plan_has_no_side_effects(env, tmp_path):
+def test_video_plan_has_no_side_effects(env, tmp_path, fake_clip_check):
     sb_path, _ = env
     pipe = make_pipe(sb_path, tmp_path / "out")
-    put_state(pipe, "s01", SUBMITTING, clip_bytes=20_000)
+    put_state(pipe, "s01", SUBMITTING, clip_bytes=20_000, submitted_at=stamp(-60))
     before = (pipe.out / "state.json").read_bytes()
     assert [k for _, k in pipe.video_plan(None, set(), False)] == ["adopt", "send", "send"]
     assert (pipe.out / "state.json").read_bytes() == before
     assert pipe.state.scene("s01")["status"] == SUBMITTING
 
 
-def test_scene_group_and_manual_clip(env, tmp_path):
+def test_scene_group_and_manual_clip(env, tmp_path, fake_clip_check):
     sb_path, _ = env
     pipe = make_pipe(sb_path, tmp_path / "out")
     s1 = put_state(pipe, "s01", DONE, good_fp=False)          # changed -> todo
-    s2 = put_state(pipe, "s02", SUBMITTING, clip_bytes=10_000)
+    s2 = put_state(pipe, "s02", SUBMITTING, clip_bytes=10_000, submitted_at=stamp(-60))
     s3 = put_state(pipe, "s03", FAILED, clip_bytes=9_999)
     assert [pipe.scene_group(s) for s in (s1, s2, s3)] == ["todo", "interrupted", "todo"]
     assert pipe.has_manual_clip(s2) and not pipe.has_manual_clip(s3) and not pipe.has_manual_clip(s1)
@@ -136,10 +144,10 @@ def test_scene_group_and_manual_clip(env, tmp_path):
     assert pipe.scene_group(s1) == "done"
 
 
-def test_run_blocks_when_manual_clip_vanishes(env, tmp_path, monkeypatch):
+def test_run_blocks_when_manual_clip_vanishes(env, tmp_path, monkeypatch, fake_clip_check):
     sb_path, calls = env
     pipe = make_pipe(sb_path, tmp_path / "out")
-    put_state(pipe, "s01", SUBMITTING, clip_bytes=20_000)
+    put_state(pipe, "s01", SUBMITTING, clip_bytes=20_000, submitted_at=stamp(-60))
     monkeypatch.setattr(Pipeline, "_adopt_manual_clip", lambda self, s: False)
     rep = pipe.run(RunOptions(only={"s01"}))
     assert "s01" in rep.failed and "bị ngắt" in rep.failed["s01"]

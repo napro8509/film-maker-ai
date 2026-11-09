@@ -30,13 +30,13 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from .. import model_change, model_meta, retirement
+from .. import manual_clip, model_change, model_meta, retirement
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
 from ..settings import DEFAULT_BACKUP_REMOTE
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
-from ..storyboard import CAMERA_PRESETS, Storyboard, load_storyboard
+from ..storyboard import CAMERA_PRESETS, Scene, Storyboard, load_storyboard
 from ..thumbnail import ThumbnailError
 
 STATIC = Path(__file__).parent / "static"
@@ -126,7 +126,8 @@ class Jobs:
     def start(self, kind: str, title: str, project: str | None, fn: Callable[[Job], dict | None]) -> Job:
         with self.lock:
             if self.current and self.current.status == "running":
-                raise HTTPException(409, f"Đang có việc chạy: {self.current.title}. Chờ xong hoặc bấm Dừng.")
+                raise HTTPException(409, detail={"message": f"Đang có việc chạy: {self.current.title}. Chờ xong hoặc bấm Dừng.",
+                                                 "reason": "job_running"})
             job = Job(id=uuid.uuid4().hex[:10], kind=kind, project=project, title=title)
             self.jobs[job.id] = job
             self.current = job
@@ -205,7 +206,8 @@ class RunBody(BaseModel):
     only: list[str] = []
     force: list[str] = []
     force_keyframes: list[str] = []
-    retry_unknown: bool = False
+    retry_unknown: bool = False  # ignored on the web: only `confirm_resend` resends an interrupted scene
+    confirm_resend: list[str] = []  # interrupted ("submitting") scenes the user ticked to send again
     fail_fast: bool = False
     music: str | None = None
     volume: float = 0.25
@@ -409,6 +411,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             pipe = Pipeline(sb, out_dir(pid), gflow(True))
             project_id = sb.project_id or pipe.state.data.get("project_id")
             meta = model_meta.load()
+            # While a job runs for this project its clips/<id>.mp4 may be half written: probing it on every
+            # poll would cost an ffprobe each time (size changes, so no cache hit) and show "invalid" for a
+            # clip still downloading. Nothing can be adopted during a job anyway, so report no clip until it ends.
+            busy = bool(jobs.current and jobs.current.status == "running" and jobs.current.project == pid)
             model_info = {"model_warning": retirement.model_warning(pipe, meta),
                           "model_note": retirement.model_note(pipe),
                           "models_used": retirement.models_used(pipe, meta)}
@@ -431,6 +437,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "model_status": meta.status(retirement.effective_model(sb, s)),
                     "model_retires_label": meta.retires_label(retirement.effective_model(sb, s)),
                     "refs": [n for n, _ in sb.scene_refs(s)],
+                    # ffprobe only for "submitting" scenes with a file, never while a job runs here
+                    "manual_clip": None if busy else pipe.manual_clip_state(s),
                 }
         final = out_dir(pid) / "final.mp4"
         srt = final.with_suffix(".srt")
@@ -758,7 +766,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def delete(pid: str) -> dict[str, Any]:
         d = pdir(pid)
         if jobs.current and jobs.current.status == "running" and jobs.current.project == pid:
-            raise HTTPException(409, "Dự án đang chạy, hãy dừng trước.")
+            raise HTTPException(409, detail={"message": "Dự án đang chạy, hãy dừng trước.", "reason": "job_running"})
         trash = workspace / ".trash"
         trash.mkdir(exist_ok=True)
         dest = trash / f"{pid}-{datetime.now():%Y%m%d-%H%M%S}"
@@ -967,7 +975,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if not body.base:
                 raise HTTPException(400, "Thiếu base (lấy từ bản xem trước).")
             if body.base != base:
-                raise HTTPException(409, "Storyboard đã thay đổi từ lúc xem trước. Hãy xem trước lại.")
+                raise HTTPException(409, detail={"message": "Storyboard đã thay đổi từ lúc xem trước. Hãy xem trước lại.",
+                                                 "reason": "stale_base"})
             if plan.bad_duration and not body.rounding:
                 raise HTTPException(400, "Có cảnh có độ dài model mới không nhận: chọn làm tròn lên hoặc xuống.")
             changed = plan.has_changes()
@@ -979,10 +988,37 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     # ---- run / estimate ----
 
-    def retired_to_send(pipe: Pipeline, body: RunBody) -> list[dict[str, Any]]:
-        """Scenes this video run would send to Flow whose model is already retired (blocks the run)."""
-        send = [s for s, kind in pipe.video_plan(set(body.only), set(body.force), body.retry_unknown) if kind == "send"]
-        return retirement.retired_of(pipe, model_meta.load(), send)
+    def check_ids(sb: Storyboard, body: RunBody) -> None:
+        """400 for scene ids in only/force/confirm_resend that are not in the storyboard."""
+        unknown = (set(body.only) | set(body.force) | set(body.confirm_resend)) - {s.id for s in sb.scenes}
+        if unknown:
+            raise HTTPException(400, f"Không có cảnh: {', '.join(sorted(unknown))}")
+
+    @dataclass
+    class WebPlan:
+        send: list[Scene]
+        blocked: list[Scene]
+        adopt: list[Scene]
+        needs_confirm: list[str]  # forced interrupted scenes not ticked in confirm_resend (storyboard order)
+        retired: list[dict[str, Any]]  # sent or forced scenes whose model is retired (storyboard order)
+        unverified_clip: list[str]  # blocked legacy interrupted scenes with a readable clip
+
+    def web_video_plan(pipe: Pipeline, body: RunBody) -> WebPlan:
+        """What a web video run does with each scene: the one rule for /estimate and /run. On the web an
+        interrupted scene is only resent when its id is in `confirm_resend` (`retry_unknown` is ignored)."""
+        force = set(body.force)
+        plan = pipe.video_plan(set(body.only), force, False, confirm=set(body.confirm_resend))  # empty only = all
+        blocked = [s for s, kind in plan if kind == "blocked"]
+        needs = [s.id for s in blocked if s.id in force]
+        return WebPlan(
+            send=[s for s, kind in plan if kind == "send"],
+            blocked=blocked,
+            adopt=[s for s, kind in plan if kind == "adopt"],
+            needs_confirm=needs,
+            retired=retirement.retired_of(pipe, model_meta.load(),
+                                          [s for s, kind in plan if kind == "send" or s.id in needs]),
+            unverified_clip=[s.id for s in blocked if pipe.manual_clip_state(s) == "unverified"],
+        )
 
     @app.post("/api/projects/{pid}/estimate")
     def estimate(pid: str, body: RunBody) -> dict[str, Any]:
@@ -991,19 +1027,47 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except (ValidationError, ValueError) as exc:
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        check_ids(sb, body)
         pipe = Pipeline(sb, out_dir(pid), gflow(True))
-        plan = pipe.video_plan(set(body.only), set(body.force), body.retry_unknown)  # empty `only` = every scene
-        todo = [s for s, kind in plan if kind == "send"]
-        blocked = [s.id for s, kind in plan if kind == "blocked"]
+        wp = web_video_plan(pipe, body)
+        todo = wp.send
         kf_new = [s.id for s in todo if s.mode == "keyframe" and (not pipe.has_keyframe(s) or s.id in body.force_keyframes)]
         return {
             "renders": [{"id": s.id, "mode": s.mode, "model": s.model or sb.model or "mặc định",
                          "duration": s.duration, "prompt": s.prompt[:120]} for s in todo],
-            "blocked": blocked,
+            "blocked": [s.id for s in wp.blocked],
+            "adopt": [s.id for s in wp.adopt],
+            "adopt_lines": [manual_clip.adopt_line(s.id, pipe.clip_path(s)) for s in wp.adopt],
+            "unverified_clip": wp.unverified_clip,
             "new_keyframes": kf_new,
             "done": [s.id for s in sb.scenes if pipe.is_done(s)],
-            "retired": retirement.retired_of(pipe, model_meta.load(), todo),
+            "retired": wp.retired,
         }
+
+    @app.post("/api/projects/{pid}/scenes/{sid}/adopt-clip")
+    def adopt_clip(pid: str, sid: str) -> dict[str, Any]:
+        """“Dùng clip này”: take clips/<sid>.mp4 for a scene interrupted by an older version. No job, nothing
+        sent to Flow (dry gflow); the state is written all the same (`adopt_legacy_clip`)."""
+        pdir(pid)
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        s = next((x for x in sb.scenes if x.id == sid), None)
+        if s is None:
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        # Probe once outside jobs.lock (cached per path/size/mtime): ffprobe may take up to PROBE_TIMEOUT,
+        # and jobs.lock blocks every job start. Inside, adopt_legacy_clip checks again (a cache hit if unchanged).
+        manual_clip.check_file(Pipeline(sb, out_dir(pid), gflow(True), log=lambda *_: None).clip_path(s))
+        with jobs.lock:  # no job may start for this project while the state is written
+            if jobs.current and jobs.current.status == "running" and jobs.current.project == pid:
+                raise HTTPException(409, detail={"message": "Dự án đang chạy, đợi xong rồi dùng clip.",
+                                                 "reason": "job_running"})
+            reason, msg = Pipeline(sb, out_dir(pid), gflow(True), log=lambda *_: None).adopt_legacy_clip(s)
+        if reason:
+            raise HTTPException(409, detail={"message": f"[{sid}] {msg}", "reason": reason})
+        return detail(pid)  # outside jobs.lock: ffprobe/retirement for the whole project need no lock
 
     # ---- editor agent: edit plan (edit.json) ----
 
@@ -1066,18 +1130,23 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except (ValidationError, ValueError) as exc:
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-        unknown = (set(body.only) | set(body.force)) - {s.id for s in sb.scenes}
-        if unknown:
-            raise HTTPException(400, f"Không có cảnh: {', '.join(sorted(unknown))}")
+        check_ids(sb, body)
         if body.action not in {"dry", "keyframes", "video", "stitch", "edit", "make", "thumbnail"}:
             raise HTTPException(400, "action không hợp lệ")
         if body.engine not in {"auto", "ai", "rules"}:
             raise HTTPException(400, "action không hợp lệ")
         if body.action in ("video", "make"):
-            retired = retired_to_send(Pipeline(sb, out_dir(pid), gflow(True)), body)
+            wp = web_video_plan(Pipeline(sb, out_dir(pid), gflow(True)), body)
+            retired = wp.retired
             if retired:  # before jobs.start: no job, no backup, nothing sent to Flow
                 raise HTTPException(409, detail={"message": f"Không thể render: {len(retired)} cảnh dùng model đã ngừng",
-                                                 "retired": retired})
+                                                 "reason": "model_retired", "retired": retired})
+            if wp.needs_confirm:  # a forced interrupted scene the user did not tick: may cost credits twice
+                ids = ", ".join(wp.needs_confirm)
+                raise HTTPException(428, detail={
+                    "message": f"Cảnh {ids} bị ngắt khi render lần trước, có thể đã trừ credit. Kiểm tra trên Flow "
+                               "rồi tick ô xác nhận trong hộp Render để gửi lại.",
+                    "reason": "needs_confirm", "scenes": wp.needs_confirm})
         settings = load_settings()
         music = None
         if body.music:
@@ -1097,7 +1166,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 job.log("== XEM TRƯỚC: không gửi gì lên Flow ==")
             pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
             report = pipe.run(RunOptions(
-                only=set(body.only) or None, force=set(body.force), retry_unknown=body.retry_unknown,
+                only=set(body.only) or None, force=set(body.force), retry_unknown=False,
+                confirm=set(body.confirm_resend),  # web: an interrupted scene is only resent when ticked
                 max_retries=int(settings.get("retries", 2)),
                 pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
                 fail_fast=body.fail_fast, keyframes_only=keyframes_only,
@@ -1280,7 +1350,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "Bản backup này không phải dự án của giao diện; khôi phục bằng lệnh "
                                      f"`filmmaker restore {name}`.")
         if (workspace / name).exists():
-            raise HTTPException(409, f"Đã có dự án “{name}” trên máy. Xoá hoặc đổi tên dự án đó trước khi khôi phục.")
+            raise HTTPException(409, detail={
+                "message": f"Đã có dự án “{name}” trên máy. Xoá hoặc đổi tên dự án đó trước khi khôi phục.",
+                "reason": "project_exists"})
 
         def work(job: Job) -> dict[str, Any]:
             r = rclone(job.log)

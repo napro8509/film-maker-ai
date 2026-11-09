@@ -3,6 +3,7 @@
 Everything runs in-process (CliRunner) so the patched `model_meta.today` applies.
 """
 import json
+import os
 import re
 import shutil
 import sys
@@ -13,7 +14,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from filmmaker import model_meta, planner
+from filmmaker import manual_clip, model_meta, planner
 from filmmaker.cli import main
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import DONE, SUBMITTING, Pipeline
@@ -96,13 +97,18 @@ def pipe_for(sb_path: Path) -> Pipeline:
                     Gflow(dry_run=True, log=lambda *_: None), log=lambda *_: None)
 
 
-def put_state(pipe: Pipeline, sid: str, status: str, *, good_fp=True, clip_bytes=None):
+def put_state(pipe: Pipeline, sid: str, status: str, *, good_fp=True, clip_bytes=None, submitted_at=None):
     s = next(x for x in pipe.sb.scenes if x.id == sid)
     if clip_bytes is not None:
         clip = pipe.clip_path(s)
         clip.parent.mkdir(parents=True, exist_ok=True)
         clip.write_bytes(b"\0" * clip_bytes)
+        t = manual_clip.parse_stamp(submitted_at)
+        if t is not None:  # saved after the submission
+            os.utime(clip, (t + 5, t + 5))
     fields = {"status": status}
+    if submitted_at is not None:
+        fields["submitted_at"] = submitted_at
     if status == DONE:
         video = pipe.out / "done" / f"{sid}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
@@ -313,9 +319,9 @@ def test_cli_dry_run_and_keyframes_only_warn_only(env, monkeypatch):
 
 
 @needs_ffmpeg
-def test_cli_retry_unknown_adopts_manual_clip_after_retirement(env, monkeypatch):
+def test_cli_retry_unknown_adopts_manual_clip_after_retirement(env, monkeypatch, fake_clip_check):
     sb = env.storyboard(STORY + "    model: veo-lite\n")  # s02 is sent on an active model
-    put_state(pipe_for(sb), "s01", SUBMITTING, clip_bytes=20_000)
+    put_state(pipe_for(sb), "s01", SUBMITTING, clip_bytes=20_000, submitted_at=manual_clip.stamp_now())
     set_today(monkeypatch, 2026, 12, 6)
     res = cli("run", sb, "--retry-unknown", "--pause", "0-0")
     assert res.exit_code == 0, res.output

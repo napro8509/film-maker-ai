@@ -6,21 +6,31 @@ Scene kinds for `set_scene`:
   interrupted state SUBMITTING                                     -> group "interrupted"
   failed      state FAILED                                         -> group "todo"
   todo        no state                                             -> group "todo"
-`manual_clip=True` also writes clips/<id>.mp4 of MANUAL_CLIP_BYTES (a valid hand-downloaded clip).
+`manual_clip=True` also writes clips/<id>.mp4 of MANUAL_CLIP_BYTES (a valid hand-downloaded clip with the
+`fake_clip_check` fixture). `submitted_at` (interrupted only; none = legacy interrupted scene) also sets the
+clip's mtime 5 s after it.
 """
 from __future__ import annotations
 
-from datetime import date
+import os
+import subprocess
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
-from filmmaker import model_meta
+from filmmaker import manual_clip as _mc, model_meta
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import DONE, FAILED, SUBMITTING, Pipeline
 from filmmaker.storyboard import load_storyboard
 
 MANUAL_CLIP_BYTES = 20_000
+
+
+def stamp(offset_s: float = 0) -> str:
+    """A `submitted_at` value `offset_s` seconds from now (same format as manual_clip.stamp_now)."""
+    t = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=offset_s)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def set_today(monkeypatch, y: int, m: int, d: int) -> None:
@@ -58,13 +68,17 @@ def pipeline(sb_path: Path, out: Path | None = None) -> Pipeline:
                     log=lambda *_: None)
 
 
-def set_scene(sb_path: Path, sid: str, kind: str, *, manual_clip: bool = False, out: Path | None = None) -> Pipeline:
+def set_scene(sb_path: Path, sid: str, kind: str, *, manual_clip: bool = False, out: Path | None = None,
+              submitted_at: str | None = None, clip_bytes: bytes | None = None) -> Pipeline:
     pipe = pipeline(sb_path, out)
     s = next(x for x in pipe.sb.scenes if x.id == sid)
     if manual_clip:
         clip = pipe.clip_path(s)
         clip.parent.mkdir(parents=True, exist_ok=True)
-        clip.write_bytes(b"\0" * MANUAL_CLIP_BYTES)
+        clip.write_bytes(clip_bytes if clip_bytes is not None else b"\0" * MANUAL_CLIP_BYTES)
+        t = _mc.parse_stamp(submitted_at)
+        if t is not None:
+            os.utime(clip, (t + 5, t + 5))
     if kind in ("done", "changed"):
         video = pipe.out / "rendered" / f"{sid}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +86,8 @@ def set_scene(sb_path: Path, sid: str, kind: str, *, manual_clip: bool = False, 
         fp = pipe.sb.scene_fingerprint(s) if kind == "done" else "old-fingerprint"
         pipe.state.update(sid, status=DONE, video=str(video), fingerprint=fp)
     elif kind == "interrupted":
-        pipe.state.update(sid, status=SUBMITTING, fingerprint=pipe.sb.scene_fingerprint(s))
+        fields = {"submitted_at": submitted_at} if submitted_at is not None else {}
+        pipe.state.update(sid, status=SUBMITTING, fingerprint=pipe.sb.scene_fingerprint(s), **fields)
     elif kind == "failed":
         pipe.state.update(sid, status=FAILED, error="boom")
     elif kind != "todo":
@@ -93,3 +108,18 @@ def write_override(path: Path, text: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def make_mp4(path: Path, *, seconds: int = 4, faststart: bool = False) -> Path:
+    """A real mp4 (mpeg4, so no libx264 needed), big enough to pass MIN_BYTES."""
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=s=320x240:d={seconds}:r=24",
+           "-c:v", "mpeg4", "-q:v", "2"]
+    if faststart:
+        cmd += ["-movflags", "+faststart"]
+    subprocess.run(cmd + [str(path)], check=True)
+    return path
+
+
+def truncate_half(path: Path) -> None:
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])

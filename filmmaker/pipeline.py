@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Literal
 
+from . import manual_clip
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Character, Scene, Storyboard
 from .thumbnail import render_cover
@@ -23,7 +25,9 @@ from .thumbnail import render_cover
 DONE = "done"
 SUBMITTING = "submitting"
 FAILED = "failed"
-MANUAL_CLIP_MIN_BYTES = 10_000  # a hand-downloaded clips/<id>.mp4 smaller than this is not adopted
+MANUAL_CLIP_MIN_BYTES = manual_clip.MIN_BYTES  # a hand-downloaded clips/<id>.mp4 smaller than this is not adopted
+# State of clips/<id>.mp4 for a scene left in "submitting" (see Pipeline.manual_clip_state).
+ManualClip = Literal["ok", "unverified", "stale", "invalid", "unchecked"]
 
 
 def _now() -> str:
@@ -67,6 +71,8 @@ class RunOptions:
     # checked right before each paid video submission; a returned reason means "do not send this scene"
     # (e.g. its model was retired, even if the run started before midnight of the retirement day)
     refuse: Callable[[Scene], str | None] = lambda _s: None
+    # web: only resend "submitting" scenes whose id is here; None = CLI rules (force/retry_unknown)
+    confirm: set[str] | None = None
 
 
 @dataclass
@@ -129,10 +135,37 @@ class Pipeline:
             return "changed"
         return {SUBMITTING: "interrupted", FAILED: "failed"}.get(st.get("status"), "todo")
 
-    def has_manual_clip(self, s: Scene) -> bool:
-        """clips/<id>.mp4 exists and is big enough to be a real clip (no state is written)."""
+    def is_legacy_interrupted(self, s: Scene) -> bool:
+        """Left in "submitting" by an older version (no usable `submitted_at`): the app cannot tell whether
+        clips/<id>.mp4 is the new clip or an old one. The only definition of this case."""
+        st = self.state.scene(s.id)
+        return st.get("status") == SUBMITTING and manual_clip.parse_stamp(st.get("submitted_at")) is None
+
+    def manual_clip_state(self, s: Scene) -> ManualClip | None:
+        """None (not "submitting", or no clips/<id>.mp4) | unchecked (no ffprobe) | invalid (cannot be read
+        in full) | unverified (legacy interrupted scene) | stale (older than the submission) | ok (will be
+        adopted). In this order of priority. No state is written."""
+        if self.state.scene(s.id).get("status") != SUBMITTING:
+            return None
         clip = self.clip_path(s)
-        return clip.is_file() and clip.stat().st_size >= MANUAL_CLIP_MIN_BYTES
+        verdict = manual_clip.check_file(clip)
+        if verdict == "missing":
+            return None
+        if verdict in ("unchecked", "invalid"):
+            return verdict
+        if self.is_legacy_interrupted(s):
+            return "unverified"
+        sent = manual_clip.parse_stamp(self.state.scene(s.id).get("submitted_at"))
+        try:
+            mtime = clip.stat().st_mtime
+        except OSError:
+            return None
+        return "stale" if mtime < sent else "ok"
+
+    def has_manual_clip(self, s: Scene) -> bool:
+        """The scene is "submitting" and clips/<id>.mp4 is a complete clip saved after the submission,
+        i.e. it will be adopted (no state is written)."""
+        return self.manual_clip_state(s) == "ok"
 
     def scene_group(self, s: Scene) -> Literal["done", "interrupted", "todo"]:
         """done (has a valid clip) | interrupted (left in "submitting") | todo (todo/failed/changed)"""
@@ -142,25 +175,35 @@ class Pipeline:
             return "interrupted"
         return "todo"
 
+    def _plan_kind(self, s: Scene, force: Collection[str], retry_unknown: bool, confirm: Collection[str] | None,
+                   *, allow_adopt: bool = True) -> str:
+        """done | adopt | blocked | send for one scene (the rule of `video_plan`). No side effects."""
+        if self.state.scene(s.id).get("status") != SUBMITTING:
+            return "done" if (s.id not in force and self.is_done(s)) else "send"
+        mc = self.manual_clip_state(s)
+        if allow_adopt and mc == "ok":
+            return "adopt"  # even when forced: it is almost surely the clip already paid for
+        if confirm is not None:  # web: only what the user ticked, whatever force/retry_unknown say
+            return "send" if s.id in confirm else "blocked"
+        if s.id in force:
+            return "send"
+        # --retry-unknown never resends a legacy interrupted scene that has a clip (use --adopt/--force).
+        # Without ffprobe that clip is "unchecked", not "unverified", so it IS resent (as with no clip, AC8).
+        if retry_unknown and mc != "unverified":
+            return "send"
+        return "blocked"
+
     def video_plan(self, only: Collection[str] | None, force: Collection[str],
-                   retry_unknown: bool) -> list[tuple[Scene, str]]:
+                   retry_unknown: bool, confirm: Collection[str] | None = None) -> list[tuple[Scene, str]]:
         """What a video run would do with each scene: done | adopt | blocked | send. No side effects.
 
-        `only` None or empty means every scene. Same rules, in the same order, as `run`."""
+        `only` None or empty means every scene. `confirm` not None (web) means a "submitting" scene is sent
+        only when its id is in it. Same rules, in the same order, as `run`."""
         plan: list[tuple[Scene, str]] = []
         for s in self.sb.scenes:
             if only and s.id not in only:
                 continue
-            submitting = self.state.scene(s.id).get("status") == SUBMITTING
-            if s.id not in force and self.is_done(s):
-                kind = "done"
-            elif submitting and s.id not in force and self.has_manual_clip(s):
-                kind = "adopt"
-            elif submitting and not retry_unknown and s.id not in force:
-                kind = "blocked"
-            else:
-                kind = "send"
-            plan.append((s, kind))
+            plan.append((s, self._plan_kind(s, force, retry_unknown, confirm)))
         return plan
 
     def ensure_project(self) -> str:
@@ -195,10 +238,16 @@ class Pipeline:
         (self.out / "keyframes").mkdir(parents=True, exist_ok=True)
 
         scenes = [s for s in self.sb.scenes if not opts.only or s.id in opts.only]
+        # Once per run (dry-run too), only when there is a hand-downloaded clip that cannot be checked.
+        if not manual_clip.ffprobe_available() and any(
+                self.state.scene(s.id).get("status") == SUBMITTING and self.clip_path(s).is_file() for s in scenes):
+            self.log("⚠ không có ffprobe nên không kiểm được clip tải tay; cài ffmpeg (brew install ffmpeg) "
+                     "để app tự nhận clip")
         if opts.keyframes_only:
             return self._run_keyframes(scenes, opts, report)
         todo = []
-        for s, kind in self.video_plan(opts.only, opts.force, opts.retry_unknown):
+        resend: set[str] = set()  # "submitting" scenes that will be sent again (may be billed twice)
+        for s, kind in self.video_plan(opts.only, opts.force, opts.retry_unknown, opts.confirm):
             if kind == "done":
                 report.skipped.append(s.id)
                 continue
@@ -206,15 +255,16 @@ class Pipeline:
                 if self._adopt_manual_clip(s):
                     report.skipped.append(s.id)
                     continue
-                # the file vanished between the two checks: decide as if there were no clip
-                kind = "send" if opts.retry_unknown else "blocked"
+                # the file vanished or broke between the two checks: decide as if there were no clip
+                # (web: only a confirmed scene is sent)
+                kind = self._plan_kind(s, opts.force, opts.retry_unknown, opts.confirm, allow_adopt=False)
             if kind == "blocked":
-                msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. Nếu video đã có trên Flow, "
-                       f"tải về và lưu thành {self.clip_path(s)} rồi chạy lại; nếu chưa có, chạy lại với "
-                       "--retry-unknown hoặc --force " + s.id)
+                msg = self._blocked_message(s, opts)
                 self.log(f"[{s.id}] BỎ QUA: {msg}")
                 report.failed[s.id] = msg
                 continue
+            if self.state.scene(s.id).get("status") == SUBMITTING:
+                resend.add(s.id)
             todo.append(s)
 
         if report.skipped:
@@ -248,14 +298,26 @@ class Pipeline:
                 self.log(f"[{s.id}] KHÔNG GỬI: {reason}")
                 continue
             sent = True
+            if s.id in resend and not self.g.dry_run:
+                self.log(f"[{s.id}] có thể đã bị trừ credit ở lần trước, đang gửi lại")
             self.log(f"[{s.id}] {s.mode}: {s.prompt[:80]}")
+            started = manual_clip.stamp_now()
             try:
                 video = self._render_scene(s, project, opts)
             except GflowError as exc:
                 if not self.g.dry_run:
                     # A request Flow may have billed stays "submitting" so it is not resent blindly.
-                    self.state.update(s.id, status=SUBMITTING if exc.spent else FAILED, error=str(exc),
-                                      exit_code=exc.exit_code)
+                    if exc.spent:
+                        fields: dict[str, Any] = dict(status=SUBMITTING, error=str(exc), exit_code=exc.exit_code)
+                        # Billed before the video call (e.g. keyframe): `submitted_at` must still belong to
+                        # this attempt, never to an older one, so an old clips/<id>.mp4 is not adopted later.
+                        prev = manual_clip.parse_stamp(self.state.scene(s.id).get("submitted_at"))
+                        if prev is None or prev < manual_clip.parse_stamp(started):
+                            fields["submitted_at"] = started
+                        self.state.update(s.id, **fields)
+                    else:
+                        self.state.update(s.id, status=FAILED, error=str(exc), exit_code=exc.exit_code,
+                                          submitted_at=None)
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
                 if exc.fatal:
@@ -404,12 +466,14 @@ class Pipeline:
         prompt = self.sb.text_only_prompt(s)
         self.log(f"  (Chữ → Video) {prompt[:120]}")
         if not self.g.dry_run:
-            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
+            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
+                              submitted_at=manual_clip.stamp_now())
         video, media_id, how = self._text_video(s, prompt, common, opts)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
-            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how)
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how,
+                              submitted_at=None)
         return Path(video)
 
     def _render_scene(self, s: Scene, project: str, opts: RunOptions) -> Path:
@@ -430,7 +494,8 @@ class Pipeline:
                 raise GflowError(f"không tìm thấy ảnh {start_image}", exit_code=2)
 
         if not dry:
-            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
+            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
+                              submitted_at=manual_clip.stamp_now())
 
         prompt = self.sb.video_prompt(s)
         if start_image is None:
@@ -438,7 +503,8 @@ class Pipeline:
             if not dry:
                 if not Path(video).is_file():
                     raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
-                self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how)
+                self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=how,
+                              submitted_at=None)
             return Path(video)
         if ui:
             return self._render_via_ui(s, start_image, prompt, common)
@@ -450,7 +516,7 @@ class Pipeline:
                 raise
             # Refused before submit, so no credits were spent: forget the "submitting" mark.
             if not dry:
-                self.state.update(s.id, status=None, fingerprint=None)
+                self.state.update(s.id, status=None, fingerprint=None, submitted_at=None)
             self.log(f"  ! gflow từ chối Ảnh → Video trước khi gửi (chưa trừ credit): {exc}")
             self.state.data["i2v_unsupported"] = True
             self.state.data["i2v_error"] = str(exc)
@@ -475,26 +541,83 @@ class Pipeline:
         if not dry:
             if not Path(video).is_file():
                 raise GflowError(f"gflow báo thành công nhưng không thấy file {video}", exit_code=1)
-            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=None)
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as=None,
+                              submitted_at=None)
         return Path(video)
 
-    def _adopt_manual_clip(self, s: Scene) -> bool:
+    def _adopt_manual_clip(self, s: Scene, *, unverified_ok: bool = False, dry: bool | None = None) -> bool:
         """A render was interrupted after Flow billed it, and the user downloaded the clip from Flow
-        by hand into clips/<id>.mp4: take that file instead of rendering (and paying) again."""
-        clip = self.clip_path(s)
-        if not self.has_manual_clip(s):
+        by hand into clips/<id>.mp4: take that file instead of rendering (and paying) again.
+
+        Only a complete clip saved after the submission ("ok"), or with `unverified_ok` the clip of a legacy
+        interrupted scene. `dry` None follows the gflow dry-run. The only place a clip is adopted."""
+        dry = self.g.dry_run if dry is None else dry
+        mc = self.manual_clip_state(s)
+        if not (mc == "ok" or (unverified_ok and mc == "unverified")):
             return False
-        self.log(f"[{s.id}] dùng video bạn đã tải về: {clip}")
+        clip = self.clip_path(s)
+        if dry:
+            self.log(f"[{s.id}] (dry-run) sẽ dùng clip bạn đã tải về ({clip})")
+            return True
+        self.log(manual_clip.adopt_line(s.id, clip))
         self.state.update(s.id, status=DONE, video=str(clip), fingerprint=self.sb.scene_fingerprint(s),
-                          error=None, rendered_as="manual")
+                          error=None, rendered_as="manual", submitted_at=None)
         return True
+
+    def adopt_legacy_clip(self, s: Scene) -> tuple[str | None, str]:
+        """Take clips/<id>.mp4 for a legacy interrupted scene (CLI --adopt, web "Dùng clip này"), after
+        checking the file. Always writes the state, whatever `g.dry_run` is (the web route uses a dry gflow so
+        nothing can reach Flow). Returns (None, message) when adopted, else ("not_adoptable" | "clip_invalid",
+        reason)."""
+        if not self.is_legacy_interrupted(s):
+            if self.state.scene(s.id).get("status") != SUBMITTING:
+                return "not_adoptable", "cảnh không ở trạng thái bị ngắt"
+            return "not_adoptable", "cảnh đã có mốc gửi, app tự nhận clip mới khi chạy"
+        clip = self.clip_path(s)
+        mc = self.manual_clip_state(s)
+        if mc == "unverified":
+            if self._adopt_manual_clip(s, unverified_ok=True, dry=False):
+                return None, manual_clip.adopt_line(s.id, clip)
+            mc = self.manual_clip_state(s)  # the file changed or vanished between the two checks
+            if mc == "unverified":
+                return "clip_invalid", "clip vừa thay đổi, thử lại"
+        if mc is None:
+            return "clip_invalid", f"không thấy {clip}"
+        if mc == "unchecked":
+            return "clip_invalid", "Chưa cài ffprobe nên không kiểm được clip (brew install ffmpeg)"
+        return "clip_invalid", "không đọc được trọn clip, có thể tải dở — tải lại từ Flow"
+
+    def _blocked_message(self, s: Scene, opts: RunOptions) -> str:
+        """Why an interrupted scene is not sent, what to do with the clip, and how to resend it."""
+        clip = self.clip_path(s)
+        web = opts.confirm is not None
+        mc = self.manual_clip_state(s)
+        how = ("bấm “Gửi lại” trên thẻ cảnh và tick ô xác nhận trong hộp Render" if web
+               else f"chạy lại với --force {s.id}" if mc == "unverified"  # --retry-unknown skips it (AC10)
+               else f"chạy lại với --retry-unknown hoặc --force {s.id}")
+        msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. Nếu video đã có trên Flow, "
+               f"tải về và lưu thành {clip} rồi chạy lại; nếu chưa có, {how}")
+        if mc == "stale":
+            msg += (f". Có {clip} nhưng clip cũ hơn lần gửi; nếu chắc đây là bản vừa tải từ Flow, "
+                    f"chạy `touch {clip}` rồi chạy lại")
+        elif mc == "invalid":
+            msg += f". Có {clip} nhưng không đọc được trọn clip, có thể tải dở — tải lại từ Flow"
+        elif mc == "unchecked":
+            msg += f". Có {clip} nhưng chưa cài ffprobe nên không kiểm được clip"
+        elif mc == "unverified":
+            msg += (". Có clip trong thư mục nhưng chưa rõ mới hay cũ: "
+                    + ("bấm “Dùng clip này” trên thẻ cảnh" if web else
+                       f"chạy lại với --adopt {s.id} để dùng clip này, hoặc --force {s.id} để gửi lại "
+                       "(có thể tốn credit)"))
+        return msg
 
     def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict) -> Path:
         """Image-to-video by driving the Flow chat page (flow_ui.py). Never retried: Flow may have billed it."""
         if s.end_image:
             self.log("  ! Ảnh kết thúc chưa dùng được qua giao diện chat; chỉ dùng ảnh bắt đầu.")
         if not self.g.dry_run:
-            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None)
+            self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
+                              submitted_at=manual_clip.stamp_now())
         video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow(prompt), **common)
         if not self.g.dry_run:
             if not Path(video).is_file():
@@ -502,10 +625,32 @@ class Pipeline:
             other = next((sid for sid, st in self.state.data["scenes"].items()
                           if sid != s.id and media_id and st.get("media_id") == media_id), None)
             if other:  # never accept a clip that already belongs to another scene
+                # Move it out of clips/<id>.mp4, or the next run would adopt it as this scene's clip.
+                tag = re.sub(r"[^A-Za-z0-9_-]", "", media_id)[:12] or "x"
+                dup = self.clip_path(s).with_name(f"{s.id}.dup-{tag}.mp4")
+                # Only ever touch a file in our clips/ that is not another scene's clip (the driver's
+                # local_path is not checked to be clips/<id>.mp4).
+                vpath = Path(video).resolve()
+                theirs = {self.clip_path(x).resolve() for x in self.sb.scenes if x.id != s.id} | {
+                    Path(st["video"]).resolve() for sid, st in self.state.data["scenes"].items()
+                    if sid != s.id and st.get("video")}
+                if (self.out / "clips").resolve() not in vpath.parents or vpath in theirs:
+                    moved = f"; KHÔNG dời file {video} vì không phải clip của cảnh này, hãy kiểm tra tay"
+                else:
+                    try:
+                        Path(video).replace(dup)
+                        moved = f"; đã chuyển file sang {dup}"
+                    except OSError:
+                        try:
+                            Path(video).unlink(missing_ok=True)
+                            moved = "; đã xoá file tải về"
+                        except OSError:
+                            moved = f"; KHÔNG dời được file {video}, hãy xoá tay trước khi chạy lại"
                 raise GflowError(f"video tải về trùng với cảnh {other} (media {media_id}); video mới có thể vẫn "
-                                 "đang tạo trên Flow — hãy kiểm tra trên Flow", exit_code=42,
+                                 "đang tạo trên Flow — hãy kiểm tra trên Flow" + moved, exit_code=42,
                                  payload={"error": {"spent": True}})
-            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="flow-ui")
+            self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="flow-ui",
+                              submitted_at=None)
         return Path(video)
 
     # --- thumbnail -------------------------------------------------------------
@@ -561,6 +706,6 @@ class Pipeline:
 
 
 def send_list(pipe: Pipeline, only: Collection[str] | None, force: Collection[str],
-              retry_unknown: bool) -> list[Scene]:
+              retry_unknown: bool, confirm: Collection[str] | None = None) -> list[Scene]:
     """Scenes a video run would actually submit to Flow (kind "send" of `Pipeline.video_plan`)."""
-    return [s for s, kind in pipe.video_plan(only, force, retry_unknown) if kind == "send"]
+    return [s for s, kind in pipe.video_plan(only, force, retry_unknown, confirm) if kind == "send"]
