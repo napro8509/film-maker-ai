@@ -14,7 +14,7 @@ from .assemble import AssembleError, assemble
 from .gflow import Gflow, GflowError
 from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State
-from .storyboard import Storyboard, load_storyboard, save_storyboard
+from .storyboard import load_storyboard, save_storyboard
 
 
 def _out_dir(storyboard: Path, out: Path | None) -> Path:
@@ -292,8 +292,9 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 STATUS_CODES = ("done", "changed", "interrupted", "failed", "todo")
 
 
-def _status_payload(sb: Storyboard, storyboard: Path, out_dir: Path, pipe: Pipeline) -> dict[str, Any]:
+def _status_payload(storyboard: Path, out_dir: Path, pipe: Pipeline) -> dict[str, Any]:
     """Machine-readable progress for `status --json`. Read-only: never saves state."""
+    sb = pipe.sb
     scenes: list[dict[str, Any]] = []
     summary: dict[str, int] = {c: 0 for c in STATUS_CODES}
     for s in sb.scenes:
@@ -331,7 +332,7 @@ def status(storyboard: Path, out, as_json: bool) -> None:
     out_dir = _out_dir(storyboard, out)
     pipe = Pipeline(sb, out_dir, Gflow(dry_run=True, log=lambda *_: None))
     if as_json:
-        click.echo(json.dumps(_status_payload(sb, storyboard, out_dir, pipe), ensure_ascii=False))
+        click.echo(json.dumps(_status_payload(storyboard, out_dir, pipe), ensure_ascii=False))
         return
     click.echo(f"{sb.title}  ({out_dir})  project={pipe.state.data.get('project_id') or '-'}")
     for s in sb.scenes:

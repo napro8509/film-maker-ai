@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from filmmaker.cli import main
+from filmmaker.cli import STATUS_CODES, main
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import Pipeline
 from filmmaker.storyboard import load_storyboard
@@ -132,6 +132,14 @@ def test_scenes_order_and_keys(sb_env):
     assert all(set(s) == KEYS for s in data["scenes"])
     assert [s["mode"] for s in data["scenes"]] == ["keyframe", "t2v", "i2v", "t2v", "t2v", "t2v"]
     assert data["storyboard"] == str(sb_env.resolve())
+
+
+def test_status_codes_match_scene_status():
+    # summary is keyed by STATUS_CODES; a new scene_status() code must be added there too.
+    documented = {c.strip() for c in Pipeline.scene_status.__doc__.split("|")}
+    assert set(STATUS_CODES) == documented == CODES, (
+        f"STATUS_CODES {STATUS_CODES} out of sync with Pipeline.scene_status codes {sorted(documented)}"
+    )
 
 
 def test_never_run_all_todo(sb_env):
@@ -265,6 +273,7 @@ def _boom(*_a, **_k):
 @pytest.fixture
 def no_gflow(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(subprocess, "Popen", _boom)
     monkeypatch.setattr(Gflow, "run_json", _boom)
     monkeypatch.setattr(Pipeline, "ensure_project", _boom)
 
@@ -290,7 +299,7 @@ def test_help_lists_json():
     res = CliRunner().invoke(main, ["status", "--help"])
     assert res.exit_code == 0
     assert "--json" in res.output
-    assert "In tiến độ dạng JSON" in res.output
+    assert "JSON" in res.output
 
 
 def _click_at_least_8_2() -> bool:

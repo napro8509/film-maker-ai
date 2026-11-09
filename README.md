@@ -99,7 +99,16 @@ filmmaker make cafe.yaml --music nhac.mp3 --burn-subtitles
 filmmaker status cafe.yaml
 filmmaker run cafe.yaml --force s03
 filmmaker stitch cafe.yaml --music nhac.mp3
+
+# Tiến độ dạng JSON cho script/agent (chỉ đọc, không tốn credit)
+filmmaker status cafe.yaml --json | jq '.summary'
 ```
+
+`status --json` in đúng một object JSON ra stdout: `title`, `storyboard`, `out_dir`, `project_id` (`null` nếu chưa có),
+`summary` (đếm `total`, `done`, `changed`, `interrupted`, `failed`, `todo`) và `scenes` theo thứ tự storyboard.
+Mỗi cảnh có `id`, `mode`, `status` (một trong 5 mã trên), `prompt` và `error` đầy đủ (không cắt), `video`/`keyframe`
+là đường dẫn tuyệt đối nếu file đang có trên đĩa, ngược lại `null`. Dùng chung được với `--out`. Storyboard lỗi thì
+thoát với mã ≠ 0 và stdout rỗng. Đầu ra chữ khi không có `--json` giữ nguyên.
 
 Kết quả nằm ở `output/<tên storyboard>/`:
 
