@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import sys
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ from .backup import AutoBackup, BackupError, Rclone, last_backup
 from .gflow import Gflow, GflowError
 from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State, send_list
-from .storyboard import load_storyboard, save_storyboard
+from .storyboard import LANG_MAX, clean_dialogue_language, clean_language, load_storyboard, save_storyboard
 
 
 def _out_dir(storyboard: Path, out: Path | None) -> Path:
@@ -121,22 +121,44 @@ def _check_models(storyboard: Path, out: Path | None) -> bool:
 @click.option("-o", "--output", type=click.Path(path_type=Path), default=Path("storyboard.yaml"), show_default=True)
 @click.option("-n", "--scenes", default=6, show_default=True, help="Số cảnh.")
 @click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="16:9", show_default=True)
-@click.option("--lang", "language", default=None, help="Ngôn ngữ phụ đề, ví dụ: Vietnamese.")
+@click.option("--lang", "language", default=None,
+              help="Ngôn ngữ phụ đề (narration), ví dụ: Vietnamese. Có --dialogue-lang thì được lưu vào "
+                   "`subtitle_language` (chỉ để tham khảo).")
+@click.option("--dialogue-lang", "dialogue_lang", default=None,
+              help="Ngôn ngữ nhân vật nói, tên tiếng Anh (vd Vietnamese, English, Thai); 'none' = không thoại. "
+                   "Được ép vào mọi prompt video. --lang vẫn là ngôn ngữ phụ đề (narration).")
 @click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
               help="claude_code = dùng gói Claude (Pro/Max) qua lệnh `claude`; api = dùng ANTHROPIC_API_KEY.")
-def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, backend: str) -> None:
+def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
+         backend: str) -> None:
     """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key)."""
     from .planner import plan_auto
 
+    if dialogue_lang is not None:  # checked before overwriting or calling Claude
+        dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
+        if language is not None:
+            language = _cli_lang(language, "--lang", clean_language)
     if output.exists() and not click.confirm(f"{output} đã tồn tại. Ghi đè?"):
         return
     click.echo("Đang viết storyboard...")
     try:
-        sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language)
+        sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
+                          dialogue_language=dialogue_lang)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     save_storyboard(sb, output)
     click.echo(f"✔ {output}: {len(sb.scenes)} cảnh. Xem/sửa lại rồi chạy: filmmaker run {output} --dry-run")
+
+
+def _cli_lang(value: str, opt: str, clean: Callable[[object], str | None]) -> str:
+    """--dialogue-lang / --lang value -> cleaned by `clean`; empty, too long or multi-line -> exit 2."""
+    try:
+        out = clean(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint=f"'{opt}'") from exc
+    if out is None:
+        raise click.BadParameter(f"hãy nhập tên ngôn ngữ (tối đa {LANG_MAX} ký tự).", param_hint=f"'{opt}'")
+    return out
 
 
 def _run_options(f):

@@ -17,6 +17,7 @@ const MODES = [
 const STATUS = {
   done: ["done", "Xong"], changed: ["changed", "Đã sửa · cần render lại"], interrupted: ["interrupted", "Bị ngắt khi render"],
   failed: ["failed", "Lỗi"], todo: ["todo", "Chưa làm"], running: ["running", "Đang làm"],
+  queued: ["queued", "Đang chờ…"],
 };
 
 /* ---------- icons (inline SVG, 24px grid, stroke = currentColor) ---------- */
@@ -128,6 +129,42 @@ function put(el, ...kids) { el.replaceChildren(...kids.flat(Infinity).filter((k)
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function localGet(k, d = null) { try { const v = localStorage.getItem("fm." + k); return v == null ? d : JSON.parse(v); } catch { return d; } }
 function localSet(k, v) { try { localStorage.setItem("fm." + k, JSON.stringify(v)); } catch { /* private mode */ } }
+
+/* Spoken / subtitle language: stored as the English name ("Vietnamese"), "none" = no dialogue. */
+const LANG_OTHER = "__other__";
+const DIALOGUE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"],
+                        ["none", "Không thoại (chỉ nhạc/âm thanh)"]];
+const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"]];
+/* A valid language name with whitespace collapsed, or null (not a string, empty, has a line break, > 40 chars). */
+function cleanLang(v) {
+  if (typeof v !== "string" || /[\r\n]/.test(v)) return null;
+  const s = v.replace(/\s+/g, " ").trim();
+  if (/\p{C}/u.test(s)) return null; // control/format chars (zero-width, bidi…): same rule as the backend
+  return s && s.length <= 40 ? s : null;
+}
+/* <select> of presets + "Khác…" (free text input shown only then); unset adds "Chưa đặt (Veo tự đoán)" = null. */
+function langPicker(presets, value, { unset, noNone } = {}) {
+  const fold = (s) => String(s).toLowerCase();
+  const hit = typeof value === "string" && value.trim() ? presets.find(([v]) => fold(v) === fold(value.trim())) : null;
+  const empty = value == null || (typeof value === "string" && !value.trim());
+  const pick = hit ? hit[0] : empty ? (unset ? "" : presets[0][0]) : LANG_OTHER;
+  const input = h("input", { type: "text", maxlength: 80, placeholder: "Ví dụ: Japanese", "aria-label": "Tên ngôn ngữ khác",
+    value: pick === LANG_OTHER ? String(value) : "", hidden: pick !== LANG_OTHER });
+  const select = h("select", { value: pick,
+    onchange: () => { input.hidden = select.value !== LANG_OTHER; if (!input.hidden && !input.value.trim()) input.focus(); } },
+    unset ? h("option", { value: "" }, "Chưa đặt (Veo tự đoán)") : null,
+    presets.map(([v, l]) => h("option", { value: v }, l)),
+    h("option", { value: LANG_OTHER }, "Khác…"));
+  const read = () => {
+    if (select.value === "") return { ok: true, value: null };
+    if (select.value !== LANG_OTHER) return { ok: true, value: select.value };
+    const v = cleanLang(input.value);
+    if (!v) return { ok: false, msg: "hãy nhập tên ngôn ngữ (tối đa 40 ký tự, không có ký tự đặc biệt ẩn)" };
+    if (noNone && v.toLowerCase() === "none") return { ok: false, msg: "phụ đề cần một ngôn ngữ cụ thể, không dùng “none”" };
+    return { ok: true, value: v };
+  };
+  return { el: h("div", { class: "stack tight" }, select, input), select, input, read };
+}
 function fmtBytes(n) { return n > 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.round(n / 1e3) + " KB"; }
 function fmtDur(sec) { sec = Math.round(sec); const m = Math.floor(sec / 60), s = sec % 60; return m ? `${m}p ${String(s).padStart(2, "0")}s` : `${s}s`; }
 function ago(ts) {
@@ -295,7 +332,11 @@ async function init() {
   const pick = S.projects.some((p) => p.id === want) ? want : S.projects[0]?.id;
   if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
   const j = await api("GET", "/api/jobs/current").catch(() => null);
-  if (j) { S.job = { ...j, lines: [] }; S.jobSince = 0; S.jobOpen = j.status === "running"; renderJobbar(); pollJob(); }
+  if (j) {
+    S.job = { ...j, lines: [] }; S.jobSince = 0; S.jobOpen = j.status === "running"; renderJobbar();
+    refreshZones(); progUpdate({}, S.job.progress); // F5 mid-job: overlays now, not at the next phase change
+    pollJob();
+  }
   setInterval(tickElapsed, 1000);
 }
 
@@ -321,6 +362,7 @@ async function openProject(id) {
   try {
     const [d, a] = await Promise.all([api("GET", `/api/projects/${id}`), api("GET", `/api/projects/${id}/assets`)]);
     S.cur = d; S.assets = a; S.playIdx = 0;
+    S.dlChanged = null; // the "N clips keep the old language" warning belongs to this visit only
   } catch (e) { toast(e.message, "error"); return false; }
   rememberCharNames();
   localSet("lastProject", id);
@@ -782,6 +824,13 @@ function renderScenes() {
 
 function currentSceneInJob() {
   if (!jobRunning() || S.job.project !== S.cur?.id) return null;
+  if (progOn()) {
+    for (const k of Object.keys(S.job.progress)) {
+      const m = /^(?:vid|kf):(.+)$/.exec(k);
+      if (m && progRunning(k)) return m[1];
+    }
+    return null;
+  }
   for (let i = S.job.lines.length - 1; i >= 0; i--) {
     const m = /^\[([A-Za-z0-9_-]+)\]/.exec(S.job.lines[i]);
     if (m) return /\] (OK|LỖI|BỎ QUA|\(dry-run\))/.test(S.job.lines[i]) ? null : m[1];
@@ -790,6 +839,11 @@ function currentSceneInJob() {
 }
 
 function sceneStatusKey(sc) {
+  if (progOn()) {
+    if (progRunning("vid:" + sc.id) || progRunning("kf:" + sc.id)) return "running";
+    if (progQueued("vid:" + sc.id) || progQueued("kf:" + sc.id)) return "queued";
+    return S.cur.scene_state?.[sc.id]?.status || "todo";
+  }
   if (currentSceneInJob() === sc.id) return "running";
   return S.cur.scene_state?.[sc.id]?.status || "todo";
 }
@@ -990,7 +1044,7 @@ function lazyVideo(src, poster) {
 
 /* opts.kfHint: placeholder for a keyframe scene with no picture yet (the board points at its own button).
    opts.lazy: show clips as a poster + play button (board). */
-function renderSceneMedia(sc, { kfHint = null, lazy = false } = {}) {
+function renderSceneMedia(sc, { kfHint = null, lazy = false, prog = [`kf:${sc.id}`, `vid:${sc.id}`] } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const portrait = S.cur.storyboard.aspect === "9:16";
   const box = h("div", { class: "media" + (portrait ? " portrait" : "") });
@@ -1015,6 +1069,7 @@ function renderSceneMedia(sc, { kfHint = null, lazy = false } = {}) {
     box.append(h("div", { class: "ph" }, icon(sc.mode === "t2v" ? "video" : "image"),
       h("span", {}, sc.mode === "keyframe" ? (kfHint || "Bấm “Tạo ảnh” để xem trước khung hình (miễn phí)") : sc.mode === "i2v" ? "Chọn hoặc tải ảnh bắt đầu" : "Video sẽ hiện ở đây sau khi render")));
   }
+  progAttach(box, prog);
   return h("div", { class: "stack tight" }, box);
 }
 
@@ -1115,6 +1170,7 @@ function renderStory() {
         field("Phong cách hình ảnh",
           h("textarea", { rows: 2, value: sb.style || "", placeholder: "cinematic, warm morning light, shallow depth of field, 35mm film grain",
             oninput: (e) => set("style", e.target.value) }), "thêm vào mọi prompt"),
+        renderDialogueLang(sb, set),
         h("div", { class: "stack tight" },
           h("label", { class: "check" },
             h("input", { type: "checkbox", checked: sb.no_text !== false,
@@ -1129,6 +1185,53 @@ function renderStory() {
             h("input", { type: "text", value: sb.project_id || "", placeholder: S.cur.project_id ? `Đang dùng: ${S.cur.project_id}` : "Để trống: tự tạo project mới",
               oninput: (e) => set("project_id", e.target.value || undefined) }))))),
     renderCharacters(sb));
+}
+
+/* Key order as backend _dump_dict: language keys right after `aspect` (write_raw dumps in object order).
+   Reorders `sb` in place, since other code holds references to it. */
+function placeLangKeys(sb) {
+  if (!("aspect" in sb)) return;
+  const entries = Object.entries(sb), langs = ["dialogue_language", "subtitle_language"].filter((k) => k in sb);
+  for (const [k] of entries) delete sb[k];
+  for (const [k, v] of entries) {
+    if (langs.includes(k)) continue;
+    sb[k] = v;
+    if (k === "aspect") for (const l of langs) sb[l] = entries.find(([x]) => x === l)[1];
+  }
+}
+
+/* "Nhân vật nói": saved like other fields (autosave only, no job). Scenes that already have a clip keep the old language. */
+function renderDialogueLang(sb, set) {
+  const p = langPicker(DIALOGUE_LANGS, sb.dialogue_language, { unset: true });
+  const save = (e) => {
+    if (p.select.value === LANG_OTHER && !p.input.value.trim()) {
+      if (e.target === p.select) return; // "Khác…" just picked: wait for the name
+      // name erased: show the saved value again so the UI never differs from storyboard.yaml
+      const cur = cleanLang(sb.dialogue_language), hit = cur && DIALOGUE_LANGS.find(([v]) => v.toLowerCase() === cur.toLowerCase());
+      p.select.value = !cur ? "" : hit ? hit[0] : LANG_OTHER;
+      p.input.value = cur && !hit ? cur : "";
+      p.input.hidden = p.select.value !== LANG_OTHER;
+      toast("Nhân vật nói: chưa nhập tên ngôn ngữ, giữ giá trị đã lưu", "error");
+      return;
+    }
+    const r = p.read();
+    if (!r.ok) { toast("Nhân vật nói: " + r.msg, "error"); return; }
+    if ((r.value ?? null) === (cleanLang(sb.dialogue_language) ?? null)) return;
+    const isNew = !("dialogue_language" in sb);
+    set("dialogue_language", r.value ?? undefined); // undefined = key dropped from storyboard.yaml
+    if (isNew) placeLangKeys(sb);
+    S.dlChanged = S.cur.id;
+    refreshZone("dl-warn");
+  };
+  p.select.addEventListener("change", save);
+  p.input.addEventListener("change", save);
+  return h("div", { class: "stack tight" },
+    field("Nhân vật nói", p.el, "thêm vào mọi prompt video"),
+    zone("dl-warn", () => {
+      const n = S.cur.clips_rendered || 0, show = S.dlChanged === S.cur.id && n >= 1;
+      return h("div", { class: "banner warn flush" + (show ? "" : " hidden"), hidden: !show }, icon("alert"), h("div", { class: "b-body" }, show
+        ? `Chỉ áp dụng cho các cảnh render từ giờ. ${n} cảnh đã có clip vẫn giữ tiếng cũ. Muốn đổi tiếng thì bấm Render lại từng cảnh (tốn credit).` : ""));
+    }));
 }
 
 function charImageUrl(c) {
@@ -1182,10 +1285,16 @@ function renderCharacter(sb, c, i, busy) {
   const canMake = !!(c.name && c.description);
   const isAsset = !c.image || S.assets.images.some((a) => a.path === c.image);
   const badName = charNameProblems(sb).has(i);
+  // A zone, so a portrait made mid-job (char:<name> → done) shows up without re-rendering the inputs.
+  const charImg = () => {
+    const u = charImageUrl(c), st = S.cur.characters_state?.[i];
+    const div = h("div", { class: "char-img" + (portrait ? " portrait" : ""), style: u ? { backgroundImage: `url("${u}")` } : { cursor: "default" },
+      title: u ? "Bấm để xem lớn" : "", onclick: () => { if (u) lightbox(u); } },
+    u ? null : h("span", {}, c.image && st?.image_missing ? "Không thấy file ảnh" : "Chưa có ảnh"));
+    return progAttach(div, [progCharKey(c)]);
+  };
   return h("div", { class: "char-row" },
-    h("div", { class: "char-img" + (portrait ? " portrait" : ""), style: url ? { backgroundImage: `url("${url}")` } : { cursor: "default" },
-      title: url ? "Bấm để xem lớn" : "", onclick: () => { if (url) lightbox(url); } },
-      url ? null : h("span", {}, c.image && cs?.image_missing ? "Không thấy file ảnh" : "Chưa có ảnh")),
+    zone(`charimg-${i}`, charImg),
     h("div", { class: "stack tight", style: { minWidth: 0 } },
       h("input", { type: "text", value: c.name, placeholder: "Tên, ví dụ: Lan", "aria-label": "Tên nhân vật", "data-char": i,
         "aria-invalid": badName ? "true" : null, title: badName ? "Tên trống hoặc trùng với nhân vật khác" : null,
@@ -1913,19 +2022,28 @@ function openNewProject() {
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
     const n = h("input", { type: "number", min: 1, max: 20, value: 6 });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
-    const lang = h("select", {}, h("option", { value: "Vietnamese" }, "Tiếng Việt"), h("option", { value: "English" }, "English"));
+    const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
+    const subSaved = cleanLang(localGet("subtitleLang"));
+    const sub = langPicker(SUBTITLE_LANGS, subSaved && subSaved.toLowerCase() !== "none" ? subSaved : "Vietnamese", { noNone: true });
     setTimeout(() => idea.focus(), 30);
     const go = async (e) => {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
-      e.target.disabled = true;
+      const a = speak.read(), b = sub.read();
+      if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); speak.input.focus(); return; }
+      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.input.focus(); return; }
+      const btn = e.currentTarget;
+      localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); // remembered even if the plan job fails
+      btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: lang.value });
+        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value });
         close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–3 phút…", "", 6000);
-      } catch (err) { toast(err.message, "error"); e.target.disabled = false; }
+      } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
     return h("div", { class: "stack" },
       field("Ý tưởng phim", idea),
-      h("div", { class: "grid3" }, field("Số cảnh", n), field("Khung hình", aspect), field("Ngôn ngữ phụ đề", lang)),
+      h("div", { class: "grid2" }, field("Số cảnh", n), field("Khung hình", aspect)),
+      h("div", { class: "grid2" }, field("Nhân vật nói", speak.el), field("Ngôn ngữ phụ đề", sub.el)),
+      h("p", { class: "help" }, "Câu “nhân vật nói …” được thêm vào mọi prompt video gửi Flow để cả phim cùng một thứ tiếng."),
       h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
         S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, icon("sparkle"), "Viết storyboard")));

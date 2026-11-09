@@ -37,7 +37,8 @@ from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, 
 from ..settings import DEFAULT_BACKUP_REMOTE
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
-from ..storyboard import CAMERA_PRESETS, Scene, Storyboard, load_storyboard
+from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, Scene, Storyboard, clean_dialogue_language, clean_language,
+                          load_storyboard, save_storyboard)
 from ..thumbnail import ThumbnailError
 from . import ui_prefs
 
@@ -201,7 +202,8 @@ class PlanBody(BaseModel):
     idea: str
     scenes: int = 6
     aspect: str = "16:9"
-    language: str = "Vietnamese"
+    language: str = "Vietnamese"  # subtitle (narration) language
+    dialogue_language: str | None = None  # language every character speaks; "none" = no dialogue
 
 
 class RunBody(BaseModel):
@@ -392,6 +394,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         errors: list[str] = []
         scenes: dict[str, Any] = {}
         project_id = None
+        clips_rendered = 0  # scenes whose state is DONE (any rendered_as, file or not): they keep their old language
         model_info: dict[str, Any] = {"model_warning": None, "model_note": None, "models_used": {}}
         st_data = State(out_dir(pid) / "state.json").data
         i2v_off = bool(st_data.get("i2v_unsupported"))
@@ -418,8 +421,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
+                status = pipe.scene_status(s)
+                clips_rendered += status in ("done", "changed")
                 scenes[s.id] = {
-                    "status": pipe.scene_status(s),
+                    "status": status,
                     "error": st.get("error"),
                     "updated_at": st.get("updated_at"),
                     "keyframe_url": file_url(pid, kf) if s.mode == "keyframe" else None,
@@ -427,7 +432,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
-                    "video_prompt": sb.for_flow(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s)),
+                    "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s)),
                     "rendered_as": st.get("rendered_as"),
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
@@ -454,6 +459,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "yaml": sb_path(pid).read_text(encoding="utf-8"),
             "errors": errors,
             "scene_state": scenes,
+            "clips_rendered": clips_rendered,
             "project_id": project_id,
             "final_url": file_url(pid, final),
             "final_size": final.stat().st_size if final.is_file() else None,
@@ -701,10 +707,36 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
 
+    def _lang_or_400(value: object, label: str, *, dialogue: bool) -> str:
+        """A language sent by the "Phim mới" form: blank / too long / line break -> 400 (Vietnamese)."""
+        try:
+            v = (clean_dialogue_language if dialogue else clean_language)(value)
+        except ValueError as exc:
+            raise HTTPException(400, f"{label}: {exc}.")
+        if v is None:
+            raise HTTPException(400, f"{label}: hãy nhập tên ngôn ngữ.")
+        return v
+
+    def check_lang_fields(data: dict[str, Any], on_disk: dict[str, Any] | None = None) -> None:
+        """Only the two language keys, when present (blank / null = not set). The rest of the storyboard keeps
+        the "save a broken draft" behaviour, so the whole model is NOT validated here.
+        With `on_disk`, a key left unchanged is not checked: a bad value hand-written in the YAML must not
+        block every autosave of the other fields (it is still reported by the model errors)."""
+        for key, label, clean in (("dialogue_language", "Ngôn ngữ thoại", clean_dialogue_language),
+                                  ("subtitle_language", "Ngôn ngữ phụ đề", clean_language)):
+            if key in data and not (on_disk is not None and key in on_disk and on_disk[key] == data[key]):
+                try:
+                    clean(data[key])
+                except ValueError as exc:
+                    raise HTTPException(400, f"{label}: {exc}.")
+
     @app.post("/api/projects/plan")
     def plan_project(body: PlanBody) -> dict[str, Any]:
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
+        dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
+                    if body.dialogue_language is not None else None)
         backend = planner_backend()
         if not backend:
             raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
@@ -716,12 +748,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
             job.log(f"Claude đang viết storyboard {body.scenes} cảnh qua {via}…")
             job.log(f"Ý tưởng: {body.idea[:300]}")
+            dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
+                        else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
+            job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: {language}")
             sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
-                              aspect=body.aspect, language_hint=body.language)
+                              aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             pid, d = new_project_dir(sb.title)
-            data = sb.model_dump(exclude_none=True)
-            (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=100),
-                                               encoding="utf-8")
+            save_storyboard(sb, d / "storyboard.yaml")
             job.log(f"✔ Xong: “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
             return {"project": pid}
 
@@ -734,6 +767,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.put("/api/projects/{pid}")
     def save_project(pid: str, body: SaveBody) -> dict[str, Any]:
         pdir(pid)
+        try:
+            on_disk = read_raw(pid)
+        except (HTTPException, yaml.YAMLError, OSError):
+            on_disk = None
+        check_lang_fields(body.storyboard, on_disk)
         write_raw(pid, body.storyboard)
         return detail(pid)
 
@@ -745,6 +783,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, f"YAML lỗi: {exc}")
         if not isinstance(data, dict):
             raise HTTPException(400, "YAML phải là một bảng (title, scenes, ...).")
+        check_lang_fields(data)
         with sb_lock(pid):
             sb_path(pid).write_text(body.text, encoding="utf-8")
         return detail(pid)

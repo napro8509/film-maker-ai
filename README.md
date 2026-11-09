@@ -12,7 +12,7 @@ Công cụ dòng lệnh **`filmmaker`** tự động hoá việc làm video trê
 
 | | |
 |---|---|
-| **Storyboard từ 1 câu ý tưởng** | `filmmaker plan "..."` dùng Claude viết danh sách cảnh, prompt tiếng Anh chuẩn cho Veo, phụ đề tiếng Việt. |
+| **Storyboard từ 1 câu ý tưởng** | `filmmaker plan "..."` dùng Claude viết danh sách cảnh, prompt tiếng Anh chuẩn cho Veo, phụ đề tiếng Việt. Chọn riêng tiếng nhân vật nói (`--dialogue-lang`) và tiếng phụ đề (`--lang`). |
 | **Nhân vật đồng nhất** | Khai báo `characters` một lần; mô tả được tự chèn vào mọi cảnh có tên nhân vật. Chế độ `keyframe` tạo ảnh mở đầu (miễn phí) rồi mới animate. |
 | **Chạy lại không mất tiền** | Tiến độ lưu ở `state.json`. Cảnh đã xong được bỏ qua; sửa prompt cảnh nào thì chỉ cảnh đó được tạo lại. |
 | **An toàn credit** | Cảnh được đánh dấu *trước* khi gửi lệnh render tốn tiền. Nếu bị ngắt giữa chừng, lần sau tool **không** tự gửi lại (tránh trừ credit 2 lần) cho tới khi bạn cho phép. Hết credit / mất đăng nhập / Flow đổi giao diện → dừng ngay. |
@@ -87,6 +87,8 @@ Server chỉ nghe trên `127.0.0.1` và mỗi lần mở có một mã riêng, n
 ```bash
 # A. Có ý tưởng -> để Claude viết storyboard (cần ANTHROPIC_API_KEY)
 filmmaker plan "Một ngày của cô gái bán cà phê ở Hà Nội" -n 6 --lang Vietnamese -o cafe.yaml
+#    nhân vật nói tiếng Việt, phụ đề tiếng Anh (--dialogue-lang none = không thoại)
+filmmaker plan "..." --dialogue-lang Vietnamese --lang English -o cafe.yaml
 
 # hoặc B. Tự viết từ file mẫu
 filmmaker template cafe.yaml
@@ -217,6 +219,27 @@ scenes:
 - Bỏ trống: dò tên trong prompt như cũ. Có `characters`: dùng đúng danh sách đó cho phần mô tả và ảnh tham chiếu (tối đa 3 ảnh mỗi cảnh); `[]` = không nhân vật.
 - Tên không phân biệt hoa thường, phải có trong `characters` cấp trên và không trùng nhau, nếu không storyboard bị báo lỗi.
 - Tab "Bảng" ghi trường này khi bạn kéo/xoá mũi tên nhân vật → cảnh.
+
+### Ngôn ngữ thoại và phụ đề
+
+```yaml
+dialogue_language: "Vietnamese"   # nhân vật nói tiếng gì; "none" = không thoại; bỏ trống = Veo tự đoán
+subtitle_language: "English"      # ngôn ngữ phụ đề lúc viết storyboard (chỉ để tham khảo)
+```
+
+- `dialogue_language`: tool thêm một câu cố định ("All spoken dialogue is in Vietnamese; …") vào **mọi prompt video**
+  gửi Flow, nên mọi cảnh nói cùng một thứ tiếng. Câu này không vào prompt ảnh và không đổi fingerprint: đổi giữa
+  chừng thì cảnh đã có clip vẫn giữ tiếng cũ (muốn đổi thì render lại cảnh đó, tốn credit).
+- `subtitle_language`: chỉ để tham khảo, không gửi Flow. Phụ đề lấy từ `narration`.
+- Mỗi giá trị tối đa 40 ký tự, một dòng: không xuống dòng, không ký tự ẩn (rộng bằng không, điều khiển chiều chữ...);
+  khoảng trắng thừa được gộp. Vi phạm thì storyboard báo lỗi (tab YAML trả 400, CLI thoát mã ≠ 0 trước khi gọi Claude).
+- Luôn đặt giá trị trong ngoặc kép: YAML đọc `no`, `off`, `yes` không có ngoặc thành true/false và storyboard sẽ báo lỗi.
+- `none` (không phân biệt hoa thường) chỉ dùng cho `dialogue_language`; ô phụ đề trong popup và `--lang` cần một
+  ngôn ngữ cụ thể, popup không nhận "none".
+- Đổi `dialogue_language` ở card Thông tin phim chỉ lưu storyboard và hiện cảnh báo nếu đã có cảnh có clip; app không
+  tự render lại gì. Cảnh nào muốn đổi tiếng thì bấm Render lại thủ công.
+- `filmmaker plan --dialogue-lang Thai --lang Vietnamese` ghi hai trường này; popup "Phim mới" trong app có hai ô
+  "Nhân vật nói" và "Ngôn ngữ phụ đề", và nhớ lựa chọn gần nhất.
 
 ### Chỉ đạo hình ảnh (`camera`)
 

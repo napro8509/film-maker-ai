@@ -161,7 +161,9 @@ def test_field_order_unchanged():
               "use_character_refs", "no_text", "fallback_t2v", "scenes"]
     old_scene = ["id", "mode", "prompt", "image_prompt", "image", "end_image", "duration", "model", "narration",
                  "camera"]
-    assert list(Storyboard.model_fields) == old_sb == list(StoryboardDraft.model_fields)
+    # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
+    assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language"]
+    assert list(StoryboardDraft.model_fields) == old_sb
     assert list(Scene.model_fields)[:-1] == old_scene == list(SceneDraft.model_fields)
     assert list(Scene.model_fields)[-1] == "characters"
 

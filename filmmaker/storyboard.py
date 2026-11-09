@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +20,37 @@ MAX_REFS = 3  # reference images sent with one generation (Flow accepts only a f
 # Added to every prompt sent to Flow: models like to burn dialogue/titles into the picture.
 NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; "
            "any dialogue is spoken audio only.")
+# Spoken language forced into every *video* prompt (never into image prompts or the fingerprints).
+LANG_MAX = 40
+NO_DIALOGUE = "none"  # stored value for "Không thoại"
+DIALOGUE_RULE = "All spoken dialogue is in {lang}; characters speak only {lang}."
+NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
+
+
+def clean_language(value: object) -> str | None:
+    """A language name as stored: None / "" / blanks -> None, inner whitespace collapsed.
+    ValueError when it is not text, has a line break, a control / format character (NUL, ESC, bidi
+    override, zero-width...) or is longer than LANG_MAX."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("tên ngôn ngữ phải là chữ")
+    if "\n" in value or "\r" in value:
+        raise ValueError("tên ngôn ngữ không được xuống dòng")
+    v = " ".join(value.split())
+    if not v:
+        return None
+    if any(unicodedata.category(ch).startswith("C") for ch in v):
+        raise ValueError("tên ngôn ngữ có ký tự không hợp lệ")
+    if len(v) > LANG_MAX:
+        raise ValueError(f"tên ngôn ngữ dài quá {LANG_MAX} ký tự")
+    return v
+
+
+def clean_dialogue_language(value: object) -> str | None:
+    """Like clean_language; "none" in any case means no spoken dialogue and is stored as "none"."""
+    v = clean_language(value)
+    return NO_DIALOGUE if v is not None and v.casefold() == NO_DIALOGUE else v
 
 
 class Character(BaseModel):
@@ -267,6 +299,22 @@ class StoryboardDraft(BaseModel):
 
 class Storyboard(StoryboardDraft):
     scenes: list[Scene]  # same position as in StoryboardDraft
+    # Only on Storyboard (not StoryboardDraft), so they are not in the schema sent to Claude.
+    dialogue_language: str | None = Field(default=None, description="Language every character speaks in the videos "
+                                          "(English name, e.g. Vietnamese), or 'none' for no spoken dialogue. "
+                                          "Empty = Veo guesses.")
+    subtitle_language: str | None = Field(default=None, description="Language of `narration` chosen when planning. "
+                                          "Reference only: never sent to Flow.")
+
+    @field_validator("dialogue_language", mode="before")
+    @classmethod
+    def _dialogue_language(cls, v: object) -> str | None:
+        return clean_dialogue_language(v)
+
+    @field_validator("subtitle_language", mode="before")
+    @classmethod
+    def _subtitle_language(cls, v: object) -> str | None:
+        return clean_language(v)
 
     @model_validator(mode="after")
     def _check_scene_characters(self) -> "Storyboard":
@@ -318,6 +366,26 @@ class Storyboard(StoryboardDraft):
         if base and base[-1] not in ".!?":
             base += "."
         return f"{base} {NO_TEXT}" if base else NO_TEXT
+
+    def dialogue_rule(self) -> str:
+        """The sentence that fixes the spoken language ("" when `dialogue_language` is not set)."""
+        lang = self.dialogue_language
+        if not lang:
+            return ""
+        return NO_DIALOGUE_RULE if lang.casefold() == NO_DIALOGUE else DIALOGUE_RULE.format(lang=lang)
+
+    def for_flow_video(self, prompt: str) -> str:
+        """A video prompt as actually sent to Flow: the spoken-language sentence, then `for_flow` (NO_TEXT).
+        Like NO_TEXT it is not part of the fingerprints, so changing the language re-renders nothing."""
+        rule = self.dialogue_rule()
+        if not rule or rule.rstrip(".") in prompt:  # already there (pasted by the user, maybe without the dot)
+            return self.for_flow(prompt)
+        if NO_TEXT in prompt:  # keep the rule before NO_TEXT
+            return self.for_flow(prompt.replace(NO_TEXT, f"{rule} {NO_TEXT}", 1))
+        base = prompt.rstrip()
+        if base and base[-1] not in ".!?":
+            base += "."
+        return self.for_flow(f"{base} {rule}" if base else rule)
 
     def portrait_prompt(self, c: Character) -> str:
         if c.image_prompt and c.image_prompt.strip():
@@ -440,6 +508,24 @@ def load_storyboard(path: str | Path) -> Storyboard:
     return sb
 
 
-def save_storyboard(sb: Storyboard, path: str | Path) -> None:
+_LANG_KEYS = ("dialogue_language", "subtitle_language")
+
+
+def _dump_dict(sb: Storyboard) -> dict:
+    """`sb` as saved to YAML: the language fields (when set) come right after `aspect` so they are easy
+    to find; without them the key order is exactly as before."""
     data = sb.model_dump(exclude_none=True)
+    langs = {k: data.pop(k) for k in _LANG_KEYS if k in data}
+    if not langs:
+        return data
+    out: dict = {}
+    for k, v in data.items():
+        out[k] = v
+        if k == "aspect":
+            out.update(langs)
+    return out
+
+
+def save_storyboard(sb: Storyboard, path: str | Path) -> None:
+    data = _dump_dict(sb)
     Path(path).write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=100), encoding="utf-8")

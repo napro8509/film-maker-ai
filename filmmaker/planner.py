@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from . import model_meta
-from .storyboard import Storyboard, StoryboardDraft
+from .storyboard import NO_DIALOGUE, Storyboard, StoryboardDraft, clean_dialogue_language, clean_language
 
 MODEL = "claude-opus-5-5"
 
@@ -26,10 +26,10 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Edit like a film: open with a wide/establishing shot, vary shot sizes between consecutive scenes (wide -> medium -> close-up), go closer for emotion, use low angles for power and high angles for vulnerability, keep the 180-degree rule in dialogue (over-the-shoulder / reverse shots), and match the camera move to the mood (static or slow for calm, handheld or tracking for tension).
 - Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
 - Put the shared visual look in `style` once instead of repeating it.
-- `narration` is an optional short subtitle line in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
-- If a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
+- `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
+- Spoken audio: if the message gives a "Spoken dialogue language", every character who speaks speaks ONLY that language; describe it as spoken audio in English naming that language, e.g. "she says angrily in <that language>, voice only". If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene; describe only ambient sound, sound effects and music. If neither is given and a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
-- Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
+- Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) written in the spoken dialogue language when the message gives one; when it says "Spoken dialogue: none", in the subtitle language, or, without a subtitle line, in the language of `narration` (the user's idea); when neither is given, in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id or image/end_image."""
 
 
@@ -37,16 +37,28 @@ def _to_storyboard(data: dict) -> Storyboard:
     """Planner output -> Storyboard. Claude does not pick scene `characters` (detection by name stays the default),
     so drop any it invents in a scene; the storyboard's own `characters` list is kept."""
     data = copy.deepcopy(data)
+    data.pop("dialogue_language", None)  # set from the request by plan_auto, never by Claude
+    data.pop("subtitle_language", None)
     for scene in data.get("scenes") or []:
         if isinstance(scene, dict):
             scene.pop("characters", None)
     return Storyboard.model_validate(data)
 
 
-def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None) -> str:
+def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None,
+                  dialogue_language: str | None = None) -> str:
     user = f"Idea: {idea}\nNumber of scenes: {scenes}\nAspect ratio: {aspect}"
+    if dialogue_language is None:  # old clients / CLI without --dialogue-lang: unchanged message
+        if language_hint:
+            user += f"\nNarration language: {language_hint}"
+        return user
+    if dialogue_language.strip().casefold() == NO_DIALOGUE:
+        user += "\nSpoken dialogue: none (no character speaks; only ambient sound, sound effects and music)"
+    else:
+        user += (f"\nSpoken dialogue language: {dialogue_language} "
+                 f"(every character who speaks speaks only {dialogue_language})")
     if language_hint:
-        user += f"\nNarration language: {language_hint}"
+        user += f"\nSubtitle (narration) language: {language_hint}"
     return user
 
 
@@ -75,13 +87,13 @@ def claude_code_status() -> dict:
 
 
 def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-                          timeout: int = 900) -> Storyboard:
+                          dialogue_language: str | None = None, timeout: int = 900) -> Storyboard:
     """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
     schema = json.dumps(StoryboardDraft.model_json_schema())
-    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint),
+    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint, dialogue_language),
            "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     with tempfile.TemporaryDirectory() as cwd:  # keep any project CLAUDE.md out of the prompt
@@ -105,8 +117,14 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
     return sb
 
 
-def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, **kw) -> tuple[Storyboard, str]:
-    """backend: auto | claude_code | api. auto prefers Claude Code (subscription, no API credit needed)."""
+def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, dialogue_language: str | None = None,
+              **kw) -> tuple[Storyboard, str]:
+    """backend: auto | claude_code | api. auto prefers Claude Code (subscription, no API credit needed).
+    dialogue_language (and language_hint as subtitle_language) are stored on the storyboard from the request,
+    overriding anything the backend returned; without dialogue_language neither field is set."""
+    dialogue_language = clean_dialogue_language(dialogue_language)  # ValueError before any Claude call
+    if dialogue_language is not None:
+        kw["dialogue_language"] = dialogue_language
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     if backend == "claude_code":
@@ -117,18 +135,21 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, *
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
         sb, used = plan(idea, **kw), "api"
+    sb.dialogue_language = dialogue_language
+    sb.subtitle_language = clean_language(kw.get("language_hint")) if sb.dialogue_language else None
     # New projects never start on a model Flow is retiring (default: veo-lite).
     return model_meta.normalize_new_storyboard(sb, model_meta.load()), used
 
 
-def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None) -> Storyboard:
+def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+         dialogue_language: str | None = None) -> Storyboard:
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
-    user = _user_message(idea, scenes, aspect, language_hint)
+    user = _user_message(idea, scenes, aspect, language_hint, dialogue_language)
 
     response = client.messages.parse(
         model=MODEL,
@@ -154,8 +175,10 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
 
 TITLE_SYSTEM = """You write titles for short drama videos posted on Facebook / TikTok / YouTube Shorts.
 Given a storyboard, propose catchy, emotional, curiosity-driven titles that make people click.
-Write each title in the VIDEO'S LANGUAGE: the language the characters speak in the video
-(look for hints such as "says ... in Thai" in the scene prompts, or a Language line). Only if nothing
+Write each title in the VIDEO'S LANGUAGE: the language the characters speak in the video.
+If the storyboard has a "Spoken language:" line, it decides the language and overrides any hint in the
+scene prompts (such as "says ... in Thai"); "Spoken language: none; write titles in X" means write in X.
+Otherwise look for hints such as "says ... in Thai" in the scene prompts. Only if nothing
 says what language is spoken, use the language of the narration lines, else of the film title.
 Each title: at most ~8 words, no hashtags, no emojis, no quotation marks, no ending period.
 For each title also give `vi`: a natural Vietnamese translation, so a Vietnamese editor understands it
@@ -165,6 +188,11 @@ Vary the angle: the secret, the twist, the conflict, the emotion. Return only th
 
 def _story_summary(sb: Storyboard) -> str:
     lines = [f"Film title: {sb.title}"]
+    if sb.dialogue_language == NO_DIALOGUE:
+        lines.append(f"Spoken language: none; write titles in {sb.subtitle_language}" if sb.subtitle_language
+                     else "Spoken language: none; write titles in the language of the narration lines")
+    elif sb.dialogue_language:
+        lines.append(f"Spoken language: {sb.dialogue_language}")
     if sb.characters:
         lines.append("Characters: " + "; ".join(f"{c.name} ({c.description[:80]})" for c in sb.characters))
     narr = [s.narration for s in sb.scenes if s.narration]
