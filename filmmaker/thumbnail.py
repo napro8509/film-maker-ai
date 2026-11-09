@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 THAI = re.compile(r"[\u0E00-\u0E7F]")
@@ -48,14 +49,30 @@ def find_font(text: str) -> str | None:
     return None
 
 
-def _drawtext_caps(ffmpeg: str) -> tuple[bool, bool]:
-    """(drawtext available, can shape complex scripts such as Thai)."""
+def _drawtext_caps(ffmpeg: str) -> tuple[bool, bool, bool]:
+    """(drawtext available, can shape complex scripts such as Thai, has the `text_shaping` option).
+
+    ffmpeg 6.1-8 had a `text_shaping` switch; newer builds dropped it and always shape when built
+    with libharfbuzz, so look at the build configuration too."""
     try:
         out = subprocess.run([ffmpeg, "-hide_banner", "-h", "filter=drawtext"], capture_output=True, text=True,
                              timeout=20).stdout
+        conf = subprocess.run([ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return False, False
-    return "fontfile" in out, "text_shaping" in out
+        return False, False, False
+    has_opt = "text_shaping" in out
+    return "fontfile" in out, has_opt or "--enable-libharfbuzz" in conf, has_opt
+
+
+THAI_LEADING = "เแโใไ"  # vowels written before their consonant: never end a line on one
+
+
+def _safe_cut(w: str, i: int) -> int:
+    """Move a hard-split point back so it never splits a combining mark or a Thai leading vowel from its letter."""
+    j = i
+    while 0 < j < len(w) and (unicodedata.category(w[j]).startswith("M") or w[j - 1] in THAI_LEADING):
+        j -= 1
+    return j or i
 
 
 def wrap(text: str, max_chars: int, max_lines: int = 3) -> list[str]:
@@ -73,6 +90,7 @@ def wrap(text: str, max_chars: int, max_lines: int = 3) -> list[str]:
                 lines.append(cur)
                 cur = ""
                 continue
+            room = _safe_cut(w, room)
             lines.append((cur + " " if cur else "") + w[:room])
             cur, w = "", w[room:]
         if not cur:
@@ -104,7 +122,7 @@ def render_cover(image: Path, out: Path, *, aspect: str, text: str | None, log=p
     tmp = Path(tempfile.mkdtemp(prefix="fm-thumb-"))
     try:
         if text:
-            has_drawtext, shaping = _drawtext_caps(ffmpeg)
+            has_drawtext, shaping, shaping_opt = _drawtext_caps(ffmpeg)
             font = find_font(text)
             if not has_drawtext:
                 log("  ! ffmpeg này không có bộ vẽ chữ (drawtext): thumbnail không có tiêu đề.")
@@ -135,7 +153,7 @@ def render_cover(image: Path, out: Path, *, aspect: str, text: str | None, log=p
                     opts = [f"fontfile='{_esc(font)}'", f"textfile='{_esc(str(tf))}'", f"fontsize={size}",
                             f"fontcolor={color}", "borderw=5", "bordercolor=black", "shadowx=3", "shadowy=3",
                             "shadowcolor=black@0.6", "x=(w-text_w)/2", f"y={top + i * (size + gap)}"]
-                    if shaping:
+                    if shaping_opt:
                         opts.append("text_shaping=1")
                     filters.append("drawtext=" + ":".join(opts))
         out.parent.mkdir(parents=True, exist_ok=True)

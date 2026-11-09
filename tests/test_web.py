@@ -236,3 +236,20 @@ def test_thumbnail_action_and_make_adds_one(client):
     j = run(client, pid2, action="make")
     assert j["status"] == "done", j["lines"]
     assert client.get(f"/api/projects/{pid2}").json()["thumbnail"]["url"]
+
+
+def test_thumbnail_titles_are_suggested_and_used_when_empty(client, tmp_path, monkeypatch):
+    from tests.test_planner import _fake
+
+    _fake(tmp_path, monkeypatch)
+    client.get("/api/env?refresh=true")
+    pid = client.post("/api/projects", json={"title": "Tựa", "source": "template"}).json()["id"]
+    sb = client.get(f"/api/projects/{pid}").json()["storyboard"]
+    sb["thumbnail"].pop("text", None)
+    client.put(f"/api/projects/{pid}", json={"storyboard": sb})
+    r = client.post(f"/api/projects/{pid}/thumbnail/titles")
+    assert r.status_code == 200 and r.json()["titles"][0] == {"text": "ความลับของกำไล", "vi": "Bí mật chiếc vòng"}
+    assert client.get(f"/api/projects/{pid}").json()["thumbnail"]["suggestions"] == r.json()["titles"]
+    j = run(client, pid, action="thumbnail")
+    assert j["status"] == "done", j["lines"] and j["result"]["title"] == "ความลับของกำไล"
+    assert client.get(f"/api/projects/{pid}").json()["storyboard"]["thumbnail"]["text"] == "ความลับของกำไล"

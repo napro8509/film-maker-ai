@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -12,7 +14,7 @@ from .assemble import AssembleError, assemble
 from .gflow import Gflow, GflowError
 from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State
-from .storyboard import load_storyboard, save_storyboard
+from .storyboard import Storyboard, load_storyboard, save_storyboard
 
 
 def _out_dir(storyboard: Path, out: Path | None) -> Path:
@@ -115,7 +117,8 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     report = pipe.run(RunOptions(
         only=set(only) or None, force=set(force), retry_unknown=retry_unknown,
         max_retries=retries, pause=_parse_pause(pause), fail_fast=fail_fast,
-        keyframes_only=keyframes_only, force_keyframes=set(force),
+        # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
+        keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
     ))
     click.echo("")
     if dry_run:
@@ -223,14 +226,113 @@ def thumbnail(storyboard: Path, out, profile, remake) -> None:
     click.echo(f"🖼 Thumbnail: {path}")
 
 
+def _slug(text: str) -> str:
+    import re
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text.replace("đ", "d").replace("Đ", "D")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()[:50]
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--name", "names", multiple=True, help="Chỉ tạo ảnh cho nhân vật này (lặp lại được).")
+@click.option("--force", is_flag=True, help="Tạo lại cả nhân vật đã có ảnh.")
+@click.option("--out", type=click.Path(path_type=Path))
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--dry-run", is_flag=True, help="Chỉ in lệnh gflow, không gửi gì.")
+@click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi.")
+def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> None:
+    """Tạo ảnh tham chiếu nhân vật trên Flow (miễn phí) và ghi đường dẫn vào storyboard.
+
+    Mặc định chỉ tạo cho nhân vật chưa có ảnh. Ảnh lưu ở assets/characters/<tên>.png.
+    """
+    import yaml
+    sb = load_storyboard(storyboard)
+    unknown = set(names) - {c.name for c in sb.characters}
+    if unknown:
+        raise click.ClickException(f"không có nhân vật: {', '.join(sorted(unknown))}")
+    picked, used = [], set()
+    for i, c in enumerate(sb.characters):
+        if names and c.name not in names:
+            continue
+        if not names and not force and c.image and Path(c.image).is_file():
+            continue
+        if not c.name.strip() or not c.description.strip():
+            raise click.ClickException(f"nhân vật #{i + 1} cần có name và description")
+        stem = _slug(c.name) or f"nhan-vat-{i + 1}"
+        while stem in used:
+            stem += f"-{i + 1}"
+        used.add(stem)
+        picked.append((i, c, storyboard.parent / "assets" / "characters" / f"{stem}.png"))
+    if not picked:
+        click.echo("Tất cả nhân vật đã có ảnh (dùng --force hoặc --name để tạo lại).")
+        return
+    g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
+    if not dry_run and not g.available():
+        raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
+    pipe = Pipeline(sb, _out_dir(storyboard, out), g, log=click.echo)
+    report = pipe.generate_portraits([(c, dest) for _, c, dest in picked],
+                                     RunOptions(pause=_parse_pause(pause)))
+    if not dry_run and report.done:
+        raw = yaml.safe_load(storyboard.read_text(encoding="utf-8"))
+        chars = raw.get("characters") or []
+        for i, c, dest in picked:
+            if c.name in report.done and i < len(chars) and chars[i].get("name") == c.name:
+                chars[i]["image"] = dest.relative_to(storyboard.parent).as_posix()
+        storyboard.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False, width=100), encoding="utf-8")
+    click.echo("")
+    click.echo(f"Xong: {len(report.done)} ảnh nhân vật  |  Lỗi: {len(report.failed)}")
+    for name, err in report.failed.items():
+        click.echo(f"  ✘ {name}: {err}")
+    if report.aborted:
+        click.echo(f"⚠ {report.aborted}")
+    sys.exit(0 if not report.failed and not report.aborted else 1)
+
+
+STATUS_CODES = ("done", "changed", "interrupted", "failed", "todo")
+
+
+def _status_payload(sb: Storyboard, storyboard: Path, out_dir: Path, pipe: Pipeline) -> dict[str, Any]:
+    """Machine-readable progress for `status --json`. Read-only: never saves state."""
+    scenes: list[dict[str, Any]] = []
+    summary: dict[str, int] = {c: 0 for c in STATUS_CODES}
+    for s in sb.scenes:
+        st = pipe.state.scene(s.id)
+        code = pipe.scene_status(s)
+        summary[code] += 1
+        v = st.get("video")
+        has_kf = s.mode == "keyframe" and pipe.has_keyframe(s)
+        scenes.append({
+            "id": s.id,
+            "mode": s.mode,
+            "status": code,
+            "prompt": s.prompt,
+            "video": str(Path(v).resolve()) if v and Path(v).is_file() else None,
+            "keyframe": str(pipe.keyframe_path(s).resolve()) if has_kf else None,
+            "error": st.get("error") or None,
+        })
+    return {
+        "title": sb.title,
+        "storyboard": str(storyboard.resolve()),
+        "out_dir": str(out_dir.resolve()),
+        "project_id": sb.project_id or pipe.state.data.get("project_id") or None,
+        "summary": {"total": len(scenes), **summary},
+        "scenes": scenes,
+    }
+
+
 @main.command()
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path))
-def status(storyboard: Path, out) -> None:
+@click.option("--json", "as_json", is_flag=True, help="In tiến độ dạng JSON (cho script/agent).")
+def status(storyboard: Path, out, as_json: bool) -> None:
     """Xem tiến độ từng cảnh."""
     sb = load_storyboard(storyboard)
     out_dir = _out_dir(storyboard, out)
     pipe = Pipeline(sb, out_dir, Gflow(dry_run=True, log=lambda *_: None))
+    if as_json:
+        click.echo(json.dumps(_status_payload(sb, storyboard, out_dir, pipe), ensure_ascii=False))
+        return
     click.echo(f"{sb.title}  ({out_dir})  project={pipe.state.data.get('project_id') or '-'}")
     for s in sb.scenes:
         st = pipe.state.scene(s.id)
@@ -268,6 +370,16 @@ def ui(workspace: Path | None, port: int, no_browser: bool) -> None:
     except ImportError as exc:
         raise click.ClickException("cần cài thêm: pip install -e '.[ui]'") from exc
     serve(workspace or Path.home() / "FilmMaker", port=port, open_browser=not no_browser)
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
+def app(workspace: Path | None) -> None:
+    """Mở Film Maker dạng cửa sổ app macOS (không cần trình duyệt)."""
+    from .desktop import main as desktop_main
+
+    desktop_main(workspace)
 
 
 if __name__ == "__main__":

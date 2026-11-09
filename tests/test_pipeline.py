@@ -419,3 +419,43 @@ def test_interrupted_render_adopts_clip_downloaded_by_hand(env, tmp_path):
     assert "s02" in report.skipped and "s02" not in report.failed
     assert not any("s02.mp4" in " ".join(c) for c in calls())  # nothing resubmitted
     assert make_pipe(sb_path, out).is_done(pipe.sb.scenes[1])
+
+
+def test_cli_characters_makes_portraits_and_saves_paths(env):
+    sb_path, calls = env
+    res = CliRunner().invoke(main, ["characters", str(sb_path), "--pause", "0"])
+    assert res.exit_code == 0, res.output
+    img = sb_path.parent / "assets" / "characters" / "lan.png"
+    assert img.is_file()
+    assert load_storyboard(sb_path).characters[0].image == str(img.resolve())
+    assert sum(c[:2] == ["image", "t2i"] for c in calls()) == 1
+    # Second run: everyone already has a picture, nothing is sent.
+    res = CliRunner().invoke(main, ["characters", str(sb_path), "--pause", "0"])
+    assert res.exit_code == 0 and "đã có ảnh" in res.output
+    assert sum(c[:2] == ["image", "t2i"] for c in calls()) == 1
+
+
+def test_cli_force_video_keeps_approved_keyframe(env):
+    sb_path, calls = env
+    assert CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0"]).exit_code == 0
+    images = sum(c[0] == "image" for c in calls())
+    res = CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0", "--force", "s01"])
+    assert res.exit_code == 0, res.output
+    assert sum(c[0] == "image" for c in calls()) == images  # keyframe reused
+    res = CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0", "--force", "s01", "--keyframes-only"])
+    assert res.exit_code == 0, res.output
+    assert sum(c[0] == "image" for c in calls()) == images + 1
+
+
+def test_poll_timeout_after_submit_is_not_resent(env, monkeypatch):
+    """gflow exit 9 'Submit was already clicked ... may have billed': the next run must not resend it."""
+    sb_path, calls = env
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "s02.mp4:9:false")
+    monkeypatch.setenv("FAKE_GFLOW_HINT", "Submit was already clicked, so Flow may have made and billed this generation.")
+    res = CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0"])
+    assert res.exit_code == 1
+    monkeypatch.delenv("FAKE_GFLOW_FAIL")
+    sent = sum(c[0] == "video" and "s02.mp4" in " ".join(c) for c in calls())
+    res = CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0"])
+    assert "bị ngắt" in res.output
+    assert sum(c[0] == "video" and "s02.mp4" in " ".join(c) for c in calls()) == sent

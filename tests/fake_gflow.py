@@ -23,7 +23,8 @@ for rule in filter(None, os.environ.get("FAKE_GFLOW_FAIL", "").split(",")):
             if counter:
                 counter.write_text(str(n + 1))
             print(json.dumps({"status": "fail", "error": {"title": "fake failure", "detail": f"fake {sub}",
-                              "exit_code": int(code), "retryable": retry == "true"}}))
+                              "exit_code": int(code), "retryable": retry == "true",
+                              "remediation_hint": os.environ.get("FAKE_GFLOW_HINT")}}))
             sys.exit(int(code))
 
 def out_path():

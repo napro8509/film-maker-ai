@@ -414,6 +414,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             tp = Pipeline(sb, out_dir(pid), gflow(True))
             thumb_info.update(picture_ready=tp.has_thumbnail_image(), prompt=sb.for_flow(sb.thumbnail_prompt()),
                               refs=[n for n, _ in sb.thumbnail_refs()])
+        thumb_info["suggestions"] = saved_titles(pid)
         return {
             **summary(pid),
             "storyboard": raw,
@@ -776,6 +777,39 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         (pdir(pid) / "ui.json").write_text(json.dumps(prefs, indent=2), encoding="utf-8")
         return prefs["final"]
 
+    def saved_titles(pid: str) -> list[dict[str, str]]:
+        from ..planner import _clean_titles
+
+        return _clean_titles(ui_prefs(pid).get("thumbnail_titles"), 20)  # old projects stored plain strings
+
+    def suggest_titles_for(pid: str, sb: Storyboard, log: Callable[[str], None] = lambda *_: None) -> list[dict[str, str]]:
+        from ..planner import suggest_titles
+
+        backend = planner_backend()
+        if not backend:
+            raise RuntimeError("Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        log("Claude đang nghĩ tiêu đề cho video…")
+        titles = suggest_titles(sb, backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
+        if not titles:
+            raise RuntimeError("Claude không trả về tiêu đề nào.")
+        prefs = ui_prefs(pid)
+        prefs["thumbnail_titles"] = titles
+        (pdir(pid) / "ui.json").write_text(json.dumps(prefs, indent=2, ensure_ascii=False), encoding="utf-8")
+        return titles
+
+    @app.post("/api/projects/{pid}/thumbnail/titles")
+    def thumbnail_titles(pid: str) -> dict[str, Any]:
+        """Title ideas for the thumbnail (Claude). Not a job: it does not touch Flow."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        try:
+            return {"titles": suggest_titles_for(pid, sb)}
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc))
+
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
         """Generate reference images for characters (free on Flow) and store them in the storyboard."""
@@ -944,12 +978,31 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"final": str(output)}
 
         def do_thumbnail(job: Job, remake: bool) -> dict[str, Any]:
+            res: dict[str, Any] = {}
+            if not (sb.thumbnail.text or "").strip():  # no title yet: let Claude write one (editable later)
+                try:
+                    titles = saved_titles(pid) or suggest_titles_for(pid, sb, job.log)
+                    title = titles[0]["text"]
+                    sb.thumbnail.text = title
+                    raw = read_raw(pid)
+                    if not ((raw.get("thumbnail") or {}).get("text") or "").strip():
+                        raw.setdefault("thumbnail", {})
+                        if not isinstance(raw["thumbnail"], dict):
+                            raw["thumbnail"] = {}
+                        raw["thumbnail"]["text"] = title
+                        write_raw(pid, raw)
+                    vi = f" ({titles[0]['vi']})" if titles[0]["vi"] else ""
+                    job.log(f"Tiêu đề (Claude gợi ý, sửa được): {title}{vi}")
+                    res["title"] = title
+                except Exception as exc:  # no Claude: fall back to the film title
+                    job.log(f"  (không gợi ý được tiêu đề: {exc}; dùng tên phim)")
             g = gflow(log=job.log)
             pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
             if (remake or not pipe.has_thumbnail_image()) and not g.available():
                 raise RuntimeError("không thấy lệnh gflow")
             path = pipe.make_thumbnail(RunOptions(max_retries=int(settings.get("retries", 2))), remake=remake)
-            return {"thumbnail": str(path)}
+            res["thumbnail"] = str(path)
+            return res
 
         def work(job: Job) -> dict[str, Any]:
             if body.action == "thumbnail":

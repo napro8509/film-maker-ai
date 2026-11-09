@@ -4,26 +4,29 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="token" content="__TOKEN__">
+  <meta name="color-scheme" content="light dark">
   <title>Film Maker</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23c2410c'/><path d='M12 10.5v11l9-5.5z' fill='white'/></svg>">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="logo">🎬</span> Film Maker</div>
-    <div id="envchips" class="chips"></div>
+    <button id="btn-menu" class="btn ghost icon" aria-label="Danh sách dự án" aria-expanded="false"></button>
+    <div class="brand"><span class="logo" aria-hidden="true"></span>Film Maker</div>
+    <div id="envchips" class="env" aria-label="Trạng thái công cụ"></div>
     <div class="top-actions">
-      <button id="btn-credits" class="btn ghost" title="Xem số credit còn lại trên Google Flow">💳 Credit</button>
-      <button id="btn-settings" class="btn ghost">⚙️ Cài đặt</button>
+      <button id="btn-credits" class="btn ghost" title="Xem số credit còn lại trên Google Flow"><span class="lbl-text">Credit</span></button>
+      <button id="btn-settings" class="btn ghost" title="Cài đặt"><span class="lbl-text">Cài đặt</span></button>
     </div>
   </header>
   <div class="layout">
-    <aside id="sidebar"></aside>
-    <main id="main"></main>
+    <aside id="sidebar" aria-label="Dự án"></aside>
+    <main id="main"><div class="loading"><span class="spinner"></span>Đang tải…</div></main>
   </div>
-  <section id="jobbar" class="jobbar hidden"></section>
+  <div class="scrim" id="scrim"></div>
+  <section id="jobbar" class="jobbar hidden" aria-live="polite"></section>
   <div id="modal-root"></div>
-  <div id="toasts"></div>
+  <div id="toasts" aria-live="polite"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

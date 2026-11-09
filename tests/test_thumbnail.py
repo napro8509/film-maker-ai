@@ -109,3 +109,22 @@ def test_default_thumbnail_prompt_names_characters(env):
     sb = load_storyboard(env[0])
     tp = sb.thumbnail_prompt()
     assert "Mali" in tp and "Ratana" in tp and "mint blouse" in tp and "cinematic" in tp
+
+
+def test_thai_wrap_keeps_leading_vowels_and_marks_with_their_letter():
+    assert wrap("ความลับของกำไลที่ไม่มีใครรู้", 18) == ["ความลับของกำไลที่", "ไม่มีใครรู้"]
+    for line in wrap("ที่ไม่มีใครรู้เลยแม้แต่คนเดียว", 7):
+        assert line[-1] not in "เแโใไ" and not line[0] in "่้๊๋ิีึืุู"
+
+
+def test_newer_ffmpeg_without_text_shaping_switch_still_shapes(monkeypatch):
+    from filmmaker import thumbnail
+
+    class R:
+        def __init__(self, out): self.stdout = out
+
+    def fake_run(cmd, **kw):
+        return R("fontfile textfile") if "-h" in cmd else R("configuration: --enable-libharfbuzz --enable-libfreetype")
+
+    monkeypatch.setattr(thumbnail.subprocess, "run", fake_run)
+    assert thumbnail._drawtext_caps("ffmpeg") == (True, True, False)

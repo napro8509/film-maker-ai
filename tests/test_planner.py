@@ -13,8 +13,13 @@ if sys.argv[1:3] == ["auth", "status"]:
     print(json.dumps({{"loggedIn": True, "authMethod": "claude.ai"}})); sys.exit(0)
 assert "-p" in sys.argv and "--json-schema" in sys.argv
 open(os.environ["FAKE_CLAUDE_ENV"], "w").write(json.dumps(sorted(os.environ)))
-sb = {{"title": "Mèo", "scenes": [{{"id": "s01", "prompt": "a cat walks"}}]}}
-print(json.dumps({{"type": "result", "is_error": False, "structured_output": sb}}))
+schema = sys.argv[sys.argv.index("--json-schema") + 1]
+if '"titles"' in schema:
+    out = {{"titles": [{{"text": "“ความลับของกำไล”.", "vi": "Bí mật chiếc vòng"}}, {{"text": "ความลับของกำไล", "vi": "x"}},
+                       {{"text": "  Mẹ chồng   ác độc ", "vi": "Mẹ chồng ác độc"}}, {{"text": "", "vi": ""}}]}}
+else:
+    out = {{"title": "Mèo", "scenes": [{{"id": "s01", "prompt": "a cat walks"}}]}}
+print(json.dumps({{"type": "result", "is_error": False, "structured_output": out}}))
 """
 
 
@@ -45,3 +50,14 @@ def test_no_claude_and_no_key_gives_clear_error(monkeypatch):
         assert "ANTHROPIC_API_KEY" in str(exc)
     else:
         raise AssertionError("expected an error")
+
+
+def test_suggest_titles_via_claude_code_are_cleaned(tmp_path, monkeypatch):
+    from filmmaker.storyboard import Storyboard
+
+    _fake(tmp_path, monkeypatch)
+    sb = Storyboard.model_validate({"title": "Chiếc vòng", "scenes": [{"id": "s01", "prompt": "x", "narration": "Mẹ ơi"}]})
+    assert planner.suggest_titles(sb, backend="claude_code") == [
+        {"text": "ความลับของกำไล", "vi": "Bí mật chiếc vòng"}, {"text": "Mẹ chồng ác độc", "vi": ""}]
+    assert planner._clean_titles(["Cũ"], 5) == [{"text": "Cũ", "vi": ""}]  # old saved format
+    assert "Mẹ ơi" in planner._story_summary(sb)

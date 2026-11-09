@@ -45,8 +45,12 @@ class GflowError(RuntimeError):
 
     @property
     def spent(self) -> bool:
-        """The request may already have been billed (only the Flow chat driver reports this)."""
-        return bool(((self.payload or {}).get("error") or {}).get("spent"))
+        """The request may already have been billed: the Flow chat driver says so in the payload,
+        gflow-cli says so in its hint (e.g. a poll timeout after the submit click)."""
+        if ((self.payload or {}).get("error") or {}).get("spent"):
+            return True
+        text = str(self).lower()
+        return "already clicked" in text or "billed" in text
 
 
 def _extract_json(stdout: str) -> dict[str, Any] | None:

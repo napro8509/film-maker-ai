@@ -22,7 +22,7 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - `narration` is an optional short subtitle line in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
 - If a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
-- Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) in the SAME language as the narration; `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
+- Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id or image/end_image."""
 
 
@@ -128,3 +128,102 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
     sb = response.parsed_output
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
+
+
+# --- video titles for the thumbnail -------------------------------------------
+
+TITLE_SYSTEM = """You write titles for short drama videos posted on Facebook / TikTok / YouTube Shorts.
+Given a storyboard, propose catchy, emotional, curiosity-driven titles that make people click.
+Write each title in the VIDEO'S LANGUAGE: the language the characters speak in the video
+(look for hints such as "says ... in Thai" in the scene prompts, or a Language line). Only if nothing
+says what language is spoken, use the language of the narration lines, else of the film title.
+Each title: at most ~8 words, no hashtags, no emojis, no quotation marks, no ending period.
+For each title also give `vi`: a natural Vietnamese translation, so a Vietnamese editor understands it
+(leave `vi` empty if the title is already in Vietnamese).
+Vary the angle: the secret, the twist, the conflict, the emotion. Return only the titles."""
+
+
+def _story_summary(sb: Storyboard) -> str:
+    lines = [f"Film title: {sb.title}"]
+    if sb.characters:
+        lines.append("Characters: " + "; ".join(f"{c.name} ({c.description[:80]})" for c in sb.characters))
+    narr = [s.narration for s in sb.scenes if s.narration]
+    if narr:
+        lines.append("Narration lines (subtitle language): " + " / ".join(narr))
+    lines.append("Scenes: " + " | ".join(
+        f"{s.id}: {' / '.join(x[:300] for x in (s.image_prompt, s.prompt) if x)}" for s in sb.scenes))
+    return "\n".join(lines)
+
+
+def _clean_line(t) -> str:
+    return " ".join(str(t or "").split()).strip(" \"'“”‘’«».。")
+
+
+def _clean_titles(items, n: int) -> list[dict[str, str]]:
+    """[{"text": title in the video's language, "vi": Vietnamese translation or ""}]. Accepts plain strings too."""
+    out: list[dict[str, str]] = []
+    for it in items or []:
+        if isinstance(it, dict):
+            text, vi = _clean_line(it.get("text") or it.get("title")), _clean_line(it.get("vi"))
+        else:
+            text, vi = _clean_line(it), ""
+        if text and all(o["text"] != text for o in out):
+            out.append({"text": text, "vi": "" if vi == text else vi})
+    return out[:n]
+
+
+def suggest_titles(sb: Storyboard, *, backend: str = "auto", api_key: str | None = None, n: int = 5,
+                   timeout: int = 180) -> list[dict[str, str]]:
+    """A few title ideas for the thumbnail, written by Claude (Claude Code subscription or API key)."""
+    user = f"{_story_summary(sb)}\n\nWrite {n} title options."
+    if backend == "auto":
+        backend = "claude_code" if claude_code_binary() else "api"
+    if backend == "claude_code":
+        binary = claude_code_binary()
+        if not binary:
+            raise RuntimeError("không thấy lệnh `claude` (Claude Code)")
+        item = {"type": "object", "properties": {"text": {"type": "string"}, "vi": {"type": "string"}},
+                "required": ["text", "vi"]}
+        schema = json.dumps({"type": "object", "properties": {"titles": {"type": "array", "items": item}},
+                             "required": ["titles"]})
+        cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", TITLE_SYSTEM,
+               "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
+        with tempfile.TemporaryDirectory() as cwd:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                                      env=_subscription_env())
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Claude Code chạy quá lâu; hãy thử lại.") from exc
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            raise RuntimeError(f"Claude Code lỗi (exit {proc.returncode}): {(proc.stderr or proc.stdout).strip()[-400:]}") from None
+        if data.get("is_error") or not data.get("structured_output"):
+            raise RuntimeError("Claude Code không gợi ý được tiêu đề: " + str(data.get("result") or "không có kết quả")[:400])
+        return _clean_titles(data["structured_output"].get("titles"), n)
+
+    if api_key:
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+    try:
+        import anthropic
+        from pydantic import BaseModel
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
+
+    class Title(BaseModel):
+        text: str
+        vi: str
+
+    class Titles(BaseModel):
+        titles: list[Title]
+
+    response = anthropic.Anthropic().messages.parse(
+        model=MODEL, max_tokens=2000, system=TITLE_SYSTEM, messages=[{"role": "user", "content": user}],
+        output_format=Titles, output_config={"effort": "low"},
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
+    )
+    if response.stop_reason == "refusal" or not response.parsed_output:
+        raise RuntimeError("Claude không gợi ý được tiêu đề cho phim này.")
+    return _clean_titles([t.model_dump() for t in response.parsed_output.titles], n)

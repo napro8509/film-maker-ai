@@ -37,6 +37,18 @@ pip install -e '.[ai,ui]'              # [ai] cho `plan`, [ui] cho giao diện w
 filmmaker check
 ```
 
+## App macOS (khuyên dùng)
+
+```bash
+scripts/build_mac_app.sh          # tạo ~/Applications/Film Maker.app
+```
+
+Mở "Film Maker" từ Launchpad/Spotlight hoặc kéo vào Dock. App là cửa sổ native (WKWebView),
+không cần mở trình duyệt hay bật server bằng tay — phần xử lý chạy ngầm bên trong app và tắt khi đóng cửa sổ.
+Tải file dùng hộp thoại Lưu của macOS; thông báo khi render xong hiện ở Notification Center.
+Log ở `~/Library/Logs/FilmMaker.log`. Chạy lại script nếu di chuyển thư mục dự án hoặc tạo lại `.venv`.
+Không cần build app: `filmmaker app`.
+
 ## Giao diện web
 
 ```bash
@@ -134,6 +146,33 @@ scenes:
 ```
 
 Mẹo: viết `prompt` bằng tiếng Anh, mỗi cảnh một hành động + một chuyển động máy quay.
+
+## Đội AI làm phim tự động (Claude Code)
+
+Mở Claude Code trong thư mục repo này rồi gõ:
+
+```
+/make-film ca-phe-sang Một ngày của cô gái bán cà phê ở Hà Nội
+/make-film ca-phe-sang --auto Một ngày ...    # không dừng hỏi trước khi render video tốn credit
+```
+
+Phim nằm ở `~/FilmMaker/<slug>/` (mở được trong `filmmaker ui`). Sửa `brief.md` để đổi thể loại, khán giả,
+khung hình, ngôn ngữ thoại/phụ đề, số cảnh, nhạc nền. Chạy lại lệnh với cùng slug để làm tiếp từ công đoạn còn dở.
+
+| Công đoạn | Agent tạo | Agent review | Tốn credit |
+|---|---|---|---|
+| Kịch bản `script.md` | screenwriter | script-reviewer | không |
+| Nhân vật + ảnh tham chiếu | character-designer, producer | visual-reviewer (characters) | không |
+| Storyboard `storyboard.yaml` | director | storyboard-reviewer | không |
+| Keyframe | producer | visual-reviewer (keyframes) | không |
+| Video | producer | visual-reviewer (clips) | **có** |
+| Ghép phim + ảnh bìa | producer | visual-reviewer (final) | không |
+
+Mỗi review ghi vào `reviews/` và kết thúc bằng `VERDICT: PASS` / `REVISE`; mỗi công đoạn sửa tối đa 2 vòng rồi hỏi bạn.
+Không có `--auto` thì đội luôn dừng hỏi trước khi render video. Với `--auto`, mỗi clip được render lại tối đa 1 lần;
+hết credit, mất đăng nhập hoặc cảnh bị ngắt khi render thì vẫn dừng hỏi. Định nghĩa agent ở `.claude/agents/`, lệnh ở `.claude/commands/make-film.md`.
+
+Tạo ảnh nhân vật bằng CLI: `filmmaker characters storyboard.yaml [--name Lan] [--force]` (miễn phí, tự ghi `image` vào storyboard).
 
 ## Các tuỳ chọn hay dùng
 
