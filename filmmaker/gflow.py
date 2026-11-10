@@ -139,6 +139,19 @@ MODEL_NAMES = {
     "veo-lite-lp": "Veo 3.1 Lite (lower priority)", "omni-flash": "Omni Flash", "omni-1.2-flash": "Omni 1.2 Flash",
 }
 
+PROMPT_LOG_MAX = 300
+
+
+def short_prompt(text: str, limit: int = PROMPT_LOG_MAX) -> str:
+    """The prompt on one line (whitespace and newlines folded), cut to `limit` chars with "…"."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
+def ui_log_line(head: list[str], sub: str, opts: list[str], prompt: str) -> str:
+    """The `  $ …` line shown for a flow_ui call: shell-quoted, one line, no --profile-dir/--project/-o/--timeout."""
+    return "  $ " + shlex.join([*head, sub, *opts, "--prompt", short_prompt(prompt)])
+
 
 def _gflow_python(binary: str) -> str | None:
     """The Python inside gflow-cli's own environment (it has Playwright and the browsers)."""
@@ -407,7 +420,12 @@ class Gflow:
             args += ["--max-credits", str(self.ui_max_credits)]
         if self.ui_window in ("show", "hidden", "headless"):
             args += ["--window", self.ui_window]
-        self.log("  $ " + shlex.join(args[:2] + ["i2v", "--image", str(image), "…"]))
+        opts = ["--image", str(image), *(a for r in refs or [] for a in ("--ref", str(r))), "--aspect", aspect]
+        if model:
+            opts += ["--model", MODEL_NAMES.get(model, model)]
+        if duration:
+            opts += ["--duration", str(duration)]
+        self.log(ui_log_line(cmd, "i2v", opts, prompt))
         if self.dry_run:
             return out, None
         payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)
@@ -430,7 +448,8 @@ class Gflow:
             args += ["--ref", str(r)]
         if self.ui_window in ("show", "hidden", "headless"):
             args += ["--window", self.ui_window]
-        self.log("  $ " + shlex.join(args[:2] + ["i2i", *(a for r in refs for a in ("--ref", str(r))), "…"]))
+        self.log(ui_log_line(cmd, "i2i", [*(a for r in refs for a in ("--ref", str(r))), "--aspect", aspect,
+                                          "--model", model], prompt))
         if self.dry_run:
             return out
         payload = self._run_ui(args, "ảnh có thể vẫn đang tạo trên Flow", spent=False)

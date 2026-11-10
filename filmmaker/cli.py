@@ -12,6 +12,7 @@ from typing import Any
 
 import click
 
+from . import durations as dur
 from . import model_meta, retirement
 from . import settings as user_settings
 from .assemble import AssembleError, assemble
@@ -53,7 +54,8 @@ def main() -> None:
 def check(storyboard: Path | None, out: Path | None, profile: str | None) -> None:
     """Kiểm tra gflow, phiên đăng nhập và ffmpeg.
 
-    Có STORYBOARD thì liệt kê thêm cảnh dùng model sắp ngừng/đã ngừng.
+    Có STORYBOARD thì liệt kê thêm cảnh dùng model sắp ngừng/đã ngừng và cảnh chưa có clip có độ dài
+    model không nhận.
     """
     ok = True
     g = Gflow(profile=profile)
@@ -74,6 +76,7 @@ def check(storyboard: Path | None, out: Path | None, profile: str | None) -> Non
         ok = ok and bool(found)
     if storyboard is not None:
         ok = _check_models(storyboard, out) and ok
+        ok = _check_durations(storyboard, out) and ok
     sys.exit(0 if ok else 1)
 
 
@@ -114,6 +117,44 @@ def _check_models(storyboard: Path, out: Path | None) -> bool:
         click.echo(f"✘ {len(blocked)} cảnh chưa có clip dùng model đã ngừng: đổi model trong UI "
                    "hoặc sửa `model:` trong storyboard.")
     return not blocked
+
+
+def _round_hint(storyboard: Path, out: Path | None) -> str:
+    out_part = f" --out {out}" if out is not None else ""
+    return f"Sửa nhanh: filmmaker round-durations {storyboard}{out_part} --up   (hoặc --down)"
+
+
+def _dry_pipeline(sb, storyboard: Path, out: Path | None) -> Pipeline:
+    return Pipeline(sb, _out_dir(storyboard, out), Gflow(dry_run=True, log=lambda *_: None), log=lambda *_: None)
+
+
+def _durations_ok_line(all_rows: list[dict]) -> str:
+    """The ✔ line when no scene without a clip has a bad duration. "hợp lệ" only when not even a done scene is
+    off; done scenes keep their clip and are never rounded, so they are only mentioned."""
+    done = sorted(r["id"] for r in all_rows if r["reason"] == "done")
+    if not done:
+        return "✔ Độ dài cảnh hợp lệ với model"
+    return (f"✔ Không có cảnh chưa có clip nào có độ dài model không nhận ({len(done)} cảnh đã có clip vẫn sai độ dài: "
+            f"{', '.join(done)} — giữ nguyên clip, không cần sửa)")
+
+
+def _check_durations(storyboard: Path, out: Path | None) -> bool:
+    """`check STORYBOARD`: scenes without a clip (todo, interrupted) whose duration the model does not accept."""
+    try:
+        sb = load_storyboard(storyboard)
+    except Exception:  # already reported (and failed) by _check_models
+        return True
+    all_rows = dur.scan(_dry_pipeline(sb, storyboard, out), model_meta.load())
+    rows = [r for r in all_rows if r["reason"] != "done"]
+    if not rows:
+        click.echo(_durations_ok_line(all_rows))
+        return True
+    click.echo(f"✘ {len(rows)} cảnh chưa có clip có độ dài model không nhận:")
+    for r in rows:
+        click.echo("  " + dur.describe(r))
+    if any(r["roundable"] for r in rows):
+        click.echo(_round_hint(storyboard, out))
+    return False
 
 
 @main.command()
@@ -217,6 +258,22 @@ def _check_run_models(pipe: Pipeline, only, force, retry_unknown: bool, *, warn_
                    + ", ".join(f"{r['id']} ({r['model']}, {_retire_text(r)})" for r in old))
 
 
+def _check_run_durations(pipe: Pipeline, storyboard: Path, out, only, force, retry_unknown: bool, *,
+                         warn_only: bool, skip: Collection[str] = ()) -> None:
+    """Before sending anything: stop if a scene to send has a duration its model does not accept.
+    Same scenes as `_check_run_models`. Only called from `_do_run`, once the storyboard loaded."""
+    send = [s for s in send_list(pipe, set(only) or None, set(force), retry_unknown) if s.id not in skip]
+    rows = dur.scan(pipe, model_meta.load(), send)
+    if not rows:
+        return
+    lines = "\n".join("  " + dur.describe(r) for r in rows)
+    hint = ("\n" + _round_hint(storyboard, out)) if any(r["roundable"] for r in rows) else ""
+    if not warn_only:
+        raise click.ClickException(
+            f"{len(rows)} cảnh có độ dài model không nhận, không gửi gì lên Flow:\n{lines}{hint}")
+    click.echo(f"⚠ Độ dài model không nhận:\n{lines}{hint}")
+
+
 def _adopt_clips(pipe: Pipeline, adopt, dry_run: bool) -> dict[str, str]:
     """`--adopt`: take clips/<id>.mp4 of legacy interrupted scenes. Returns {id: reason} of clips not usable."""
     failed: dict[str, str] = {}
@@ -254,13 +311,16 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     pipe = Pipeline(sb, out_dir, g, log=click.echo)
     adopt_failed = _adopt_clips(pipe, adopt, dry_run)
     _check_run_models(pipe, only, force, retry_unknown, warn_only=dry_run or keyframes_only, skip=adopt_failed)
+    _check_run_durations(pipe, storyboard, out, only, force, retry_unknown, warn_only=dry_run or keyframes_only,
+                         skip=adopt_failed)
     retired = retirement.refuse_retired(sb) if not dry_run else (lambda _s: None)
+    bad = dur.refuse_bad_duration(sb) if not dry_run else (lambda _s: None)
 
     def refuse(s):
         # A scene whose --adopt clip was unusable is never sent in this run, even with --retry-unknown
         # (its clip is "invalid"/"unchecked", which --retry-unknown would resend: maybe billed twice).
         # --force <id> would be the way to resend, but --adopt and --force on one scene are refused above.
-        return adopt_failed.get(s.id) or retired(s)
+        return adopt_failed.get(s.id) or retired(s) or bad(s)
 
     ab = None if dry_run else _auto_backup(storyboard, out_dir, auto_backup)
     try:
@@ -295,7 +355,8 @@ def run(storyboard: Path, **kw) -> None:
     """Tạo tất cả clip trên Google Flow. Chạy lại an toàn: cảnh đã xong sẽ được bỏ qua.
 
     Từ ngày model ngừng, cảnh sắp gửi dùng model đã ngừng bị chặn (không gửi gì, exit 1);
-    --dry-run và --keyframes-only chỉ cảnh báo.
+    --dry-run và --keyframes-only chỉ cảnh báo. Cảnh sắp gửi có độ dài model không nhận cũng bị chặn
+    như vậy (sửa nhanh: filmmaker round-durations STORYBOARD --up|--down).
 
     Cảnh bị ngắt từ bản cũ có clip tải tay trong clips/: --adopt <id> để dùng clip đó (không tốn credit).
     """
@@ -415,7 +476,7 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing,
 def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smart_edit, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim.
 
-    Chặn cảnh dùng model đã ngừng giống `run`.
+    Chặn cảnh dùng model đã ngừng và cảnh có độ dài model không nhận giống `run`.
     """
     sb, out_dir, report = _do_run(storyboard, **kw)
     if kw["dry_run"] or kw["keyframes_only"]:
@@ -433,6 +494,55 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smar
     ab = _auto_backup(storyboard, out_dir, kw.get("auto_backup"))
     if ab:
         ab.finish()  # final.mp4 + thumbnail
+
+
+@main.command("round-durations")
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
+@click.option("--up", "up", is_flag=True, help="Làm tròn lên độ dài hợp lệ gần nhất.")
+@click.option("--down", "down", is_flag=True, help="Làm tròn xuống độ dài hợp lệ gần nhất.")
+def round_durations(storyboard: Path, out: Path | None, up: bool, down: bool) -> None:
+    """Làm tròn độ dài cảnh mà model không nhận (không gọi gflow).
+
+    Không cờ: chỉ liệt kê (exit 1 nếu có cảnh sai). --up/--down: ghi lại `duration:` của các cảnh chưa có clip.
+    Cảnh bị ngắt và cảnh đã có clip không bao giờ bị sửa; còn cảnh bị ngắt sai độ dài thì exit 1.
+    """
+    if up and down:
+        raise click.UsageError("chọn một trong --up hoặc --down, không dùng cả hai.")
+    try:
+        sb = load_storyboard(storyboard)
+    except Exception as exc:  # pydantic/yaml errors: report, don't crash
+        raise click.ClickException(f"Storyboard còn lỗi, chưa làm tròn được: {exc}")
+    pipe = _dry_pipeline(sb, storyboard, out)
+    meta = model_meta.load()
+    all_rows = dur.scan(pipe, meta)
+    if not (up or down):
+        rows = [r for r in all_rows if r["reason"] != "done"]
+        rows.sort(key=lambda r: not r["roundable"])  # roundable first, interrupted after (stable)
+        if not rows:
+            click.echo(_durations_ok_line(all_rows))
+            return
+        for r in rows:
+            click.echo(dur.describe(r))
+        n = sum(1 for r in rows if r["roundable"])
+        if n:
+            click.echo(f"Chạy lại với --up hoặc --down để sửa {n} cảnh.")
+        sys.exit(1)
+    scenes, skipped = dur.preview(pipe, meta)
+    edits = dur.edits_for(scenes, "up" if up else "down")
+    if edits:  # nothing to round: leave the file untouched
+        try:
+            dur.rewrite_file(storyboard, edits)
+        except OSError as exc:
+            raise click.ClickException(f"Không ghi được {storyboard}: {exc.strerror or exc} (file chưa bị đổi)")
+    for r in scenes:
+        click.echo(f"{r['id']}: {r['duration']} → {edits[r['id']]} giây")
+    durations = {s.id: s.duration for s in sb.scenes}
+    for sid in skipped:
+        click.echo(f"⚠ {sid}: {durations[sid]} giây — bị ngắt, không tự làm tròn (kiểm tra Flow / tải clip về / sửa tay)")
+    if not scenes and not skipped:
+        click.echo(_durations_ok_line(all_rows))
+    sys.exit(1 if skipped else 0)
 
 
 def _do_thumbnail(sb, out_dir: Path, profile: str | None, *, remake: bool) -> Path:

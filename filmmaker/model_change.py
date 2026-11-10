@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from .durations import round_options  # moved; model_change.round_options still works
 from .model_meta import ModelMeta
 from .pipeline import Pipeline
 from .retirement import effective_model
@@ -53,13 +54,6 @@ class ChangePlan:
             "credits": self.credits, "credits_approx": self.credits_approx,
             "has_changes": self.has_changes(), "base": base,
         }
-
-
-def round_options(d: int, allowed: list[int]) -> tuple[int, int]:
-    """(up, down): nearest allowed duration >= d and <= d, clamped to the ends of `allowed`."""
-    up = min((x for x in allowed if x >= d), default=max(allowed))
-    down = max((x for x in allowed if x <= d), default=min(allowed))
-    return up, down
 
 
 def _unique(ids: Iterable[str]) -> list[str]:

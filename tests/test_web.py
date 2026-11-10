@@ -256,6 +256,7 @@ def test_thumbnail_titles_are_suggested_and_used_when_empty(client, tmp_path, mo
 
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="needs rclone")
+@pytest.mark.usefixtures("local_rclone")
 def test_backup_auto_backup_and_restore(client, tmp_path):
     remote = str(tmp_path / "drive" / "FilmMaker")
     st = client.put("/api/settings", json={"backup_remote": remote, "auto_backup": True}).json()
@@ -298,6 +299,7 @@ def test_backup_auto_backup_and_restore(client, tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("rclone"), reason="needs rclone")
+@pytest.mark.usefixtures("local_rclone")
 def test_failed_auto_backup_does_not_fail_the_render(client, tmp_path):
     client.put("/api/settings", json={"backup_remote": "nosuchremote:FilmMaker", "auto_backup": True})
     pid = client.post("/api/projects", json={"title": "Ly cà phê", "source": "template"}).json()["id"]

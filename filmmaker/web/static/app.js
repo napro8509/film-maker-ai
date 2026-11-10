@@ -180,19 +180,22 @@ function toast(msg, kind = "", ms = 4000) {
   setTimeout(() => t.remove(), ms);
 }
 
-function modal({ title, body, buttons = [], wide = false, onClose }) {
+/* canClose(): optional guard for user closes (Esc, ×, backdrop, plain buttons); the close() handed to onclick always closes. */
+function modal({ title, body, buttons = [], wide = false, onClose, canClose }) {
   const root = $("#modal-root");
   const close = () => {
+    if (!ov.isConnected) return;
     ov.remove(); document.removeEventListener("keydown", onKey); onClose && onClose();
     if (prevFocus && prevFocus.isConnected && prevFocus.focus) prevFocus.focus();
   };
-  const onKey = (e) => { if (e.key === "Escape") close(); };
+  const userClose = () => { if (!canClose || canClose()) close(); };
+  const onKey = (e) => { if (e.key === "Escape") userClose(); };
   const foot = buttons.length ? h("div", { class: "modal-foot" }, buttons.map((b) =>
-    h("button", { class: "btn " + (b.cls || ""), disabled: b.disabled, id: b.id, onclick: () => b.onclick ? b.onclick(close) : close() }, b.label))) : null;
+    h("button", { class: "btn " + (b.cls || ""), disabled: b.disabled, id: b.id, onclick: () => b.onclick ? b.onclick(close) : userClose() }, b.label))) : null;
   const prevFocus = document.activeElement;
-  const ov = h("div", { class: "overlay", onmousedown: (e) => { if (e.target === ov) close(); } },
+  const ov = h("div", { class: "overlay", onmousedown: (e) => { if (e.target === ov) userClose(); } },
     h("div", { class: "modal" + (wide ? " wide" : ""), role: "dialog", "aria-modal": "true", "aria-label": title },
-      h("div", { class: "modal-head" }, h("h2", {}, title), h("button", { class: "btn ghost icon", onclick: close, "aria-label": "Đóng", title: "Đóng (Esc)" }, icon("x"))),
+      h("div", { class: "modal-head" }, h("h2", {}, title), h("button", { class: "btn ghost icon", onclick: userClose, "aria-label": "Đóng", title: "Đóng (Esc)" }, icon("x"))),
       h("div", { class: "modal-body" }, body), foot));
   root.append(ov);
   document.addEventListener("keydown", onKey);
@@ -1074,6 +1077,28 @@ function renderSceneMedia(sc, { kfHint = null, lazy = false, prog = [`kf:${sc.id
 }
 
 /* retry: a failed render shows "Thử lại" (board, AC40). blocked: reason the render button is off (storyboard invalid). */
+/* Scene durations the model does not accept (rows from /estimate, /run 409, or scene_state[id].bad_duration). Pure helpers. */
+function durationRowText(r) {
+  return `${r.duration} giây — ${r.model} chỉ nhận ${(r.allowed || []).join(", ")}`;
+}
+function durationManualReason(r) {
+  if (r.reason === "interrupted") return `bị ngắt khi render, có thể Flow đã trừ credit — app không tự đổi độ dài; kiểm tra Flow/tải clip về clips/${r.id}.mp4, hoặc sửa tay độ dài trong editor`;
+  if (r.reason === "done") return "đã có clip — sửa tay độ dài trong editor rồi bấm Render lại";
+  return "";
+}
+const upperFirst = (s) => s ? s[0].toUpperCase() + s.slice(1) : s;
+function resendableBlocked(est) {
+  const bad = new Set((est.blocked_bad_duration || []).map((r) => r.id));
+  return (est.blocked || []).filter((id) => !bad.has(id));
+}
+function blockedBadDurationText(r) {
+  return `Cảnh ${r.id}: ${durationRowText(r)}. Bị ngắt nên app không tự làm tròn: kiểm tra Flow / tải clip về clips/${r.id}.mp4, hoặc sửa tay độ dài trong editor rồi bấm lại.`;
+}
+function interruptedReasonText(err) {
+  const s = String(err ?? "").replace(/^Flow \(giao diện chat\): /, "").trim();
+  return s.length > 300 ? s.slice(0, 299) + "…" : s;
+}
+
 function renderSceneActions(sc, { keyframe = true, video = true, retry = false, blocked = "" } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const busy = jobRunning();
@@ -1081,8 +1106,16 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
   if (st.status === "failed" && st.error) kids.push(h("div", { class: "scene-msg err" }, st.error));
   if (st.status === "interrupted") {
     kids.push(h("div", { class: "scene-msg warn" }, "Lần trước bị ngắt khi đang render, có thể Flow đã trừ credit. Hãy mở Flow xem clip đã có chưa trước khi gửi lại."));
+    const why = interruptedReasonText(st.error);
+    if (why) kids.push(h("div", { class: "scene-msg small" }, "Lý do lần trước: " + why));
     const clipMsg = manualClipMsg(sc, st, busy);
     if (clipMsg) kids.push(clipMsg);
+  }
+  // Server sends null for done/valid scenes. A hand-downloaded clip that will be taken in makes the advice moot (minor 5).
+  if (st.bad_duration && st.manual_clip !== "ok") {
+    kids.push(h("div", { class: "scene-msg warn" }, durationRowText(st.bad_duration) + (st.status === "interrupted"
+      ? " — bị ngắt nên app không tự làm tròn; sửa tay độ dài hoặc tải clip về"
+      : " — bấm Render để làm tròn, hoặc chọn độ dài khác")));
   }
   if (st.status === "done" && st.model_status === "retiring") {
     kids.push(h("div", { class: "scene-msg warn" }, `Model này ngừng ngày ${st.model_retires_label}. Clip hiện tại vẫn dùng được, nhưng Render lại sau ngày đó sẽ lỗi; nên đổi model trước khi render lại (sẽ tốn credit).`));
@@ -1803,6 +1836,12 @@ async function runAction(action, extra = {}, ctx = {}) {
   } catch (e) {
     // The server re-checks retired models (e.g. ticking "gửi lại" added an interrupted scene after /estimate).
     if (e.status === 409 && e.detail?.reason === "model_retired" && Array.isArray(e.detail.retired)) { openBlockedModelChange(e.detail.retired, ctx); return; }
+    // Safety net: a scene with a duration the model rejects was about to be sent. Offer the fix; never re-run on our own.
+    if (e.status === 409 && e.detail?.reason === "bad_duration" && Array.isArray(e.detail.bad_duration)) {
+      const r = await openDurationFix(e.detail.bad_duration, ctx);
+      if (r === "applied") toast("Đã làm tròn độ dài. Bấm Render khi sẵn sàng.", "ok", 6000);
+      return;
+    }
     // An interrupted scene (Flow may have billed it) was not confirmed: show why and reload, never resend on our own.
     if (e.status === 428 && e.detail?.reason === "needs_confirm") { toast(e.message, "error", 8000); refreshCurrent(); return; }
     toast(e.message, "error");
@@ -1815,7 +1854,103 @@ function openBlockedModelChange(retired, ctx = {}) {
   else openModelChange({ include: ids, blockedCount: ids.length });
 }
 
-async function confirmPaid(body, ctx = {}) {
+/* "Độ dài không hợp lệ": rows = bad_duration from /estimate or a /run 409. Rounding covers every roundable scene of the film
+   (durations/preview), called once; "Áp dụng" sends that preview's base. Resolves "applied" | "closed". */
+async function openDurationFix(rows, ctx = {}, { again = false } = {}) {
+  if (!S.cur) return "closed";
+  const pid = S.cur.id;
+  const roundable = rows.filter((r) => r.roundable), manual = rows.filter((r) => !r.roundable);
+  if (roundable.length) {
+    await flushSave();
+    if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return "closed"; }
+  }
+  const st = { dir: null, pv: null, loading: false, error: "", stale: false, applying: false, seq: 0 };
+  const box = h("div", { class: "stack" });
+  const okBtn = () => document.getElementById("df-ok");
+  const canApply = () => !!st.pv && !st.loading && !st.applying && !!st.dir && st.pv.scenes.length > 0 && !jobRunning();
+  const syncBtn = () => { const b = okBtn(); if (b) { b.disabled = !canApply(); b.textContent = st.applying ? "Đang áp dụng…" : "Áp dụng"; b.style.display = st.error ? "none" : ""; }
+    const c = document.getElementById("df-cancel"); if (c) c.disabled = st.applying; };
+
+  const roundPart = () => {
+    if (!roundable.length) return null;
+    const pv = st.pv;
+    if (st.loading && !pv) return h("div", { class: "row muted small" }, h("span", { class: "spinner" }), "Đang tính các cảnh sẽ làm tròn…");
+    if (st.error) return h("div", { class: "banner err flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" },
+      h("div", {}, "Không xem trước được: " + st.error), h("div", {}, h("button", { class: "btn sm", onclick: preview }, icon("refresh"), "Thử lại"))));
+    if (!pv) return null;
+    const head = h("div", { class: "lbl" }, "Làm tròn được");
+    if (!pv.scenes.length) return h("div", { class: "stack tight" }, head, h("p", { class: "muted" }, "Không còn cảnh nào cần làm tròn."));
+    return h("div", { class: "stack tight" + (st.loading ? " muted" : "") }, head,
+      st.stale ? h("div", { class: "banner warn flush", role: "alert" }, icon("alert"), h("div", { class: "b-body" }, "Storyboard vừa thay đổi — đã tải lại bảng, xem lại rồi bấm Áp dụng")) : null,
+      h("div", { class: "row" }, h("span", {}, h("b", {}, `Áp dụng sẽ đổi độ dài ${pv.scenes.length} cảnh trong cả phim`)),
+        h("div", { class: "seg", role: "group", "aria-label": "Hướng làm tròn" }, [["up", "Làm tròn lên"], ["down", "Làm tròn xuống"]].map(([v, l]) =>
+          h("button", { class: st.dir === v ? "on" : "", "aria-pressed": String(st.dir === v), onclick: () => { st.dir = v; draw(); } }, l)))),
+      h("table", { class: "list" },
+        h("tr", {}, h("th", {}, "Cảnh"), h("th", {}, "Model"), h("th", {}, "Độ dài hiện tại"), h("th", {}, "Model nhận"), h("th", {}, "Sẽ thành")),
+        pv.scenes.map((s) => h("tr", {}, h("td", { class: "mono" }, s.id), h("td", { class: "mono" }, s.model), h("td", {}, s.duration + " giây"),
+          h("td", {}, (s.allowed || []).join(", ")),
+          h("td", {}, st.dir ? `${st.dir === "up" ? s.up : s.down} giây` : h("span", { class: "muted" }, `lên ${s.up} / xuống ${s.down}`))))),
+      // Kept in the layout once a direction is picked so the dialog does not shrink and shift the buttons (QA 2).
+      h("p", { class: "help", style: st.dir ? "visibility:hidden" : null, "aria-hidden": st.dir ? "true" : null }, "Chọn làm tròn lên hoặc xuống thì mới áp dụng được."),
+      ctx.scene ? h("p", { class: "help" }, `Dù bạn chỉ render cảnh ${ctx.scene}, áp dụng sẽ làm tròn mọi cảnh trong bảng.`) : null);
+  };
+  const manualPart = () => manual.length ? h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" },
+    h("div", {}, h("b", {}, "Cần bạn tự xử lý")),
+    manual.map((r) => h("div", {}, h("span", { class: "mono" }, r.id), ": " + durationRowText(r) + ". " + upperFirst(durationManualReason(r)))))) : null;
+  const draw = () => {
+    put(box,
+      again && !roundable.length ? h("p", {}, "Đã làm tròn xong, nhưng vẫn còn cảnh app không tự sửa được.") : null,
+      roundPart(), manualPart(),
+      roundable.length && jobRunning() ? h("p", { class: "help" }, "Đang có job chạy. Đợi job xong rồi mới áp dụng.") : null,
+      h("p", { class: "help" }, roundable.length ? "Chỉ ghi storyboard, không render, không tốn credit." : "Sửa xong thì bấm Render lại."));
+    syncBtn();
+  };
+
+  async function preview() {
+    const my = ++st.seq;
+    st.loading = true; st.error = ""; draw();
+    try {
+      const pv = await api("POST", `/api/projects/${pid}/durations/preview`);
+      if (my !== st.seq) return;
+      st.pv = pv;
+    } catch (e) {
+      if (my !== st.seq) return;
+      st.pv = null; st.error = e.message;
+    }
+    st.loading = false; draw();
+  }
+
+  return new Promise((resolve) => {
+    let result = "closed";
+    async function apply(close) {
+      if (!canApply()) { if (jobRunning()) toast("Đang có job chạy. Đợi job xong rồi mới áp dụng.", "error"); return; }
+      st.applying = true; syncBtn();
+      try {
+        const r = await api("POST", `/api/projects/${pid}/durations/round`, { direction: st.dir, base: st.pv.base });
+        result = "applied";
+        close();
+        reloadProject(r.project);
+      } catch (e) {
+        st.applying = false;
+        if (e.status === 409 && e.detail?.reason === "stale_base") { st.stale = true; preview(); return; } // never re-round on our own
+        syncBtn();
+        toast(e.message, "error", 7000);
+      }
+    }
+    modal({
+      title: "Độ dài không hợp lệ", body: box, wide: true,
+      onClose: () => { st.seq++; resolve(result); },
+      canClose: () => !st.applying, // durations/round in flight: it may already have written the storyboard
+      buttons: roundable.length
+        ? [{ label: "Huỷ", id: "df-cancel" }, { label: "Áp dụng", id: "df-ok", cls: "primary", disabled: true, onclick: apply }]
+        : [{ label: "Đóng" }],
+    });
+    draw();
+    if (roundable.length) preview();
+  });
+}
+
+async function confirmPaid(body, ctx = {}, again = false) {
   let est;
   // Only scenes the user ticks below are resent; retry_unknown is never sent from the web.
   delete body.retry_unknown;
@@ -1824,6 +1959,15 @@ async function confirmPaid(body, ctx = {}) {
   if (est.retired?.length) { // never send a retired model to Flow: offer the model change instead
     openBlockedModelChange(est.retired, ctx);
     return false;
+  }
+  if (est.bad_duration?.length) { // never send a duration the model rejects: offer rounding instead of the credit box
+    if (again && est.bad_duration.some((r) => r.roundable)) {
+      toast("Vẫn còn cảnh có độ dài model không nhận sau khi làm tròn — kiểm tra models.yaml/storyboard rồi thử lại", "error", 8000);
+      return false;
+    }
+    const r = await openDurationFix(est.bad_duration, ctx, { again });
+    if (r !== "applied") return false;
+    return confirmPaid(body, ctx, true);
   }
   const adopt = est.adopt || [], unverified = est.unverified_clip || [];
   if (!est.renders.length && !est.blocked.length && adopt.length) {
@@ -1838,7 +1982,8 @@ async function confirmPaid(body, ctx = {}) {
   }
   return new Promise((resolve) => {
     let done = false, retry = false;
-    const count = () => est.renders.length + (retry ? est.blocked.length : 0);
+    const bbd = est.blocked_bad_duration || [], resend = resendableBlocked(est); // AC13: wrong-length interrupted scenes are never resent
+    const count = () => est.renders.length + (retry ? resend.length : 0);
     const okBtnLabel = () => count() || !adopt.length ? `Render ${count()} clip` : "Dùng clip đã tải về";
     const okEnabled = () => count() > 0 || adopt.length > 0; // adopt-only runs spend no credit
     const body2 = h("div", { class: "stack" },
@@ -1851,7 +1996,8 @@ async function confirmPaid(body, ctx = {}) {
         h("div", {}, `Cảnh ${est.blocked.join(", ")} bị ngắt khi render lần trước, có thể Flow đã trừ credit. Hãy kiểm tra trên Flow trước.`),
         est.blocked.filter((id) => unverified.includes(id)).map((id) =>
           h("div", { class: "small", style: { marginTop: "4px" } }, `Cảnh ${id}: có clip trong thư mục — dùng [Dùng clip này] trên thẻ cảnh thay vì gửi lại`)),
-        h("label", { class: "check", style: { marginTop: "8px" } }, h("input", { type: "checkbox", onchange: (e) => { retry = e.target.checked; body.confirm_resend = retry ? [...est.blocked] : []; document.getElementById("paid-ok").textContent = okBtnLabel(); document.getElementById("paid-ok").disabled = !okEnabled(); } }),
+        bbd.map((r) => h("div", { class: "small", style: { marginTop: "4px" } }, blockedBadDurationText(r))),
+        h("label", { class: "check", style: { marginTop: "8px" } }, h("input", { type: "checkbox", disabled: !resend.length, onchange: (e) => { retry = e.target.checked; body.confirm_resend = retry ? [...resend] : []; document.getElementById("paid-ok").textContent = okBtnLabel(); document.getElementById("paid-ok").disabled = !okEnabled(); } }),
           h("span", {}, "Tôi đã kiểm tra, gửi lại các cảnh này")))) : null,
       adopt.length ? h("div", { class: "banner info flush" }, icon("check"), h("div", { class: "b-body" },
         adopt.map((id) => h("div", {}, `Cảnh ${id} sẽ dùng clip bạn đã tải về (không tốn credit)`)))) : null,
@@ -1976,8 +2122,8 @@ function renderJobbar() {
 }
 
 function lineClass(l) {
+  if (/^\s+\$ /.test(l)) return "l-cmd"; // command lines carry the prompt, which may say "Error"
   if (/LỖI|✘|lỗi:|Error/.test(l)) return "l-err";
-  if (/^\s+\$ /.test(l)) return "l-cmd";
   if (/OK ->|✔|🎬/.test(l)) return "l-ok";
   if (/⚠|BỎ QUA|⏸|!/.test(l)) return "l-warn";
   return "";

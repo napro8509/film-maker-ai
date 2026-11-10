@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from .. import durations as dur
 from .. import manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble
@@ -255,6 +256,11 @@ class ModelChangeBody(BaseModel):
     base: str | None = None  # content hash from the preview (required to apply)
 
 
+class RoundBody(BaseModel):
+    direction: str | None = None  # "up" | "down"
+    base: str | None = None  # from durations/preview
+
+
 class FinalSettings(BaseModel):
     music: str | None = None
     volume: float = 0.25
@@ -350,8 +356,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "storyboard.yaml không hợp lệ")
         return data
 
-    def write_raw(pid: str, data: dict[str, Any]) -> None:
-        text = yaml.safe_dump(_clean(data), allow_unicode=True, sort_keys=False, width=100)
+    def write_raw(pid: str, data: dict[str, Any], *, clean: bool = True) -> None:
+        """clean=False dumps `data` as is (rounding durations: the raw dict only differs in `duration`)."""
+        text = yaml.safe_dump(_clean(data) if clean else data, allow_unicode=True, sort_keys=False, width=100)
         with sb_lock(pid):
             tmp = sb_path(pid).with_suffix(".tmp")
             tmp.write_text(text, encoding="utf-8")
@@ -436,6 +443,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
                 status = pipe.scene_status(s)
+                eff = retirement.effective_model(sb, s)
                 clips_rendered += status in ("done", "changed")
                 scenes[s.id] = {
                     "status": status,
@@ -450,8 +458,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "rendered_as": st.get("rendered_as"),
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
-                    "model_status": meta.status(retirement.effective_model(sb, s)),
-                    "model_retires_label": meta.retires_label(retirement.effective_model(sb, s)),
+                    "model_status": meta.status(eff),
+                    "model_retires_label": meta.retires_label(eff),
+                    # a duration the effective model does not accept (not for done scenes: the clip exists)
+                    "bad_duration": ({"duration": s.duration, "model": eff, "allowed": meta.durations(eff)}
+                                     if status != "done" and dur.is_bad(sb, s, meta) else None),
                     "refs": [n for n, _ in sb.scene_refs(s)],
                     "characters": [c.name for c in sb.scene_characters(s)],
                     "characters_explicit": s.characters is not None,
@@ -1087,6 +1098,57 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"changed": False, "message": "Không có gì thay đổi", "project": detail(pid)}
         return {"changed": True, "preview": plan.public(base), "project": detail(pid)}
 
+    # ---- durations: round the scenes whose duration the model does not accept ----
+
+    def durations_state(pid: str) -> tuple[Pipeline, model_meta.ModelMeta, str]:
+        """(pipe, meta, base) from the file on disk. Call inside sb_lock(pid). 400 for a broken storyboard."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError, yaml.YAMLError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        pipe = Pipeline(sb, out_dir(pid), gflow(True), log=lambda *_: None)
+        meta = model_meta.load()
+        # the scene groups and allowed durations are in the base: a scene rendered or a models.yaml edit
+        # between preview and round gives 409 stale_base
+        base = dur.base_of(sb_path(pid).read_bytes(), dur.groups(pipe), dur.allowed_map(pipe, meta))
+        return pipe, meta, base
+
+    @app.post("/api/projects/{pid}/durations/preview")
+    def durations_preview(pid: str) -> dict[str, Any]:
+        """Only reads: the roundable scenes, the interrupted ones skipped, and the base for the round."""
+        pdir(pid)  # check pid before creating a lock for it
+        with sb_lock(pid):
+            pipe, meta, base = durations_state(pid)
+            scenes, skipped = dur.preview(pipe, meta)
+        return {"scenes": scenes, "skipped": skipped, "base": base}
+
+    @app.post("/api/projects/{pid}/durations/round")
+    def durations_round(pid: str, body: RoundBody) -> dict[str, Any]:
+        """Only rewrites `duration` in storyboard.yaml: no job, nothing sent to Flow. Done and interrupted
+        scenes are never changed (recomputed here from the current state, even when the base matches)."""
+        pdir(pid)  # check pid before creating a lock for it
+        if body.direction not in dur.DIRECTIONS:
+            raise HTTPException(400, "direction phải là up hoặc down.")
+        if not body.base:
+            raise HTTPException(400, "Thiếu base (lấy từ bản xem trước).")
+        with jobs.lock:  # no job may start for this project while the storyboard is written
+            if jobs.current and jobs.current.status == "running" and jobs.current.project == pid:
+                raise HTTPException(409, detail={"message": "Đang có job chạy, đợi xong rồi làm tròn độ dài.",
+                                                 "reason": "job_running"})
+            with sb_lock(pid):
+                pipe, meta, base = durations_state(pid)
+                if body.base != base:
+                    raise HTTPException(409, detail={
+                        "message": "Storyboard vừa thay đổi từ lúc xem trước. Hãy xem lại bảng rồi áp dụng.",
+                        "reason": "stale_base"})
+                scenes, skipped = dur.preview(pipe, meta)
+                edits = dur.edits_for(scenes, body.direction)
+                if edits:
+                    write_raw(pid, dur.apply_to_raw(read_raw(pid), edits), clean=False)
+        changed = [{"id": r["id"], "from": r["duration"], "to": edits[r["id"]]} for r in scenes]
+        return {"changed": bool(changed), "scenes": changed, "skipped": skipped, "project": detail(pid)}
+
     # ---- run / estimate ----
 
     def check_ids(sb: Storyboard, body: RunBody) -> None:
@@ -1103,6 +1165,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         needs_confirm: list[str]  # forced interrupted scenes not ticked in confirm_resend (storyboard order)
         retired: list[dict[str, Any]]  # sent or forced scenes whose model is retired (storyboard order)
         unverified_clip: list[str]  # blocked legacy interrupted scenes with a readable clip
+        bad_duration: list[dict[str, Any]]  # sent scenes with a duration their model does not accept
+        blocked_bad_duration: list[dict[str, Any]]  # blocked (interrupted) scenes with a bad duration
 
     def web_video_plan(pipe: Pipeline, body: RunBody) -> WebPlan:
         """What a web video run does with each scene: the one rule for /estimate and /run. On the web an
@@ -1111,14 +1175,18 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         plan = pipe.video_plan(set(body.only), force, False, confirm=set(body.confirm_resend))  # empty only = all
         blocked = [s for s, kind in plan if kind == "blocked"]
         needs = [s.id for s in blocked if s.id in force]
+        send = [s for s, kind in plan if kind == "send"]
+        meta = model_meta.load()
+        rows = {r["id"]: r for r in dur.scan(pipe, meta)}  # adopted scenes are not checked (AC5)
         return WebPlan(
-            send=[s for s, kind in plan if kind == "send"],
+            send=send,
             blocked=blocked,
             adopt=[s for s, kind in plan if kind == "adopt"],
             needs_confirm=needs,
-            retired=retirement.retired_of(pipe, model_meta.load(),
-                                          [s for s, kind in plan if kind == "send" or s.id in needs]),
+            retired=retirement.retired_of(pipe, meta, [s for s, kind in plan if kind == "send" or s.id in needs]),
             unverified_clip=[s.id for s in blocked if pipe.manual_clip_state(s) == "unverified"],
+            bad_duration=[rows[s.id] for s in send if s.id in rows],
+            blocked_bad_duration=[rows[s.id] for s in blocked if s.id in rows],
         )
 
     @app.post("/api/projects/{pid}/estimate")
@@ -1143,6 +1211,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "new_keyframes": kf_new,
             "done": [s.id for s in sb.scenes if pipe.is_done(s)],
             "retired": wp.retired,
+            "bad_duration": wp.bad_duration,
+            "blocked_bad_duration": wp.blocked_bad_duration,
         }
 
     @app.post("/api/projects/{pid}/scenes/{sid}/adopt-clip")
@@ -1242,6 +1312,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if retired:  # before jobs.start: no job, no backup, nothing sent to Flow
                 raise HTTPException(409, detail={"message": f"Không thể render: {len(retired)} cảnh dùng model đã ngừng",
                                                  "reason": "model_retired", "retired": retired})
+            if wp.bad_duration:  # same: refused before anything is sent (AC8)
+                ids = ", ".join(r["id"] for r in wp.bad_duration)
+                raise HTTPException(409, detail={
+                    "message": f"Không thể render: {len(wp.bad_duration)} cảnh có độ dài model không nhận ({ids})",
+                    "reason": "bad_duration", "bad_duration": wp.bad_duration})
             if wp.needs_confirm:  # a forced interrupted scene the user did not tick: may cost credits twice
                 ids = ", ".join(wp.needs_confirm)
                 raise HTTPException(428, detail={
@@ -1266,6 +1341,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if dry:
                 job.log("== XEM TRƯỚC: không gửi gì lên Flow ==")
             pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=None if dry else job.set_progress)
+            retired = retirement.refuse_retired(sb) if not dry else (lambda _s: None)
+            bad = dur.refuse_bad_duration(sb) if not dry else (lambda _s: None)
             report = pipe.run(RunOptions(
                 only=set(body.only) or None, force=set(body.force), retry_unknown=False,
                 confirm=set(body.confirm_resend),  # web: an interrupted scene is only resent when ticked
@@ -1275,7 +1352,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 force_keyframes=set(body.force_keyframes),
                 should_stop=lambda: job.stop_requested,
                 after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
-                refuse=retirement.refuse_retired(sb) if not dry else (lambda _s: None),
+                refuse=lambda s: retired(s) or bad(s),  # retired model first, then the duration
             ))
             job.log("")
             if dry:

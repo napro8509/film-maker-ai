@@ -15,3 +15,7 @@ and only with a `gflow.py` that is known to print the same as before:
 cd /Users/mac/Desktop/Projects/film-maker-ai
 .venv/bin/python tests/fixtures/cli_golden/capture.py
 ```
+
+**Out of date (flow-render-fixes, 2026-11-10):** `run_real.txt` still has the old one-line `  $ … i2v --image <img> …`
+log of the Flow chat-page call. That line now shows every option and a shortened `--prompt` (see `ui_log_line` in
+`filmmaker/gflow.py`). No test reads `run_real.txt` today; recapture with `capture.py` before using it again.

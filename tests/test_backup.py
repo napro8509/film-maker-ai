@@ -129,6 +129,7 @@ def test_auto_backup_merges_requests_and_survives_errors():
 
 
 @needs_rclone
+@pytest.mark.usefixtures("local_rclone")
 def test_backup_restore_roundtrip_with_versions(tmp_path):
     ws = tmp_path / "ws"
     d = make_ui_project(ws)
@@ -172,6 +173,7 @@ def test_backup_restore_roundtrip_with_versions(tmp_path):
 
 
 @needs_rclone
+@pytest.mark.usefixtures("local_rclone")
 def test_restored_project_is_seen_as_done(tmp_path):
     """The point of fixing paths: a restored clip must not be rendered (paid) again."""
     from filmmaker.gflow import Gflow
@@ -195,6 +197,7 @@ def test_restored_project_is_seen_as_done(tmp_path):
 
 
 @needs_rclone
+@pytest.mark.usefixtures("local_rclone")
 def test_cli_run_with_auto_backup_then_restore(tmp_path, monkeypatch):
     import sys
 
@@ -249,6 +252,7 @@ def test_cli_backup_explains_missing_rclone(tmp_path, monkeypatch):
 
 
 @needs_rclone
+@pytest.mark.usefixtures("local_rclone")
 def test_restore_project_that_was_never_rendered(tmp_path):
     d = tmp_path / "ws" / "moi"
     d.mkdir(parents=True)

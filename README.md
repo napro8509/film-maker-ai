@@ -99,8 +99,11 @@ filmmaker run cafe.yaml --dry-run
 # Tạo clip + ghép phim
 filmmaker make cafe.yaml --music nhac.mp3 --burn-subtitles
 
-# Kiểm tra công cụ + cảnh dùng model sắp ngừng/đã ngừng
+# Kiểm tra công cụ + cảnh dùng model sắp ngừng/đã ngừng + cảnh có độ dài model không nhận
 filmmaker check cafe.yaml            # [--out DIR], mặc định output/<tên storyboard>
+
+# Làm tròn độ dài model không nhận (vd veo-lite chỉ nhận 4, 6, 8 giây); không cờ thì chỉ liệt kê
+filmmaker round-durations cafe.yaml --up     # hoặc --down; [--out DIR]
 
 # Xem tiến độ / làm lại một cảnh / ghép lại
 filmmaker status cafe.yaml
@@ -293,6 +296,30 @@ models:
   Cảnh bị ngắt vẫn cần kiểm tra trên Flow rồi mới "Gửi lại", đổi model không xoá trạng thái bị ngắt.
 - Thử trước hành vi "đã ngừng": trong file ghi đè đặt `retires` của model đó là một ngày đã qua, xoá dòng đó để quay lại.
 
+#### Độ dài cảnh model không nhận
+
+Model có khai báo `durations` (vd `veo-lite: [4, 6, 8]`) chỉ nhận các độ dài đó; gửi cảnh `duration: 5` thì Flow từ
+chối và cảnh bị lỗi. `duration` để trống (mặc định của Flow) và model không khai báo `durations` thì không bị kiểm.
+
+- `filmmaker check cafe.yaml` liệt kê cảnh chưa có clip (chưa render, bị ngắt) có độ dài sai, dạng
+  `s03: 5 giây — veo-lite chỉ nhận 4, 6, 8 (lên 6 / xuống 4)`, và thoát mã 1.
+- `run`/`make`: có cảnh sắp gửi bị sai độ dài thì không gửi gì (thoát mã 1). `--dry-run` và `--keyframes-only` chỉ
+  cảnh báo. Chỉ xét cảnh lượt này sẽ gửi: cảnh đã có clip (trừ khi `--force`) và cảnh bị ngắt "BỎ QUA" không chặn.
+- `filmmaker round-durations cafe.yaml [--out DIR] [--up | --down]`: không cờ thì chỉ liệt kê (thoát mã 1 nếu có cảnh
+  sai); `--up`/`--down` ghi lại `duration:` của các cảnh chưa có clip về độ dài hợp lệ gần nhất (kẹp ở hai đầu danh
+  sách), in `s03: 5 → 6 giây`. Không gọi gflow, không tốn credit. Ghi lại storyboard nên comment và kiểu trích dẫn trong YAML bị mất
+  (giá trị các khoá khác giữ nguyên, chỉ `duration` đổi); nút "Áp dụng" trong giao diện cũng vậy.
+  Cảnh **bị ngắt** không bao giờ tự làm tròn (có thể Flow vẫn đang render): kiểm tra Flow, tải clip về hoặc sửa tay;
+  còn cảnh như vậy thì lệnh thoát mã 1. Cảnh **đã có clip** cũng không bị sửa; muốn render lại thì sửa tay `duration:`.
+- Giao diện: bấm Render mà có cảnh sai độ dài thì hiện hộp "Độ dài không hợp lệ" (làm tròn lên/xuống) trước hộp credit.
+
+#### Flow báo xếp hàng
+
+Sau khi đồng ý trả credit, nếu Flow trả lời "đang xếp hàng (đông người dùng)" thì app không coi là lỗi mà chờ tiếp
+trong thời gian cho phép (log in số phút còn lại). Hết giờ mà chưa có video, cảnh ở trạng thái bị ngắt kèm cách xử lý:
+mở Flow, tải video về `clips/<id>.mp4`, rồi "Dùng clip này" (hoặc chạy lại; app tự nhận clip, không tốn credit).
+App không tự gửi lại cảnh đã trả credit. Dòng lệnh trong log giờ có prompt (rút gọn), model và độ dài đã gửi.
+
 ## Đội AI làm phim tự động (Claude Code)
 
 Mở Claude Code trong thư mục repo này rồi gõ:
@@ -325,6 +352,7 @@ Tạo ảnh nhân vật bằng CLI: `filmmaker characters storyboard.yaml [--nam
 | Lệnh | Tuỳ chọn |
 |---|---|
 | `run` / `make` | `--dry-run`, `--keyframes-only`, `--only s02`, `--force s02`, `--retry-unknown`, `--adopt s02`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
+| `round-durations` | `--up`, `--down`, `--out <thư mục>` |
 | `stitch` / `make` | `--music file.mp3`, `--music-volume 0.25`, `--burn-subtitles`, `--allow-missing`, `-o phim.mp4` |
 
 Biến môi trường: `GFLOW_BIN` (đường dẫn lệnh gflow khác), `ANTHROPIC_API_KEY` (cho `plan`).

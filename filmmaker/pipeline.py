@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Literal
 
-from . import manual_clip
+from . import durations as dur
+from . import manual_clip, model_meta
 from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Character, Scene, Storyboard
@@ -730,6 +731,12 @@ class Pipeline:
         how = ("bấm “Gửi lại” trên thẻ cảnh và tick ô xác nhận trong hộp Render" if web
                else f"chạy lại với --force {s.id}" if mc == "unverified"  # --retry-unknown skips it (AC10)
                else f"chạy lại với --retry-unknown hoặc --force {s.id}")
+        meta = model_meta.load()
+        if dur.is_bad(self.sb, s, meta):
+            # a resend is refused anyway (the UI tick box is off for it): say the duration comes first
+            allowed = dur.allowed_text(dur.allowed_for(self.sb, s, meta) or [])
+            how = (f"sửa tay `duration:` ({s.duration} giây, {s.model or self.sb.model} chỉ nhận {allowed}; "
+                   f"bị ngắt nên app không tự làm tròn) rồi {how}")
         msg = ("lần chạy trước bị ngắt khi đang render — có thể đã trừ credit. Nếu video đã có trên Flow, "
                f"tải về và lưu thành {clip} rồi chạy lại; nếu chưa có, {how}")
         if mc == "stale":

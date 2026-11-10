@@ -14,12 +14,16 @@ It prints one JSON document on stdout, shaped like gflow's:
   {"status": "fail", "error": {"exit_code": N, "detail": ..., "retryable": false, "spent": bool}}
 
 Nothing is ever retried after "Approve" has been clicked, so credits are spent at most once.
+For i2v, --timeout counts from the moment the driver starts: every long wait (opening the page,
+uploads, Flow's offer, the render, each download) is cut to the time left, so the JSON is always
+printed before the caller kills the process.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -105,7 +109,7 @@ def _unheadless_ua(ctx, page) -> None:
         pass
 
 
-def _session(pw, profile: Path, channel: str | None, window: str, project: str):
+def _session(pw, profile: Path, channel: str | None, window: str, project: str, deadline: Deadline | None = None):
     """Open the project page with gflow's signed-in profile. Tries Chrome, then Playwright's Chromium
     (whichever one gflow signed in with is the one that can read the profile's cookies).
     window: "show" (visible), "hidden" (real browser kept off-screen/minimized), "headless"."""
@@ -129,7 +133,7 @@ def _session(pw, profile: Path, channel: str | None, window: str, project: str):
         elif window == "headless":
             _unheadless_ua(ctx, page)
         try:
-            _open_project(page, project)
+            _open_project(page, project, deadline)
             return ctx, page
         except Fail as f:
             ctx.close()
@@ -168,16 +172,61 @@ def _wait(fn, timeout: float, every: float = 0.5):
     return None
 
 
-def _open_project(page, project: str) -> None:
-    page.goto(f"{FLOW}/project/{project}", wait_until="domcontentloaded", timeout=90_000)
-    ok = _wait(lambda: page.locator(EDITOR).count() > 0 or "accounts.google.com" in page.url or "/about" in page.url, 90)
+class Deadline:
+    """One time budget for a whole i2v run, started when the driver starts (reads the module's `time`)."""
+
+    def __init__(self, seconds: float):
+        self.start = time.time()
+        self.end = self.start + seconds
+
+    def left(self) -> float:
+        return max(0.0, self.end - time.time())
+
+    def expired(self) -> bool:
+        return self.left() <= 0
+
+    def cap(self, seconds: float) -> float:
+        return max(0.0, min(seconds, self.left()))
+
+    def cap_ms(self, ms: float) -> int:
+        return max(1, int(min(ms, self.left() * 1000)))
+
+
+def _cap(deadline: Deadline | None, seconds: float) -> float:
+    return seconds if deadline is None else deadline.cap(seconds)
+
+
+def _pre_send_timeout(detail: str | None = None) -> Fail:
+    """Out of time before anything was sent to Flow: exit 9, nothing spent. Never 23 (that one stops
+    the whole render run), because nothing is wrong with the page; the next scene can still go."""
+    return Fail(EXIT_TIMEOUT, detail or "Hết thời gian chờ trước khi gửi yêu cầu lên Flow (chưa gửi, chưa trừ credit) "
+                "— thử render lại.", spent=False)
+
+
+def _open_project(page, project: str, deadline: Deadline | None = None) -> None:
+    goto_ms = 90_000 if deadline is None else deadline.cap_ms(90_000)
+    try:
+        page.goto(f"{FLOW}/project/{project}", wait_until="domcontentloaded", timeout=goto_ms)
+    except Exception as exc:
+        # On purpose: with a deadline, a page that does not load in time (even a slow network while time
+        # is still left) is exit 9 spent=False, not 23, so the render run goes on with the next scene.
+        if deadline is not None and (deadline.expired() or type(exc).__name__ == "TimeoutError"):
+            if deadline.expired():
+                raise _pre_send_timeout() from exc
+            raise _pre_send_timeout(f"Không mở được trang Flow trong {goto_ms // 1000} giây (chưa gửi, "
+                                    "chưa trừ credit) — kiểm tra mạng rồi thử render lại.") from exc
+        raise
+    ok = _wait(lambda: page.locator(EDITOR).count() > 0 or "accounts.google.com" in page.url or "/about" in page.url,
+               _cap(deadline, 90))
     if "accounts.google.com" in page.url or "/about" in page.url:
         raise Fail(EXIT_AUTH, "Chưa đăng nhập Google trong profile của gflow. Chạy: gflow auth login --browser chrome")
     if not ok:
+        if deadline is not None and deadline.expired():
+            raise _pre_send_timeout()
         raise Fail(EXIT_DRIFT, "Không thấy ô chat của Flow (giao diện có thể đã thay đổi).")
 
 
-def _attach(page, image: Path) -> None:
+def _attach(page, image: Path, deadline: Deadline | None = None) -> None:
     before = page.locator(CHIP).count()
     page.locator(ADD_BTN).click()
     menu = page.locator(ADD_MENU)
@@ -204,15 +253,21 @@ def _attach(page, image: Path) -> None:
             return "listed"
         return None
 
-    how = _wait(settled, 180, 1.0)
+    how = _wait(settled, _cap(deadline, 180), 1.0)
+    if how is None and deadline is not None and deadline.expired():
+        if menu.is_visible():
+            page.keyboard.press("Escape")
+        raise _pre_send_timeout()
     if how == "listed":
         time.sleep(1.5)  # let the thumbnail finish processing
         items.first.click()
         time.sleep(0.8)
         menu.locator("button", has_text="Add to prompt").first.click()
-    if not _wait(lambda: page.locator(CHIP).count() > before, 60, 1.0):
+    if not _wait(lambda: page.locator(CHIP).count() > before, _cap(deadline, 60), 1.0):
         if menu.is_visible():
             page.keyboard.press("Escape")
+        if deadline is not None and deadline.expired():
+            raise _pre_send_timeout()
         raise Fail(EXIT_DRIFT, "Đã tải ảnh lên nhưng không gắn được vào ô chat của Flow.")
     if menu.is_visible():
         page.keyboard.press("Escape")
@@ -263,10 +318,13 @@ def _tile(page, title: str):
             .filter(has=page.locator(VIDEO_TILE)).first)
 
 
-def _try_download(page, title: str, out: Path) -> str:
+def _try_download(page, title: str, out: Path, deadline: Deadline | None = None) -> str:
     """Click Download > Original size and keep the video bytes the page fetches.
     Returns "ok", or "pending" if the clip is not ready yet. The browser's own file download is
-    suppressed (it is what closed the browser before); the bytes come from the page's request."""
+    suppressed (it is what closed the browser before); the bytes come from the page's request.
+    With a deadline, the wait for the bytes is cut to the time left (under 1 s left: not tried)."""
+    if deadline is not None and deadline.left() < 1:
+        return "pending"
     tile = _tile(page, title)
     if not tile.count():
         return "pending"
@@ -297,7 +355,7 @@ def _try_download(page, title: str, out: Path) -> str:
     page.evaluate("""() => { if (!window.__fmNoDl) { window.__fmNoDl = HTMLAnchorElement.prototype.click;
         HTMLAnchorElement.prototype.click = function () { if (!(this.href || '').startsWith('blob:')) return window.__fmNoDl.call(this); }; } }""")
     try:
-        with page.expect_response(lambda r: VIDEO_URL in r.url, timeout=180_000) as resp:
+        with page.expect_response(lambda r: VIDEO_URL in r.url, timeout=180_000 if deadline is None else deadline.cap_ms(180_000)) as resp:
             orig.click()
         r = resp.value
         body = r.body() if r.ok else b""
@@ -330,7 +388,8 @@ def _close_menus(page) -> None:
         pass
 
 
-def _poll_download(page, titles_before: list[str], out: Path, last_try: float, every: float = 20) -> bool:
+def _poll_download(page, titles_before: list[str], out: Path, last_try: float, every: float = 20,
+                   deadline: Deadline | None = None) -> bool:
     """One check of the grid: True once the new clip is saved to `out`.
     Raises PollTried after an attempt that found the clip not ready (at most every `every` seconds)."""
     title = _new_tile(page, titles_before)
@@ -339,7 +398,7 @@ def _poll_download(page, titles_before: list[str], out: Path, last_try: float, e
     busy = _tile(page, title).locator("[role=progressbar], mat-progress-spinner, mat-progress-bar").count()
     if busy or time.time() - last_try <= every:
         return False
-    if _try_download(page, title, out) == "ok":
+    if _try_download(page, title, out, deadline) == "ok":
         return True
     raise PollTried()
 
@@ -354,7 +413,31 @@ FAILED_RE = re.compile(r"(generation|video) (has )?failed|couldn['’]t (generat
                        r"unable to (generate|create)|violat|against (our|the) (policy|policies)|something went wrong", re.I)
 
 
+# Flow's answer when it accepted the job but has not started it yet ("…has been scheduled and is waiting in the
+# queue due to high demand…"). Kept narrow, so a real error is never taken for "queued".
+QUEUED_RE = re.compile(r"waiting in (the )?queue|has been scheduled", re.I)
+AUDIO_FAILED_RE = re.compile(r"audio generation failed", re.I)
+APPROVE_MIN_LEFT = 180  # seconds: with less left, Flow's offer is rejected (spent=False) instead of approved
+SEND_MIN_LEFT = 240 + APPROVE_MIN_LEFT + 60  # = 480 s: with less left, nothing is sent (exit 9, spent=False)
+# 240 = longest wait for Flow's offer; 60 = _stable_titles (<= 30 s) + waiting for the send button (<= 15 s) + slack
+AUDIO_HINT = ("Flow báo “Audio generation failed”: thường do lời thoại/nội dung thoại — sửa lời thoại hoặc prompt "
+              "rồi gửi lại (có thể tốn credit).")
+
+
+def classify_replies(texts: list[str]) -> tuple[str | None, bool]:
+    """Flow's replies after the offer (`_bubble_texts(page)[bubbles_before:][1:]`) -> ("queued" | "failed" | None,
+    audio failed). The newest bubble with a signal decides; a queue notice wins over "failed" in the same bubble."""
+    audio = any(AUDIO_FAILED_RE.search(t or "") for t in texts)
+    for t in reversed(texts):
+        if QUEUED_RE.search(t or ""):
+            return "queued", audio
+        if FAILED_RE.search(t or ""):
+            return "failed", audio
+    return None, audio
+
+
 def run_i2v(args) -> dict:
+    dl = Deadline(args.timeout)  # first: the budget counts from the moment the driver starts
     image = Path(args.image).expanduser()
     refs = [Path(r).expanduser() for r in args.ref or []]
     for p in [image, *refs]:
@@ -370,109 +453,168 @@ def run_i2v(args) -> dict:
 
     with sync_playwright() as pw:
         window = "headless" if args.headless else args.window
-        ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project)
+        ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project, deadline=dl)
         try:
-            if page.locator(NEW_SESSION_BTN).count():
-                page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
-                time.sleep(1.5)
-            if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
-                page.locator(CLEAR_BTN).first.click()
-                time.sleep(0.5)
-
-            for p in [image, *refs]:
-                _attach(page, p)
-
-            editor = page.locator(EDITOR)
-            editor.click()
-            page.keyboard.insert_text(prompt)
-            time.sleep(0.5)
-            if args.dry_run:
-                log("  (dry-run) đã gắn ảnh và gõ prompt, không bấm gửi.")
-                page.locator(CLEAR_BTN).first.click()
-                return {"status": "ok", "dry_run": True}
-
-            titles_before = _stable_titles(page)
-            perms_before = page.locator(PERMISSION).count()
-            bubbles_before = page.locator(BUBBLE).count()
-            send = page.locator(SEND_BTN)
-            if not _wait(lambda: send.is_enabled(), 15):
-                raise Fail(EXIT_DRIFT, "Nút gửi của Flow không bật lên.")
-            send.click()
-            log("  đã gửi yêu cầu, chờ Flow xác nhận…")
-
-            # 1) Flow asks to confirm the cost (or starts straight away when "Confirm before generating" is Never).
-            def asked():
-                if page.locator(PERMISSION).count() > perms_before:
-                    p = page.locator(PERMISSION).last
-                    if p.locator('[role=radio][aria-label="Approve"]:not(.read-only)').count():
-                        return "ask"
-                if _new_tile(page, titles_before) is not None:
-                    return "started"
-                texts = _bubble_texts(page)[bubbles_before:]
-                if any(NO_CREDITS_RE.search(t) for t in texts):
-                    return "credits"
-                return None
-
-            state = _wait(asked, 240, 1.0)
-            if state == "credits":
-                raise Fail(EXIT_NO_CREDITS, "Flow báo không đủ credit.")
-            if state is None:
-                texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
-                raise Fail(EXIT_AGENT_DECLINED, "Flow không đề nghị tạo video. Trả lời của Flow: "
-                           + (texts[-1][:400] if texts else "(không có)"))
-            credits = None
-            if state == "ask":
-                perm = page.locator(PERMISSION).last
-                text = perm.inner_text()
-                m = CREDIT_RE.search(text)
-                n_videos, credits = (int(m.group(1)), int(m.group(2))) if m else (None, None)
-                if n_videos != 1 or (args.max_credits and credits and credits > args.max_credits):
-                    perm.locator('[role=radio][aria-label="Reject"]').first.click()
-                    raise Fail(EXIT_AGENT_DECLINED, f"Đã từ chối đề nghị của Flow (chưa trừ credit): {text.strip()[:300]}")
-                perm.locator('[role=radio][aria-label="Approve"]').first.click()
-                SPENT["approved"] = True
-                log(f"  đã đồng ý: 1 video, {credits} credit")
-
-            SPENT["approved"] = True  # from here credits may be spent: never resubmit
-            started = time.time()
-            last_note = 0.0
-            last_try = 0.0
-            res = None
-            while time.time() - started < args.timeout:
-                texts = _bubble_texts(page)[bubbles_before:]
-                if any(FAILED_RE.search(t) for t in texts[1:]):
-                    res = "failed"
-                    break
-                if time.time() - last_note > 60:
-                    last_note = time.time()
-                    log(f"  đang chờ Flow render… {int(time.time() - started)}s")
-                try:
-                    if _poll_download(page, titles_before, out, last_try):
-                        res = "ok"
-                        break
-                except PollTried:
-                    last_try = time.time()
-                except Exception as exc:
-                    # Credits are already spent, so a re-rendering page must not end the wait.
-                    if not _transient(exc):
-                        raise
-                    log(f"  (trang Flow đang vẽ lại, thử lại: {str(exc).splitlines()[0][:120]})")
-                    _close_menus(page)
-                time.sleep(5)
-            if res == "failed":
-                texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
-                raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo video lỗi: " + texts[-1][:400], spent=True)
-            if res is None:
-                raise Fail(EXIT_TIMEOUT, f"Quá {args.timeout}s mà chưa tải được video. Video có thể vẫn đang tạo trên Flow; "
-                           "hãy tải về tay rồi đặt vào thư mục clips.", spent=True)
-            log(f"  đã tải video về: {out} ({out.stat().st_size // 1024} KB)")
-            return {"status": "ok", "local_path": str(out), "credits": credits, "succeeded": True,
-                    "media_id": LAST_MEDIA["id"]}
+            return _i2v_on_page(page, args, prompt, [image, *refs], out, dl)
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
+
+
+def _i2v_on_page(page, args, prompt: str, files: list[Path], out: Path, dl: Deadline) -> dict:
+    if page.locator(NEW_SESSION_BTN).count():
+        page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
+        time.sleep(1.5)
+    if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
+        page.locator(CLEAR_BTN).first.click()
+        time.sleep(0.5)
+
+    for p in files:
+        _attach(page, p, dl)
+
+    editor = page.locator(EDITOR)
+    editor.click()
+    page.keyboard.insert_text(prompt)
+    time.sleep(0.5)
+    if args.dry_run:
+        log("  (dry-run) đã gắn ảnh và gõ prompt, không bấm gửi.")
+        page.locator(CLEAR_BTN).first.click()
+        return {"status": "ok", "dry_run": True}
+
+    if dl.left() < SEND_MIN_LEFT:  # not enough time to wait for the offer and the clip: do not spend anything
+        left = int(dl.left())
+        try:
+            if page.locator(CLEAR_BTN).count():
+                page.locator(CLEAR_BTN).first.click()
+        except Exception:
+            pass
+        raise Fail(EXIT_TIMEOUT, f"Chỉ còn {left} giây nên không gửi yêu cầu (chưa gửi, chưa trừ credit) — thử render lại.",
+                   spent=False)
+
+    titles_before = _stable_titles(page, limit=30.0)  # full 30 s: an old clip must never look new
+    perms_before = page.locator(PERMISSION).count()
+    bubbles_before = page.locator(BUBBLE).count()
+    send = page.locator(SEND_BTN)
+    if not _wait(lambda: send.is_enabled(), 15):
+        raise Fail(EXIT_DRIFT, "Nút gửi của Flow không bật lên.")
+    send.click()
+    log("  đã gửi yêu cầu, chờ Flow xác nhận…")
+    credits = _offer(page, args, titles_before, perms_before, bubbles_before, dl)
+    return _wait_video(page, titles_before, bubbles_before, out, dl, credits)
+
+
+def _offer(page, args, titles_before: list[str], perms_before: int, bubbles_before: int, dl: Deadline) -> int | None:
+    """Flow asks to confirm the cost (or starts straight away when "Confirm before generating" is Never).
+    Returns the credits approved (None if Flow started by itself). From the end of this on, never resubmit."""
+    def asked():
+        if page.locator(PERMISSION).count() > perms_before:
+            p = page.locator(PERMISSION).last
+            if p.locator('[role=radio][aria-label="Approve"]:not(.read-only)').count():
+                return "ask"
+        if _new_tile(page, titles_before) is not None:
+            return "started"
+        texts = _bubble_texts(page)[bubbles_before:]
+        if any(NO_CREDITS_RE.search(t) for t in texts):
+            return "credits"
+        return None
+
+    state = _wait(asked, dl.cap(240), 1.0)
+    if state == "credits":
+        raise Fail(EXIT_NO_CREDITS, "Flow báo không đủ credit.")
+    if state is None:
+        texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
+        reply = texts[-1][:400] if texts else "(không có)"
+        if dl.expired():
+            try:
+                tile = _new_tile(page, titles_before)
+            except Exception as exc:
+                if not _transient(exc):
+                    raise
+                tile = None
+            if tile is not None:  # Flow went ahead on its own: credits may be spent
+                SPENT["approved"] = True
+                out = Path(args.out).expanduser()
+                raise Fail(EXIT_TIMEOUT, "Hết thời gian chờ: Flow đã bắt đầu tạo video (thấy ô video mới) nhưng hết giờ "
+                           f"chờ. Video có thể vẫn đang tạo trên Flow: mở Flow kiểm tra, tải về lưu thành {out} rồi chạy "
+                           "lại (app tự nhận clip, không tốn credit).", spent=True)
+            raise Fail(EXIT_AGENT_DECLINED, "Hết thời gian chờ trước khi Flow đề nghị tạo video (chưa đồng ý, chưa trừ "
+                       "credit). Trả lời của Flow: " + reply, spent=False)
+        raise Fail(EXIT_AGENT_DECLINED, "Flow không đề nghị tạo video. Trả lời của Flow: " + reply)
+    credits = None
+    if state == "ask":
+        perm = page.locator(PERMISSION).last
+        if dl.left() < APPROVE_MIN_LEFT:  # too late to get the clip back: do not pay for it
+            left = int(dl.left())
+            perm.locator('[role=radio][aria-label="Reject"]').first.click()
+            raise Fail(EXIT_AGENT_DECLINED, f"Gần hết thời gian chờ (còn {left} giây) nên không đồng ý đề nghị của Flow "
+                       "(chưa trừ credit) — thử render lại.", spent=False)
+        text = perm.inner_text()
+        m = CREDIT_RE.search(text)
+        n_videos, credits = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+        if n_videos != 1 or (args.max_credits and credits and credits > args.max_credits):
+            perm.locator('[role=radio][aria-label="Reject"]').first.click()
+            raise Fail(EXIT_AGENT_DECLINED, f"Đã từ chối đề nghị của Flow (chưa trừ credit): {text.strip()[:300]}")
+        perm.locator('[role=radio][aria-label="Approve"]').first.click()
+        SPENT["approved"] = True
+        log(f"  đã đồng ý: 1 video, {credits} credit")
+    SPENT["approved"] = True  # from here credits may be spent: never resubmit
+    return credits
+
+
+def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, dl: Deadline,
+                credits: int | None) -> dict:
+    """Wait for the clip until the deadline. "queued" keeps waiting, "failed" is exit 42, out of time is exit 9;
+    both spent=True."""
+    approved_at = time.time()
+    queued_seen = audio_seen = queued_logged = False
+    last_note = 0.0
+    last_try = 0.0
+    while not dl.expired():
+        try:
+            replies = _bubble_texts(page)[bubbles_before:]
+        except Exception as exc:
+            if not _transient(exc):
+                raise
+            replies = []
+        kind, audio = classify_replies(replies[1:])
+        audio_seen = audio_seen or audio
+        if kind == "failed":
+            # the texts just read, not a second read: a page re-render there would be exit 23
+            texts = [t.strip() for t in replies if t and t.strip()]
+            last = texts[-1] if texts else "(không có)"
+            raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo video lỗi: " + last[:400]
+                       + (" " + AUDIO_HINT if audio_seen else ""), spent=True)
+        if kind == "queued":
+            queued_seen = True
+            if not queued_logged:
+                queued_logged = True
+                log(f"  Flow báo đang xếp hàng (đông người dùng) — tiếp tục chờ tối đa {math.ceil(dl.left() / 60)} phút")
+        if time.time() - last_note > 60:
+            last_note = time.time()
+            log(f"  đang chờ Flow render… {int(time.time() - approved_at)}s")
+        try:
+            if _poll_download(page, titles_before, out, last_try, deadline=dl):
+                log(f"  đã tải video về: {out} ({out.stat().st_size // 1024} KB)")
+                return {"status": "ok", "local_path": str(out), "credits": credits, "succeeded": True,
+                        "media_id": LAST_MEDIA["id"]}
+        except PollTried:
+            last_try = time.time()
+        except Exception as exc:
+            # Credits are already spent, so a re-rendering page must not end the wait.
+            if not _transient(exc):
+                raise
+            log(f"  (trang Flow đang vẽ lại, thử lại: {str(exc).splitlines()[0][:120]})")
+            _close_menus(page)
+        time.sleep(min(5.0, dl.left()))
+    mins = round((time.time() - approved_at) / 60)
+    tail = (f"Video có thể vẫn đang tạo trên Flow: mở Flow kiểm tra, tải video về lưu thành {out} rồi chạy lại "
+            "(app tự nhận clip, không tốn credit).")
+    if queued_seen:
+        raise Fail(EXIT_TIMEOUT, f"Flow báo đang xếp hàng (đông người dùng); đã chờ {mins} phút sau khi đồng ý mà chưa "
+                   "tải được video. " + tail + (" " + AUDIO_HINT if audio_seen else ""), spent=True)
+    raise Fail(EXIT_TIMEOUT, f"Đã chờ {mins} phút sau khi đồng ý mà chưa tải được video. " + tail, spent=True)
 
 
 IMAGE_NAMES = {"nano2": "Nano Banana 2", "nanopro": "Nano Banana Pro", "imagen4": "Imagen 4"}

@@ -9,10 +9,14 @@ import shutil
 import subprocess
 import tempfile
 
+from . import durations as durations_mod
 from . import model_meta
 from .storyboard import NO_DIALOGUE, Storyboard, StoryboardDraft, clean_dialogue_language, clean_language
 
 MODEL = "claude-opus-5-5"
+
+# plan()/plan_with_claude_code() without `durations`: ask the metadata for the default video model's list.
+_DEFAULT = object()
 
 SYSTEM = """You are a film director writing shot lists for Google Flow (Veo video model).
 Each scene becomes ONE short clip (4-8 seconds). Rules:
@@ -46,8 +50,10 @@ def _to_storyboard(data: dict) -> Storyboard:
 
 
 def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None,
-                  dialogue_language: str | None = None) -> str:
+                  dialogue_language: str | None = None, durations: list[int] | None = None) -> str:
     user = f"Idea: {idea}\nNumber of scenes: {scenes}\nAspect ratio: {aspect}"
+    if durations:  # right after the aspect line, so the message still ends with the language line
+        user += "\nAllowed clip durations (seconds): " + durations_mod.allowed_text(list(durations))
     if dialogue_language is None:  # old clients / CLI without --dialogue-lang: unchanged message
         if language_hint:
             user += f"\nNarration language: {language_hint}"
@@ -60,6 +66,16 @@ def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None
     if language_hint:
         user += f"\nSubtitle (narration) language: {language_hint}"
     return user
+
+
+def default_durations() -> list[int] | None:
+    """Durations accepted by the model new projects start on (`normalize_new_storyboard`), or None."""
+    m = model_meta.load()
+    return m.durations(m.default_video_model)
+
+
+def _durations_arg(durations: "list[int] | None | object") -> list[int] | None:
+    return default_durations() if durations is _DEFAULT else durations  # type: ignore[return-value]
 
 
 def claude_code_binary() -> str | None:
@@ -87,13 +103,15 @@ def claude_code_status() -> dict:
 
 
 def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-                          dialogue_language: str | None = None, timeout: int = 900) -> Storyboard:
+                          dialogue_language: str | None = None, timeout: int = 900,
+                          durations: list[int] | None | object = _DEFAULT) -> Storyboard:
     """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
     schema = json.dumps(StoryboardDraft.model_json_schema())
-    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint, dialogue_language),
+    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint, dialogue_language,
+                                       _durations_arg(durations)),
            "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     with tempfile.TemporaryDirectory() as cwd:  # keep any project CLAUDE.md out of the prompt
@@ -138,18 +156,21 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
     sb.dialogue_language = dialogue_language
     sb.subtitle_language = clean_language(kw.get("language_hint")) if sb.dialogue_language else None
     # New projects never start on a model Flow is retiring (default: veo-lite).
-    return model_meta.normalize_new_storyboard(sb, model_meta.load()), used
+    meta = model_meta.load()
+    sb = model_meta.normalize_new_storyboard(sb, meta)
+    # Safety net: a duration the effective model does not accept is rounded up (even on a model Claude picked).
+    return durations_mod.round_new_storyboard(sb, meta), used
 
 
 def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-         dialogue_language: str | None = None) -> Storyboard:
+         dialogue_language: str | None = None, durations: list[int] | None | object = _DEFAULT) -> Storyboard:
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
-    user = _user_message(idea, scenes, aspect, language_hint, dialogue_language)
+    user = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
 
     response = client.messages.parse(
         model=MODEL,
