@@ -164,7 +164,8 @@ def test_field_order_unchanged():
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
     assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language"]
     assert list(StoryboardDraft.model_fields) == old_sb
-    assert list(Scene.model_fields)[:-1] == old_scene == list(SceneDraft.model_fields)
+    new_scene = old_scene + ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
+    assert list(Scene.model_fields)[:-1] == new_scene == list(SceneDraft.model_fields)
     assert list(Scene.model_fields)[-1] == "characters"
 
 

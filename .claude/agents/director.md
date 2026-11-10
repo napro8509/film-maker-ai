@@ -17,7 +17,15 @@ Mỗi cảnh:
   - id: s01
     mode: keyframe            # mặc định: ảnh mở đầu (miễn phí) rồi mới animate
     image_prompt: "khung hình mở đầu: ai đứng đâu, biểu cảm, bối cảnh"
-    prompt: "MỘT hành động; thoại nếu có: Lan says in Vietnamese: \"...\""
+    prompt: "MỘT hành động (KHÔNG ghi lời thoại ở đây)"
+    content_direction: "chỉ đạo nội dung (tiếng Anh): khán giả phải hiểu/cảm thấy gì, nhịp cảm xúc, từng nhân vật diễn thế nào"
+    dialogue:                 # thoại theo thứ tự nói, mỗi dòng MỘT người; bỏ trống nếu không ai nói
+      - character: Lan        # đúng `name` trong characters
+        line: "Anh đi đâu cả đêm qua?"   # đúng lời nói, viết bằng ngôn ngữ thoại trong brief
+        delivery: "hurt, voice trembling"  # nói thế nào (tiếng Anh): cảm xúc, giọng, âm lượng, tốc độ
+      - character: Minh
+        line: "Không phải việc của em."
+        delivery: "cold, looking away"
     camera:                   # chỉ đạo hình ảnh, tool tự ghép vào prompt (không lặp lại trong prompt)
       shot: medium close-up   # cỡ cảnh: establishing/wide/full/medium/medium close-up/close-up/extreme close-up/over-the-shoulder/POV/insert
       angle: low angle        # eye-level, low, high, bird's-eye/top-down, worm's-eye, dutch angle, aerial
@@ -34,6 +42,11 @@ Quy tắc:
 - image_prompt và prompt viết tiếng Anh; gọi nhân vật đúng `name` để tool tự chèn mô tả và ảnh tham chiếu.
   Không chép lại description. Tối đa 3 nhân vật mỗi cảnh.
 - Không yêu cầu chữ, biển hiệu, phụ đề trong hình.
+- Thoại chỉ ghi trong `dialogue`, không ghi trong prompt/image_prompt, không dùng ngoặc kép trong prompt.
+  Nhân vật nói lần lượt, mỗi dòng một người, ngắn vừa clip (khoảng 2-3 câu ngắn cho 8 giây).
+  KHÔNG lặp thoại: không ai nói lại/nhại câu người khác vừa nói, không câu nào trùng câu ở cảnh trước.
+  Phim "Không thoại" thì để trống `dialogue` ở mọi cảnh.
+- Mỗi cảnh có `content_direction` nói rõ mục đích cảnh và cách từng nhân vật diễn.
 - Ngôn ngữ hình ảnh: mỗi cảnh BẮT BUỘC có camera.shot, camera.angle, camera.movement (tiếng Anh), lens khi cần.
   Mở phim/đổi bối cảnh bằng establishing hoặc wide shot; đổi cỡ cảnh giữa hai cảnh liền nhau (wide → medium → close-up),
   không để hai cảnh liền nhau cùng cỡ + cùng góc (jump cut). Cảm xúc mạnh → cận/đặc tả; quyền lực → góc thấp;

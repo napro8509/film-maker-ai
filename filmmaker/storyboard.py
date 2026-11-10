@@ -217,6 +217,32 @@ class Camera(BaseModel):
         return " ".join(parts)
 
 
+DIALOGUE_MAX = 12  # lines per scene (a clip is only a few seconds)
+DIALOGUE_TURNS = ("Each line is spoken exactly once, only by the character named before it; no character repeats, "
+                  "echoes or says another character's line, and they never speak at the same time.")
+
+
+def _line_key(text: str) -> str:
+    """Compare lines ignoring case, spacing and punctuation ("Về đi!" == "về đi")."""
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in text.casefold()).split())
+
+
+class DialogueLine(BaseModel):
+    """One spoken line in a scene."""
+    character: str = Field(description="Exact name of the character who speaks (one of `characters`).")
+    line: str = Field(description="The exact words spoken, in the spoken dialogue language. Short: a clip is "
+                      "only a few seconds. Never repeat a line another character already said.")
+    delivery: str | None = Field(default=None, description="How it is said, in English: emotion, tone, volume, "
+                                 "pace, e.g. softly, holding back tears / shouting angrily / whispering.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip(cls, data):
+        if isinstance(data, dict):
+            return {k: (" ".join(v.split()) or None) if isinstance(v, str) else v for k, v in data.items()}
+        return data
+
+
 class SceneDraft(BaseModel):
     """A scene without `characters`: the schema the planner sends to Claude (still titled "Scene")."""
     model_config = ConfigDict(title="Scene")
@@ -238,6 +264,28 @@ class SceneDraft(BaseModel):
     narration: str | None = Field(default=None, description="Optional line shown as a subtitle in the final film.")
     camera: Camera | None = Field(default=None, description="Visual direction: shot size, angle, camera movement, "
                                   "lens, focus, composition, lighting, speed. Added to the prompts automatically.")
+    content_direction: str | None = Field(default=None, description="Content direction (English): what this scene "
+                                          "must make the audience understand and feel, the emotional beat, and how "
+                                          "each character acts and reacts. Added to the prompts automatically.")
+    dialogue: list[DialogueLine] | None = Field(default=None, description="Spoken lines in the order they are "
+                                                "said, one speaker per line. Each line is said once by one "
+                                                "character only: no character repeats or echoes another's line, "
+                                                "and no line repeats an earlier scene. Empty when nobody speaks.")
+
+    @field_validator("content_direction", mode="before")
+    @classmethod
+    def _clean_content(cls, v: object) -> object:
+        return (v.strip() or None) if isinstance(v, str) else v
+
+    @field_validator("dialogue", mode="before")
+    @classmethod
+    def _clean_dialogue(cls, v: object) -> object:
+        """Drop blank rows (the editor adds empty ones); [] -> None so old storyboards stay identical."""
+        if not isinstance(v, list):
+            return v
+        rows = [r for r in v if not (isinstance(r, dict) and not str(r.get("line") or "").strip()
+                                     and not str(r.get("character") or "").strip())]
+        return rows or None
 
     @model_validator(mode="after")
     def _check(self) -> "SceneDraft":
@@ -245,7 +293,13 @@ class SceneDraft(BaseModel):
             raise ValueError(f"scene id '{self.id}' may only contain letters, digits, - and _")
         if self.mode == "i2v" and not self.image:
             raise ValueError(f"scene {self.id}: mode=i2v needs 'image'")
+        if self.dialogue and len(self.dialogue) > DIALOGUE_MAX:
+            raise ValueError(f"scene {self.id}: at most {DIALOGUE_MAX} dialogue lines")
         return self
+
+    def spoken_lines(self) -> list[DialogueLine]:
+        """Dialogue rows that have both a speaker and words."""
+        return [d for d in self.dialogue or [] if d.character and d.line]
 
 
 class Scene(SceneDraft):
@@ -416,8 +470,10 @@ class Storyboard(StoryboardDraft):
                 if c.image and Path(c.image).is_file()][:MAX_REFS]
 
     def scene_text(self, scene: Scene) -> str:
-        """Text whose character names decide which references a scene gets."""
-        return f"{scene.image_prompt or ''} {scene.prompt}" if scene.mode == "keyframe" else scene.prompt
+        """Text whose character names decide which references a scene gets (speakers count too)."""
+        text = f"{scene.image_prompt or ''} {scene.prompt}" if scene.mode == "keyframe" else scene.prompt
+        speakers = [d.character for d in scene.spoken_lines()]
+        return f"{text} {' '.join(speakers)}" if speakers else text
 
     def auto_characters(self, scene: Scene) -> list[Character]:
         """Characters found by name in the scene text (what an old storyboard gets)."""
@@ -432,7 +488,71 @@ class Storyboard(StoryboardDraft):
 
     def _prompt_characters(self, scene: Scene) -> list[Character] | None:
         """Characters to describe in the scene's prompts; None = detect names in each prompt text (old behaviour)."""
-        return None if scene.characters is None else self.scene_characters(scene)
+        if scene.characters is None:
+            return self.auto_characters(scene) if scene.spoken_lines() else None
+        return self.scene_characters(scene)
+
+    def speaks(self) -> bool:
+        """False when the film is set to "no spoken dialogue" (then scene dialogue is left out of the prompts)."""
+        return (self.dialogue_language or "").casefold() != NO_DIALOGUE
+
+    def performance(self, scene: Scene) -> str:
+        """Content direction and dialogue as video prompt text ("" when the scene has neither).
+        Lines use `Name says: words` without quotation marks (Veo burns quoted text into the picture)."""
+        parts: list[str] = []
+        if scene.content_direction:
+            parts.append(f"Content direction: {scene.content_direction.strip().rstrip('.')}.")
+        lines: list[DialogueLine] = []
+        seen: set[str] = set()
+        for d in scene.spoken_lines() if self.speaks() else []:
+            key = _line_key(d.line)
+            if key and key not in seen:  # a line repeated in the same scene is never sent (the editor warns)
+                seen.add(key)
+                lines.append(d)
+        if lines:
+            said = []
+            for i, d in enumerate(lines):
+                how = f" ({d.delivery.strip().rstrip('.')})" if d.delivery else ""
+                words = d.line.strip()
+                if words[-1] not in ".!?…":
+                    words += "."
+                said.append(f"{'Then ' if i else ''}{d.character}{how} says: {words}")
+            order = "in this order" if len(lines) > 1 else "only this line"
+            parts.append(f"Dialogue, spoken one character at a time, {order}: " + " ".join(said))
+            parts.append(DIALOGUE_TURNS)
+            speakers = {d.character.casefold() for d in lines}
+            silent = [c.name for c in self.scene_characters(scene) if c.name.strip().casefold() not in speakers]
+            if silent:
+                parts.append(f"{' and '.join(silent)} {'stays' if len(silent) == 1 else 'stay'} silent.")
+        return " ".join(parts)
+
+    def dialogue_warnings(self) -> dict[str, list[str]]:
+        """Problems with the dialogue, per scene id (Vietnamese, for the editor and `filmmaker check`):
+        a line said twice (in the scene or in an earlier scene), unknown speaker, speaker not in the scene."""
+        out: dict[str, list[str]] = {}
+        known = {c.name.strip().casefold() for c in self.characters if c.name.strip()}
+        said: dict[str, str] = {}  # line key -> "scene id / speaker" that said it first
+        for s in self.scenes:
+            msgs: list[str] = []
+            in_scene = {c.name.strip().casefold() for c in self.scene_characters(s)} if s.characters is not None else None
+            for d in s.spoken_lines():
+                who = d.character.strip()
+                if who.casefold() not in known:
+                    msgs.append(f"“{who}” không có trong danh sách nhân vật")
+                elif in_scene is not None and who.casefold() not in in_scene:
+                    msgs.append(f"{who} có thoại nhưng chưa được chọn vào cảnh")
+                key = _line_key(d.line)
+                if not key:
+                    continue
+                if key in said:
+                    msgs.append(f"{who} nói lặp câu “{d.line}” (đã có ở {said[key]})")
+                else:
+                    said[key] = f"cảnh {s.id}, {who}"
+            if s.spoken_lines() and not self.speaks():
+                msgs.append("phim đang đặt Không thoại nên lời thoại cảnh này bị bỏ qua")
+            if msgs:
+                out[s.id] = msgs
+        return out
 
     def scene_refs(self, scene: Scene) -> list[tuple[str, Path]]:
         """(name, image) of characters in this scene that have a reference image on disk."""
@@ -451,28 +571,36 @@ class Storyboard(StoryboardDraft):
         """The scene's camera direction as prompt text ("" when it has none)."""
         return scene.camera.describe(fields) if scene.camera and not scene.camera.is_empty() else ""
 
+    @staticmethod
+    def _join(*parts: str) -> str:
+        return " ".join(p for p in parts if p)
+
     def video_prompt(self, scene: Scene) -> str:
+        perf = self.performance(scene)
         if scene.mode == "t2v":
-            return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
+            return self._compose(scene.prompt, self._join(self.direction(scene), perf), self._prompt_characters(scene))
         # In keyframe/i2v mode the look and framing are already in the image; keep the prompt on the motion.
         motion = self.direction(scene, MOTION_FIELDS + ("focus",))
         action = scene.prompt.strip().rstrip(".")
-        if not motion:
+        if not motion and not perf:
             return scene.prompt.strip()
-        return f"{action}. {motion}" if action else motion
+        return self._join(f"{action}." if action else "", motion, perf)
 
     def text_only_prompt(self, scene: Scene) -> str:
         """Text-to-video prompt for a keyframe scene when image-to-video is unavailable:
         the opening-frame description plus the motion, with characters and style."""
+        direction = self._join(self.direction(scene), self.performance(scene))
         if scene.image_prompt and scene.image_prompt.strip():
             return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
-                                 self.direction(scene), self._prompt_characters(scene))
-        return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
+                                 direction, self._prompt_characters(scene))
+        return self._compose(scene.prompt, direction, self._prompt_characters(scene))
 
     def image_prompt(self, scene: Scene) -> str:
         # A still has no motion: only the framing, lens, focus, composition and lighting apply.
-        return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS),
-                             self._prompt_characters(scene))
+        # The content direction sets the faces and body language of the opening frame; dialogue is audio only.
+        content = f"Content direction: {scene.content_direction.rstrip('.')}." if scene.content_direction else ""
+        return self._compose(scene.image_prompt or scene.prompt,
+                             self._join(self.direction(scene, FRAME_FIELDS), content), self._prompt_characters(scene))
 
     def scene_fingerprint(self, scene: Scene) -> str:
         """Changes whenever anything that affects the generated clip changes."""

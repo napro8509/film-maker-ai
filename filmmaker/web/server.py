@@ -439,6 +439,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             model_info = {"model_warning": retirement.model_warning(pipe, meta),
                           "model_note": retirement.model_note(pipe),
                           "models_used": retirement.models_used(pipe, meta)}
+            talk = sb.dialogue_warnings()
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
@@ -466,6 +467,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "refs": [n for n, _ in sb.scene_refs(s)],
                     "characters": [c.name for c in sb.scene_characters(s)],
                     "characters_explicit": s.characters is not None,
+                    "dialogue_warnings": talk.get(s.id, []),
                     # ffprobe only for "submitting" scenes with a file, never while a job runs here
                     "manual_clip": None if busy else pipe.manual_clip_state(s),
                 }

@@ -475,6 +475,18 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 /* Scene visual direction (camera) */
 .camera-box { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-1); background: var(--surface-2); }
 .camera-box details[open] > .grid2 { margin: var(--sp-3) 0; }
+.talk-list { display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
+.talk-row { display: grid; grid-template-columns: 1.5em minmax(6.5em, 8em) minmax(0, 3fr) minmax(8em, 2fr) auto; gap: var(--sp-2); align-items: center; width: 100%; }
+.talk-row.dup .talk-line { border-color: var(--warn); }
+.talk-tools { display: flex; gap: 2px; }
+.talk-warn { grid-column: 2 / -1; }
+.talk-warnings { margin: 0; padding-left: 1.2em; }
+.warn-text { color: var(--warn-ink); }
+@media (max-width: 720px) {
+  .talk-row { grid-template-columns: 1.5em 1fr auto; }
+  .talk-row .talk-line, .talk-row .talk-how { grid-column: 2 / -1; }
+  .talk-row .talk-tools { grid-column: 3; grid-row: 1; }
+}
 
 /* editor agent: edit plan table */
 .edit-table td { vertical-align: middle; }

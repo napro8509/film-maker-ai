@@ -16,6 +16,9 @@ Kiểm tra từng cảnh:
 - Chỉ đạo hình ảnh: mỗi cảnh có camera.shot, camera.angle, camera.movement (đúng MỘT chuyển động)?
   Cỡ cảnh có thay đổi hợp lý giữa các cảnh liền nhau (không jump cut cùng cỡ + cùng góc), mở bằng establishing/wide,
   góc máy và chuyển động hợp cảm xúc, hội thoại giữ quy tắc 180°? Không lặp lại camera trong prompt/image_prompt.
+- Chỉ đạo nội dung và thoại: mỗi cảnh có content_direction rõ? Thoại nằm trong `dialogue` (không trong prompt),
+  `character` đúng tên nhân vật có trong cảnh, đúng ngôn ngữ thoại, vừa độ dài clip? Có câu nào bị lặp
+  (hai nhân vật nói cùng câu, nhại lại câu vừa nói, trùng câu cảnh trước) không? `filmmaker check` cũng báo lỗi lặp.
 - Bối cảnh, ánh sáng, trang phục nhất quán giữa các cảnh cùng bối cảnh.
 - Lệnh sau chạy không lỗi (không tốn credit), chạy từ thư mục gốc repo film-maker-ai:
     .venv/bin/filmmaker run FILM/storyboard.yaml --dry-run

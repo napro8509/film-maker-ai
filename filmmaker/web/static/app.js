@@ -892,6 +892,70 @@ function renderCamera(sc) {
         oninput: (e) => set("notes", e.target.value) }), "tiếng Anh")));
 }
 
+/* Content direction + dialogue (scene.content_direction, scene.dialogue). The server adds them to the video
+   prompt as "Name (delivery) says: words" lines, spoken one at a time, with a rule that nobody repeats a line. */
+const DELIVERY_PRESETS = [
+  ["calmly", "Bình thản"], ["softly, gently", "Nhẹ nhàng"], ["warmly, smiling", "Ấm áp, mỉm cười"],
+  ["whispering", "Thì thầm"], ["hesitantly, unsure", "Ngập ngừng"], ["sadly, voice trembling", "Buồn, giọng run"],
+  ["holding back tears", "Cố nén nước mắt"], ["sobbing", "Nức nở"], ["angrily", "Tức giận"],
+  ["shouting angrily", "Quát lớn"], ["coldly, flat voice", "Lạnh lùng"], ["sarcastically", "Mỉa mai"],
+  ["excitedly", "Hào hứng"], ["nervously, fast", "Lo lắng, nói nhanh"], ["firmly, determined", "Dứt khoát"],
+  ["pleading", "Van nài"], ["laughing", "Vừa nói vừa cười"], ["shocked", "Sững sờ"],
+];
+function ensureDeliveryList() {
+  if (document.getElementById("dl-delivery")) return;
+  document.body.append(h("datalist", { id: "dl-delivery" }, DELIVERY_PRESETS.map(([v, l]) => h("option", { value: v }, l))));
+}
+function lineKey(t) { return (t || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim(); }
+function renderDirection(sc, i) {
+  ensureDeliveryList();
+  const sb = S.cur.storyboard;
+  const noTalk = (sb.dialogue_language || "").toLowerCase() === "none";
+  const rows = () => (sc.dialogue = Array.isArray(sc.dialogue) ? sc.dialogue : []);
+  const names = (sb.characters || []).map((c) => c.name).filter(Boolean);
+  const talkZone = `talk-${i}`;
+  const redraw = () => { changed(); refreshZone(talkZone); refreshZone(`chars-${i}`); };
+  const lang = sb.dialogue_language && !noTalk ? sb.dialogue_language : "";
+  return h("div", { class: "camera-box talk-box" },
+    h("div", { class: "lbl" }, "Chỉ đạo nội dung & thoại", h("span", { class: "hint" }, " · tự thêm vào prompt video; mỗi người nói lần lượt, không ai nói lặp câu của người khác")),
+    field("Chỉ đạo nội dung", h("textarea", { rows: 2, value: sc.content_direction || "",
+      placeholder: "Cảnh này cần khán giả hiểu/cảm thấy gì, từng nhân vật diễn thế nào. Ví dụ: Lan finally confronts her brother; Minh avoids her eyes, guilty",
+      oninput: (e) => { sc.content_direction = e.target.value || undefined; changed(); } }), "nên viết tiếng Anh"),
+    zone(talkZone, () => {
+      const list = Array.isArray(sc.dialogue) ? sc.dialogue : [];
+      // Live duplicate check inside this scene (the server also checks earlier scenes after saving).
+      const seen = new Map();
+      const dup = list.map((d, j) => { const k = lineKey(d.line); if (!k) return null; if (seen.has(k)) return seen.get(k); seen.set(k, j); return null; });
+      const opts = (cur) => [h("option", { value: "" }, "— Ai nói —"), ...[...names, ...(cur && !names.includes(cur) ? [cur] : [])].map((n) => h("option", { value: n }, n))];
+      return h("div", { class: "talk-list" },
+        noTalk && list.length ? h("div", { class: "small warn-text" }, "Phim đang đặt “Không thoại”: lời thoại cảnh này sẽ không được gửi lên Flow.") : null,
+        list.map((d, j) => h("div", { class: "talk-row" + (dup[j] != null ? " dup" : "") },
+          h("span", { class: "talk-num mono muted" }, j + 1),
+          h("select", { "aria-label": "Nhân vật nói", value: d.character || "", onchange: (e) => { d.character = e.target.value; redraw(); } }, opts(d.character)),
+          h("input", { type: "text", class: "talk-line", "aria-label": "Lời thoại", value: d.line || "", placeholder: lang ? `Lời thoại (${lang})` : "Lời thoại",
+            oninput: (e) => { d.line = e.target.value; changed(); }, onchange: () => refreshZone(talkZone) }),
+          h("input", { type: "text", class: "talk-how", list: "dl-delivery", "aria-label": "Cách nói", value: d.delivery || "", placeholder: "Cách nói, ví dụ: whispering",
+            oninput: (e) => { d.delivery = e.target.value || undefined; changed(); } }),
+          h("div", { class: "talk-tools" },
+            h("button", { class: "btn ghost icon sm", title: "Lên", "aria-label": "Chuyển câu lên", disabled: j === 0, onclick: () => { const r = rows(); [r[j - 1], r[j]] = [r[j], r[j - 1]]; redraw(); } }, icon("up")),
+            h("button", { class: "btn ghost icon sm danger", title: "Xoá câu", "aria-label": "Xoá câu thoại", onclick: () => { const r = rows(); r.splice(j, 1); if (!r.length) delete sc.dialogue; redraw(); } }, icon("trash"))),
+          dup[j] != null ? h("div", { class: "small warn-text talk-warn" }, `Trùng câu ${dup[j] + 1}: mỗi câu chỉ được nói một lần`) : null)),
+        list.length >= 12 ? null : h("button", { class: "btn ghost sm", onclick: () => {
+          const r = rows();
+          // Suggest the next speaker: someone other than the last one (characters take turns).
+          const inScene = S.cur.scene_state?.[sc.id]?.characters || names;
+          const last = r.length ? r[r.length - 1].character : null;
+          r.push({ character: inScene.find((n) => n !== last) || last || "", line: "" });
+          redraw();
+          setTimeout(() => document.querySelectorAll(`#${talkZone} .talk-line`)[r.length - 1]?.focus(), 30);
+        } }, icon("plus"), "Thêm câu thoại"));
+    }),
+    zone(`talkwarn-${i}`, () => {
+      const w = S.cur.scene_state?.[sc.id]?.dialogue_warnings || [];
+      return w.length ? h("ul", { class: "small warn-text talk-warnings" }, w.map((m) => h("li", {}, m))) : h("div");
+    }));
+}
+
 function renderScene(sc, i) {
   const sb = S.cur.storyboard;
   const move = (d) => { const j = i + d; if (j < 0 || j >= sb.scenes.length) return; [sb.scenes[i], sb.scenes[j]] = [sb.scenes[j], sb.scenes[i]]; changed(); renderMain(); };
@@ -910,7 +974,7 @@ function renderScene(sc, i) {
       h("div", { class: "scene-tools" },
       h("button", { class: "btn ghost icon sm", title: "Chuyển lên", "aria-label": "Chuyển lên", disabled: i === 0, onclick: () => move(-1) }, icon("up")),
       h("button", { class: "btn ghost icon sm", title: "Chuyển xuống", "aria-label": "Chuyển xuống", disabled: i === sb.scenes.length - 1, onclick: () => move(1) }, icon("down")),
-      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, characters: Array.isArray(sc.characters) ? [...sc.characters] : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
+      h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, dialogue: Array.isArray(sc.dialogue) ? sc.dialogue.map((d) => ({ ...d })) : undefined, characters: Array.isArray(sc.characters) ? [...sc.characters] : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
       h("button", { class: "btn ghost icon sm danger", title: "Xoá cảnh", "aria-label": "Xoá cảnh", onclick: async () => {
         if (sb.scenes.length === 1) { toast("Phim cần ít nhất một cảnh", "error"); return; }
         const hasWork = S.cur.scene_state?.[sc.id]?.clip_url;
@@ -924,8 +988,10 @@ function renderScene(sc, i) {
         sc.mode === "i2v" ? h("div", { class: "grid2" }, imagePicker(sc, "image", "Ảnh bắt đầu"), imagePicker(sc, "end_image", "Ảnh kết thúc (tuỳ chọn)", true)) : null,
         text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles… (góc máy chọn ở mục Chỉ đạo hình ảnh)", 3, "nên viết tiếng Anh"),
         renderCamera(sc),
+        renderDirection(sc, i),
         zone(`chars-${i}`, () => {
-          const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""}`;
+          const speakers = (Array.isArray(sc.dialogue) ? sc.dialogue : []).filter((d) => d.line && d.character).map((d) => d.character).join(" ");
+          const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""} ${speakers}`;
           // A list picked on the board (scenes[].characters) replaces finding names in the prompt.
           const picked = Array.isArray(sc.characters) ? new Set(sc.characters.map(nameKey)) : null;
           const found = (sb.characters || []).filter((c) => c.name && (picked ? picked.has(charKey(c))

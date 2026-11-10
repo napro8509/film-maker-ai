@@ -11,7 +11,8 @@ import tempfile
 
 from . import durations as durations_mod
 from . import model_meta
-from .storyboard import NO_DIALOGUE, Storyboard, StoryboardDraft, clean_dialogue_language, clean_language
+from .storyboard import (NO_DIALOGUE, Storyboard, StoryboardDraft, _line_key, clean_dialogue_language,
+                         clean_language)
 
 MODEL = "claude-opus-5-5"
 
@@ -31,7 +32,10 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
 - Put the shared visual look in `style` once instead of repeating it.
 - `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
-- Spoken audio: if the message gives a "Spoken dialogue language", every character who speaks speaks ONLY that language; describe it as spoken audio in English naming that language, e.g. "she says angrily in <that language>, voice only". If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene; describe only ambient sound, sound effects and music. If neither is given and a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
+- Direct the content of every scene in `content_direction` (English, 1-2 sentences): what the audience must understand and feel in this clip, the emotional beat, and how each character in it acts and reacts (expression, body language). Make each scene move the story forward.
+- Spoken lines go ONLY in `dialogue`, never in `prompt` / `image_prompt`: one row per line in the order spoken, `character` = exact character name, `line` = the exact words, `delivery` = how it is said in English (emotion, tone, volume, pace, e.g. "whispering, holding back tears"). Keep it short enough for the clip (about 2-3 short lines in 8 seconds). Characters take turns: one speaker per row, nobody talks at the same time.
+- Never repeat dialogue: no character says or echoes a line another character already said, nobody says the same line twice, and no line repeats one from an earlier scene. Each line adds something new (an answer, a question, a reveal).
+- Spoken audio language: if the message gives a "Spoken dialogue language", write every `line` in ONLY that language. If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene: leave `dialogue` empty everywhere and describe only ambient sound, sound effects and music in `prompt`. If neither is given, write `line` in the language the characters would naturally speak (the idea's language when unclear) and name that language in `delivery` (instead of "she says angrily in Thai, voice only" in the prompt, delivery = "angrily, in Thai"). Never put spoken words in quotation marks anywhere: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
 - Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) written in the spoken dialogue language when the message gives one; when it says "Spoken dialogue: none", in the subtitle language, or, without a subtitle line, in the language of `narration` (the user's idea); when neither is given, in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id or image/end_image."""
@@ -43,9 +47,20 @@ def _to_storyboard(data: dict) -> Storyboard:
     data = copy.deepcopy(data)
     data.pop("dialogue_language", None)  # set from the request by plan_auto, never by Claude
     data.pop("subtitle_language", None)
+    said: set[str] = set()
     for scene in data.get("scenes") or []:
         if isinstance(scene, dict):
             scene.pop("characters", None)
+            # Safety net for the "never repeat a line" rule: drop a line already said anywhere earlier.
+            rows = []
+            for row in scene.get("dialogue") or []:
+                key = _line_key(str(row.get("line") or "")) if isinstance(row, dict) else ""
+                if key and key in said:
+                    continue
+                said.add(key)
+                rows.append(row)
+            if "dialogue" in scene:
+                scene["dialogue"] = rows or None
     return Storyboard.model_validate(data)
 
 
@@ -219,6 +234,9 @@ def _story_summary(sb: Storyboard) -> str:
     narr = [s.narration for s in sb.scenes if s.narration]
     if narr:
         lines.append("Narration lines (subtitle language): " + " / ".join(narr))
+    spoken = [f"{d.character}: {d.line}" for s in sb.scenes for d in s.spoken_lines()]
+    if spoken:
+        lines.append("Dialogue (spoken language): " + " / ".join(spoken)[:1500])
     lines.append("Scenes: " + " | ".join(
         f"{s.id}: {' / '.join(x[:300] for x in (s.image_prompt, s.prompt) if x)}" for s in sb.scenes))
     return "\n".join(lines)

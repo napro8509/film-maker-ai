@@ -77,7 +77,19 @@ def check(storyboard: Path | None, out: Path | None, profile: str | None) -> Non
     if storyboard is not None:
         ok = _check_models(storyboard, out) and ok
         ok = _check_durations(storyboard, out) and ok
+        _warn_dialogue(storyboard)
     sys.exit(0 if ok else 1)
+
+
+def _warn_dialogue(storyboard: Path) -> None:
+    """Dialogue problems (a line said twice, unknown speaker...). Warnings only: rendering is not blocked."""
+    try:
+        warnings = load_storyboard(storyboard).dialogue_warnings()
+    except Exception:  # a broken storyboard is reported by the other checks
+        return
+    for sid, msgs in warnings.items():
+        for m in msgs:
+            click.echo(f"! Thoại cảnh {sid}: {m}")
 
 
 _GROUP_ORDER = (("todo", "Chưa có clip"), ("interrupted", "Bị ngắt"), ("done", "Đã có clip"))
@@ -308,6 +320,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
             "--adopt dùng clip đã tải về, --force gửi lại (có thể tốn credit); chọn một")
     if dry_run:
         click.echo("== DRY RUN: không gửi gì lên Flow ==")
+    _warn_dialogue(storyboard)
     pipe = Pipeline(sb, out_dir, g, log=click.echo)
     adopt_failed = _adopt_clips(pipe, adopt, dry_run)
     _check_run_models(pipe, only, force, retry_unknown, warn_only=dry_run or keyframes_only, skip=adopt_failed)
