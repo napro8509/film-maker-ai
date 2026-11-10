@@ -25,7 +25,10 @@ needs_ffmpeg = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmp
 
 
 def _norm(value, tmp_path: Path):
+    """Replace paths that differ per machine (tmp dir, Python, this checkout) with placeholders."""
     s = json.dumps(value, ensure_ascii=False)
+    s = s.replace(str(FAKE.resolve()), "<fake_gflow>").replace(str(FAKE), "<fake_gflow>")
+    s = s.replace(sys.executable, "<python>")
     for p in sorted({str(tmp_path.resolve()), str(tmp_path)}, key=len, reverse=True):
         s = s.replace(p, "<tmp>")
     return json.loads(s)
@@ -1284,12 +1287,12 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             'proj-123',
             '--json']],
  'log': ['Tạo project Flow mới: The Inheritance War',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py project create --name 'The Inheritance War' "
+         '  $ <python> '
+         "<fake_gflow> project create --name 'The Inheritance War' "
          '--json',
          '[s01] keyframe: Ancestral altar in a traditional Vietnamese family house, framed black-and-white',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image t2i 'Ancestral altar in a traditional "
+         '  $ <python> '
+         "<fake_gflow> image t2i 'Ancestral altar in a traditional "
          'Vietnamese family house, framed black-and-white portrait of an elderly man surrounded by incense smoke, '
          'candles and white chrysanthemums, dim warm light, 50mm lens. Style: Cinematic Vietnamese family drama, '
          'vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film '
@@ -1299,8 +1302,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s01] OK -> <tmp>/out/keyframes/s01.png',
          '[s02] keyframe: Wooden living room of an old Vietnamese house at night, Minh and Lan sit on one ',
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Wooden living room of an old "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Wooden living room of an old "
          'Vietnamese house at night, Minh and Lan sit on one side of a carved wooden table, Tuan and Hoa on the '
          'other, Mother sits at the head clutching prayer beads, a thick envelope lies in the center, tense lighting '
          'from a single hanging lamp, 24mm lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat '
@@ -1322,8 +1325,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s02] OK -> <tmp>/out/keyframes/s02.png',
          '[s03] keyframe: Close-up of Minh opening a thick envelope at a wooden table, reading a document,',
          '  ảnh tham chiếu nhân vật: Minh',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Close-up of Minh opening a thick "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Close-up of Minh opening a thick "
          'envelope at a wooden table, reading a document, lamp light on his stern face, 85mm lens. Shot: close-up. '
          'Focus: rack focus from foreground to background. Lighting: single hanging lamp. Minh: Vietnamese man, 45, '
          'elder brother, stocky build, short neat black hair greying at the temples, thick eyebrows, stern square '
@@ -1336,8 +1339,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s03] OK -> <tmp>/out/keyframes/s03.png',
          '[s04] keyframe: Close-up of Hoa at a wooden table, eyes wide in disbelief, jade bangle on her wr',
          '  ảnh tham chiếu nhân vật: Tuan, Hoa',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Close-up of Hoa at a wooden "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Close-up of Hoa at a wooden "
          'table, eyes wide in disbelief, jade bangle on her wrist resting on the table, warm side light, 85mm lens. '
          'Hoa: Vietnamese woman, 35, Tuan\'"\'"\'s wife, petite, long straight black hair worn loose, round face, '
          'large jade bangle on right wrist, cream silk blouse and black pencil skirt, fiery expressive eyes. Style: '
@@ -1350,8 +1353,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s04] OK -> <tmp>/out/keyframes/s04.png',
          '[s05] keyframe: Medium shot of Lan sitting upright with arms folded, cold smile, red lipstick, g',
          '  ảnh tham chiếu nhân vật: Lan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Medium shot of Lan sitting "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Medium shot of Lan sitting "
          'upright with arms folded, cold smile, red lipstick, gold necklace catching the light, dark living room '
          'background, 50mm lens. Lan: Vietnamese woman, 42, Minh\'"\'"\'s wife, slim, sharp cheekbones, black hair '
          'in a tight low bun, thin gold necklace, fitted dark burgundy blouse and black trousers, red lipstick, '
@@ -1364,8 +1367,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s05] OK -> <tmp>/out/keyframes/s05.png',
          '[s06] keyframe: Tuan standing abruptly from a wooden chair in a dim living room, chair tipping b',
          '  ảnh tham chiếu nhân vật: Minh, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Tuan standing abruptly from a "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Tuan standing abruptly from a "
          'wooden chair in a dim living room, chair tipping backward, furious face, mourning headband, 35mm lens. '
          'Tuan: Vietnamese man, 38, younger brother, lean and tall, messy medium-length black hair, light stubble, '
          'hot-tempered expression, white mourning headband, plain grey polo shirt and jeans. Style: Cinematic '
@@ -1378,8 +1381,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s06] OK -> <tmp>/out/keyframes/s06.png',
          '[s07] keyframe: Minh rising from his seat facing camera, veins on his neck, dim lamp light, his ',
          '  ảnh tham chiếu nhân vật: Minh, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Minh rising from his seat facing "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Minh rising from his seat facing "
          'camera, veins on his neck, dim lamp light, his brother\'"\'"\'s shoulder blurred in the foreground, 50mm '
          'lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at the temples, '
          'thick eyebrows, stern square face, wears a black long-sleeve dress shirt with a white mourning band on his '
@@ -1392,8 +1395,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s07] OK -> <tmp>/out/keyframes/s07.png',
          '[s08] keyframe: Mother seated at the head of the table, frail hands gripping prayer beads, eyes ',
          '  ảnh tham chiếu nhân vật: Mother',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Mother seated at the head of the "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Mother seated at the head of the "
          'table, frail hands gripping prayer beads, eyes filled with tears, soft backlight from the altar, 85mm '
          'lens. Mother: Vietnamese grandmother, 72, frail and small, silver hair in a bun, deep wrinkles, gentle sad '
          'eyes, white traditional mourning ao ba ba, holds wooden prayer beads. Style: Cinematic Vietnamese family '
@@ -1405,8 +1408,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s08] OK -> <tmp>/out/keyframes/s08.png',
          '[s09] keyframe: Hoa and Lan standing face to face beside the wooden table, Hoa with loose hair g',
          '  ảnh tham chiếu nhân vật: Lan, Hoa',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Hoa and Lan standing face to face "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Hoa and Lan standing face to face "
          'beside the wooden table, Hoa with loose hair glaring up, Lan smirking down, harsh overhead lamp, 35mm '
          'lens. Lan: Vietnamese woman, 42, Minh\'"\'"\'s wife, slim, sharp cheekbones, black hair in a tight low '
          'bun, thin gold necklace, fitted dark burgundy blouse and black trousers, red lipstick, calculating eyes. '
@@ -1421,8 +1424,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s09] OK -> <tmp>/out/keyframes/s09.png',
          '[s10] keyframe: Lan in a burgundy blouse with her hand raised mid-swing, Hoa flinching, dim livi',
          '  ảnh tham chiếu nhân vật: Lan, Hoa',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Lan in a burgundy blouse with her "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Lan in a burgundy blouse with her "
          'hand raised mid-swing, Hoa flinching, dim living room, motion blur, 50mm lens. Lan: Vietnamese woman, 42, '
          'Minh\'"\'"\'s wife, slim, sharp cheekbones, black hair in a tight low bun, thin gold necklace, fitted dark '
          'burgundy blouse and black trousers, red lipstick, calculating eyes. Hoa: Vietnamese woman, 35, '
@@ -1436,8 +1439,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s10] OK -> <tmp>/out/keyframes/s10.png',
          '[s11] keyframe: Hoa holding her cheek, eyes burning, Tuan behind her lunging forward, Minh grabb',
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Hoa holding her cheek, eyes "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Hoa holding her cheek, eyes "
          'burning, Tuan behind her lunging forward, Minh grabbing his arm, chaotic lamp-lit room, 24mm lens. Minh: '
          'Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at the temples, thick '
          'eyebrows, stern square face, wears a black long-sleeve dress shirt with a white mourning band on his left '
@@ -1454,8 +1457,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s11] OK -> <tmp>/out/keyframes/s11.png',
          "[s12] keyframe: Close-up of Tuan's hands gripping the will document, Minh's hands pulling the ot",
          '  ảnh tham chiếu nhân vật: Minh, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         '/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i \'Close-up of Tuan\'"\'"\'s hands '
+         '  $ <python> '
+         '<fake_gflow> image i2i \'Close-up of Tuan\'"\'"\'s hands '
          'gripping the will document, Minh\'"\'"\'s hands pulling the other side, paper stretched tight, dramatic '
          'side light, 85mm lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat black hair '
          'greying at the temples, thick eyebrows, stern square face, wears a black long-sleeve dress shirt with a '
@@ -1470,8 +1473,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s12] OK -> <tmp>/out/keyframes/s12.png',
          '[s13] keyframe: Mother clutching her chest, prayer beads slipping from her fingers, swaying in h',
          '  ảnh tham chiếu nhân vật: Mother',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Mother clutching her chest, "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Mother clutching her chest, "
          'prayer beads slipping from her fingers, swaying in her chair, altar candles behind her, 50mm lens. Mother: '
          'Vietnamese grandmother, 72, frail and small, silver hair in a bun, deep wrinkles, gentle sad eyes, white '
          'traditional mourning ao ba ba, holds wooden prayer beads. Style: Cinematic Vietnamese family drama, '
@@ -1483,8 +1486,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s13] OK -> <tmp>/out/keyframes/s13.png',
          '[s14] keyframe: Minh and Tuan kneeling on a tiled floor holding their unconscious mother, Lan an',
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Minh and Tuan kneeling on a tiled "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Minh and Tuan kneeling on a tiled "
          'floor holding their unconscious mother, Lan and Hoa frozen behind them in shock, scattered beads, dim '
          'light, 24mm lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at '
          'the temples, thick eyebrows, stern square face, wears a black long-sleeve dress shirt with a white '
@@ -1505,8 +1508,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s14] OK -> <tmp>/out/keyframes/s14.png',
          '[s15] keyframe: Hospital corridor at night, cold fluorescent light, Minh, Lan, Tuan and Hoa sitt',
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Hospital corridor at night, cold "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Hospital corridor at night, cold "
          'fluorescent light, Minh, Lan, Tuan and Hoa sitting apart on plastic chairs, heads down, long empty '
          'hallway, 35mm lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat black hair greying '
          'at the temples, thick eyebrows, stern square face, wears a black long-sleeve dress shirt with a white '
@@ -1525,8 +1528,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s15] OK -> <tmp>/out/keyframes/s15.png',
          '[s16] keyframe: Hospital room, Mother lying awake in bed with oxygen tube, weak smile, holding a',
          '  ảnh tham chiếu nhân vật: Mother',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Hospital room, Mother lying awake "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Hospital room, Mother lying awake "
          'in bed with oxygen tube, weak smile, holding a small old sealed envelope, soft morning window light, 50mm '
          'lens. Mother: Vietnamese grandmother, 72, frail and small, silver hair in a bun, deep wrinkles, gentle sad '
          'eyes, white traditional mourning ao ba ba, holds wooden prayer beads. Style: Cinematic Vietnamese family '
@@ -1538,8 +1541,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s16] OK -> <tmp>/out/keyframes/s16.png',
          '[s17] keyframe: Close-up of Tuan reading a handwritten letter in a hospital room, Minh reading o',
          '  ảnh tham chiếu nhân vật: Minh, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Close-up of Tuan reading a "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Close-up of Tuan reading a "
          'handwritten letter in a hospital room, Minh reading over his shoulder, morning light, eyes glistening, '
          '85mm lens. Minh: Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at the '
          'temples, thick eyebrows, stern square face, wears a black long-sleeve dress shirt with a white mourning '
@@ -1554,8 +1557,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s17] OK -> <tmp>/out/keyframes/s17.png',
          '[s18] keyframe: Lan and Hoa standing near a hospital window, both ashamed, Hoa with a red mark o',
          '  ảnh tham chiếu nhân vật: Lan, Hoa',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Lan and Hoa standing near a "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Lan and Hoa standing near a "
          'hospital window, both ashamed, Hoa with a red mark on her cheek, Lan looking down, soft daylight, 50mm '
          'lens. Lan: Vietnamese woman, 42, Minh\'"\'"\'s wife, slim, sharp cheekbones, black hair in a tight low '
          'bun, thin gold necklace, fitted dark burgundy blouse and black trousers, red lipstick, calculating eyes. '
@@ -1570,8 +1573,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s18] OK -> <tmp>/out/keyframes/s18.png',
          '[s19] keyframe: Minh and Tuan standing at the foot of a hospital bed, Mother smiling weakly betw',
          '  ảnh tham chiếu nhân vật: Minh, Tuan, Mother',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Minh and Tuan standing at the "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Minh and Tuan standing at the "
          'foot of a hospital bed, Mother smiling weakly between them, morning sun through blinds, 35mm lens. Minh: '
          'Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at the temples, thick '
          'eyebrows, stern square face, wears a black long-sleeve dress shirt with a white mourning band on his left '
@@ -1588,8 +1591,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s19] OK -> <tmp>/out/keyframes/s19.png',
          "[s20] keyframe: Ancestral altar in the family house in daylight, father's framed portrait, fresh",
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'Ancestral altar in the family "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'Ancestral altar in the family "
          'house in daylight, father\'"\'"\'s framed portrait, fresh incense, Minh, Lan, Tuan, Hoa and Mother '
          'standing together bowing, warm golden light, 24mm lens. Minh: Vietnamese man, 45, elder brother, stocky '
          'build, short neat black hair greying at the temples, thick eyebrows, stern square face, wears a black '
@@ -1610,8 +1613,8 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '[s20] OK -> <tmp>/out/keyframes/s20.png',
          '[x3] keyframe: The whole family sits around the wooden table, lamp light',
          '  ảnh tham chiếu nhân vật: Lan, Tuan, Hoa',
-         '  $ /Users/mac/Desktop/Projects/film-maker-ai/.venv/bin/python '
-         "/Users/mac/Desktop/Projects/film-maker-ai/tests/fake_gflow.py image i2i 'The whole family sits around the "
+         '  $ <python> '
+         "<fake_gflow> image i2i 'The whole family sits around the "
          'wooden table, lamp light. Lan: Vietnamese woman, 42, Minh\'"\'"\'s wife, slim, sharp cheekbones, black '
          'hair in a tight low bun, thin gold necklace, fitted dark burgundy blouse and black trousers, red lipstick, '
          'calculating eyes. Tuan: Vietnamese man, 38, younger brother, lean and tall, messy medium-length black '
