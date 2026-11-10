@@ -135,6 +135,44 @@ const LANG_OTHER = "__other__";
 const DIALOGUE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"],
                         ["none", "Không thoại (chỉ nhạc/âm thanh)"]];
 const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"]];
+
+/* Every film always has three subtitle tracks. `narration` is the line in the primary track's language. */
+const SUB_TRACKS = [["vi", "Tiếng Việt", "Vietnamese"], ["th", "ไทย", "Thai"], ["en", "English", "English"]];
+const SUB_ALIASES = { vi: "vi", vie: "vi", vietnamese: "vi", "tiếng việt": "vi", th: "th", tha: "th", thai: "th", "ไทย": "th", en: "en", eng: "en", english: "en" };
+const normLine = (v) => String(v || "").split(/\s+/).filter(Boolean).join(" ");
+function primarySubCode(sb) {
+  const c = SUB_ALIASES[normLine(sb?.subtitle_language).toLowerCase()];
+  if (c) return c;
+  for (const sc of sb?.scenes || []) {
+    const n = normLine(sc.narration);
+    const hit = n && sc.subtitles && SUB_TRACKS.find(([k]) => sc.subtitles[k] === n);
+    if (hit) return hit[0];
+  }
+  return "vi";
+}
+/* The line shown on track `code`: a missing translation falls back to narration (same as the server). */
+function subLine(sb, sc, code) {
+  const n = normLine(sc.narration);
+  if (code === primarySubCode(sb) && n) return n;
+  return normLine(sc.subtitles?.[code]) || n;
+}
+function setSubLine(sb, sc, code, value) {
+  const primary = primarySubCode(sb);
+  const subs = { ...(sc.subtitles || {}) };
+  if (normLine(value)) subs[code] = value; else delete subs[code];
+  sc.subtitles = Object.keys(subs).length ? subs : undefined;
+  if (code === primary) sc.narration = value || undefined;
+}
+/* Three inputs (vi / th / en) for one scene. */
+function subtitleFields(sb, sc, onChange) {
+  const primary = primarySubCode(sb);
+  return h("div", { class: "grid3" }, SUB_TRACKS.map(([code, label]) => field(
+    `Phụ đề ${label}${code === primary ? " · gốc" : ""}`,
+    h("input", { type: "text", lang: code, value: code === primary ? (sc.narration || "") : (sc.subtitles?.[code] || ""),
+      placeholder: code === primary ? "Không bắt buộc" : "Để trống: tự dịch khi ghép phim",
+      oninput: (e) => { setSubLine(sb, sc, code, e.target.value); onChange(); } }))));
+}
+function subTrack() { const c = localGet("subTrack", "vi"); return SUB_TRACKS.some(([k]) => k === c) ? c : "vi"; }
 /* A valid language name with whitespace collapsed, or null (not a string, empty, has a line break, > 40 chars). */
 function cleanLang(v) {
   if (typeof v !== "string" || /[\r\n]/.test(v)) return null;
@@ -941,14 +979,13 @@ function renderScene(sc, i) {
                 url ? h("img", { src: url, alt: "" }) : null, c.name);
             }));
         }),
-        h("div", { class: "grid3" },
+        h("div", { class: "grid2" },
           field("Độ dài", durationSelect(sc)),
           field("Model video",
             h("select", { value: sc.model || "", onchange: (e) => { sc.model = e.target.value || undefined; changed(); renderMain(); } },
               h("option", { value: "" }, `Theo phim (${sb.model ? modelLabel(sb.model) : "mặc định"})`),
-              videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label)))),
-          field("Phụ đề / lời dẫn",
-            h("input", { type: "text", value: sc.narration || "", placeholder: "Không bắt buộc", oninput: (e) => { sc.narration = e.target.value; changed(); } }))),
+              videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label))))),
+        subtitleFields(sb, sc, changed),
         zone(`preview-${i}`, () => {
           const st = S.cur.scene_state?.[sc.id];
           if (!st) return h("div");
@@ -1377,6 +1414,41 @@ function readyClips() {
   return (S.cur.storyboard.scenes || []).map((sc) => ({ sc, st: S.cur.scene_state?.[sc.id] })).filter((x) => x.st && x.st.clip_url && x.st.status === "done");
 }
 
+/* VI / TH / EN: which subtitle track the final tab shows (remembered per browser). */
+function subTrackSwitch() {
+  const cur = subTrack();
+  return h("div", { class: "seg sm", role: "group", "aria-label": "Ngôn ngữ phụ đề" }, SUB_TRACKS.map(([code, label]) =>
+    h("button", { class: cur === code ? "on" : "", title: `Phụ đề ${label}`, "aria-pressed": String(cur === code),
+      onclick: () => { localSet("subTrack", code); refreshZone("final-zone"); refreshZone("playlist-zone"); refreshZone("narr-zone"); } }, code.toUpperCase())));
+}
+function parseSrt(text) {
+  const t = (x) => { const [h, m, rest] = x.split(":"); const [sec, ms] = rest.split(","); return +h * 3600 + +m * 60 + +sec + +ms / 1000; };
+  return text.replace(/\r/g, "").split(/\n\s*\n/).map((block) => {
+    const lines = block.trim().split("\n");
+    const i = lines.findIndex((l) => l.includes("-->"));
+    if (i < 0) return null;
+    const [a, b] = lines[i].split("-->").map((x) => x.trim());
+    return { start: t(a), end: t(b), text: lines.slice(i + 1).join("\n") };
+  }).filter(Boolean);
+}
+/* The final film with the three .srt files as text tracks, the chosen one showing (not in the DOM, so zone refreshes stay cheap). */
+function finalVideo() {
+  const video = h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true });
+  const want = subTrack();
+  SUB_TRACKS.forEach(async ([code, label]) => {
+    const url = S.cur.srt_urls?.[code];
+    if (!url) return;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return;
+      const track = video.addTextTrack("subtitles", label, code);
+      for (const c of parseSrt(await r.text())) track.addCue(new VTTCue(c.start, c.end, c.text));
+      track.mode = code === want ? "showing" : "hidden";
+    } catch { /* subtitles are optional in the preview */ }
+  });
+  return video;
+}
+
 function renderFinal() {
   const p = finalPrefs();
   const portrait = S.cur.storyboard.aspect === "9:16";
@@ -1398,11 +1470,15 @@ function renderFinal() {
         if (!S.cur.final_url) return h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh")),
           h("div", { class: "player" + (portrait ? " portrait" : "") }, h("div", { class: "ph" }, icon("film"), h("span", {}, "Chưa ghép phim. Render xong các cảnh rồi bấm “Ghép phim”."))));
         return h("div", { class: "card card-pad" },
-          h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh"), h("span", { class: "spacer" }), S.cur.final_size ? h("span", { class: "small muted" }, fmtBytes(S.cur.final_size)) : null),
-          h("div", { class: "player" + (portrait ? " portrait" : "") }, h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true })),
+          h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh"), h("span", { class: "spacer" }),
+            S.cur.final_size ? h("span", { class: "small muted" }, fmtBytes(S.cur.final_size)) : null, subTrackSwitch()),
+          h("div", { class: "player" + (portrait ? " portrait" : "") }, finalVideo()),
           h("div", { class: "row", style: { marginTop: "12px" } },
             h("a", { class: "btn primary sm", href: S.cur.final_url.split("?")[0], download: `${S.cur.id}.mp4` }, icon("download"), "Tải MP4"),
-            S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
+            SUB_TRACKS.map(([code, label]) => S.cur.srt_urls?.[code]
+              ? h("a", { class: "btn sm", href: S.cur.srt_urls[code].split("?")[0], download: `${S.cur.id}.${code}.srt`, title: `Phụ đề ${label}` }, icon("download"), `.srt ${code.toUpperCase()}`)
+              : null),
+            !SUB_TRACKS.some(([c]) => S.cur.srt_urls?.[c]) && S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
             h("button", { class: "btn sm ghost", onclick: () => api("POST", `/api/projects/${S.cur.id}/reveal`, { path: "output/storyboard/final.mp4" }).catch((e) => toast(e.message, "error")) }, icon("folder"), "Mở trong Finder")));
       }),
       zone("playlist-zone", renderPlaylist)),
@@ -1420,7 +1496,10 @@ function renderFinal() {
               oninput: (e) => { document.getElementById("volv").textContent = Math.round(e.target.value * 100) + "%"; },
               onchange: (e) => saveFinalPrefs({ ...finalPrefs(), volume: +e.target.value }) })) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
-            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Luôn xuất thêm file .srt riêng nếu có lời dẫn."))),
+            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Phim luôn có 3 track phụ đề Việt / Thái / Anh (bật/tắt trong trình phát) và 3 file .srt. Bản dịch còn thiếu được Claude tự dịch khi ghép."))),
+          p.burn_subtitles ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Track in lên hình"),
+            h("select", { value: p.burn_language || primarySubCode(S.cur.storyboard), onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_language: e.target.value }) },
+              SUB_TRACKS.map(([code, label]) => h("option", { value: code }, label)))) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.allow_missing, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), allow_missing: e.target.checked }) }),
             h("span", {}, "Ghép cả khi còn thiếu cảnh", h("span", { class: "sub" }, "Bỏ qua các cảnh chưa render để xem thử bản nháp."))),
           zone("final-actions", () => {
@@ -1435,10 +1514,18 @@ function renderFinal() {
           }))),
       renderEditPlan(),
       renderThumbnail(),
-      h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề")),
-        (S.cur.storyboard.scenes || []).some((s) => s.narration)
-          ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
-          : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+      zone("narr-zone", () => {
+        const sb = S.cur.storyboard, code = subTrack(), primary = primarySubCode(sb);
+        const rows = (sb.scenes || []).filter((sc) => normLine(sc.narration));
+        return h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Phụ đề"), h("span", { class: "spacer" }), subTrackSwitch()),
+          rows.length
+            ? h("ol", { class: "narr-list" }, rows.map((sc) => {
+              const own = code === primary || normLine(sc.subtitles?.[code]);
+              return h("li", { lang: code }, h("span", { class: "mono muted" }, sc.id + " "), subLine(sb, sc, code),
+                own ? null : h("span", { class: "small muted" }, " (chưa dịch — tự dịch khi ghép)"));
+            }))
+            : h("p", { class: "help" }, "Chưa có. Thêm phụ đề ở từng cảnh."));
+      })));
 }
 
 /* ---------- editor agent (edit plan) ---------- */
@@ -1639,7 +1726,7 @@ function renderPlaylist() {
   const portrait = S.cur.storyboard.aspect === "9:16";
   if (S.playIdx >= clips.length) S.playIdx = 0;
   const cur = clips[S.playIdx];
-  const sub = h("div", { class: "subtitle" }, cur.sc.narration || "");
+  const sub = h("div", { class: "subtitle", lang: subTrack() }, subLine(S.cur.storyboard, cur.sc, subTrack()) || "");
   const video = h("video", { src: cur.st.clip_url, controls: true, preload: "metadata", playsinline: true, poster: cur.st.keyframe_url || null,
     onended: () => { if (S.playIdx < clips.length - 1) { S.playIdx++; const z = document.getElementById("playlist-zone"); const n = renderPlaylist(); n.id = "playlist-zone"; z.replaceWith(n); n.querySelector("video").play(); } } });
   return h("div", { class: "card card-pad" },

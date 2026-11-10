@@ -47,10 +47,40 @@ def clean_language(value: object) -> str | None:
     return v
 
 
+# Every film always gets these three subtitle tracks: (code, English name, ISO 639-2 for the MP4 track).
+SUBTITLE_LANGS = (("vi", "Vietnamese", "vie"), ("th", "Thai", "tha"), ("en", "English", "eng"))
+SUBTITLE_CODES = tuple(c for c, _, _ in SUBTITLE_LANGS)
+
+
+def subtitle_code(language: str | None) -> str | None:
+    """"Vietnamese" / "vi" / "tiếng việt" -> "vi"; None when it is not one of the three track languages."""
+    v = " ".join(str(language or "").split()).casefold()
+    if not v:
+        return None
+    for code, name, iso in SUBTITLE_LANGS:
+        if v in (code, name.casefold(), iso):
+            return code
+    aliases = {"tiếng việt": "vi", "tieng viet": "vi", "tiếng thái": "th", "tieng thai": "th", "ไทย": "th",
+               "tiếng anh": "en", "tieng anh": "en"}
+    return aliases.get(v)
+
+
 def clean_dialogue_language(value: object) -> str | None:
     """Like clean_language; "none" in any case means no spoken dialogue and is stored as "none"."""
     v = clean_language(value)
     return NO_DIALOGUE if v is not None and v.casefold() == NO_DIALOGUE else v
+
+
+class Subtitles(BaseModel):
+    """The scene's subtitle line in each of the three track languages."""
+    vi: str | None = Field(default=None, description="Vietnamese subtitle line.")
+    th: str | None = Field(default=None, description="Thai subtitle line.")
+    en: str | None = Field(default=None, description="English subtitle line.")
+
+    @field_validator("vi", "th", "en", mode="before")
+    @classmethod
+    def _strip(cls, v: object) -> object:
+        return (" ".join(v.split()) or None) if isinstance(v, str) else v
 
 
 class Character(BaseModel):
@@ -238,6 +268,8 @@ class SceneDraft(BaseModel):
     narration: str | None = Field(default=None, description="Optional line shown as a subtitle in the final film.")
     camera: Camera | None = Field(default=None, description="Visual direction: shot size, angle, camera movement, "
                                   "lens, focus, composition, lighting, speed. Added to the prompts automatically.")
+    subtitles: Subtitles | None = Field(default=None, description="The `narration` line in Vietnamese, Thai and "
+                                        "English: the film always has these three subtitle tracks.")
 
     @model_validator(mode="after")
     def _check(self) -> "SceneDraft":
@@ -474,6 +506,44 @@ class Storyboard(StoryboardDraft):
         return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS),
                              self._prompt_characters(scene))
 
+    # --- subtitles (three tracks: vi / th / en) ---
+
+    def primary_subtitle_code(self) -> str:
+        """Track language `narration` is written in: the planning subtitle language, else the track whose
+        line equals `narration`, else Vietnamese."""
+        code = subtitle_code(self.subtitle_language)
+        if code:
+            return code
+        for s in self.scenes:
+            n = " ".join((s.narration or "").split())
+            if n and s.subtitles:
+                for c in SUBTITLE_CODES:
+                    if getattr(s.subtitles, c) == n:
+                        return c
+        return "vi"
+
+    def subtitle_line(self, scene: SceneDraft, code: str) -> str | None:
+        """The scene's line for track `code`. A missing translation falls back to `narration`,
+        so every track has a line wherever the scene has narration. The primary track is `narration` itself."""
+        narration = scene.narration.strip() if scene.narration and scene.narration.strip() else None
+        if code == self.primary_subtitle_code() and narration:
+            return narration
+        own = getattr(scene.subtitles, code, None) if scene.subtitles else None
+        return own or narration
+
+    def missing_subtitles(self) -> dict[str, list[str]]:
+        """{scene id: [track codes without their own line]} for scenes with narration."""
+        out: dict[str, list[str]] = {}
+        primary = self.primary_subtitle_code()
+        for s in self.scenes:
+            if not (s.narration and s.narration.strip()):
+                continue
+            miss = [c for c in SUBTITLE_CODES
+                    if c != primary and not (s.subtitles and getattr(s.subtitles, c))]
+            if miss:
+                out[s.id] = miss
+        return out
+
     def scene_fingerprint(self, scene: Scene) -> str:
         """Changes whenever anything that affects the generated clip changes."""
         data = {
@@ -506,6 +576,23 @@ def load_storyboard(path: str | Path) -> Storyboard:
         if c.image and not Path(c.image).is_absolute():
             c.image = str((path.parent / c.image).resolve())
     return sb
+
+
+def merge_subtitles_raw(raw: dict, added: dict[str, dict[str, str]]) -> bool:
+    """Write translated lines ({scene id: {code: line}}) into a raw storyboard dict (as read from YAML),
+    keeping lines already there. True when something changed."""
+    changed = False
+    for sc in raw.get("scenes") or []:
+        if not isinstance(sc, dict) or str(sc.get("id")) not in added:
+            continue
+        subs = sc.get("subtitles") if isinstance(sc.get("subtitles"), dict) else {}
+        for code, line in added[str(sc["id"])].items():
+            if code in SUBTITLE_CODES and line and not subs.get(code):
+                subs[code] = line
+                changed = True
+        if subs:
+            sc["subtitles"] = {c: subs[c] for c in SUBTITLE_CODES if subs.get(c)}
+    return changed
 
 
 _LANG_KEYS = ("dialogue_language", "subtitle_language")

@@ -160,7 +160,7 @@ def test_field_order_unchanged():
     old_sb = ["title", "aspect", "model", "image_model", "style", "project_id", "characters", "thumbnail",
               "use_character_refs", "no_text", "fallback_t2v", "scenes"]
     old_scene = ["id", "mode", "prompt", "image_prompt", "image", "end_image", "duration", "model", "narration",
-                 "camera"]
+                 "camera", "subtitles"]  # subtitles (vi / th / en tracks) appended after every old field
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
     assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language"]
     assert list(StoryboardDraft.model_fields) == old_sb

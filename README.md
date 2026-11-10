@@ -127,8 +127,9 @@ output/cafe/
 ├── state.json        # tiến độ, project_id, media_id từng cảnh
 ├── keyframes/s01.png
 ├── clips/s01.mp4 ...
-├── final.mp4
-└── final.srt
+├── final.mp4         # có sẵn 3 track phụ đề vi / th / en (bật/tắt trong trình phát)
+├── final.srt         # phụ đề ngôn ngữ gốc (như trước)
+└── final.vi.srt, final.th.srt, final.en.srt
 ```
 
 ## Backup lên Google Drive
@@ -184,7 +185,10 @@ scenes:
       movement: slow dolly-in
       lens: 85mm portrait lens
     duration: 8
-    narration: "Hà Nội, 5 giờ sáng."   # phụ đề
+    narration: "Hà Nội, 5 giờ sáng."   # phụ đề (ngôn ngữ gốc)
+    subtitles:                          # tuỳ chọn: bản Việt / Thái / Anh; thiếu thì Claude tự dịch khi ghép
+      th: "ฮานอย ตีห้า"
+      en: "Hanoi, 5 a.m."
 
   - id: s02
     mode: t2v             # thẳng từ chữ
@@ -234,6 +238,11 @@ subtitle_language: "English"      # ngôn ngữ phụ đề lúc viết storyboa
   gửi Flow, nên mọi cảnh nói cùng một thứ tiếng. Câu này không vào prompt ảnh và không đổi fingerprint: đổi giữa
   chừng thì cảnh đã có clip vẫn giữ tiếng cũ (muốn đổi thì render lại cảnh đó, tốn credit).
 - `subtitle_language`: chỉ để tham khảo, không gửi Flow. Phụ đề lấy từ `narration`.
+- Phim luôn có **3 bộ phụ đề: Tiếng Việt, Tiếng Thái, Tiếng Anh**. `narration` là bản gốc; bản dịch nằm trong
+  `subtitles` của từng cảnh (Claude viết sẵn khi lập storyboard). Khi ghép / dựng, câu nào còn thiếu bản dịch được
+  Claude tự dịch và lưu lại vào storyboard.yaml (không có Claude thì track đó dùng tạm câu gốc). MP4 xuất ra có 3
+  track phụ đề chuyển qua lại được, kèm `final.vi.srt` / `final.th.srt` / `final.en.srt`. In phụ đề lên hình thì
+  chọn track bằng `--burn-lang vi|th|en` (CLI) hoặc ô "Track in lên hình" (app); tab Ghép phim có nút VI / TH / EN.
 - Mỗi giá trị tối đa 40 ký tự, một dòng: không xuống dòng, không ký tự ẩn (rộng bằng không, điều khiển chiều chữ...);
   khoảng trắng thừa được gộp. Vi phạm thì storyboard báo lỗi (tab YAML trả 400, CLI thoát mã ≠ 0 trước khi gọi Claude).
 - Luôn đặt giá trị trong ngoặc kép: YAML đọc `no`, `off`, `yes` không có ngoặc thành true/false và storyboard sẽ báo lỗi.

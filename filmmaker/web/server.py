@@ -34,13 +34,13 @@ from starlette.concurrency import run_in_threadpool
 from .. import durations as dur
 from .. import manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
-from ..assemble import AssembleError, assemble
+from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
 from ..settings import DEFAULT_BACKUP_REMOTE, settings_path
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, Scene, Storyboard, clean_dialogue_language, clean_language,
-                          load_storyboard, save_storyboard)
+                          load_storyboard, merge_subtitles_raw, save_storyboard)
 from ..thumbnail import ThumbnailError
 from . import ui_prefs
 
@@ -232,6 +232,7 @@ class RunBody(BaseModel):
     music: str | None = None
     volume: float = 0.25
     burn_subtitles: bool = False
+    burn_language: str | None = None  # vi | th | en: which subtitle track to burn in (default: narration's)
     allow_missing: bool = False
     remake_thumbnail: bool = False  # action=thumbnail: new picture on Flow, not just the title
     engine: str = "auto"  # action=edit: auto | ai | rules
@@ -265,6 +266,7 @@ class FinalSettings(BaseModel):
     music: str | None = None
     volume: float = 0.25
     burn_subtitles: bool = False
+    burn_language: str | None = None  # vi | th | en: which subtitle track to burn in (default: narration's)
     allow_missing: bool = False
     smart_edit: bool = True
 
@@ -489,6 +491,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "final_url": file_url(pid, final),
             "final_size": final.stat().st_size if final.is_file() else None,
             "srt_url": file_url(pid, srt),
+            "srt_urls": {code: file_url(pid, path) for code, path in subtitle_paths(final).items()},
             "final_prefs": ui_prefs.read(pdir(pid)).get("final", {}),
             "i2v_unsupported": i2v_off,
             "i2v_error": st_data.get("i2v_error"),
@@ -1384,13 +1387,38 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 job.log(f"Bỏ qua cảnh chưa có: {', '.join(missing)}")
             return clips
 
+        def fill_subtitles(job: Job) -> None:
+            """Translate missing vi / th / en subtitle lines (best effort) and save them to storyboard.yaml."""
+            from ..planner import translate_subtitles
+
+            if not sb.missing_subtitles():
+                return
+            backend = planner_backend()
+            if backend is None:
+                job.log("⚠ Chưa có Claude để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
+                return
+            job.log("Dịch phụ đề sang Tiếng Việt / Thái / Anh…")
+            try:
+                added = translate_subtitles(sb, backend=backend, api_key=settings.get("anthropic_api_key") or None)
+            except Exception as exc:  # the film still gets three tracks (untranslated lines fall back)
+                job.log(f"⚠ Không dịch được phụ đề ({exc}); track còn thiếu dùng tạm lời dẫn gốc.")
+                return
+            if added:
+                with sb_lock(pid):
+                    raw = read_raw(pid)
+                    if merge_subtitles_raw(raw, added):
+                        write_raw(pid, raw)
+                job.log(f"✔ Đã dịch phụ đề cho {len(added)} cảnh.")
+
         def do_edit(job: Job) -> dict[str, Any]:
             from ..editor import edit_film
 
             clips = ready_clips(job)
+            fill_subtitles(job)
             backend = planner_backend()
             output, plan = edit_film(
                 sb, clips, out_dir(pid), music=music, music_volume=body.volume, burn_subtitles=body.burn_subtitles,
+                burn_language=body.burn_language,
                 engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
                 api_key=settings.get("anthropic_api_key") or None, log=job.log)
             job.log(f"🎬 Phim đã dựng: {output}")
@@ -1398,9 +1426,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         def do_stitch(job: Job) -> dict[str, Any]:
             clips = ready_clips(job)
+            fill_subtitles(job)
             output = out_dir(pid) / "final.mp4"
             assemble(sb, clips, output, music=music, music_volume=body.volume,
-                     burn_subtitles=body.burn_subtitles, log=job.log)
+                     burn_subtitles=body.burn_subtitles, burn_language=body.burn_language, log=job.log)
             job.log(f"🎬 Phim hoàn chỉnh: {output}")
             return {"final": str(output)}
 

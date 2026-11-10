@@ -888,8 +888,7 @@ function bEditPrompt(sc, key) {
     body: h("div", { class: "stack" },
       ta("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, ai đứng đâu, bối cảnh…"),
       ta("prompt", "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles…"),
-      field("Phụ đề / lời dẫn", h("input", { type: "text", value: sc.narration || "", placeholder: "Không bắt buộc",
-        oninput: (e) => { sc.narration = e.target.value; changed(); } })),
+      subtitleFields(S.cur.storyboard, sc, changed),
       h("p", { class: "help" }, "Tự lưu khi bạn gõ. Sửa prompt có thể làm keyframe đã có thành “Ảnh cũ”.")),
     buttons: [{ label: "Xong", cls: "primary" }] });
 }

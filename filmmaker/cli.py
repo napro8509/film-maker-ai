@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import yaml
 
 from . import durations as dur
 from . import model_meta, retirement
@@ -377,13 +378,35 @@ def _clips(sb, out_dir: Path) -> tuple[list[tuple[str, Path]], list[str]]:
     return clips, missing
 
 
-def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing):
+def _fill_subtitles(sb, storyboard: Path, backend: str = "auto") -> None:
+    """Translate missing vi / th / en subtitle lines with Claude and save them into the YAML (best effort)."""
+    from .planner import translate_subtitles
+    from .storyboard import merge_subtitles_raw
+
+    if not sb.missing_subtitles():
+        return
+    if not _ai_ready(backend):
+        click.echo("⚠ Chưa có Claude để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
+        return
+    try:
+        added = translate_subtitles(sb, backend=backend, api_key=user_settings.load().get("anthropic_api_key") or None)
+    except RuntimeError as exc:
+        click.echo(f"⚠ Không dịch được phụ đề ({exc}); track còn thiếu dùng tạm lời dẫn gốc.")
+        return
+    raw = yaml.safe_load(storyboard.read_text(encoding="utf-8")) or {}
+    if added and isinstance(raw, dict) and merge_subtitles_raw(raw, added):
+        storyboard.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False, width=100), encoding="utf-8")
+        click.echo(f"✔ Đã dịch phụ đề Việt / Thái / Anh cho {len(added)} cảnh (lưu vào {storyboard.name}).")
+
+
+def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, burn_lang=None):
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để ghép phần đã có)")
     output = output or out_dir / "final.mp4"
     try:
-        assemble(sb, clips, output, music=music, music_volume=volume, burn_subtitles=subtitles, log=click.echo)
+        assemble(sb, clips, output, music=music, music_volume=volume, burn_subtitles=subtitles,
+                 burn_language=burn_lang, log=click.echo)
     except AssembleError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"🎬 Phim hoàn chỉnh: {output}")
@@ -394,6 +417,8 @@ def _stitch_options(f):
     f = click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")(f)
     f = click.option("--music-volume", "volume", default=0.25, show_default=True)(f)
     f = click.option("--burn-subtitles", "subtitles", is_flag=True, help="In phụ đề (narration) lên hình.")(f)
+    f = click.option("--burn-lang", type=click.Choice(["vi", "th", "en"]), default=None,
+                     help="Track phụ đề in lên hình (mặc định: ngôn ngữ lời dẫn). Phim luôn có 3 track vi / th / en.")(f)
     f = click.option("--allow-missing", is_flag=True, help="Vẫn ghép khi còn cảnh chưa có.")(f)
     return f
 
@@ -402,10 +427,11 @@ def _stitch_options(f):
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path))
 @_stitch_options
-def stitch(storyboard: Path, out, output, music, volume, subtitles, allow_missing) -> None:
-    """Ghép các clip đã tạo thành một phim (ffmpeg, không tốn credit)."""
+def stitch(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing) -> None:
+    """Ghép các clip đã tạo thành một phim (ffmpeg, không tốn credit). Phim luôn có 3 track phụ đề vi / th / en."""
     sb = load_storyboard(storyboard)
-    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing)
+    _fill_subtitles(sb, storyboard)
+    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang)
 
 
 def _ai_ready(backend: str) -> bool:
@@ -420,7 +446,7 @@ def _ai_ready(backend: str) -> bool:
 
 
 def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
-             engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
+             burn_lang: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
     from .editor import edit_film, make_plan, plan_path
 
     clips, missing = _clips(sb, out_dir)
@@ -434,7 +460,7 @@ def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, a
             click.echo(f"✔ Kế hoạch dựng: {plan_path(out_dir)} (sửa được, rồi chạy `filmmaker edit` để xuất phim)")
             return
         output, _ = edit_film(sb, clips, out_dir, output, music=music, music_volume=volume,
-                              burn_subtitles=subtitles, **kw)
+                              burn_subtitles=subtitles, burn_language=burn_lang, **kw)
     except (AssembleError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"🎬 Phim đã dựng: {output}")
@@ -454,7 +480,7 @@ def _edit_options(f):
 @_stitch_options
 @_edit_options
 @click.option("--plan-only", is_flag=True, help="Chỉ lập kế hoạch dựng (edit.json), chưa xuất phim.")
-def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing, engine, replan, backend,
+def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing, engine, replan, backend,
          plan_only) -> None:
     """Agent dựng phim: cắt thừa, chuyển cảnh, cân âm, nhạc nền -> phim liền mạch (không tốn credit).
 
@@ -463,7 +489,9 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing,
     <out>/edit.json. Sửa file đó rồi chạy lại để xuất theo ý mình; --replan để agent làm bản mới.
     """
     sb = load_storyboard(storyboard)
-    _do_edit(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing,
+    if not plan_only:
+        _fill_subtitles(sb, storyboard, backend)
+    _do_edit(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang=burn_lang,
              engine=engine, replan=replan, backend=backend, plan_only=plan_only)
 
 
@@ -473,7 +501,7 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing,
 @_stitch_options
 @click.option("--edit/--no-edit", "smart_edit", default=False,
               help="Dựng bằng agent dựng phim (chuyển cảnh, cân âm) thay vì nối thẳng.")
-def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smart_edit, **kw) -> None:
+def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim.
 
     Chặn cảnh dùng model đã ngừng và cảnh có độ dài model không nhận giống `run`.
@@ -483,10 +511,11 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smar
         return
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
+    _fill_subtitles(sb, storyboard)
     if smart_edit:
-        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing)
+        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang=burn_lang)
     else:
-        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing)
+        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang)
     try:
         _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
     except click.ClickException as exc:  # the film is done; a missing cover is not a failure
