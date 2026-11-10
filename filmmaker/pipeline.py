@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Literal
 
 from . import durations as dur
-from . import manual_clip, model_meta
+from . import flow_caps, manual_clip, model_meta
 from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Character, Scene, Storyboard
@@ -65,6 +65,8 @@ class RunOptions:
     retry_unknown: bool = False  # resubmit scenes left in "submitting" by a crash
     max_retries: int = 2
     pause: tuple[float, float] = (8.0, 20.0)  # random pause between paid submissions
+    # between free image generations (portraits, keyframes); None = a quarter of `pause`
+    image_pause: tuple[float, float] | None = None
     fail_fast: bool = False
     keyframes_only: bool = False  # only make the (free) keyframe stills, no paid video
     force_keyframes: set[str] = field(default_factory=set)  # remake these keyframes even if they exist
@@ -103,6 +105,10 @@ class Pipeline:
         if progress is not None:
             self.g.on_event = self.rep.gflow_event
         self.state = State(out_dir / "state.json")
+        if not gflow.dry_run:
+            # What this account cannot do through gflow was found out in an earlier project: skip the failing try.
+            for k, v in flow_caps.load(gflow.binary, gflow.profile).items():
+                self.state.data.setdefault(k, v)
         self._flow_media: dict[str, dict[str, str]] = {}  # project -> {sha256 of file: media id}
         self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
 
@@ -143,8 +149,14 @@ class Pipeline:
         and the project remembers it so the next images go there straight away."""
         self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
         files = [p for _, p in refs]
+        # Say which picture is whom (Nano Banana follows labelled references better); not part of any fingerprint.
+        order = ["first", "second", "third", "fourth"]
+        ui_prompt = ("Reference images: " + "; ".join(
+            f"the {order[i] if i < len(order) else str(i + 1) + 'th'} is {n} (keep {n}'s face, hair and clothes exactly)"
+            for i, (n, _) in enumerate(refs)) + ". " + prompt)
+        # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
         if self.state.data.get("i2i_ui") and self.g.ui_available():
-            return self._image_via_ui(what, prompt, files, kw)
+            return self._image_via_ui(what, ui_prompt, files, kw)
         ref_args = files if project in self._no_media_refs else self.flow_refs(refs, project)
         while True:
             try:
@@ -163,7 +175,8 @@ class Pipeline:
                              "chuyển sang tạo qua giao diện chat của Flow (miễn phí).")
                     self.state.data["i2i_ui"] = True
                     self.state.save()
-                    return self._image_via_ui(what, prompt, files, kw)
+                    self._remember(i2i_ui=True)
+                    return self._image_via_ui(what, ui_prompt, files, kw)
                 self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
                 return None
 
@@ -174,6 +187,14 @@ class Pipeline:
         except GflowError as exc:
             self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật qua giao diện chat ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
             return None
+
+    def _remember(self, **flags: Any) -> None:
+        if not self.g.dry_run:
+            flow_caps.remember(self.g.binary, self.g.profile, **flags)
+
+    def _image_pause(self, opts: RunOptions) -> float:
+        lo, hi = opts.image_pause or (opts.pause[0] / 4, opts.pause[1] / 4)
+        return random.uniform(lo, hi)
 
     # --- helpers -----------------------------------------------------------
 
@@ -495,7 +516,7 @@ class Pipeline:
                 self.log("Đã dừng theo yêu cầu.")
                 break
             if idx > 0 and not self.g.dry_run:
-                self.sleep(random.uniform(*opts.pause))
+                self.sleep(self._image_pause(opts))
             prompt = self.sb.portrait_prompt(c)
             self.log(f"[{c.name}] ảnh nhân vật: {prompt[:100]}")
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -560,7 +581,7 @@ class Pipeline:
                 self.log("Đã dừng theo yêu cầu.")
                 break
             if idx > 0 and not self.g.dry_run:
-                self.sleep(random.uniform(*opts.pause))
+                self.sleep(self._image_pause(opts))
             self.log(f"[{s.id}] keyframe: {(s.image_prompt or s.prompt)[:80]}")
             try:
                 kf = self._keyframe(s, project, opts, remake=True)
@@ -594,6 +615,7 @@ class Pipeline:
                          "Dùng Chữ → Video thường.")
                 self.state.data["r2v_unsupported"] = True
                 self.state.save()
+                self._remember(r2v_unsupported=True)
         video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(self.sb.for_flow_video(prompt), **common),
                                              opts.max_retries)
         return video, media_id, "t2v"
@@ -657,6 +679,7 @@ class Pipeline:
             self.state.data["i2v_unsupported"] = True
             self.state.data["i2v_error"] = str(exc)
             self.state.save()
+            self._remember(i2v_unsupported=True, i2v_error=str(exc))
             if self.g.ui_available():
                 self.log("  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).")
                 return self._render_via_ui(s, start_image, prompt, common)

@@ -664,6 +664,7 @@ function renderMain() {
     renderHeader(),
     zone("errors-zone", renderErrors),
     zone("model-zone", renderModelWarning),
+    zone("auto-zone", renderAutoSteps),
     h("div", { class: "tabs", role: "tablist" },
       tabs.map(([k, ic, l, n]) => h("button", { class: S.tab === k ? "on" : "", role: "tab", "aria-selected": String(S.tab === k), onclick: () => switchTab(k) },
         icon(ic), l, n != null ? h("span", { class: "count" }, n) : null))),
@@ -724,6 +725,7 @@ function renderHeader() {
       const busy = jobRunning();
       // Pipeline order, one primary action (render). Dry-run and file actions live in the ⋯ menu.
       return h("div", { class: "actions" },
+        h("button", { class: "btn", disabled: busy, onclick: () => openAutopilot(S.cur), title: "Chạy tự động mọi bước còn thiếu: nhân vật, keyframe, video, AI dựng phim, thumbnail, kèm agent review" }, icon("sparkle"), "Tạo tự động", PAID()),
         h("button", { class: "btn", disabled: busy, onclick: () => runAction("keyframes"), title: "Tạo ảnh mở đầu cho các cảnh kiểu Ảnh → Video (miễn phí)" }, icon("image"), "Tạo keyframe", FREE()),
         h("button", { class: "btn primary", disabled: busy, onclick: () => runAction("video"), title: "Render các cảnh chưa xong (tốn credit, có bước xác nhận)" }, icon("video"), "Render video", PAID()),
         h("button", { class: "btn", disabled: busy, onclick: () => switchTab("final"), title: "Ghép các clip thành phim, thêm nhạc và ảnh bìa" }, icon("stitch"), "Ghép phim"),
@@ -1473,6 +1475,7 @@ function renderFinal() {
       }),
       zone("playlist-zone", renderPlaylist)),
     h("div", { class: "stack" },
+      zone("auto-review-zone", renderAutoReview),
       h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Ghép phim")),
         h("div", { class: "stack" },
           h("div", { class: "field" }, h("span", { class: "lbl" }, "Nhạc nền"),
@@ -1505,6 +1508,81 @@ function renderFinal() {
         (S.cur.storyboard.scenes || []).some((s) => s.narration)
           ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
           : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+}
+
+/* ---------- autopilot ---------- */
+
+const AUTO_STEPS = [["storyboard", "Storyboard"], ["review_storyboard", "Review kịch bản"], ["characters", "Nhân vật"],
+  ["keyframes", "Keyframe"], ["review_keyframes", "Review keyframe"], ["videos", "Video"], ["review_clips", "Review clip"],
+  ["edit", "AI dựng phim"], ["thumbnail", "Thumbnail"], ["review_film", "Review cả phim"]];
+
+function autoCostText(scenes, review) {
+  return `Chạy liền: viết storyboard → ${review ? "agent review → " : ""}ảnh nhân vật → keyframe → ${review ? "review keyframe → " : ""}`
+    + `render ${scenes} clip video → ${review ? "review clip → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
+    + `Video TỐN CREDIT (veo-lite khoảng 10 credit/clip ≈ ${scenes * 10} credit${review ? ", cộng tối đa 3 clip agent render lại" : ""}). `
+    + "Ảnh và dựng phim miễn phí. Có thể bấm Dừng bất cứ lúc nào; bấm “Tạo tự động” lần nữa để làm tiếp từ chỗ dừng.";
+}
+
+async function openAutopilot(cur) {
+  const review = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
+  const subs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+  const left = (cur.storyboard.scenes || []).filter((s) => cur.scene_state?.[s.id]?.status !== "done").length;
+  modal({
+    title: "Tạo tự động", body: h("div", { class: "stack" },
+      h("p", {}, left ? `Làm mọi bước còn thiếu cho “${cur.storyboard.title}”: ${left} cảnh chưa có clip.` : "Mọi cảnh đã có clip: agent review, dựng lại phim và làm thumbnail nếu cần."),
+      h("p", { class: "help" }, autoCostText(left, review.checked)),
+      h("label", { class: "check" }, review, h("span", {}, "Agent review từng bước")),
+      h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video"))),
+    buttons: [{ label: "Huỷ" }, { label: "Bắt đầu", cls: "primary", onclick: async (c) => {
+      localSet("autoReview", review.checked); localSet("autoSubs", subs.checked);
+      try {
+        await flushSave();
+        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, music: finalPrefs().music }));
+        c();
+      } catch (e) { toast(e.message, "error"); }
+    } }],
+  });
+}
+
+function autoStageMap() {
+  const saved = Object.fromEntries((S.cur?.autopilot?.stages || []).map((s) => [s.key, s]));
+  const j = S.job, live = j && j.kind === "auto" && j.project === S.cur?.id && j.status === "running" ? j.stage : null;
+  return { saved, live };
+}
+
+function renderAutoSteps() {
+  if (!S.cur) return null;
+  const { saved, live } = autoStageMap();
+  if (!live && !S.cur.autopilot) return null;
+  const liveIdx = live ? AUTO_STEPS.findIndex(([k]) => k === live.key) : -1;
+  return h("div", { class: "auto-steps", role: "list", "aria-label": "Các bước tạo tự động" },
+    AUTO_STEPS.map(([k, label], i) => {
+      const st = saved[k] || {};
+      let cls = st.status === "done" ? "done" : st.status === "partial" || st.status === "failed" ? "warn" : st.status === "skipped" ? "skip" : "";
+      if (live && i === liveIdx && live.status === "running") cls = "running";
+      return h("div", { class: "auto-step " + cls, role: "listitem", title: [label, st.note].filter(Boolean).join(" — ") },
+        h("span", { class: "n" }, cls === "done" ? "✓" : i + 1), h("span", { class: "l" }, label));
+    }));
+}
+
+function renderAutoReview() {
+  const a = S.cur?.autopilot;
+  if (!a) return null;
+  const f = a.film_review, sbr = a.storyboard_review;
+  const stage = (k) => (a.stages || []).find((s) => s.key === k) || {};
+  const rows = [["Kịch bản", sbr ? `${sbr.score}/10` : stage("review_storyboard").note],
+    ["Keyframe", stage("review_keyframes").note], ["Clip", stage("review_clips").note]].filter(([, v]) => v);
+  return h("div", { class: "card card-pad" },
+    h("div", { class: "card-head" }, h("h3", {}, "Agent review"), h("span", { class: "spacer" }),
+      f ? h("span", { class: "score " + (f.score >= 8 ? "ok" : f.score >= 6 ? "mid" : "bad") }, `${f.score}/10`) : null),
+    f ? h("div", { class: "stack tight" },
+      h("p", {}, f.summary),
+      f.strengths?.length ? h("ul", { class: "rev-list ok" }, f.strengths.map((x) => h("li", {}, x))) : null,
+      f.issues?.length ? h("ul", { class: "rev-list bad" }, f.issues.map((x) => h("li", {}, x))) : null,
+      f.suggestions?.length ? h("ul", { class: "rev-list next" }, f.suggestions.map((x) => h("li", {}, x))) : null,
+      f.thumbnail ? h("p", { class: "small muted" }, "Ảnh bìa: " + f.thumbnail) : null)
+      : h("p", { class: "help" }, "Agent sẽ chấm cả phim khi tạo tự động xong."),
+    rows.length ? h("table", { class: "list small", style: { marginTop: "8px" } }, rows.map(([k, v]) => h("tr", {}, h("td", {}, k), h("td", {}, v)))) : null);
 }
 
 /* ---------- editor agent (edit plan) ---------- */
@@ -2096,7 +2174,17 @@ async function pollJob() {
     S.job.lines.push(...fresh);
     S.jobSince = d.total;
     const wasRunning = S.job.status === "running";
-    Object.assign(S.job, { status: d.status, result: d.result, finished: d.finished, stop_requested: d.stop_requested });
+    const prevStage = S.job.stage || {};
+    Object.assign(S.job, { status: d.status, result: d.result, finished: d.finished, stop_requested: d.stop_requested,
+      title: d.title, stage: d.stage || {} });
+    if (d.project && S.job.project !== d.project) {
+      S.job.project = d.project;
+      if (S.job.kind === "auto") { await loadProjects(); await openProject(d.project); }
+    }
+    if (S.job.kind === "auto" && (prevStage.key !== S.job.stage.key || prevStage.status !== S.job.stage.status)) {
+      refreshZone("auto-zone");
+      if (S.cur && S.cur.id === S.job.project) refreshCurrent();
+    }
     const prev = S.job.progress || {};
     S.job.progress = d.progress && typeof d.progress === "object" ? d.progress : undefined; // no field (older server) → old way
     appendLog(fresh);
@@ -2132,6 +2220,14 @@ async function onJobDone() {
   }
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
+  if (j.kind === "auto" && j.result?.project) {
+    if (!S.cur || S.cur.id !== j.result.project) await openProject(j.result.project);
+    else await refreshCurrent();
+    await loadEditPlan(true);
+    if (j.result.final) { S.tab = "final"; }
+    renderMain();
+    return;
+  }
   if (j.kind === "restore" && j.status === "done" && j.result?.id) { await openProject(j.result.id); return; }
   if (j.kind === "portraits" && S.cur && S.cur.id === j.project && j.result?.images) {
     for (const c of S.cur.storyboard.characters || []) if (j.result.images[c.name]) c.image = j.result.images[c.name];
@@ -2214,6 +2310,7 @@ function updateJobHead() {
   put(head,
     h("span", { class: "dot " + j.status }),
     h("span", { class: "title" }, j.title),
+    j.kind === "auto" && j.stage?.label && j.status === "running" ? h("span", { class: "badge mini running" }, `Bước ${j.stage.index || "?"}/${j.stage.total || 10}: ${j.stage.label}`) : null,
     h("span", { class: "badge mini " + kind }, statusText, " · ", h("span", { id: "elapsed" }, elapsedText())),
     h("span", { class: "last", title: last }, last),
     h("div", { class: "tools" },
@@ -2269,12 +2366,30 @@ function openNewProject() {
         : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
       h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")));
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
-    const n = h("input", { type: "number", min: 1, max: 20, value: 6 });
+    const n = h("input", { type: "number", min: 1, max: 20, value: localGet("autoScenes", 10) });
+    const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
+    const autoSubs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
     const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
     const subSaved = cleanLang(localGet("subtitleLang"));
     const sub = langPicker(SUBTITLE_LANGS, subSaved && subSaved.toLowerCase() !== "none" ? subSaved : "Vietnamese", { noNone: true });
     setTimeout(() => idea.focus(), 30);
+    const goAuto = async (e) => {
+      if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
+      const a = speak.read(), b = sub.read();
+      if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); speak.input.focus(); return; }
+      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.input.focus(); return; }
+      const btn = e.currentTarget, scenes = +n.value || 10;
+      localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); localSet("autoScenes", scenes);
+      localSet("autoReview", autoReview.checked); localSet("autoSubs", autoSubs.checked);
+      if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(scenes, autoReview.checked), "Bắt đầu"))) return;
+      btn.disabled = true;
+      try {
+        const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
+          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked });
+        close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
+      } catch (err) { toast(err.message, "error"); btn.disabled = false; }
+    };
     const go = async (e) => {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
       const a = speak.read(), b = sub.read();
@@ -2295,7 +2410,12 @@ function openNewProject() {
       h("p", { class: "help" }, "Câu “nhân vật nói …” được thêm vào mọi prompt video gửi Flow để cả phim cùng một thứ tiếng."),
       h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
         S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
-      h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, icon("sparkle"), "Viết storyboard")));
+      h("div", { class: "auto-opts" },
+        h("label", { class: "check" }, autoReview, h("span", {}, "Agent review từng bước", h("span", { class: "sub" }, "Review storyboard, keyframe (tự tạo lại ảnh lỗi), clip (render lại clip hỏng, tối đa 3) và cả phim."))),
+        h("label", { class: "check" }, autoSubs, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng.")))),
+      h("div", { class: "row" }, h("span", { class: "spacer" }),
+        h("button", { class: "btn", onclick: go, title: "Chỉ viết storyboard để bạn xem và sửa trước" }, "Chỉ viết storyboard"),
+        h("button", { class: "btn primary", onclick: goAuto, title: "Storyboard → nhân vật → keyframe → video → AI dựng phim → thumbnail, có agent review" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
   };
   const importForm = () => {
     const inp = h("input", { type: "file", accept: ".yaml,.yml" });

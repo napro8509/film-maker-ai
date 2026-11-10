@@ -644,6 +644,75 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
     sys.exit(0 if not report.failed and not report.aborted else 1)
 
 
+@main.command()
+@click.argument("idea", required=False)
+@click.option("--storyboard", "existing", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Làm tiếp một storyboard có sẵn thay vì viết mới từ ý tưởng.")
+@click.option("-n", "--scenes", default=10, show_default=True, help="Số cảnh.")
+@click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="9:16", show_default=True)
+@click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề.")
+@click.option("--dialogue-lang", "dialogue_lang", default="Vietnamese", show_default=True,
+              help="Ngôn ngữ nhân vật nói; 'none' = không thoại.")
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa dự án (mặc định ~/FilmMaker, dùng chung với app).")
+@click.option("--review/--no-review", default=True, show_default=True, help="Agent review từng công đoạn.")
+@click.option("--rerender-budget", default=3, show_default=True,
+              help="Số clip tối đa agent review được render lại (tốn credit).")
+@click.option("--burn-subtitles/--no-burn-subtitles", default=True, show_default=True)
+@click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
+def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
+         burn_subtitles, music, profile, pause) -> None:
+    """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
+
+    \b
+    Agent review storyboard, keyframe (tạo lại ảnh lỗi, miễn phí), clip (render lại clip hỏng, tối đa
+    --rerender-budget clip) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp chỗ dừng.
+    """
+    from .autopilot import AutoError, Autopilot, AutoSettings, slug
+    from .planner import plan_auto
+
+    if not idea and not existing:
+        raise click.UsageError("cần IDEA hoặc --storyboard")
+    g = Gflow(profile=profile, log=click.echo)
+    if not g.available():
+        raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+    if existing:
+        sb_path = existing
+    else:
+        dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
+        language = _cli_lang(language, "--lang", clean_language)
+        click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
+        try:
+            sb, _ = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=language,
+                              dialogue_language=dialogue_lang)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ws = workspace or Path.home() / "FilmMaker"
+        base = slug(sb.title) or "phim"
+        d, n = ws / base, 2
+        while d.exists():
+            d, n = ws / f"{base}-{n}", n + 1
+        (d / "assets").mkdir(parents=True)
+        sb_path = d / "storyboard.yaml"
+        save_storyboard(sb, sb_path)
+        click.echo(f"✔ {sb_path}")
+    cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
+                       api_key=key, pause=_parse_pause(pause))
+    pilot = Autopilot(sb_path, _out_dir(sb_path, None), g, settings=cfg, log=click.echo)
+    try:
+        result = pilot.run()
+    except AutoError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (GflowError, ThumbnailError, AssembleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result.get("stopped"):
+        sys.exit(1)
+
+
 STATUS_CODES = ("done", "changed", "interrupted", "failed", "todo")
 
 

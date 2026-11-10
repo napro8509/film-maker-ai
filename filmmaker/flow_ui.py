@@ -311,10 +311,24 @@ def _new_tile(page, before: list[str]) -> str | None:
     return None
 
 
+def css_string(text: str) -> str:
+    """`text` as a quoted CSS string. Not json.dumps: its \\u00f4 escapes mean nothing in CSS, so a title with
+    an accented letter ("xôi") never matched and the finished clip was never downloaded."""
+    out = []
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\{ord(ch):x} ")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def _tile(page, title: str):
     """Locator for the video tile with this title. Looked up again on every use, because the
     virtual grid swaps tile nodes while it scrolls and re-renders."""
-    return (page.locator(f"{GRID_TILE}[aria-label={json.dumps(title)}]")
+    return (page.locator(f"{GRID_TILE}[aria-label={css_string(title)}]")
             .filter(has=page.locator(VIDEO_TILE)).first)
 
 
@@ -416,6 +430,24 @@ FAILED_RE = re.compile(r"(generation|video) (has )?failed|couldn['’]t (generat
 # Flow's answer when it accepted the job but has not started it yet ("…has been scheduled and is waiting in the
 # queue due to high demand…"). Kept narrow, so a real error is never taken for "queued".
 QUEUED_RE = re.compile(r"waiting in (the )?queue|has been scheduled", re.I)
+OFFER_RE = re.compile(r"would you like me to (kick off|start|generate)[^?]*\?", re.I)
+BLOCKED_MARK = "Flow xoá video"  # autopilot looks for it to rewrite the prompt
+# Flow made the clip and then removed it (its safety filter): "warning Video has been deleted".
+DELETED_RE = re.compile(r"video has been (deleted|removed)|video was (deleted|removed)", re.I)
+
+
+def after_offer(text: str) -> str:
+    """The part of a bubble after Flow's offer. The agent's turn keeps the offer ("…kick off this 1 video generation,
+    costing 5 credits?"), the Approve/Reject buttons and, folded in, its reasoning ("Show thinking"), which may talk
+    about policies; what Flow says about the result comes after the offer in the SAME bubble."""
+    ends = [m.end() for rx in (CREDIT_RE, OFFER_RE) for m in rx.finditer(text)]
+    if not ends:
+        return text
+    rest = text[max(ends):]
+    m = re.search(r"\bReject\b", rest)
+    return rest[m.end():] if m else rest
+
+
 AUDIO_FAILED_RE = re.compile(r"audio generation failed", re.I)
 APPROVE_MIN_LEFT = 180  # seconds: with less left, Flow's offer is rejected (spent=False) instead of approved
 SEND_MIN_LEFT = 240 + APPROVE_MIN_LEFT + 60  # = 480 s: with less left, nothing is sent (exit 9, spent=False)
@@ -429,9 +461,12 @@ def classify_replies(texts: list[str]) -> tuple[str | None, bool]:
     audio failed). The newest bubble with a signal decides; a queue notice wins over "failed" in the same bubble."""
     audio = any(AUDIO_FAILED_RE.search(t or "") for t in texts)
     for t in reversed(texts):
-        if QUEUED_RE.search(t or ""):
+        t = after_offer(t or "")
+        if DELETED_RE.search(t):
+            return "deleted", audio
+        if QUEUED_RE.search(t):
             return "queued", audio
-        if FAILED_RE.search(t or ""):
+        if FAILED_RE.search(t):
             return "failed", audio
     return None, audio
 
@@ -580,9 +615,12 @@ def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, 
             replies = []
         kind, audio = classify_replies(replies[1:])
         audio_seen = audio_seen or audio
+        if kind == "deleted":
+            raise Fail(EXIT_GENERATION_FAILED, f"{BLOCKED_MARK}: Flow đã tạo rồi tự xoá video (“Video has been deleted”, "
+                       "thường do bộ lọc an toàn của Flow). Sửa prompt cho nhẹ nhàng hơn rồi gửi lại.", spent=True)
         if kind == "failed":
             # the texts just read, not a second read: a page re-render there would be exit 23
-            texts = [t.strip() for t in replies if t and t.strip()]
+            texts = [after_offer(t).strip() for t in replies if t and after_offer(t).strip()]
             last = texts[-1] if texts else "(không có)"
             raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo video lỗi: " + last[:400]
                        + (" " + AUDIO_HINT if audio_seen else ""), spent=True)

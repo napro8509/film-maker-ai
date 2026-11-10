@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import manual_clip, model_change, model_meta, retirement
+from .. import autopilot, flow_caps, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -102,6 +102,7 @@ class Job:
     stop_requested: bool = False
     # Per-item progress (char:<name>, kf:<sid>, vid:<sid>), written by the pipeline thread via set_progress.
     progress: dict[str, dict] = field(default_factory=dict)
+    stage: dict[str, Any] = field(default_factory=dict)  # autopilot: the step now running
     _plock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_progress(self, key: str, item: dict | None) -> None:
@@ -131,6 +132,7 @@ class Job:
             "result": self.result, "started": self.started, "finished": self.finished,
             "stop_requested": self.stop_requested,
             "progress": prog.public_view(snapshot, prog.now()),
+            "stage": dict(self.stage),
         }
 
 
@@ -237,6 +239,17 @@ class RunBody(BaseModel):
     engine: str = "auto"  # action=edit: auto | ai | rules
     replan: bool = False  # action=edit: ignore the saved edit plan, let the agent make a new one
     smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
+
+
+class AutoBody(BaseModel):
+    review: bool = True  # AI agents review storyboard, keyframes, clips and the finished film
+    burn_subtitles: bool = True
+    rerender_budget: int = 3  # clips the clip review may render again (credits)
+    music: str | None = None
+
+
+class AutoPlanBody(PlanBody, AutoBody):
+    scenes: int = 10
 
 
 class RestoreBody(BaseModel):
@@ -497,6 +510,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "characters_state": characters_state(pid, raw, sb),
             "thumbnail": thumb_info,
             "backup": last_backup(out_dir(pid)),
+            "autopilot": autopilot.load_public(out_dir(pid)),
             **model_info,
             "path": str(pdir(pid)),
         }
@@ -937,6 +951,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         state.data.pop("i2v_unsupported", None)
         state.data.pop("i2v_error", None)
         state.save()
+        g = gflow(True)
+        flow_caps.remember(g.binary, g.profile, i2v_unsupported=None, i2v_error=None)  # the next project tries too
         return detail(pid)
 
     @app.put("/api/projects/{pid}/final-settings")
@@ -1471,6 +1487,95 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
+
+    # ---- autopilot: one button from the idea to the finished film ----
+
+    def auto_work(job: Job, pid: str, body: AutoBody) -> dict[str, Any]:
+        from ..autopilot import AutoError, Autopilot, AutoSettings
+
+        settings = load_settings()
+        g = gflow(log=job.log)
+        if not g.available():
+            raise RuntimeError("không thấy lệnh gflow")
+        music = None
+        if body.music:
+            music = (pdir(pid) / body.music).resolve()
+            if pdir(pid).resolve() not in music.parents or not music.is_file():
+                music = None
+
+        def edit_raw(fn: Callable[[dict], bool]) -> bool:
+            with sb_lock(pid):
+                raw = read_raw(pid)
+                if not fn(raw):
+                    return False
+                write_raw(pid, raw)
+                return True
+
+        def on_stage(info: dict) -> None:
+            job.stage = {**job.stage, **info}
+
+        pilot = Autopilot(sb_path(pid), out_dir(pid), g, settings=AutoSettings(
+            review=body.review, burn_subtitles=body.burn_subtitles,
+            rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
+            ai_backend=settings.get("planner") or "auto", api_key=settings.get("anthropic_api_key") or None,
+            max_retries=int(settings.get("retries", 2)),
+            pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20)))),
+            log=job.log, sleep=job.sleep, progress=job.set_progress, should_stop=lambda: job.stop_requested,
+            edit_raw=edit_raw, on_stage=on_stage)
+        ab = auto_backup(pid, job)
+        try:
+            res = pilot.run()
+        except AutoError as exc:
+            job.log(f"✘ {exc}")
+            return {"error": str(exc), "project": pid}
+        finally:
+            if ab:
+                ab.finish()
+        return {**res, "project": pid}
+
+    @app.post("/api/projects/autopilot")
+    def autopilot_new(body: AutoPlanBody) -> dict[str, Any]:
+        """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
+        if not body.idea.strip():
+            raise HTTPException(400, "Hãy nhập ý tưởng.")
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
+        dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
+                    if body.dialogue_language is not None else None)
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
+
+        def work(job: Job) -> dict[str, Any]:
+            from ..planner import plan_auto
+
+            job.stage = {"key": "storyboard", "label": "Viết storyboard", "status": "running", "index": 1, "total": 10}
+            job.log(f"=== Bước 1/10: Viết storyboard ({body.scenes} cảnh) ===")
+            job.log(f"Ý tưởng: {body.idea[:300]}")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
+                              aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+            pid, d = new_project_dir(sb.title)
+            save_storyboard(sb, d / "storyboard.yaml")
+            job.project = pid  # the UI opens the project while the rest runs
+            job.title = f"Tạo tự động: {sb.title}"
+            job.log(f"✔ “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
+            return auto_work(job, pid, body)
+
+        return jobs.start("auto", "Tạo tự động toàn bộ", None, work).public()
+
+    @app.post("/api/projects/{pid}/autopilot")
+    def autopilot_resume(pid: str, body: AutoBody) -> dict[str, Any]:
+        """“Tạo tự động” on an existing project: every step still missing, reviews included."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        wp = web_video_plan(Pipeline(sb, out_dir(pid), gflow(True)), RunBody(action="video"))
+        if wp.retired:
+            raise HTTPException(409, detail={"message": f"Không thể render: {len(wp.retired)} cảnh dùng model đã ngừng",
+                                             "reason": "model_retired", "retired": wp.retired})
+        return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body)).public()
 
     # ---- backup (Google Drive via rclone) ----
 
