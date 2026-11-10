@@ -66,6 +66,7 @@ Giao diện có:
 - **Chỉ đạo nội dung & thoại** (mỗi cảnh): ghi mục đích cảnh và cách nhân vật diễn; thêm từng câu thoại (ai nói, nói gì, nói thế nào). Lời thoại được đưa vào prompt video theo dạng `Lan (whispering) says: ...`, nói lần lượt từng người, kèm quy tắc không ai nói lặp câu của người khác. Câu trùng trong cùng cảnh không được gửi lên Flow; câu trùng với cảnh trước được cảnh báo (cả trong app và `filmmaker check`). "Từ ý tưởng" cũng tự viết phần này cho mỗi cảnh.
 - **Nhân vật & phong cách**: mô tả nhân vật một lần, tự thêm vào mọi cảnh có tên nhân vật đó.
 - **Ảnh nhân vật (tham chiếu)**: tạo ảnh nhân vật trên Flow (miễn phí) hoặc tải ảnh lên. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
+- **Bối cảnh (thẻ "Bối cảnh" ở tab Câu chuyện, ngay dưới "Nhân vật")**: khai báo mỗi nơi lặp lại một lần (mô tả + ảnh tham chiếu), thêm/sửa/xoá, tải ảnh lên hoặc bấm "Tạo ảnh bối cảnh" (miễn phí). Trình sửa cảnh có ô "Bối cảnh" và ô "Nối tiếp keyframe cảnh trước"; thẻ có ô chung "Nối keyframe cảnh liền trước cùng bối cảnh". Cảnh Ảnh → Video bỏ qua bối cảnh. Xem mục "Bối cảnh và cảnh liền mạch".
 - **Tab "Bảng"**: xem cả phim như một bảng card: nhân vật → keyframe → video của từng cảnh. Kéo nối mũi tên để chọn nhân vật xuất hiện trong cảnh; tạo ảnh nhân vật và keyframe ngay trên card (miễn phí); render video có hộp xác nhận credit. Xem mục "Nhân vật trong từng cảnh".
 - **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.
 - **Render an toàn**: hộp xác nhận liệt kê đúng các clip sẽ tốn credit; cảnh bị ngắt giữa chừng không bị gửi lại nếu bạn chưa xác nhận; nút Dừng (cảnh đang render được làm nốt).
@@ -128,8 +129,9 @@ output/cafe/
 ├── state.json        # tiến độ, project_id, media_id từng cảnh
 ├── keyframes/s01.png
 ├── clips/s01.mp4 ...
-├── final.mp4
-└── final.srt
+├── final.mp4         # có sẵn 3 track phụ đề vi / th / en (bật/tắt trong trình phát)
+├── final.srt         # phụ đề ngôn ngữ gốc (như trước)
+└── final.vi.srt, final.th.srt, final.en.srt
 ```
 
 ## Backup lên Google Drive
@@ -185,7 +187,10 @@ scenes:
       movement: slow dolly-in
       lens: 85mm portrait lens
     duration: 8
-    narration: "Hà Nội, 5 giờ sáng."   # phụ đề
+    narration: "Hà Nội, 5 giờ sáng."   # phụ đề (ngôn ngữ gốc)
+    subtitles:                          # tuỳ chọn: bản Việt / Thái / Anh; thiếu thì Claude tự dịch khi ghép
+      th: "ฮานอย ตีห้า"
+      en: "Hanoi, 5 a.m."
 
   - id: s02
     mode: t2v             # thẳng từ chữ
@@ -220,9 +225,44 @@ scenes:
     prompt: "Lan walks home"  # bỏ trống characters: dò tên như cũ
 ```
 
-- Bỏ trống: dò tên trong prompt như cũ. Có `characters`: dùng đúng danh sách đó cho phần mô tả và ảnh tham chiếu (tối đa 3 ảnh mỗi cảnh); `[]` = không nhân vật.
+- Bỏ trống: dò tên trong prompt như cũ. Có `characters`: dùng đúng danh sách đó cho phần mô tả và ảnh tham chiếu (tối đa 3 ảnh mỗi cảnh, 2 nếu cảnh có bối cảnh); `[]` = không nhân vật.
 - Tên không phân biệt hoa thường, phải có trong `characters` cấp trên và không trùng nhau, nếu không storyboard bị báo lỗi.
 - Tab "Bảng" ghi trường này khi bạn kéo/xoá mũi tên nhân vật → cảnh.
+
+### Bối cảnh và cảnh liền mạch (`locations`)
+
+Khai báo mỗi nơi lặp lại một lần để các cảnh ở cùng chỗ giữ cùng căn phòng, bàn ghế, ánh đèn:
+
+```yaml
+locations:
+  - name: Phòng khách nhà cũ
+    description: "Dim family living room, round teak table, brass pendant lamp, faded green wallpaper"
+    # image: assets/locations/phong-khach-nha-cu.png   # tự ghi sau khi tạo/tải ảnh
+
+continuity: true          # tuỳ chọn; bỏ trống = bật
+
+scenes:
+  - id: s02
+    mode: keyframe
+    location: Phòng khách nhà cũ   # tên trong locations (không phân biệt hoa thường)
+    image_prompt: "Minh stands left of the table, Lan sits right, warm lamp light, evening"
+    prompt: "Minh slams his hand on the table"
+  - id: s03
+    mode: keyframe
+    location: Phòng khách nhà cũ
+    continue_previous: false       # tuỳ chọn: cảnh nhảy thời gian, không nối keyframe cảnh trước
+    image_prompt: "The same room the next morning, empty chairs"
+    prompt: "Slow push-in on the table"
+```
+
+- Cảnh có `location` được thêm câu `Setting: <description>.` vào prompt ảnh (và prompt video của cảnh Chữ → Video). Cảnh Ảnh → Video (`i2v`) bỏ qua `location` hoàn toàn.
+- `locations` có thể bỏ trống; storyboard cũ chạy như trước. Bối cảnh trùng tên (không phân biệt hoa thường), tên rỗng, hoặc `location` của cảnh không có trong `locations` thì storyboard bị báo lỗi.
+- Tạo ảnh bối cảnh (miễn phí): `filmmaker locations storyboard.yaml` (chỉ bối cảnh chưa có ảnh; `--name` chọn bối cảnh, `--force` tạo lại, `--dry-run` chỉ in lệnh). Ảnh lưu ở `assets/locations/`. Trên web: nút "Tạo ảnh bối cảnh".
+- **Nối keyframe cảnh trước**: khi tạo keyframe, cảnh có bối cảnh dùng keyframe của cảnh liền trước (cùng bối cảnh; cả hai cảnh đều kiểu `keyframe`) làm ảnh tham chiếu để giữ ánh sáng, chỗ ngồi, đồ vật. Miễn phí. Tắt cho cả phim bằng `continuity: false`, hoặc cho một cảnh bằng `continue_previous: false`. Không có keyframe cảnh trước (hoặc khác bối cảnh) thì dùng ảnh bối cảnh. Khi keyframe cảnh trước được tạo lại, cảnh sau chỉ được báo "có keyframe mới hơn"; bạn tự tạo lại keyframe đó nếu muốn nối lại.
+- **Giới hạn ảnh tham chiếu**: mỗi cảnh gửi tối đa 3 ảnh. Cảnh có bối cảnh giữ ô đầu cho bối cảnh/keyframe cảnh trước nên chỉ gửi tối đa **2 ảnh nhân vật** (nhân vật còn lại vẫn có mô tả chữ). Cảnh không có bối cảnh vẫn tối đa 3 ảnh nhân vật. `use_character_refs: false` chỉ tắt ảnh nhân vật, ảnh bối cảnh và nối keyframe vẫn gửi.
+- **Lưu ý credit**: gán, đổi hay bỏ `location` của cảnh đã render, sửa mô tả bối cảnh, hoặc tạo/đổi/xoá ảnh bối cảnh sẽ chuyển các cảnh đang dùng bối cảnh đó sang "Đã đổi". Keyframe vẽ lại miễn phí, nhưng render lại video tốn credit và vẫn phải qua hộp xác nhận. Web cảnh báo trước khi làm; `filmmaker locations` in danh sách cảnh sẽ bị ảnh hưởng. Đổi tên bối cảnh thì không làm cảnh nào thành "Đã đổi".
+- **Nâng cấp phim cũ bằng tay** (app không tự gán bối cảnh): mở phim, thêm bối cảnh và tạo ảnh (lúc này chưa cảnh nào dùng nên không bị đánh dấu), gán bối cảnh cho từng cảnh (xác nhận nếu cảnh đã có clip), tạo lại keyframe theo thứ tự cảnh, rồi mới "Render video" những cảnh bạn muốn. Với CLI: thêm `locations` và `location` vào YAML, chạy `filmmaker locations`, rồi `filmmaker run --keyframes-only`.
+- `filmmaker plan` (và nút tạo phim từ ý tưởng) tự viết `locations`, `location` cho từng cảnh, và prompt nêu rõ giờ, ánh sáng, ai ở vị trí nào, nối tiếp trạng thái cuối cảnh trước.
 
 ### Ngôn ngữ thoại và phụ đề
 
@@ -235,6 +275,11 @@ subtitle_language: "English"      # ngôn ngữ phụ đề lúc viết storyboa
   gửi Flow, nên mọi cảnh nói cùng một thứ tiếng. Câu này không vào prompt ảnh và không đổi fingerprint: đổi giữa
   chừng thì cảnh đã có clip vẫn giữ tiếng cũ (muốn đổi thì render lại cảnh đó, tốn credit).
 - `subtitle_language`: chỉ để tham khảo, không gửi Flow. Phụ đề lấy từ `narration`.
+- Phim luôn có **3 bộ phụ đề: Tiếng Việt, Tiếng Thái, Tiếng Anh**. `narration` là bản gốc; bản dịch nằm trong
+  `subtitles` của từng cảnh (Claude viết sẵn khi lập storyboard). Khi ghép / dựng, câu nào còn thiếu bản dịch được
+  Claude tự dịch và lưu lại vào storyboard.yaml (không có Claude thì track đó dùng tạm câu gốc). MP4 xuất ra có 3
+  track phụ đề chuyển qua lại được, kèm `final.vi.srt` / `final.th.srt` / `final.en.srt`. In phụ đề lên hình thì
+  chọn track bằng `--burn-lang vi|th|en` (CLI) hoặc ô "Track in lên hình" (app); tab Ghép phim có nút VI / TH / EN.
 - Mỗi giá trị tối đa 40 ký tự, một dòng: không xuống dòng, không ký tự ẩn (rộng bằng không, điều khiển chiều chữ...);
   khoảng trắng thừa được gộp. Vi phạm thì storyboard báo lỗi (tab YAML trả 400, CLI thoát mã ≠ 0 trước khi gọi Claude).
 - Luôn đặt giá trị trong ngoặc kép: YAML đọc `no`, `off`, `yes` không có ngoặc thành true/false và storyboard sẽ báo lỗi.
@@ -316,8 +361,9 @@ chối và cảnh bị lỗi. `duration` để trống (mặc định của Flow
 
 #### Flow báo xếp hàng
 
-Sau khi đồng ý trả credit, nếu Flow trả lời "đang xếp hàng (đông người dùng)" thì app không coi là lỗi mà chờ tiếp
-trong thời gian cho phép (log in số phút còn lại). Hết giờ mà chưa có video, cảnh ở trạng thái bị ngắt kèm cách xử lý:
+Sau khi đồng ý trả credit, nếu Flow trả lời "đang xếp hàng (đông người dùng)" thì app chờ tối đa 3 phút để Flow
+bắt đầu tạo (thấy ô video mới). Flow đã bắt đầu tạo thì chờ tiếp tới hết thời gian cho phép; vẫn xếp hàng sau 3 phút
+thì bỏ qua cảnh đó và render tiếp các cảnh sau. Cảnh bị bỏ qua (hoặc hết giờ) ở trạng thái bị ngắt kèm cách xử lý:
 mở Flow, tải video về `clips/<id>.mp4`, rồi "Dùng clip này" (hoặc chạy lại; app tự nhận clip, không tốn credit).
 App không tự gửi lại cảnh đã trả credit. Dòng lệnh trong log giờ có prompt (rút gọn), model và độ dài đã gửi.
 
@@ -347,6 +393,7 @@ Không có `--auto` thì đội luôn dừng hỏi trước khi render video. V�
 hết credit, mất đăng nhập hoặc cảnh bị ngắt khi render thì vẫn dừng hỏi. Định nghĩa agent ở `.claude/agents/`, lệnh ở `.claude/commands/make-film.md`.
 
 Tạo ảnh nhân vật bằng CLI: `filmmaker characters storyboard.yaml [--name Lan] [--force]` (miễn phí, tự ghi `image` vào storyboard).
+Tạo ảnh bối cảnh bằng CLI: `filmmaker locations storyboard.yaml [--name "Phòng khách"] [--force]` (miễn phí, tự ghi `image` vào storyboard). Xem mục "Bối cảnh và cảnh liền mạch".
 
 ## Các tuỳ chọn hay dùng
 

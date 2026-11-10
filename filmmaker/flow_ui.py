@@ -52,6 +52,10 @@ EXIT_AGENT_DECLINED, EXIT_GENERATION_FAILED = 41, 42
 
 
 SPENT = {"approved": False}  # set once "Approve" was clicked
+POLL = {"tile": False}  # set once the grid shows the new video tile (Flow started making the clip)
+#: After Flow says the job "is waiting in the queue", wait this long for it to start (a new tile) before giving up
+#: on the scene so the run can go on to the next one. Once the tile is there, the normal deadline applies.
+QUEUE_WAIT = 180
 LAST_MEDIA: dict = {"id": None}
 
 
@@ -395,6 +399,7 @@ def _poll_download(page, titles_before: list[str], out: Path, last_try: float, e
     title = _new_tile(page, titles_before)
     if title is None:
         return False
+    POLL["tile"] = True
     busy = _tile(page, title).locator("[role=progressbar], mat-progress-spinner, mat-progress-bar").count()
     if busy or time.time() - last_try <= every:
         return False
@@ -563,12 +568,20 @@ def _offer(page, args, titles_before: list[str], perms_before: int, bubbles_befo
     return credits
 
 
+def _queue_tail(out: Path) -> str:
+    return (f"Video có thể vẫn đang tạo trên Flow: mở Flow kiểm tra, tải video về lưu thành {out} rồi chạy lại "
+            "(app tự nhận clip, không tốn credit).")
+
+
 def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, dl: Deadline,
                 credits: int | None) -> dict:
-    """Wait for the clip until the deadline. "queued" keeps waiting, "failed" is exit 42, out of time is exit 9;
-    both spent=True."""
+    """Wait for the clip until the deadline. "failed" is exit 42, out of time is exit 9; both spent=True.
+    "queued" waits at most QUEUE_WAIT for Flow to start (a new tile), else exit 9 so the run goes on to the next
+    scene; once the tile is there it keeps waiting until the deadline."""
     approved_at = time.time()
     queued_seen = audio_seen = queued_logged = False
+    queued_at: float | None = None
+    POLL["tile"] = False
     last_note = 0.0
     last_try = 0.0
     while not dl.expired():
@@ -590,7 +603,10 @@ def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, 
             queued_seen = True
             if not queued_logged:
                 queued_logged = True
-                log(f"  Flow báo đang xếp hàng (đông người dùng) — tiếp tục chờ tối đa {math.ceil(dl.left() / 60)} phút")
+                queued_at = time.time()
+                mins = math.ceil(min(QUEUE_WAIT, dl.left()) / 60)
+                log(f"  Flow báo đang xếp hàng (đông người dùng) — tiếp tục chờ tối đa {mins} phút; Flow chưa bắt đầu "
+                    "tạo thì bỏ qua cảnh này")
         if time.time() - last_note > 60:
             last_note = time.time()
             log(f"  đang chờ Flow render… {int(time.time() - approved_at)}s")
@@ -607,10 +623,13 @@ def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, 
                 raise
             log(f"  (trang Flow đang vẽ lại, thử lại: {str(exc).splitlines()[0][:120]})")
             _close_menus(page)
+        if queued_at is not None and not POLL["tile"] and time.time() - queued_at >= QUEUE_WAIT:
+            raise Fail(EXIT_TIMEOUT, f"Flow vẫn xếp hàng (đông người dùng) sau {math.ceil(QUEUE_WAIT / 60)} phút, chưa bắt "
+                       "đầu tạo video nên bỏ qua cảnh này. " + _queue_tail(out)
+                       + (" " + AUDIO_HINT if audio_seen else ""), spent=True)
         time.sleep(min(5.0, dl.left()))
     mins = round((time.time() - approved_at) / 60)
-    tail = (f"Video có thể vẫn đang tạo trên Flow: mở Flow kiểm tra, tải video về lưu thành {out} rồi chạy lại "
-            "(app tự nhận clip, không tốn credit).")
+    tail = _queue_tail(out)
     if queued_seen:
         raise Fail(EXIT_TIMEOUT, f"Flow báo đang xếp hàng (đông người dùng); đã chờ {mins} phút sau khi đồng ý mà chưa "
                    "tải được video. " + tail + (" " + AUDIO_HINT if audio_seen else ""), spent=True)

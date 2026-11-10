@@ -79,3 +79,15 @@ def no_ffprobe(monkeypatch):
     manual_clip.clear_cache()
     yield
     manual_clip.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_subtitle_translation(monkeypatch):
+    # Stitch / edit translate missing vi / th / en subtitle lines with Claude; tests never reach the real one
+    # (a test that wants translations patches `planner._translate_items` itself).
+    from filmmaker import planner
+
+    def blocked(*_a, **_k):
+        raise RuntimeError("tests: real Claude translation is blocked")
+
+    monkeypatch.setattr(planner, "_translate_items", blocked)

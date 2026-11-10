@@ -30,23 +30,58 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
   and when useful `focus` (shallow depth of field, rack focus...), `composition` (rule of thirds, symmetry, foreground framing, silhouette...), `lighting` for this shot, `speed` (slow motion, time-lapse), `notes`.
 - Edit like a film: open with a wide/establishing shot, vary shot sizes between consecutive scenes (wide -> medium -> close-up), go closer for emotion, use low angles for power and high angles for vulnerability, keep the 180-degree rule in dialogue (over-the-shoulder / reverse shots), and match the camera move to the mood (static or slow for calm, handheld or tracking for tension).
 - Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
+- Define every place that appears in the film once in `locations` with a fixed, specific `description` (layout, main furniture, props, colors, fixed light sources); set each scene's `location` to the exact location name.
+- In every `image_prompt` (and the `prompt` of t2v scenes) state where we are, the time of day and the light source, and every character visible in the frame by exact name with their position (left/right, foreground/background, sitting/standing), including people blurred in the background. Never name a character who is not in the frame.
+- Continuity: each scene starts from the end state of the previous scene: the same positions of people, objects that were moved stay moved, the same light and time of day unless the story deliberately jumps.
+- After a time jump set `continue_previous: false`; when the place changes, change `location`.
 - Put the shared visual look in `style` once instead of repeating it.
 - `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
+- The film always has three subtitle tracks: whenever a scene has `narration`, also fill `subtitles` with that same line in Vietnamese (`vi`), Thai (`th`) and English (`en`); the one in the narration's own language is exactly the `narration` text, the other two are natural translations (not transliterations).
 - Direct the content of every scene in `content_direction` (English, 1-2 sentences): what the audience must understand and feel in this clip, the emotional beat, and how each character in it acts and reacts (expression, body language). Make each scene move the story forward.
 - Spoken lines go ONLY in `dialogue`, never in `prompt` / `image_prompt`: one row per line in the order spoken, `character` = exact character name, `line` = the exact words, `delivery` = how it is said in English (emotion, tone, volume, pace, e.g. "whispering, holding back tears"). Keep it short enough for the clip (about 2-3 short lines in 8 seconds). Characters take turns: one speaker per row, nobody talks at the same time.
 - Never repeat dialogue: no character says or echoes a line another character already said, nobody says the same line twice, and no line repeats one from an earlier scene. Each line adds something new (an answer, a question, a reveal).
 - Spoken audio language: if the message gives a "Spoken dialogue language", write every `line` in ONLY that language. If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene: leave `dialogue` empty everywhere and describe only ambient sound, sound effects and music in `prompt`. If neither is given, write `line` in the language the characters would naturally speak (the idea's language when unclear) and name that language in `delivery` (instead of "she says angrily in Thai, voice only" in the prompt, delivery = "angrily, in Thai"). Never put spoken words in quotation marks anywhere: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
 - Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) written in the spoken dialogue language when the message gives one; when it says "Spoken dialogue: none", in the subtitle language, or, without a subtitle line, in the language of `narration` (the user's idea); when neither is given, in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
-- Do not set project_id or image/end_image."""
+- Do not set project_id, image/end_image, or `image` of locations."""
+
+
+def _clean_locations(data: dict) -> None:
+    """Locations as Claude wrote them -> valid ones: no blank names, first of each name (case-insensitive) kept,
+    no `image`; a scene `location` that matches none is dropped. Never fails the plan."""
+    locs = data.get("locations")
+    if locs is None:
+        return
+    kept: list[dict] = []
+    keys: set[str] = set()
+    for loc in locs if isinstance(locs, list) else []:
+        if not isinstance(loc, dict) or not isinstance(loc.get("name"), str) or not loc["name"].strip():
+            continue
+        key = loc["name"].strip().casefold()
+        if key in keys:
+            continue
+        keys.add(key)
+        loc.pop("image", None)
+        kept.append(loc)
+    if kept:
+        data["locations"] = kept
+    else:
+        data.pop("locations")
+    for scene in data.get("scenes") or []:
+        if isinstance(scene, dict) and "location" in scene:
+            name = scene["location"]
+            if not isinstance(name, str) or name.strip().casefold() not in keys:
+                scene.pop("location")
 
 
 def _to_storyboard(data: dict) -> Storyboard:
     """Planner output -> Storyboard. Claude does not pick scene `characters` (detection by name stays the default),
-    so drop any it invents in a scene; the storyboard's own `characters` list is kept."""
+    so drop any it invents in a scene; the storyboard's own `characters` list is kept. Locations are cleaned
+    (`_clean_locations`) so a slip of Claude never fails the plan."""
     data = copy.deepcopy(data)
     data.pop("dialogue_language", None)  # set from the request by plan_auto, never by Claude
     data.pop("subtitle_language", None)
+    _clean_locations(data)
     said: set[str] = set()
     for scene in data.get("scenes") or []:
         if isinstance(scene, dict):
@@ -205,6 +240,95 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
     sb = _to_storyboard(response.parsed_output.model_dump(exclude_none=True))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
+
+
+# --- subtitle translations (vi / th / en tracks) ---------------------------
+
+TRANSLATE_SYSTEM = """You translate short film subtitle lines. For every line you get, return it in
+Vietnamese (`vi`), Thai (`th`) and English (`en`): natural, short subtitle wording that keeps the meaning
+and tone; keep character names as they are. Return one item per input id, nothing else."""
+
+
+def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None, timeout: int) -> dict[str, dict]:
+    user = "Subtitle lines (id: text):\n" + "\n".join(f"{k}: {v}" for k, v in lines.items())
+    if backend == "auto":
+        backend = "claude_code" if claude_code_binary() else "api"
+    if backend == "claude_code":
+        binary = claude_code_binary()
+        if not binary:
+            raise RuntimeError("không thấy lệnh `claude` (Claude Code)")
+        item = {"type": "object", "properties": {k: {"type": "string"} for k in ("id", "vi", "th", "en")},
+                "required": ["id", "vi", "th", "en"]}
+        schema = json.dumps({"type": "object", "properties": {"lines": {"type": "array", "items": item}},
+                             "required": ["lines"]})
+        cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema,
+               "--system-prompt", TRANSLATE_SYSTEM, "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
+        with tempfile.TemporaryDirectory() as cwd:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                                      env=_subscription_env())
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Claude Code dịch phụ đề quá lâu") from exc
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            raise RuntimeError(f"Claude Code lỗi (exit {proc.returncode})") from None
+        if data.get("is_error") or not data.get("structured_output"):
+            raise RuntimeError("Claude Code không dịch được phụ đề: " + str(data.get("result") or "")[:300])
+        items = data["structured_output"].get("lines") or []
+    else:
+        if api_key:
+            os.environ["ANTHROPIC_API_KEY"] = api_key
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+        try:
+            import anthropic
+            from pydantic import BaseModel
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
+
+        class Line(BaseModel):
+            id: str
+            vi: str
+            th: str
+            en: str
+
+        class Lines(BaseModel):
+            lines: list[Line]
+
+        response = anthropic.Anthropic().messages.parse(
+            model=MODEL, max_tokens=8000, system=TRANSLATE_SYSTEM, messages=[{"role": "user", "content": user}],
+            output_format=Lines, output_config={"effort": "low"},
+            extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
+        )
+        if response.stop_reason == "refusal" or not response.parsed_output:
+            raise RuntimeError("Claude không dịch được phụ đề.")
+        items = [x.model_dump() for x in response.parsed_output.lines]
+    return {str(it.get("id")): it for it in items if isinstance(it, dict)}
+
+
+def translate_subtitles(sb: Storyboard, *, backend: str = "auto", api_key: str | None = None,
+                        timeout: int = 300) -> dict[str, dict[str, str]]:
+    """Fill the missing vi / th / en lines of scenes with narration (in place).
+    Returns {scene id: {code: line}} of what was added; {} when nothing was missing."""
+    from .storyboard import Subtitles
+
+    missing = sb.missing_subtitles()
+    if not missing:
+        return {}
+    scenes = {s.id: s for s in sb.scenes}
+    got = _translate_items({sid: scenes[sid].narration.strip() for sid in missing},
+                           backend=backend, api_key=api_key, timeout=timeout)
+    added: dict[str, dict[str, str]] = {}
+    for sid, codes in missing.items():
+        it = got.get(sid) or {}
+        new = {c: v for c in codes if (v := " ".join(str(it.get(c) or "").split()))}
+        if not new:
+            continue
+        sc = scenes[sid]
+        sc.subtitles = Subtitles(**{**(sc.subtitles.model_dump() if sc.subtitles else {}), **new})
+        added[sid] = new
+    return added
 
 
 # --- video titles for the thumbnail -------------------------------------------

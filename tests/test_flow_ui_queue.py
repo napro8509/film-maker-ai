@@ -67,6 +67,8 @@ def test_wait_video_queued_then_ok(ft, monkeypatch, tmp_path, capsys):
     page = FakePage(bubbles=[OFFER, S10])
 
     def poll(_page, _before, o, _last, every=20, deadline=None):
+        if ft.t >= 60:
+            flow_ui.POLL["tile"] = True  # Flow started the clip: the 3-minute queue limit no longer applies
         if ft.t >= 900:
             o.write_bytes(b"x" * 2048)
             return True
@@ -78,7 +80,32 @@ def test_wait_video_queued_then_ok(ft, monkeypatch, tmp_path, capsys):
     assert res["status"] == "ok" and res["local_path"] == str(out) and res["credits"] == 5
     err = capsys.readouterr().err
     assert err.count("Flow báo đang xếp hàng") == 1
-    assert "tiếp tục chờ tối đa 28 phút" in err
+    assert "tiếp tục chờ tối đa 3 phút" in err
+
+
+def test_wait_video_still_queued_after_3_min_skips_scene(ft, monkeypatch, tmp_path):
+    """Queued and no new tile for QUEUE_WAIT: give up (spent, exit 9) so the run goes on to the next scene."""
+    out = tmp_path / "s10.mp4"
+    ft.t = 100  # approved 100 s after the driver started
+    monkeypatch.setattr(flow_ui, "_poll_download", lambda *a, **k: False)
+    with pytest.raises(flow_ui.Fail) as ei:
+        flow_ui._wait_video(FakePage(bubbles=[OFFER, S10]), [], 0, out, flow_ui.Deadline(1680), 5)
+    f = ei.value
+    assert f.code == flow_ui.EXIT_TIMEOUT and f.spent is True
+    assert 100 + flow_ui.QUEUE_WAIT <= ft.t < 100 + flow_ui.QUEUE_WAIT + 10
+    assert f.detail.startswith("Flow vẫn xếp hàng (đông người dùng) sau 3 phút")
+    assert "bỏ qua cảnh này" in f.detail and str(out) in f.detail and "tự nhận clip" in f.detail
+    assert flow_ui.AUDIO_HINT in f.detail
+
+
+def test_wait_video_queue_limit_counts_from_notice(ft, monkeypatch, tmp_path):
+    """The 3 minutes start when the queue notice shows up, not at approval."""
+    page = FakePage(bubbles=lambda: [OFFER, S10] if ft.t >= 300 else [OFFER])
+    monkeypatch.setattr(flow_ui, "_poll_download", lambda *a, **k: False)
+    with pytest.raises(flow_ui.Fail) as ei:
+        flow_ui._wait_video(page, [], 0, tmp_path / "a.mp4", flow_ui.Deadline(1680), 5)
+    assert ei.value.detail.startswith("Flow vẫn xếp hàng")
+    assert 300 + flow_ui.QUEUE_WAIT <= ft.t < 300 + flow_ui.QUEUE_WAIT + 15
 
 
 # --- AC23/AC24: deadline counts from start ---------------------------------------------------------------------
@@ -86,7 +113,12 @@ def test_deadline_from_start(ft, monkeypatch, tmp_path):
     out = tmp_path / "s10.mp4"
     dl = flow_ui.Deadline(1680)
     ft.t = 600  # time spent before approving
-    monkeypatch.setattr(flow_ui, "_poll_download", lambda *a, **k: False)
+
+    def poll(*a, **k):
+        flow_ui.POLL["tile"] = True  # Flow started the clip but it never finishes: the whole deadline applies
+        return False
+
+    monkeypatch.setattr(flow_ui, "_poll_download", poll)
     with pytest.raises(flow_ui.Fail) as ei:
         flow_ui._wait_video(FakePage(bubbles=[OFFER, S10]), [], 0, out, dl, 5)
     f = ei.value
@@ -393,3 +425,35 @@ def test_ui_i2v_timeout_arg(tmp_path, monkeypatch):
         argv = json.loads(log.read_text().splitlines()[-1])
         assert argv[0] == "i2v"
         assert int(argv[argv.index("--timeout") + 1]) <= timeout - 120
+
+
+# --- Still queued after 3 minutes: the run goes on to the next scene, the skipped one is not resent -----------
+def test_pipeline_moves_on_after_queue_timeout(tmp_path, monkeypatch):
+    from filmmaker.gflow import EXIT_TIMEOUT, Gflow, GflowError
+    from filmmaker.pipeline import SUBMITTING, Pipeline, RunOptions
+    from filmmaker.storyboard import load_storyboard
+
+    sb_path = tmp_path / "story.yaml"
+    sb_path.write_text('title: Q\naspect: "9:16"\nproject_id: p1\nscenes:\n'
+                       '  - {id: s01, mode: t2v, prompt: "a"}\n  - {id: s02, mode: t2v, prompt: "b"}\n')
+    out = tmp_path / "out"
+    calls = []
+
+    def render(self, s, project, opts):
+        calls.append(s.id)
+        if s.id == "s01":
+            raise GflowError("Flow (giao diện chat): Flow vẫn xếp hàng (đông người dùng) sau 3 phút, chưa bắt đầu "
+                             "tạo video nên bỏ qua cảnh này.", exit_code=EXIT_TIMEOUT,
+                             payload={"error": {"spent": True}})
+        clip = self.clip_path(s)
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        clip.write_bytes(b"mp4")
+        return clip
+
+    monkeypatch.setattr(Pipeline, "_render_scene", render)
+    pipe = Pipeline(load_storyboard(sb_path), out, Gflow(log=lambda *_: None), log=lambda *_: None,
+                    sleep=lambda *_: None)
+    report = pipe.run(RunOptions(pause=(0, 0)))
+    assert calls == ["s01", "s02"]  # went on to the next scene
+    assert report.done == ["s02"] and "s01" in report.failed and not report.aborted
+    assert pipe.state.scene("s01")["status"] == SUBMITTING  # may be billed: never resent blindly

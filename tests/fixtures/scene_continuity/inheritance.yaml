@@ -1,0 +1,208 @@
+# Test fixture (scene-continuity AC1): the structure of the-inheritance-war storyboard (copied, not linked;
+# the original is never modified) plus x1 (t2v), x2 (i2v), x3 (characters list) and a camera on s03.
+# Character images are written by the test with fixed bytes.
+title: The Inheritance War
+aspect: '9:16'
+model: veo-lite
+image_model: nano2
+style: Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows,
+  shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy
+characters:
+- name: Minh
+  description: Vietnamese man, 45, elder brother, stocky build, short neat black hair greying at the temples, thick
+    eyebrows, stern square face, wears a black long-sleeve dress shirt with a white mourning band on his left arm
+  image: assets/characters/minh.png
+- name: Lan
+  description: Vietnamese woman, 42, Minh's wife, slim, sharp cheekbones, black hair in a tight low bun, thin gold
+    necklace, fitted dark burgundy blouse and black trousers, red lipstick, calculating eyes
+  image: assets/characters/lan.png
+- name: Tuan
+  description: Vietnamese man, 38, younger brother, lean and tall, messy medium-length black hair, light stubble,
+    hot-tempered expression, white mourning headband, plain grey polo shirt and jeans
+  image: assets/characters/tuan.png
+- name: Hoa
+  description: Vietnamese woman, 35, Tuan's wife, petite, long straight black hair worn loose, round face, large
+    jade bangle on right wrist, cream silk blouse and black pencil skirt, fiery expressive eyes
+  image: assets/characters/hoa.png
+- name: Mother
+  description: Vietnamese grandmother, 72, frail and small, silver hair in a bun, deep wrinkles, gentle sad eyes,
+    white traditional mourning ao ba ba, holds wooden prayer beads
+  image: assets/characters/mother.png
+thumbnail:
+  prompt: 'Dramatic vertical cover: Minh and Tuan tearing the will in half between them with furious faces, Lan
+    mid-slap toward a shocked Hoa behind them, Mother collapsing in the background before the father''s altar portrait,
+    incense smoke and harsh amber lamp light, high-contrast cinematic'
+  text: Chia Tài Sản, Anh Em Trở Mặt
+use_character_refs: true
+no_text: true
+fallback_t2v: false
+scenes:
+- id: s01
+  mode: keyframe
+  prompt: Slow push-in toward the father's portrait on the altar as incense smoke curls upward; distant funeral
+    gong and soft crying.
+  image_prompt: Ancestral altar in a traditional Vietnamese family house, framed black-and-white portrait of an
+    elderly man surrounded by incense smoke, candles and white chrysanthemums, dim warm light, 50mm lens
+  narration: The funeral incense had not even burned out...
+- id: s02
+  mode: keyframe
+  prompt: Slow overhead crane down onto the table as Mother's trembling hand slides the envelope to the center;
+    clock ticking loudly.
+  image_prompt: Wooden living room of an old Vietnamese house at night, Minh and Lan sit on one side of a carved
+    wooden table, Tuan and Hoa on the other, Mother sits at the head clutching prayer beads, a thick envelope lies
+    in the center, tense lighting from a single hanging lamp, 24mm lens
+  narration: '...when the family gathered to divide everything he left behind.'
+- id: s03
+  mode: keyframe
+  prompt: Minh tears open the envelope and reads; camera quickly racks focus from the paper to his face as a faint
+    satisfied smirk appears; paper rustling.
+  image_prompt: Close-up of Minh opening a thick envelope at a wooden table, reading a document, lamp light on his
+    stern face, 85mm lens
+  narration: The house in the city goes to the eldest son.
+  camera:
+    shot: close-up
+    movement: slow push-in
+    lighting: single hanging lamp
+    focus: rack focus from foreground to background
+- id: s04
+  mode: keyframe
+  prompt: Hoa slams her palm on the table, jade bangle clacking, and leans forward; fast whip pan to Tuan beside
+    her clenching his jaw. She shouts angrily in Vietnamese, voice only.
+  image_prompt: Close-up of Hoa at a wooden table, eyes wide in disbelief, jade bangle on her wrist resting on the
+    table, warm side light, 85mm lens
+  narration: '"And we get a field in the countryside?!"'
+- id: s05
+  mode: keyframe
+  prompt: Lan slowly tilts her head and smiles coldly, speaking calmly and mockingly in Vietnamese, voice only;
+    slow dolly-in on her face.
+  image_prompt: Medium shot of Lan sitting upright with arms folded, cold smile, red lipstick, gold necklace catching
+    the light, dark living room background, 50mm lens
+  narration: '"The eldest son carries the family line. That''s tradition."'
+- id: s06
+  mode: keyframe
+  prompt: Tuan leaps up, his chair crashes to the floor, and he points at Minh, yelling in Vietnamese, voice only;
+    handheld camera shakes with the movement.
+  image_prompt: Tuan standing abruptly from a wooden chair in a dim living room, chair tipping backward, furious
+    face, mourning headband, 35mm lens
+  narration: '"I''m the one who took care of Dad for ten years!"'
+- id: s07
+  mode: keyframe
+  prompt: Minh rises and steps into Tuan's face, the two brothers chest to chest; fast orbiting handheld shot around
+    them, heavy breathing, rising tension score.
+  image_prompt: Minh rising from his seat facing camera, veins on his neck, dim lamp light, his brother's shoulder
+    blurred in the foreground, 50mm lens
+  narration: '"And who paid for his hospital bills? Me!"'
+- id: s08
+  mode: keyframe
+  prompt: Mother reaches out with a trembling hand, softly pleading in Vietnamese, voice only, while the shouting
+    continues off-screen; slow push-in on her tearful eyes.
+  image_prompt: Mother seated at the head of the table, frail hands gripping prayer beads, eyes filled with tears,
+    soft backlight from the altar, 85mm lens
+  narration: '"Please... your father is still watching."'
+- id: s09
+  mode: keyframe
+  prompt: Hoa and Lan step toward each other, trading furious words in Vietnamese, voice only; rapid handheld push-in
+    between their faces.
+  image_prompt: Hoa and Lan standing face to face beside the wooden table, Hoa with loose hair glaring up, Lan smirking
+    down, harsh overhead lamp, 35mm lens
+  narration: The wives could no longer hold back.
+- id: s10
+  mode: keyframe
+  prompt: Lan slaps Hoa hard across the face, Hoa's hair whips sideways; sharp slap sound, camera snap-zooms in,
+    then silence.
+  image_prompt: Lan in a burgundy blouse with her hand raised mid-swing, Hoa flinching, dim living room, motion
+    blur, 50mm lens
+  narration: Then came the slap.
+- id: s11
+  mode: keyframe
+  prompt: Tuan lunges at Lan while Minh grabs and shoves him back; chaotic handheld tracking shot as a teacup shatters
+    on the floor.
+  image_prompt: Hoa holding her cheek, eyes burning, Tuan behind her lunging forward, Minh grabbing his arm, chaotic
+    lamp-lit room, 24mm lens
+  narration: '"Don''t you dare touch my wife!"'
+- id: s12
+  mode: keyframe
+  prompt: Tuan and Minh tug at the will until it rips in half; extreme slow motion of the paper tearing, with a
+    deep bass hit.
+  image_prompt: Close-up of Tuan's hands gripping the will document, Minh's hands pulling the other side, paper
+    stretched tight, dramatic side light, 85mm lens
+  narration: In one second, the will was torn apart.
+- id: s13
+  mode: keyframe
+  prompt: Mother gasps, clutches her chest and collapses sideways from her chair, prayer beads scattering across
+    the tiles; camera drops with her to floor level, sound fades to a high-pitched ring.
+  image_prompt: Mother clutching her chest, prayer beads slipping from her fingers, swaying in her chair, altar
+    candles behind her, 50mm lens
+  narration: '"MOTHER!"'
+- id: s14
+  mode: keyframe
+  prompt: Minh and Tuan kneel and cradle Mother, shouting her name in Vietnamese, voice only, while Lan and Hoa
+    stand frozen; fast circling handheld shot.
+  image_prompt: Minh and Tuan kneeling on a tiled floor holding their unconscious mother, Lan and Hoa frozen behind
+    them in shock, scattered beads, dim light, 24mm lens
+  narration: For the first time that night, they were on the same side.
+- id: s15
+  mode: keyframe
+  prompt: Slow lateral dolly along the row of chairs past Minh, Lan, Tuan and Hoa sitting in silence; distant heart
+    monitor beeping.
+  image_prompt: Hospital corridor at night, cold fluorescent light, Minh, Lan, Tuan and Hoa sitting apart on plastic
+    chairs, heads down, long empty hallway, 35mm lens
+  narration: Hours later, no one could look at each other.
+- id: s16
+  mode: keyframe
+  prompt: Mother lifts a small worn envelope from under her pillow and holds it out toward camera; slow push-in
+    on the envelope in her trembling hand.
+  image_prompt: Hospital room, Mother lying awake in bed with oxygen tube, weak smile, holding a small old sealed
+    envelope, soft morning window light, 50mm lens
+  narration: But Mother had one more letter. The real one.
+- id: s17
+  mode: keyframe
+  prompt: Tuan reads the letter and his hands begin to shake as Minh leans in behind him; slow rack focus from the
+    paper to their faces as tears form; soft piano begins.
+  image_prompt: Close-up of Tuan reading a handwritten letter in a hospital room, Minh reading over his shoulder,
+    morning light, eyes glistening, 85mm lens
+  narration: '"Everything goes to whichever son cares for your mother... together."'
+- id: s18
+  mode: keyframe
+  prompt: Lan slowly turns to Hoa and gently touches her bruised cheek, whispering an apology in Vietnamese, voice
+    only; Hoa's eyes fill with tears; slow arc shot around them.
+  image_prompt: Lan and Hoa standing near a hospital window, both ashamed, Hoa with a red mark on her cheek, Lan
+    looking down, soft daylight, 50mm lens
+  narration: '"I''m sorry... we forgot what really mattered."'
+- id: s19
+  mode: keyframe
+  prompt: Minh pulls Tuan into a tight embrace, both brothers crying, as Mother reaches out to hold their hands;
+    slow dolly-in, warm piano swells.
+  image_prompt: Minh and Tuan standing at the foot of a hospital bed, Mother smiling weakly between them, morning
+    sun through blinds, 35mm lens
+  narration: Brothers again.
+- id: s20
+  mode: keyframe
+  prompt: Slow crane up from the family bowing together before the altar to the father's portrait as incense smoke
+    rises in golden light; gentle temple bell.
+  image_prompt: Ancestral altar in the family house in daylight, father's framed portrait, fresh incense, Minh,
+    Lan, Tuan, Hoa and Mother standing together bowing, warm golden light, 24mm lens
+  narration: Some inheritances can't be divided. Only shared.
+- id: x1
+  mode: t2v
+  prompt: Rain on the window of the old house at night, Tuan and Hoa leave through the gate
+  camera:
+    shot: wide shot
+    movement: handheld camera, subtle shake
+  duration: 8
+- id: x2
+  mode: i2v
+  image: /golden/fixed/start.png
+  prompt: Mother turns her head toward the altar and smiles
+  camera:
+    movement: slow dolly-in
+- id: x3
+  mode: keyframe
+  characters:
+  - Lan
+  - Hoa
+  - Tuan
+  - Mother
+  image_prompt: The whole family sits around the wooden table, lamp light
+  prompt: Nobody speaks; the clock ticks
+  narration: Silence.

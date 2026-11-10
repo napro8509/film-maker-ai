@@ -86,6 +86,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSDesktopFolderUsageDescription</key><string>Film Maker cần đọc mã nguồn và dự án phim nằm trong thư mục Desktop (kể cả khi điều khiển Flow để tạo video).</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Film Maker cần đọc mã nguồn và dự án phim nằm trong thư mục Documents.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Film Maker cần đọc/lưu ảnh, video trong thư mục Downloads.</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 EOF

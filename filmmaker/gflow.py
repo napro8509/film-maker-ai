@@ -176,6 +176,28 @@ def _gflow_python(binary: str) -> str | None:
     return None
 
 
+def _tcc_direct(args: list[str]) -> tuple[list[str], dict[str, str] | None]:
+    """On macOS, run a framework Python's inner Python.app binary directly instead of its bin/ stub.
+
+    The stub (python3.12 of python.org/Homebrew builds) relaunches Python.app and disclaims
+    responsibility, so macOS privacy (TCC) treats it as a separate app: it cannot use Film Maker's
+    access to ~/Desktop, ~/Documents… and gets "Operation not permitted" with no prompt. Launched
+    directly, the process stays Film Maker's: access is asked for (and granted) in Film Maker's name.
+    __PYVENV_LAUNCHER__ is what the stub sets so the venv (gflow-cli's, with Playwright) is kept."""
+    if sys.platform != "darwin" or not args:
+        return args, None
+    try:
+        real = Path(args[0]).resolve()
+    except OSError:
+        return args, None
+    if real.parent.name != "bin" or real.parent.parent.parent.name != "Versions":
+        return args, None
+    inner = real.parent.parent / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    if not inner.is_file():
+        return args, None
+    return [str(inner), *args[1:]], {**os.environ, "__PYVENV_LAUNCHER__": args[0]}
+
+
 def _profile_roots() -> list[Path]:
     home = Path.home()
     roots = [home / "Library" / "Application Support" / "gflow-cli", home / ".local" / "share" / "gflow-cli"]
@@ -475,7 +497,8 @@ class Gflow:
         self._set_live(token)
         try:
             self._emit(token, "start", kind=None, expected=None, source=None)
-            returncode, stdout, timed_out = _stream(args, self.timeout, on_line)
+            run_args, env = _tcc_direct(args)
+            returncode, stdout, timed_out = _stream(run_args, self.timeout, on_line, env)
         finally:
             self._set_live(None)
         if timed_out:
