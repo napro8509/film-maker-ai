@@ -7,7 +7,7 @@
    it, and elements are found only with [data-prog~="${CSS.escape(progEnc(key))}"]. Keys in S.job.progress and in the
    `keys` arguments are always the raw keys. */
 
-const PROG_KINDS = new Set(["video", "make", "keyframes", "portraits"]);
+const PROG_KINDS = new Set(["video", "make", "keyframes", "portraits", "locations"]);
 const PROG_TEXT = { queued: "Đang chờ…", retry: "Chờ thử lại…", submitting: "Đang gửi…", generating: "Đang tạo…", downloading: "Đang tải về…" };
 const PROG_EST_TIP = "Flow không báo % cho cách tạo này; số này đoán theo thời gian các lần trước";
 const PROG_ACTIVE = new Set(["queued", "submitting", "generating", "downloading"]);
@@ -26,6 +26,7 @@ function progRunning(key) { const it = progItem(key); return !!(jobRunning() && 
 function progQueued(key) { const it = progItem(key); return !!(jobRunning() && it && it.phase === "queued"); }
 function progFailed(key) { return progItem(key)?.phase === "failed"; }
 function progCharKey(c) { return "char:" + String(c?.name || "").trim(); }
+function progLocKey(l) { return "loc:" + String(l?.name || "").trim(); }
 
 function progEnc(key) { return encodeURIComponent(key); }
 function progKeys(el) {

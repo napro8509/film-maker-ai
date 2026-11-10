@@ -328,6 +328,8 @@ details.prompt-preview pre { white-space: pre-wrap; word-break: break-word; back
 .char-img span { font-size: var(--fs-1); color: var(--text-muted); text-align: center; padding: var(--sp-2); }
 .char-row select.sm { max-width: 200px; width: auto; }
 .char-row input[aria-invalid="true"] { border-color: var(--err); }
+/* Locations reuse the character row; an empty room reads better filling the frame. */
+.loc-img { background-size: cover; }
 .options { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); background: var(--surface-2); border-radius: var(--r-2); margin-bottom: var(--sp-4); }
 
 /* ============ final ============ */

@@ -660,6 +660,72 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
     sys.exit(0 if not report.failed and not report.aborted else 1)
 
 
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--name", "names", multiple=True, help="Chỉ tạo ảnh cho bối cảnh này (lặp lại được).")
+@click.option("--force", is_flag=True, help="Tạo lại cả bối cảnh đã có ảnh.")
+@click.option("--out", type=click.Path(path_type=Path))
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--dry-run", is_flag=True, help="Chỉ in lệnh gflow, không gửi gì.")
+@click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi.")
+def locations(storyboard: Path, names, force, out, profile, dry_run, pause) -> None:
+    """Tạo ảnh tham chiếu bối cảnh trên Flow (miễn phí) và ghi đường dẫn vào storyboard.
+
+    Mặc định chỉ tạo cho bối cảnh chưa có ảnh. Ảnh lưu ở assets/locations/<tên>.png.
+    """
+    import yaml
+    sb = load_storyboard(storyboard)
+    locs = sb.locations or []
+    unknown = set(names) - {loc.name for loc in locs}
+    if unknown:
+        raise click.ClickException(f"không có bối cảnh: {', '.join(sorted(unknown))}")
+    if not locs:
+        click.echo("Storyboard chưa có bối cảnh nào (mục `locations`).")
+        return
+    picked, used = [], set()
+    for i, loc in enumerate(locs):
+        if names and loc.name not in names:
+            continue
+        if not names and not force and sb.location_image(loc):
+            continue
+        if not loc.name.strip() or not (loc.description.strip() or (loc.image_prompt or "").strip()):
+            raise click.ClickException(f"bối cảnh #{i + 1} cần có name và description (hoặc image_prompt)")
+        stem = _slug(loc.name) or f"boi-canh-{i + 1}"
+        while stem in used:
+            stem += f"-{i + 1}"
+        used.add(stem)
+        picked.append((i, loc, storyboard.parent / "assets" / "locations" / f"{stem}.png"))
+    if not picked:
+        click.echo("Tất cả bối cảnh đã có ảnh (dùng --force hoặc --name để tạo lại).")
+        return
+    g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
+    if not dry_run and not g.available():
+        raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
+    pipe = Pipeline(sb, _out_dir(storyboard, out), g, log=click.echo)
+    chosen = {id(loc) for _, loc, _ in picked}
+    hit = [s.id for s in sb.scenes if id(sb.scene_location(s)) in chosen and pipe.is_done(s)]
+    if hit:
+        click.echo(f"⚠ Các cảnh đã có clip sẽ chuyển “Đã đổi” sau khi tạo ảnh bối cảnh: {', '.join(hit)} "
+                   "(render lại video tốn credit; keyframe tạo lại miễn phí)")
+    report = pipe.generate_location_images([(loc, dest) for _, loc, dest in picked],
+                                           RunOptions(pause=_parse_pause(pause)))
+    if not dry_run and report.done:
+        raw = yaml.safe_load(storyboard.read_text(encoding="utf-8"))
+        raw_locs = raw.get("locations") or []
+        for i, loc, dest in picked:
+            if (loc.name in report.done and i < len(raw_locs) and isinstance(raw_locs[i], dict)
+                    and raw_locs[i].get("name") == loc.name):
+                raw_locs[i]["image"] = dest.relative_to(storyboard.parent).as_posix()
+        storyboard.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False, width=100), encoding="utf-8")
+    click.echo("")
+    click.echo(f"Xong: {len(report.done)} ảnh bối cảnh  |  Lỗi: {len(report.failed)}")
+    for name, err in report.failed.items():
+        click.echo(f"  ✘ {name}: {err}")
+    if report.aborted:
+        click.echo(f"⚠ {report.aborted}")
+    sys.exit(0 if not report.failed and not report.aborted else 1)
+
+
 STATUS_CODES = ("done", "changed", "interrupted", "failed", "todo")
 
 

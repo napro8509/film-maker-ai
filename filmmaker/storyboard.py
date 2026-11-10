@@ -7,7 +7,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -71,6 +71,27 @@ def clean_dialogue_language(value: object) -> str | None:
     return NO_DIALOGUE if v is not None and v.casefold() == NO_DIALOGUE else v
 
 
+_SHA_CACHE: dict[tuple[str, int, int, int], str] = {}
+_SHA_CACHE_MAX = 512
+
+
+def file_sha(path: str | Path) -> str | None:
+    """sha256 of a file, cached by (path, mtime, ctime, size) so the project page does not re-read every reference
+    image on each poll. None when the file cannot be read."""
+    try:
+        st = Path(path).stat()
+        key = (str(path), st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+        if key in _SHA_CACHE:
+            return _SHA_CACHE[key]
+        sha = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+    if len(_SHA_CACHE) >= _SHA_CACHE_MAX:
+        _SHA_CACHE.clear()
+    _SHA_CACHE[key] = sha
+    return sha
+
+
 class Subtitles(BaseModel):
     """The scene's subtitle line in each of the three track languages."""
     vi: str | None = Field(default=None, description="Vietnamese subtitle line.")
@@ -90,6 +111,25 @@ class Character(BaseModel):
                               "keyframe / video of a scene that mentions the name so the face stays the same.")
     image_prompt: str | None = Field(default=None, description="Prompt for generating the reference image "
                                      "(defaults to a full-body portrait built from the description).")
+
+
+class Location(BaseModel):
+    """A place that appears in several scenes, described once so it looks the same everywhere."""
+    name: str = Field(description="Short unique name of the place; scenes refer to it in `location`.")
+    description: str = Field(default="", description="Fixed look of the place (English): layout, main furniture, "
+                             "props, colors and the fixed light sources. Added to every scene set there.")
+    image: str | None = Field(default=None, description="Reference image of the empty place (path). Sent with the "
+                              "keyframes / videos of scenes set there so the room stays the same.")
+    image_prompt: str | None = Field(default=None, description="Prompt for generating the reference image "
+                                     "(defaults to an empty wide view built from the description).")
+
+
+class RefItem(NamedTuple):
+    """One reference image of a generation, in sending order. `label` is the text logged for it:
+    "bối cảnh <name>", "keyframe <scene id>" or the character's name."""
+    kind: Literal["location", "keyframe", "character"]
+    label: str
+    path: Path
 
 
 class Thumbnail(BaseModel):
@@ -270,6 +310,15 @@ class SceneDraft(BaseModel):
                                   "lens, focus, composition, lighting, speed. Added to the prompts automatically.")
     subtitles: Subtitles | None = Field(default=None, description="The `narration` line in Vietnamese, Thai and "
                                         "English: the film always has these three subtitle tracks.")
+    location: str | None = Field(default=None, description="Exact name of the place (one of `locations`) where "
+                                 "this scene happens. Ignored for mode=i2v.")
+    continue_previous: bool | None = Field(default=None, description="false after a time jump: do not continue "
+                                           "from the previous scene's frame. Omit otherwise.")
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def _blank_location(cls, v: object) -> object:
+        return (v.strip() or None) if isinstance(v, str) else v
 
     @model_validator(mode="after")
     def _check(self) -> "SceneDraft":
@@ -310,6 +359,12 @@ class StoryboardDraft(BaseModel):
     style: str = Field(default="", description="Visual style appended to every prompt.")
     project_id: str | None = Field(default=None, description="Reuse an existing Flow project.")
     characters: list[Character] = Field(default_factory=list)
+    # Right after `characters`: the schema order is the order Claude writes in, so places are defined before
+    # the scenes that use them (and `save_storyboard` writes them before the long scene list).
+    locations: list[Location] | None = Field(default=None, description="Every place that appears in the film, "
+                                             "described once; scenes refer to it by name in `location`.")
+    continuity: bool | None = Field(default=None, description="false = never start a scene's keyframe from the "
+                                    "previous scene's keyframe. Omit otherwise.")
     thumbnail: Thumbnail = Field(default_factory=Thumbnail)
     use_character_refs: bool = Field(default=True, description="Send character reference images with each generation.")
     no_text: bool = Field(default=True, description="Tell Flow not to put captions, subtitles or any text in "
@@ -371,16 +426,87 @@ class Storyboard(StoryboardDraft):
                     raise ValueError(f"scene {s.id}: unknown character '{name}' in characters")
         return self
 
+    @model_validator(mode="after")
+    def _check_locations(self) -> "Storyboard":
+        users = [s for s in self.scenes if s.mode != "i2v" and s.location]
+        if not users:
+            return self  # no scene uses a location: blank / duplicate names stay allowed (still being edited)
+        bad: list[str] = []
+        seen: set[str] = set()
+        for loc in self.locations or []:
+            key = self._loc_key(loc.name)
+            if not key or key in seen:
+                if not key:
+                    label = repr(loc.name.strip())
+                else:  # the duplicated name, with the scenes that use it
+                    label = repr(next(o.name for o in self.locations or [] if self._loc_key(o.name) == key))
+                    ids = [x.id for x in users if self._loc_key(x.location) == key]
+                    if ids:
+                        label += f" (scenes {', '.join(ids)})"
+                if label not in bad:
+                    bad.append(label)
+            seen.add(key)
+        if bad:
+            raise ValueError(f"location names must be unique and non-empty when scenes use a location "
+                             f"(scenes {', '.join(x.id for x in users)} use one): " + ", ".join(bad))
+        for s in users:
+            if self._loc_key(s.location) not in seen:
+                raise ValueError(f"scene {s.id}: unknown location '{s.location}'")
+        return self
+
+    # --- locations ---------------------------------------------------------
+
+    @staticmethod
+    def _loc_key(name: str | None) -> str:
+        return (name or "").strip().casefold()
+
+    def find_location(self, name: str | None) -> Location | None:
+        key = self._loc_key(name)
+        if not key:
+            return None
+        return next((loc for loc in self.locations or [] if self._loc_key(loc.name) == key), None)
+
+    def scene_location(self, scene: SceneDraft) -> Location | None:
+        """The location the scene is set in; None for i2v scenes (they ignore `location`) or without one.
+        The only definition of a scene's "effective" location."""
+        if scene.mode == "i2v" or not scene.location:
+            return None
+        return self.find_location(scene.location)
+
+    @staticmethod
+    def location_image(loc: Location) -> Path | None:
+        return Path(loc.image) if loc.image and Path(loc.image).is_file() else None
+
+    def location_prompt(self, loc: Location) -> str:
+        if loc.image_prompt and loc.image_prompt.strip():
+            base = loc.image_prompt.strip().rstrip(".") + "."
+        else:
+            base = (f"Location reference image: {loc.description.strip().rstrip('.')}. "
+                    "Empty set with no people, wide establishing view at eye level, furniture, props and light "
+                    "sources clearly visible, sharp detail.")
+        if self.style.strip():
+            base += f" Style: {self.style.strip().rstrip('.')}."
+        return base
+
+    def _setting(self, scene: Scene) -> str:
+        loc = self.scene_location(scene)
+        desc = loc.description.strip() if loc else ""
+        return f"Setting: {desc.rstrip('.')}." if desc else ""
+
     # --- prompt building -------------------------------------------------
 
     def _characters_in(self, text: str) -> list[Character]:
         return [c for c in self.characters if re.search(rf"\b{re.escape(c.name)}\b", text, re.IGNORECASE)]
 
-    def _compose(self, text: str, direction: str = "", chars: list[Character] | None = None) -> str:
-        """`chars` = characters whose description is added; None = those named in `text`."""
+    def _compose(self, text: str, direction: str = "", chars: list[Character] | None = None,
+                 setting: str = "") -> str:
+        """`chars` = characters whose description is added; None = those named in `text`.
+        `setting` (the location sentence) goes after the direction, before the characters."""
         parts = [text.strip().rstrip(".") + "."]
         if direction:
             parts.append(direction)
+        if setting:
+            parts.append(setting)
         if chars is None:
             chars = self._characters_in(text)
         if chars:
@@ -466,17 +592,53 @@ class Storyboard(StoryboardDraft):
         """Characters to describe in the scene's prompts; None = detect names in each prompt text (old behaviour)."""
         return None if scene.characters is None else self.scene_characters(scene)
 
-    def scene_refs(self, scene: Scene) -> list[tuple[str, Path]]:
-        """(name, image) of characters in this scene that have a reference image on disk."""
+    def char_ref_limit(self, scene: Scene) -> int:
+        """How many character pictures a scene may send: slot 1 is kept for the location (or the previous
+        scene's keyframe) when the scene has one, even while that slot is empty."""
+        return MAX_REFS - 1 if self.scene_location(scene) is not None else MAX_REFS
+
+    def _char_ref_candidates(self, scene: Scene) -> list[tuple[str, Path]]:
         if not self.use_character_refs or scene.mode == "i2v":
             return []
-        refs = [(c.name, Path(c.image)) for c in self.scene_characters(scene)
+        return [(c.name, Path(c.image)) for c in self.scene_characters(scene)
                 if c.image and Path(c.image).is_file()]
-        return refs[:MAX_REFS]
+
+    def scene_char_refs(self, scene: Scene) -> list[tuple[str, Path]]:
+        """(name, image) of characters in this scene that have a reference image on disk and are sent."""
+        return self._char_ref_candidates(scene)[:self.char_ref_limit(scene)]
+
+    def dropped_char_refs(self, scene: Scene) -> list[str]:
+        """Characters with a picture that is not sent because there is no slot left."""
+        return [n for n, _ in self._char_ref_candidates(scene)[self.char_ref_limit(scene):]]
+
+    def scene_ref_items(self, scene: Scene, prev: tuple[str, Path] | None = None) -> list[RefItem]:
+        """Every reference image of the scene in sending order. With a location: slot 1 is the previous
+        scene's keyframe (`prev` = (id, path), keyframe scenes only) or else the location's picture (or nothing),
+        then at most 2 characters. Without one: only the characters, as before."""
+        chars = [RefItem("character", n, p) for n, p in self.scene_char_refs(scene)]
+        loc = self.scene_location(scene)
+        if loc is None:
+            return chars
+        if prev is not None and scene.mode == "keyframe":
+            return [RefItem("keyframe", f"keyframe {prev[0]}", Path(prev[1])), *chars]
+        img = self.location_image(loc)
+        return ([RefItem("location", f"bối cảnh {loc.name}", img)] if img else []) + chars
+
+    def scene_refs(self, scene: Scene) -> list[tuple[str, Path]]:
+        """(label, image) sent with the scene without chaining: the location picture (if any) and the characters
+        that have a reference image on disk. Never the previous keyframe."""
+        return [(it.label, it.path) for it in self.scene_ref_items(scene)]
 
     def refs_signature(self, scene: Scene) -> list[str]:
-        """Changes when a reference image is added, removed or regenerated."""
-        return [f"{n}:{hashlib.sha256(p.read_bytes()).hexdigest()[:12]}" for n, p in self.scene_refs(scene)]
+        """Changes when a reference image is added, removed or regenerated. The location picture is
+        "loc:<sha>" (no name, so renaming changes nothing); the previous keyframe is never part of it."""
+        sig: list[str] = []
+        loc = self.scene_location(scene)
+        img = self.location_image(loc) if loc else None
+        # file_sha: the same sha256 as before, cached (a vanished file reads as "" like an unreadable one used to fail)
+        if img is not None:
+            sig.append(f"loc:{(file_sha(img) or '')[:12]}")
+        return sig + [f"{n}:{(file_sha(p) or '')[:12]}" for n, p in self.scene_char_refs(scene)]
 
     @staticmethod
     def direction(scene: Scene, fields: tuple[str, ...] | None = None) -> str:
@@ -485,7 +647,8 @@ class Storyboard(StoryboardDraft):
 
     def video_prompt(self, scene: Scene) -> str:
         if scene.mode == "t2v":
-            return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
+            return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene),
+                                 setting=self._setting(scene))
         # In keyframe/i2v mode the look and framing are already in the image; keep the prompt on the motion.
         motion = self.direction(scene, MOTION_FIELDS + ("focus",))
         action = scene.prompt.strip().rstrip(".")
@@ -498,13 +661,14 @@ class Storyboard(StoryboardDraft):
         the opening-frame description plus the motion, with characters and style."""
         if scene.image_prompt and scene.image_prompt.strip():
             return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
-                                 self.direction(scene), self._prompt_characters(scene))
-        return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene))
+                                 self.direction(scene), self._prompt_characters(scene), setting=self._setting(scene))
+        return self._compose(scene.prompt, self.direction(scene), self._prompt_characters(scene),
+                             setting=self._setting(scene))
 
     def image_prompt(self, scene: Scene) -> str:
         # A still has no motion: only the framing, lens, focus, composition and lighting apply.
         return self._compose(scene.image_prompt or scene.prompt, self.direction(scene, FRAME_FIELDS),
-                             self._prompt_characters(scene))
+                             self._prompt_characters(scene), setting=self._setting(scene))
 
     # --- subtitles (three tracks: vi / th / en) ---
 
@@ -572,7 +736,7 @@ def load_storyboard(path: str | Path) -> Storyboard:
             val = getattr(s, attr)
             if val and not Path(val).is_absolute():
                 setattr(s, attr, str((path.parent / val).resolve()))
-    for c in sb.characters:
+    for c in [*sb.characters, *(sb.locations or [])]:
         if c.image and not Path(c.image).is_absolute():
             c.image = str((path.parent / c.image).resolve())
     return sb

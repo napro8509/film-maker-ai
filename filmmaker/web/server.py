@@ -249,6 +249,11 @@ class PortraitBody(BaseModel):
     force: bool = False  # remake even if the character already has one
 
 
+class LocationImagesBody(BaseModel):
+    names: list[str] = []  # empty = every location without a reference image
+    force: bool = False  # remake even if the location already has one
+
+
 class ModelChangeBody(BaseModel):
     target: str
     scenes: list[str] | None = None  # set = single-scene mode
@@ -445,6 +450,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
                 status = pipe.scene_status(s)
+                loc = sb.scene_location(s)
+                # The previous scene whose keyframe this one starts from: worked out once per scene.
+                if s.mode == "keyframe":
+                    ref_items, src, _why = pipe.keyframe_ref_items(s)
+                else:
+                    ref_items, src = sb.scene_ref_items(s), None
                 eff = retirement.effective_model(sb, s)
                 clips_rendered += status in ("done", "changed")
                 scenes[s.id] = {
@@ -465,7 +476,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     # a duration the effective model does not accept (not for done scenes: the clip exists)
                     "bad_duration": ({"duration": s.duration, "model": eff, "allowed": meta.durations(eff)}
                                      if status != "done" and dur.is_bad(sb, s, meta) else None),
-                    "refs": [n for n, _ in sb.scene_refs(s)],
+                    "refs": [n for n, _ in sb.scene_char_refs(s)],  # character names only
+                    "ref_labels": [it.label for it in ref_items],  # every reference image, in sending order
+                    "char_ref_limit": sb.char_ref_limit(s),
+                    "location": loc.name if loc else None,
+                    "keyframe_from": st.get("keyframe_from"),
+                    "continuity_source": src.id if src else None,
+                    "continuity_outdated": pipe.continuity_outdated(s, src),
                     "characters": [c.name for c in sb.scene_characters(s)],
                     "characters_explicit": s.characters is not None,
                     # ffprobe only for "submitting" scenes with a file, never while a job runs here
@@ -496,6 +513,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "i2v_unsupported": i2v_off,
             "i2v_error": st_data.get("i2v_error"),
             "characters_state": characters_state(pid, raw, sb),
+            "locations_state": locations_state(pid, raw, sb),
             "thumbnail": thumb_info,
             "backup": last_backup(out_dir(pid)),
             **model_info,
@@ -512,6 +530,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 "image_url": file_url(pid, c.get("image")) if c.get("image") else None,
                 "image_missing": bool(c.get("image")) and not file_url(pid, c.get("image")),
                 "portrait_prompt": sb.for_flow(sb.portrait_prompt(model)) if (sb and model and model.description.strip()) else None,
+            })
+        return out
+
+    def locations_state(pid: str, raw: dict[str, Any], sb: Storyboard | None) -> list[dict[str, Any]]:
+        out = []
+        raw_locs = raw.get("locations") if isinstance(raw.get("locations"), list) else []
+        models = (sb.locations or []) if sb else []
+        for i, loc in enumerate(raw_locs):
+            loc = loc if isinstance(loc, dict) else {}
+            model = models[i] if i < len(models) else None
+            out.append({
+                "name": loc.get("name") or "",
+                "image_url": file_url(pid, loc.get("image")) if loc.get("image") else None,
+                "image_missing": bool(loc.get("image")) and not file_url(pid, loc.get("image")),
+                "image_prompt": sb.for_flow(sb.location_prompt(model)) if (sb and model and (
+                    model.description.strip() or (model.image_prompt or "").strip())) else None,
             })
         return out
 
@@ -717,21 +751,30 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if not isinstance(data, dict) or "scenes" not in data:
             raise HTTPException(400, "File không phải storyboard (thiếu 'scenes').")
         pid, d = new_project_dir(str(data.get("title") or Path(file.filename or "phim").stem))
-        # Images referenced by absolute path are copied in so the project is self-contained.
+        # Images referenced by absolute path are copied in so the project is self-contained. Only image files
+        # (a shared YAML must not pull e.g. ~/.ssh/id_rsa into the project); other paths are left as they are.
+        def copy_in(holder: Any, attr: str, sub: str) -> None:
+            src = holder.get(attr) if isinstance(holder, dict) else None
+            if not (isinstance(src, str) and src and Path(src).is_absolute() and Path(src).is_file()
+                    and Path(src).suffix.lower() in IMAGE_EXT):
+                return
+            folder = d / "assets" / sub if sub else d / "assets"
+            folder.mkdir(parents=True, exist_ok=True)
+            dest, n = folder / Path(src).name, 2
+            # Two different pictures with the same file name must not overwrite each other.
+            while dest.exists() and dest.read_bytes() != Path(src).read_bytes():
+                dest, n = folder / f"{Path(src).stem}-{n}{Path(src).suffix}", n + 1
+            if not dest.exists():
+                shutil.copy2(src, dest)
+            holder[attr] = dest.relative_to(d).as_posix()
+
         for s in data.get("scenes") or []:
             for attr in ("image", "end_image"):
-                src = s.get(attr) if isinstance(s, dict) else None
-                if src and Path(src).is_absolute() and Path(src).is_file():
-                    dest = d / "assets" / Path(src).name
-                    shutil.copy2(src, dest)
-                    s[attr] = f"assets/{dest.name}"
+                copy_in(s, attr, "")
         for c in data.get("characters") or []:
-            src = c.get("image") if isinstance(c, dict) else None
-            if src and Path(src).is_absolute() and Path(src).is_file():
-                dest = d / "assets" / "characters" / Path(src).name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
-                c["image"] = f"assets/characters/{dest.name}"
+            copy_in(c, "image", "characters")
+        for loc in data.get("locations") if isinstance(data.get("locations"), list) else []:
+            copy_in(loc, "image", "locations")
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
 
@@ -878,11 +921,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects/{pid}/upload")
     async def upload(pid: str, file: UploadFile = File(...), kind: str = Form("image")) -> dict[str, Any]:
-        d = pdir(pid) / "assets" / ("characters" if kind == "character" else "")
+        sub = {"character": "characters", "location": "locations"}.get(kind, "")
+        d = pdir(pid) / "assets" / sub
         d.mkdir(parents=True, exist_ok=True)
         name = Path(file.filename or "file").name
         ext = Path(name).suffix.lower()
-        allowed = IMAGE_EXT if kind in ("image", "character") else AUDIO_EXT
+        allowed = IMAGE_EXT if kind in ("image", "character", "location") else AUDIO_EXT
         if ext not in allowed:
             raise HTTPException(400, f"Chỉ nhận file {', '.join(sorted(allowed))}")
         stem = slugify(Path(name).stem)
@@ -902,9 +946,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         files = sorted(f for f in d.iterdir() if f.is_file()) if d.is_dir() else []
         chars = d / "characters"
         char_files = sorted(f for f in chars.iterdir() if f.is_file()) if chars.is_dir() else []
+        locs = d / "locations"
+        loc_files = sorted(f for f in locs.iterdir() if f.is_file()) if locs.is_dir() else []
         item = lambda f: {"path": f.relative_to(base).as_posix(), "url": file_url(pid, f)}
         return {
-            "images": [item(f) for f in files + char_files if f.suffix.lower() in IMAGE_EXT],
+            "images": [item(f) for f in files + char_files + loc_files if f.suffix.lower() in IMAGE_EXT],
             "audio": [item(f) for f in files if f.suffix.lower() in AUDIO_EXT],
         }
 
@@ -1053,6 +1099,89 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         title = "Tạo ảnh nhân vật" + (f" ({', '.join(c.name for _, c, _ in picked)})" if wanted else "")
         return jobs.start("portraits", title, pid, work).public()
+
+    @app.post("/api/projects/{pid}/locations/images")
+    def location_images(pid: str, body: LocationImagesBody) -> dict[str, Any]:
+        """Generate reference images for locations (free on Flow) and store them in the storyboard."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        locs = sb.locations or []
+        wanted = set(body.names)
+        unknown = wanted - {loc.name for loc in locs}
+        if unknown:
+            raise HTTPException(400, f"Không có bối cảnh: {', '.join(sorted(unknown))}")
+        picked: list[tuple[int, Any, Path]] = []
+        used: set[str] = set()
+        for i, loc in enumerate(locs):
+            if wanted and loc.name not in wanted:
+                continue
+            if not wanted and sb.location_image(loc) and not body.force:
+                continue
+            if not loc.name.strip() or not (loc.description.strip() or (loc.image_prompt or "").strip()):
+                raise HTTPException(400, f"Bối cảnh #{i + 1} cần có name và description (hoặc image_prompt).")
+            stem = slugify(loc.name) if slugify(loc.name) != "phim" else f"boi-canh-{i + 1}"
+            while stem in used:
+                stem += f"-{i + 1}"
+            used.add(stem)
+            picked.append((i, loc, pdir(pid) / "assets" / "locations" / f"{stem}.png"))
+        if not picked:
+            raise HTTPException(400, "Tất cả bối cảnh đã có ảnh. Bấm “Tạo lại” ở từng bối cảnh để làm lại.")
+        settings = load_settings()
+
+        def store(raw: dict[str, Any], i: int, loc: Any, dest: Path, images: dict[str, str]) -> bool:
+            raw_locs = raw.get("locations") if isinstance(raw.get("locations"), list) else []
+            if i < len(raw_locs) and isinstance(raw_locs[i], dict) and raw_locs[i].get("name") == loc.name:
+                rel = dest.relative_to(pdir(pid)).as_posix()
+                raw_locs[i]["image"] = rel
+                images[loc.name] = rel
+                return True
+            return False
+
+        def work(job: Job) -> dict[str, Any]:
+            g = gflow(log=job.log)
+            if not g.available():
+                raise RuntimeError("không thấy lệnh gflow")
+            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=job.set_progress)
+            chosen = {id(loc) for _, loc, _ in picked}
+            hit = [s.id for s in sb.scenes if id(sb.scene_location(s)) in chosen and pipe.is_done(s)]
+            if hit:
+                job.log(f"⚠ Các cảnh đã có clip sẽ chuyển “Đã đổi” sau khi tạo ảnh bối cảnh: {', '.join(hit)} "
+                        "(render lại video tốn credit; keyframe tạo lại miễn phí)")
+            images: dict[str, str] = {}
+
+            def save_one(idx: int, loc: Any, dest: Path) -> None:
+                """Store each image as soon as it is made, so the UI shows it before the job ends."""
+                with sb_lock(pid):
+                    raw = read_raw(pid)
+                    if store(raw, picked[idx][0], loc, dest, images):
+                        write_raw(pid, raw)
+
+            report = pipe.generate_location_images([(loc, dest) for _, loc, dest in picked], RunOptions(
+                max_retries=int(settings.get("retries", 2)),
+                pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
+                should_stop=lambda: job.stop_requested), on_done=save_one)
+            with sb_lock(pid):  # read-modify-write: a model change must not land in between
+                raw = read_raw(pid)
+                changed = False
+                for i, loc, dest in picked:
+                    if loc.name in report.done:
+                        changed = store(raw, i, loc, dest, images) or changed
+                if changed:
+                    write_raw(pid, raw)
+            job.log("")
+            job.log(f"Xong: {len(report.done)} ảnh bối cảnh | Lỗi: {len(report.failed)}")
+            if report.aborted:
+                job.log(f"⚠ {report.aborted}")
+            res: dict[str, Any] = {"images": images, "failed": report.failed}
+            if report.aborted or report.failed:
+                res["error"] = report.aborted or f"{len(report.failed)} ảnh lỗi"
+            return res
+
+        title = "Tạo ảnh bối cảnh" + (f" ({', '.join(loc.name for _, loc, _ in picked)})" if wanted else "")
+        return jobs.start("locations", title, pid, work).public()
 
     # ---- model change ----
 

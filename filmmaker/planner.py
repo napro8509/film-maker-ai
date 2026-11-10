@@ -29,21 +29,55 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
   and when useful `focus` (shallow depth of field, rack focus...), `composition` (rule of thirds, symmetry, foreground framing, silhouette...), `lighting` for this shot, `speed` (slow motion, time-lapse), `notes`.
 - Edit like a film: open with a wide/establishing shot, vary shot sizes between consecutive scenes (wide -> medium -> close-up), go closer for emotion, use low angles for power and high angles for vulnerability, keep the 180-degree rule in dialogue (over-the-shoulder / reverse shots), and match the camera move to the mood (static or slow for calm, handheld or tracking for tension).
 - Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
+- Define every place that appears in the film once in `locations` with a fixed, specific `description` (layout, main furniture, props, colors, fixed light sources); set each scene's `location` to the exact location name.
+- In every `image_prompt` (and the `prompt` of t2v scenes) state where we are, the time of day and the light source, and every character visible in the frame by exact name with their position (left/right, foreground/background, sitting/standing), including people blurred in the background. Never name a character who is not in the frame.
+- Continuity: each scene starts from the end state of the previous scene: the same positions of people, objects that were moved stay moved, the same light and time of day unless the story deliberately jumps.
+- After a time jump set `continue_previous: false`; when the place changes, change `location`.
 - Put the shared visual look in `style` once instead of repeating it.
 - `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
 - The film always has three subtitle tracks: whenever a scene has `narration`, also fill `subtitles` with that same line in Vietnamese (`vi`), Thai (`th`) and English (`en`); the one in the narration's own language is exactly the `narration` text, the other two are natural translations (not transliterations).
 - Spoken audio: if the message gives a "Spoken dialogue language", every character who speaks speaks ONLY that language; describe it as spoken audio in English naming that language, e.g. "she says angrily in <that language>, voice only". If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene; describe only ambient sound, sound effects and music. If neither is given and a character speaks, describe it as spoken audio in English, e.g. "she says angrily in Thai, voice only". Do not put the spoken words in quotation marks in the prompt: Veo tends to burn quoted lines into the picture as subtitles.
 - Scene ids: s01, s02, ...
 - Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) written in the spoken dialogue language when the message gives one; when it says "Spoken dialogue: none", in the subtitle language, or, without a subtitle line, in the language of `narration` (the user's idea); when neither is given, in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
-- Do not set project_id or image/end_image."""
+- Do not set project_id, image/end_image, or `image` of locations."""
+
+
+def _clean_locations(data: dict) -> None:
+    """Locations as Claude wrote them -> valid ones: no blank names, first of each name (case-insensitive) kept,
+    no `image`; a scene `location` that matches none is dropped. Never fails the plan."""
+    locs = data.get("locations")
+    if locs is None:
+        return
+    kept: list[dict] = []
+    keys: set[str] = set()
+    for loc in locs if isinstance(locs, list) else []:
+        if not isinstance(loc, dict) or not isinstance(loc.get("name"), str) or not loc["name"].strip():
+            continue
+        key = loc["name"].strip().casefold()
+        if key in keys:
+            continue
+        keys.add(key)
+        loc.pop("image", None)
+        kept.append(loc)
+    if kept:
+        data["locations"] = kept
+    else:
+        data.pop("locations")
+    for scene in data.get("scenes") or []:
+        if isinstance(scene, dict) and "location" in scene:
+            name = scene["location"]
+            if not isinstance(name, str) or name.strip().casefold() not in keys:
+                scene.pop("location")
 
 
 def _to_storyboard(data: dict) -> Storyboard:
     """Planner output -> Storyboard. Claude does not pick scene `characters` (detection by name stays the default),
-    so drop any it invents in a scene; the storyboard's own `characters` list is kept."""
+    so drop any it invents in a scene; the storyboard's own `characters` list is kept. Locations are cleaned
+    (`_clean_locations`) so a slip of Claude never fails the plan."""
     data = copy.deepcopy(data)
     data.pop("dialogue_language", None)  # set from the request by plan_auto, never by Claude
     data.pop("subtitle_language", None)
+    _clean_locations(data)
     for scene in data.get("scenes") or []:
         if isinstance(scene, dict):
             scene.pop("characters", None)
