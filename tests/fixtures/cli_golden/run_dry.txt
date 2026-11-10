@@ -1,0 +1,23 @@
+== exit 0
+== stdout
+== DRY RUN: không gửi gì lên Flow ==
+Tạo project Flow mới: Golden film
+  $ <PY> <REPO>/tests/fake_gflow.py project create --name 'Golden film' --json
+Project: DRY-RUN-PROJECT
+[s01] keyframe: slow push-in
+  $ <PY> <REPO>/tests/fake_gflow.py image t2i 'Lan at a cafe. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 --model nano2 -o <TMP>/output/story/keyframes/s01.png --project DRY-RUN-PROJECT --json
+  $ <PY> <REPO>/tests/fake_gflow.py video i2v --initial-frame <TMP>/output/story/keyframes/s01.png 'slow push-in. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s01.mp4 --model veo-lite --project DRY-RUN-PROJECT --json
+[s01] (dry-run) sẽ lưu -> <TMP>/output/story/clips/s01.mp4
+[s02] t2v: Lan walks in the rain
+  $ <PY> <REPO>/tests/fake_gflow.py video t2v 'Lan walks in the rain. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s02.mp4 --model veo-lite --project DRY-RUN-PROJECT --json
+[s02] (dry-run) sẽ lưu -> <TMP>/output/story/clips/s02.mp4
+[s03] i2v: pan left
+  $ <PY> <REPO>/tests/fake_gflow.py video i2v --initial-frame <TMP>/start.png 'pan left. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s03.mp4 --model veo-lite --project DRY-RUN-PROJECT --json
+[s03] (dry-run) sẽ lưu -> <TMP>/output/story/clips/s03.mp4
+[s04] t2v: the street at night
+  $ <PY> <REPO>/tests/fake_gflow.py video t2v 'the street at night. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s04.mp4 --model veo-lite --project DRY-RUN-PROJECT --json
+[s04] (dry-run) sẽ lưu -> <TMP>/output/story/clips/s04.mp4
+
+DRY RUN: 4 cảnh sẽ được tạo, 0 cảnh đã có. Chưa gửi gì lên Flow.
+== stderr
+== gflow argv

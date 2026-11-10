@@ -218,6 +218,47 @@ def test_character_image_is_sent_as_reference(env, tmp_path):
     assert not pipe.has_keyframe(pipe.sb.scenes[0])
 
 
+def test_character_image_already_on_flow_is_reused_not_uploaded_again(env, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    # gflow's catalog: the portrait was generated in this Flow project (same picture, saved as .jpg).
+    (tmp_path / "lan.jpg").write_bytes(b"lan-v1")
+    (tmp_path / "other.jpg").write_bytes(b"lan-v1")
+    cat = tmp_path / "catalog.jsonl"
+    cat.write_text("\n".join(json.dumps(r) for r in [
+        {"media_id": "other-project-id", "project_id": "elsewhere", "local_path": str(tmp_path / "other.jpg")},
+        {"media_id": "1ab3d9ff-4163-46b2-b368-c003fa2d36df", "project_id": "proj-123",
+         "local_path": str(tmp_path / "lan.jpg")},
+    ]))
+    monkeypatch.setenv("FAKE_GFLOW_CATALOG", str(cat))
+    report = make_pipe(sb_path, tmp_path / "out").run(RunOptions(pause=(0, 0), keyframes_only=True))
+    assert report.done == ["s01"]
+    i2i = calls()[1]
+    assert i2i[:2] == ["image", "i2i"] and i2i[i2i.index("--ref") + 1] == "1ab3d9ff-4163-46b2-b368-c003fa2d36df"
+
+    # A portrait Flow doesn't have yet is still sent as a file.
+    (tmp_path / "lan.png").write_bytes(b"lan-v2")
+    make_pipe(sb_path, tmp_path / "out").run(RunOptions(pause=(0, 0), keyframes_only=True))
+    i2i = calls()[-1]
+    assert i2i[i2i.index("--ref") + 1] == str(tmp_path / "lan.png")
+
+
+def test_media_id_ref_not_ported_is_resent_as_local_file(env, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    (tmp_path / "lan.jpg").write_bytes(b"lan-v1")
+    cat = tmp_path / "catalog.jsonl"
+    cat.write_text(json.dumps({"media_id": "1ab3d9ff-4163-46b2-b368-c003fa2d36df", "project_id": "proj-123",
+                               "local_path": str(tmp_path / "lan.jpg")}))
+    monkeypatch.setenv("FAKE_GFLOW_CATALOG", str(cat))
+    # flow.google.com: a media-id reference is not ported (exit 36), a local file works.
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "1ab3d9ff:36:false")
+    report = make_pipe(sb_path, tmp_path / "out").run(RunOptions(pause=(0, 0), keyframes_only=True))
+    assert report.done == ["s01"]
+    kinds = [c[:2] for c in calls()][1:]
+    assert kinds == [["image", "i2i"], ["image", "i2i"]]  # no text-only fallback
+    i2i = calls()[-1]
+    assert i2i[i2i.index("--ref") + 1] == str(tmp_path / "lan.png")
+
+
 def test_storyboards_without_reference_images_keep_fingerprints(env):
     sb = load_storyboard(env[0])
     assert all(sb.scene_refs(s) == [] for s in sb.scenes)
@@ -310,6 +351,34 @@ def test_i2v_refused_by_gflow_goes_through_flow_chat_page(env, ui, tmp_path, mon
     n = len(calls())
     pipe.run(RunOptions(only={"s01"}, force={"s01"}, pause=(0, 0)))
     assert [c[:2] for c in calls()[n:]] == [] and len(ui()) == 3
+
+
+def test_i2i_refused_by_gflow_goes_through_flow_chat_page(env, ui, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    # Agent-only Flow composer: gflow refuses i2i before submitting, even with local files (#799).
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "image i2i:36:false")
+    out = tmp_path / "out"
+    report = make_pipe(sb_path, out).run(RunOptions(pause=(0, 0), keyframes_only=True))
+    assert report.done == ["s01"]
+    assert ["image", "t2i"] not in [c[:2] for c in calls()]  # no text-only fallback
+    (first,) = ui()
+    assert first[0] == "i2i" and first[first.index("--ref") + 1] == str(tmp_path / "lan.png")
+    assert first[first.index("--project") + 1] == "proj-123" and "red scarf" in first[first.index("--prompt") + 1]
+    pipe = make_pipe(sb_path, out)
+    assert pipe.state.data["i2i_ui"] and pipe.keyframe_path(pipe.sb.scenes[0]).stat().st_size > 0
+    # Remembered: next time straight to the chat page, gflow i2i is not asked again.
+    n = len(calls())
+    pipe.run(RunOptions(pause=(0, 0), keyframes_only=True, force_keyframes={"s01"}))
+    assert ["image", "i2i"] not in [c[:2] for c in calls()[n:]] and len(ui()) == 2
+
+
+def test_i2i_chat_page_failure_falls_back_to_text_image(env, ui, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "image i2i:36:false")
+    monkeypatch.setenv("FAKE_FLOW_UI_FAIL", "23:false")
+    report = make_pipe(sb_path, tmp_path / "out").run(RunOptions(pause=(0, 0), keyframes_only=True))
+    assert report.done == ["s01"] and len(ui()) == 1
+    assert [c[:2] for c in calls()][-1] == ["image", "t2i"]
 
 
 def test_flow_chat_failure_after_approve_is_not_resent(env, ui, tmp_path, monkeypatch):

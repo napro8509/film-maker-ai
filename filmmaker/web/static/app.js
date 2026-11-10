@@ -1870,6 +1870,7 @@ function startJob(j) {
   S.jobOpen = true;
   renderJobbar();
   refreshZones();
+  progUpdate({}, S.job.progress);
   renderSidebar();
   pollJob();
 }
@@ -1884,9 +1885,20 @@ async function pollJob() {
     S.jobSince = d.total;
     const wasRunning = S.job.status === "running";
     Object.assign(S.job, { status: d.status, result: d.result, finished: d.finished, stop_requested: d.stop_requested });
+    const prev = S.job.progress || {};
+    S.job.progress = d.progress && typeof d.progress === "object" ? d.progress : undefined; // no field (older server) → old way
     appendLog(fresh);
     updateJobHead();
-    if (fresh.some((l) => /^\[[^\]]+\]/.test(l))) {
+    const pr = progUpdate(prev, S.job.progress);
+    if (progOn()) {
+      // Structured progress: a phase change redraws badges/buttons; an item reaching done/failed reloads its media.
+      if (pr.phaseChanged) refreshZones();
+      const ended = [...pr.done, ...pr.failed];
+      if (ended.length && S.cur && S.cur.id === S.job.project) {
+        const pid = S.cur.id, chars = pr.done.filter((k) => k.startsWith("char:"));
+        refreshCurrent().then(() => { if (chars.length && S.cur && S.cur.id === pid) syncCharImages(chars); });
+      }
+    } else if (fresh.some((l) => /^\[[^\]]+\]/.test(l))) {
       refreshZones();
       if (fresh.some((l) => /\] OK -> /.test(l)) && S.cur && S.cur.id === S.job.project) refreshCurrent();
     }
@@ -1896,6 +1908,7 @@ async function pollJob() {
 }
 
 async function onJobDone() {
+  document.querySelectorAll(".prog-ov").forEach((e) => e.remove()); // job over: no overlay left, even if no key changed
   const j = S.job;
   document.title = "Film Maker";
   const msg = j.status === "done" ? `✔ ${j.title}: xong` : j.status === "stopped" ? `⏸ ${j.title}: đã dừng` : `✘ ${j.title}: ${j.result?.error || "lỗi"}`;
@@ -1926,6 +1939,30 @@ async function onJobDone() {
     else if (j.kind === "thumbnail" && S.tab === "final") renderMain();
   }
   refreshZones();
+}
+
+/* A portrait finished mid-job (char:<name> → done): the server already saved characters[i].image. Pull it in without
+   renderMain() (no focus loss while typing); the end-of-job sync in onJobDone stays as the fallback. */
+async function syncCharImages(keys) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  try {
+    const d = await api("GET", `/api/projects/${pid}`);
+    if (!S.cur || S.cur.id !== pid) return;
+    const local = S.cur.storyboard.characters || [], remote = d.storyboard?.characters || [];
+    let touched = false;
+    for (const k of keys) {
+      const name = k.slice("char:".length);
+      const c = local.find((x) => String(x.name || "").trim() === name);
+      const r = remote.find((x) => String(x?.name || "").trim() === name);
+      if (c && r && r.image && c.image !== r.image) { c.image = r.image; touched = true; }
+    }
+    const a = await api("GET", `/api/projects/${pid}/assets`);
+    if (!S.cur || S.cur.id !== pid) return;
+    S.assets = a; // fresh ?v=mtime, so "Tạo lại ảnh" with the same file name shows the new picture
+    if (touched) changed(); // server saved it; this keeps a pending edit from dropping it
+    refreshZones();
+  } catch { /* network error: onJobDone syncs at the end */ }
 }
 
 function renderJobbar() {

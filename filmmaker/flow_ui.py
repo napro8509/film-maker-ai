@@ -1,8 +1,11 @@
-"""Image-to-video on the new Google Flow chat composer (flow.google.com), by driving the page.
+"""Image-to-video and image-to-image on the new Google Flow chat composer (flow.google.com), by driving the page.
 
 gflow-cli refuses image-to-video on accounts that only have the agent chat composer
 (exit 36). In the browser the same thing works by hand: "+" -> Upload media -> Add to
 prompt -> type -> Start generation -> Approve. This script does exactly those clicks.
+On accounts served the agent-only composer gflow refuses image-to-image too (#799), even
+from local files; `i2i` attaches the character pictures the same way and downloads the
+new image (images cost no credits, so nothing has to be approved).
 
 It is a standalone script (stdlib + Playwright only) so it can run with the Python that
 ships inside gflow-cli's own environment, and it reuses gflow's signed-in browser profile.
@@ -36,6 +39,7 @@ ADD_MENU = "flow-add-menu-popover-content"
 PERMISSION = "flow-permission-message"
 BUBBLE = "flow-chat-bubble"
 VIDEO_TILE = "flow-video-tile"
+IMAGE_TILE = "flow-image-tile"
 GRID_TILE = "flow-grid-tile-container"  # aria-label = the media's title
 VIDEO_URL = "flow-content.google/video/"  # what the page fetches when you click Download
 
@@ -471,29 +475,191 @@ def run_i2v(args) -> dict:
                 pass
 
 
+IMAGE_NAMES = {"nano2": "Nano Banana 2", "nanopro": "Nano Banana Pro", "imagen4": "Imagen 4"}
+
+
+def build_image_prompt(prompt: str, *, refs: int, aspect: str, model: str | None) -> str:
+    spec = [f"aspect ratio {aspect}"]
+    if model:
+        spec.append(f"model {IMAGE_NAMES.get(model, model)}")
+    return (f"Make exactly 1 image (not a video), {', '.join(spec)}. "
+            f"The {refs} attached image(s) are character references: keep those characters' faces, hair and "
+            "clothes identical, but do not copy their pose or background. Image: " + prompt.strip())
+
+
+def _image_ids(page) -> list[str]:
+    """Media ids of the image tiles at the top of the grid (newest first)."""
+    _scroll_grid_top(page)
+    return page.locator(GRID_TILE).evaluate_all(
+        "els => els.map(e => e.querySelector('flow-image-tile img[data-media-id]'))"
+        ".filter(Boolean).map(i => i.getAttribute('data-media-id'))")
+
+
+def _stable_image_ids(page, settle: float = 4.0, limit: float = 30.0) -> list[str]:
+    end, last, since = time.time() + limit, None, time.time()
+    while time.time() < end:
+        cur = _image_ids(page)
+        if cur != last:
+            last, since = cur, time.time()
+        elif time.time() - since >= settle:
+            break
+        time.sleep(0.5)
+    return last or []
+
+
+def _new_image(page, before: list[str]) -> tuple[str, str] | None:
+    """(media id, src) of the newest image tile if it was not in the grid before and has loaded."""
+    _scroll_grid_top(page)
+    found = page.locator(GRID_TILE).evaluate_all(
+        "els => els.map(e => e.querySelector('flow-image-tile img[data-media-id]')).filter(Boolean)"
+        ".slice(0, 1).map(i => [i.getAttribute('data-media-id'), i.getAttribute('src') || ''])")
+    if not found:
+        return None
+    mid, src = found[0]
+    if mid in before or "/asb/" not in src:
+        return None
+    return mid, src
+
+
+def _download_image(ctx, src: str, out: Path) -> bool:
+    """Original-size image: the tile shows a 512px thumbnail ("=s512-rw"); "=d" is the original file."""
+    url = src.rsplit("=", 1)[0] + "=d" if "=" in src.rsplit("/", 1)[-1] else src + "=d"
+    try:
+        r = ctx.request.get(url, timeout=120_000)
+        body = r.body() if r.ok else b""
+    except Exception as exc:
+        log(f"  (chưa tải được ảnh: {str(exc).splitlines()[0]})")
+        return False
+    if len(body) < 10_000 or not (body[:3] == b"\xff\xd8\xff" or body[:8] == b"\x89PNG\r\n\x1a\n"
+                                  or (body[:4] == b"RIFF" and body[8:12] == b"WEBP")):
+        return False
+    out.write_bytes(body)
+    return True
+
+
+def run_i2i(args) -> dict:
+    refs = [Path(r).expanduser() for r in args.ref or []]
+    if not refs:
+        raise Fail(EXIT_USAGE, "cần ít nhất một ảnh tham chiếu (--ref)")
+    for p in refs:
+        if not p.is_file():
+            raise Fail(EXIT_USAGE, f"không thấy ảnh {p}")
+    out = Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    prompt = build_image_prompt(args.prompt, refs=len(refs), aspect=args.aspect, model=args.model)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise Fail(EXIT_USAGE, f"Python này chưa có Playwright ({sys.executable}). Hãy dùng Python của gflow-cli.") from exc
+
+    with sync_playwright() as pw:
+        window = "headless" if args.headless else args.window
+        ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project)
+        try:
+            if page.locator(NEW_SESSION_BTN).count():
+                page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
+                time.sleep(1.5)
+            if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
+                page.locator(CLEAR_BTN).first.click()
+                time.sleep(0.5)
+            for p in refs:
+                _attach(page, p)
+            editor = page.locator(EDITOR)
+            editor.click()
+            page.keyboard.insert_text(prompt)
+            time.sleep(0.5)
+            if args.dry_run:
+                log("  (dry-run) đã gắn ảnh và gõ prompt, không bấm gửi.")
+                page.locator(CLEAR_BTN).first.click()
+                return {"status": "ok", "dry_run": True}
+
+            before = _stable_image_ids(page)  # after the uploads, so an uploaded picture is never taken for the result
+            perms_before = page.locator(PERMISSION).count()
+            bubbles_before = page.locator(BUBBLE).count()
+            send = page.locator(SEND_BTN)
+            if not _wait(lambda: send.is_enabled(), 15):
+                raise Fail(EXIT_DRIFT, "Nút gửi của Flow không bật lên.")
+            send.click()
+            log("  đã gửi yêu cầu tạo ảnh, chờ Flow…")
+
+            started, answered, res = time.time(), False, None
+            while time.time() - started < args.timeout:
+                # Images are free; Flow may still ask to confirm. Never approve anything that makes a video.
+                if not answered and page.locator(PERMISSION).count() > perms_before:
+                    perm = page.locator(PERMISSION).last
+                    approve = perm.locator('[role=radio][aria-label="Approve"]:not(.read-only)')
+                    if approve.count():
+                        text = perm.inner_text()
+                        if re.search(r"\bvideos?\b", text, re.I):
+                            perm.locator('[role=radio][aria-label="Reject"]').first.click()
+                            raise Fail(EXIT_AGENT_DECLINED, f"Flow đề nghị tạo video thay vì ảnh, đã từ chối: {text.strip()[:300]}")
+                        approve.first.click()
+                        answered = True
+                        log("  đã đồng ý tạo ảnh")
+                texts = _bubble_texts(page)[bubbles_before:]
+                if any(FAILED_RE.search(t) for t in texts[1:]):
+                    res = "failed"
+                    break
+                try:
+                    new = _new_image(page, before)
+                except Exception as exc:
+                    if not _transient(exc):
+                        raise
+                    new = None
+                if new:
+                    time.sleep(2)  # let Flow finish publishing the file behind the thumbnail
+                    if _download_image(ctx, new[1], out):
+                        LAST_MEDIA["id"] = new[0]
+                        res = "ok"
+                        break
+                time.sleep(3)
+            if res == "failed":
+                texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
+                raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo ảnh lỗi: " + texts[-1][:400])
+            if res is None:
+                texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
+                raise Fail(EXIT_TIMEOUT, f"Quá {args.timeout}s mà chưa có ảnh mới trên Flow. Trả lời của Flow: "
+                           + (texts[-1][:300] if texts else "(không có)"))
+            log(f"  đã tải ảnh về: {out} ({out.stat().st_size // 1024} KB)")
+            return {"status": "ok", "local_path": str(out), "succeeded": True, "media_id": LAST_MEDIA["id"],
+                    "images": [{"local_path": str(out), "media_id": LAST_MEDIA["id"]}]}
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(a, timeout: int) -> None:
+        a.add_argument("--project", required=True)
+        a.add_argument("--prompt", required=True)
+        a.add_argument("--aspect", default="16:9")
+        a.add_argument("--model")
+        a.add_argument("-o", "--out", required=True)
+        a.add_argument("--profile-dir", required=True)
+        a.add_argument("--channel", default="chrome")
+        a.add_argument("--window", choices=["show", "hidden", "headless"], default="hidden",
+                       help="show = visible window; hidden = real browser kept off-screen (default); headless = no window at all")
+        a.add_argument("--headless", action="store_true", help="same as --window headless")
+        a.add_argument("--timeout", type=int, default=timeout)
+        a.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
+
     a = sub.add_parser("i2v")
-    a.add_argument("--project", required=True)
+    common(a, 1800)
     a.add_argument("--image", required=True)
     a.add_argument("--ref", action="append")
-    a.add_argument("--prompt", required=True)
-    a.add_argument("--aspect", default="16:9")
-    a.add_argument("--model")
     a.add_argument("--duration", type=int)
-    a.add_argument("-o", "--out", required=True)
-    a.add_argument("--profile-dir", required=True)
-    a.add_argument("--channel", default="chrome")
-    a.add_argument("--window", choices=["show", "hidden", "headless"], default="hidden",
-                   help="show = visible window; hidden = real browser kept off-screen (default); headless = no window at all")
-    a.add_argument("--headless", action="store_true", help="same as --window headless")
-    a.add_argument("--timeout", type=int, default=1800)
     a.add_argument("--max-credits", type=int, default=0, help="reject Flow's offer above this many credits (0 = no limit)")
-    a.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
+    b = sub.add_parser("i2i", help="one image from a prompt + character reference images (free)")
+    common(b, 300)
+    b.add_argument("--ref", action="append", required=True)
     args = ap.parse_args(argv)
     try:
-        result = run_i2v(args)
+        result = run_i2i(args) if args.cmd == "i2i" else run_i2v(args)
         code = 0
     except Fail as f:
         result = {"status": "fail", "error": {"exit_code": f.code, "detail": f.detail, "retryable": False, "spent": f.spent}}

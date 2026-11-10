@@ -132,6 +132,8 @@ input.board-name[aria-invalid="true"] { border-color: var(--err); background: va
 .board-card .media.portrait { width: 100%; max-height: none; }
 .board-card .media.board-char-media { aspect-ratio: auto; height: 160px; background: var(--media-bg); }
 .board-card .media.board-char-media .ph { color: #a8a49d; }
+/* Progress overlay (progress.js) over an empty frame: hide the "no picture yet" hint so the two texts don't overlap. */
+.board-card .media:has(> .prog-ov) > .ph { visibility: hidden; }
 .board-card .board-vid-pending .media img { opacity: .5; }
 .board-card .scene-msg { padding: 6px var(--sp-2); }
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Literal
 
 from . import manual_clip
+from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .storyboard import Character, Scene, Storyboard
 from .thumbnail import render_cover
@@ -90,13 +91,88 @@ class RunReport:
 
 class Pipeline:
     def __init__(self, sb: Storyboard, out_dir: Path, gflow: Gflow, log: Callable[[str], None] = print,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, progress: prog.Emit | None = None):
         self.sb = sb
         self.out = out_dir
         self.g = gflow
         self.log = log
         self.sleep = sleep
+        # Per-item progress for the web UI (keys char:<name>, kf:<sid>, vid:<sid>); a no-op without `progress`.
+        self.rep = prog.Reporter(progress)
+        if progress is not None:
+            self.g.on_event = self.rep.gflow_event
         self.state = State(out_dir / "state.json")
+        self._flow_media: dict[str, dict[str, str]] = {}  # project -> {sha256 of file: media id}
+        self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
+
+    def _sha(self, path: Path) -> str | None:
+        try:
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def flow_refs(self, refs: list[tuple[str, Path]], project: str) -> list[Path | str]:
+        """Reference images for i2i: the media id when the same picture is already in the Flow project
+        (e.g. a character portrait made there), so Flow reuses it instead of getting a duplicate upload."""
+        if project not in self._flow_media:
+            known: dict[str, str] = {}
+            # Prefer the image Flow generated (has a prompt) over a later re-upload of the same file.
+            rows = sorted(self.g.catalog_images(project), key=lambda r: not r.get("prompt"))
+            for row in rows:
+                sha = self._sha(Path(row["local_path"]))
+                if sha:
+                    known.setdefault(sha, row["media_id"])
+            self._flow_media[project] = known
+        known = self._flow_media[project]
+        out: list[Path | str] = []
+        for name, p in refs:
+            mid = known.get(self._sha(p) or "")
+            if mid:
+                self.log(f"  {name}: dùng lại ảnh đã có trên Flow ({mid[:8]}…), không tải lên lại")
+            out.append(mid or p)
+        return out
+
+    def _image_with_refs(self, what: str, prompt: str, refs: list[tuple[str, Path]], project: str,
+                         kw: dict, opts: RunOptions) -> Path | None:
+        """i2i with the characters' pictures; None when Flow can't do it here (the caller makes a text-only image).
+
+        The migrated Flow frontend (flow.google.com) refuses some media ids as references (exit 36, gflow #639)
+        but takes local files, so on that error the request is sent again with the files. On the agent-only
+        composer gflow refuses i2i altogether (#799): then the Flow chat page is driven instead (flow_ui i2i),
+        and the project remembers it so the next images go there straight away."""
+        self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+        files = [p for _, p in refs]
+        if self.state.data.get("i2i_ui") and self.g.ui_available():
+            return self._image_via_ui(what, prompt, files, kw)
+        ref_args = files if project in self._no_media_refs else self.flow_refs(refs, project)
+        while True:
+            try:
+                return self._with_retries(what, lambda: self.g.image_to_image(self.sb.for_flow(prompt), ref_args, **kw),
+                                          opts.max_retries)
+            except GflowError as exc:
+                if exc.fatal and exc.exit_code != EXIT_NOT_PORTED:
+                    raise
+                if exc.exit_code == EXIT_NOT_PORTED and ref_args != files:
+                    self.log("  Flow chưa nhận ảnh tham chiếu theo mã ảnh trên Flow; gửi lại bằng file ảnh nhân vật")
+                    self._no_media_refs.add(project)
+                    ref_args = files
+                    continue
+                if exc.exit_code == EXIT_NOT_PORTED and self.g.ui_available():
+                    self.log("  gflow chưa tạo được ảnh theo ảnh nhân vật trên giao diện Flow mới; "
+                             "chuyển sang tạo qua giao diện chat của Flow (miễn phí).")
+                    self.state.data["i2i_ui"] = True
+                    self.state.save()
+                    return self._image_via_ui(what, prompt, files, kw)
+                self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+                return None
+
+    def _image_via_ui(self, what: str, prompt: str, files: list[Path], kw: dict) -> Path | None:
+        self.log(f"  → {what} qua giao diện chat của Flow")
+        try:
+            return self.g.ui_image_to_image(self.sb.for_flow(prompt), files, **kw)
+        except GflowError as exc:
+            self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật qua giao diện chat ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+            return None
 
     # --- helpers -----------------------------------------------------------
 
@@ -228,6 +304,7 @@ class Pipeline:
                 attempt += 1
                 wait = 30 * attempt + random.uniform(0, 15)
                 self.log(f"  ! {what} lỗi tạm thời (exit {exc.exit_code}); thử lại lần {attempt}/{max_retries} sau {wait:.0f}s")
+                self.rep.retry_wait(attempt + 1)  # the active item waits again (no-op for e.g. the cover image)
                 self.sleep(wait)
 
     # --- main --------------------------------------------------------------
@@ -273,16 +350,26 @@ class Pipeline:
             self.log("Không còn cảnh nào cần tạo.")
             return report
 
+        for s in todo:
+            self.rep.queued(f"vid:{s.id}")
         try:
             project = self.ensure_project()
         except GflowError as exc:
+            self.rep.drop_queued()
             report.aborted = str(exc)
             return report
         self.log(f"Project: {project}")
+        try:
+            return self._send_scenes(todo, resend, project, opts, report)
+        finally:
+            self.rep.settle()
 
+    def _send_scenes(self, todo: list[Scene], resend: set[str], project: str, opts: RunOptions,
+                     report: RunReport) -> RunReport:
         sent = False  # pause only between real submissions, not after a scene `refuse` skipped
         for s in todo:
             if opts.should_stop():
+                self.rep.drop_queued()
                 report.stopped = True
                 self.log("Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).")
                 break
@@ -294,6 +381,7 @@ class Pipeline:
             # (keyframe, retries, i2v->t2v fallback): a long scene can still cross it; the next run is blocked.
             reason = opts.refuse(s)
             if reason:
+                self.rep.drop(f"vid:{s.id}")
                 report.failed[s.id] = reason
                 self.log(f"[{s.id}] KHÔNG GỬI: {reason}")
                 continue
@@ -302,9 +390,12 @@ class Pipeline:
                 self.log(f"[{s.id}] có thể đã bị trừ credit ở lần trước, đang gửi lại")
             self.log(f"[{s.id}] {s.mode}: {s.prompt[:80]}")
             started = manual_clip.stamp_now()
+            self.rep.submitting(f"vid:{s.id}")
             try:
-                video = self._render_scene(s, project, opts)
+                with self.rep.active(f"vid:{s.id}"):
+                    video = self._render_scene(s, project, opts)
             except GflowError as exc:
+                self.rep.failed(f"vid:{s.id}")
                 if not self.g.dry_run:
                     # A request Flow may have billed stays "submitting" so it is not resent blindly.
                     if exc.spent:
@@ -321,14 +412,17 @@ class Pipeline:
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
                 if exc.fatal:
+                    self.rep.drop_queued()
                     report.aborted = f"dừng toàn bộ vì lỗi nghiêm trọng ở {s.id} (exit {exc.exit_code})"
                     break
                 if opts.fail_fast:
+                    self.rep.drop_queued()
                     report.aborted = f"--fail-fast: dừng ở {s.id}"
                     break
                 continue
             report.done.append(s.id)
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {video}")
+            self.rep.done(f"vid:{s.id}")  # before after_scene: a slow backup must not keep the overlay
             if not self.g.dry_run:
                 opts.after_scene(s.id)
         return report
@@ -338,21 +432,26 @@ class Pipeline:
         if self.has_keyframe(s) and not remake:
             self.log(f"  dùng lại keyframe {kf}")
             return kf
+        key = f"kf:{s.id}"
+        self.rep.submitting(key)
+        try:
+            with self.rep.active(key):
+                kf = self._make_keyframe(s, project, opts)
+        except GflowError:
+            self.rep.failed(key)
+            raise
+        self.rep.done(key)
+        return kf
+
+    def _make_keyframe(self, s: Scene, project: str, opts: RunOptions) -> Path:
+        kf = self.keyframe_path(s)
         prompt = self.sb.image_prompt(s)
         refs = self.sb.scene_refs(s)
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
         img = None
         # Images are free on Flow, so retrying them (or falling back) is safe.
         if refs:
-            self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
-            try:
-                img = self._with_retries("tạo keyframe theo ảnh nhân vật",
-                                         lambda: self.g.image_to_image(self.sb.for_flow(prompt), [p for _, p in refs], **kw),
-                                         opts.max_retries)
-            except GflowError as exc:
-                if exc.fatal and exc.exit_code != EXIT_NOT_PORTED:
-                    raise
-                self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", prompt, refs, project, kw, opts)
         if img is None:
             img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw), opts.max_retries)
         if not self.g.dry_run:
@@ -363,19 +462,34 @@ class Pipeline:
                               keyframe_refs=self.sb.refs_signature(s))
         return kf
 
-    def generate_portraits(self, chars: list[tuple[Character, Path]], opts: RunOptions) -> RunReport:
-        """Make reference images for characters (free on Flow). `chars` pairs each character with its output file."""
+    def generate_portraits(self, chars: list[tuple[Character, Path]], opts: RunOptions,
+                           on_done: Callable[[int, Character, Path], None] | None = None) -> RunReport:
+        """Make reference images for characters (free on Flow). `chars` pairs each character with its output file.
+
+        `on_done(idx, character, dest)` runs right after each image is saved; `idx` is the index in `chars`."""
         report = RunReport()
         if not chars:
             self.log("Không có nhân vật nào cần tạo ảnh.")
             return report
+        for c, _ in chars:
+            self.rep.queued(f"char:{c.name.strip()}")
         try:
             project = self.ensure_project()
         except GflowError as exc:
+            self.rep.drop_queued()
             report.aborted = str(exc)
             return report
+        try:
+            return self._portraits(chars, project, opts, on_done, report)
+        finally:
+            self.rep.settle()
+
+    def _portraits(self, chars: list[tuple[Character, Path]], project: str, opts: RunOptions,
+                   on_done: Callable[[int, Character, Path], None] | None, report: RunReport) -> RunReport:
         for idx, (c, dest) in enumerate(chars):
+            key = f"char:{c.name.strip()}"
             if opts.should_stop():
+                self.rep.drop_queued()
                 report.stopped = True
                 self.log("Đã dừng theo yêu cầu.")
                 break
@@ -384,23 +498,33 @@ class Pipeline:
             prompt = self.sb.portrait_prompt(c)
             self.log(f"[{c.name}] ảnh nhân vật: {prompt[:100]}")
             dest.parent.mkdir(parents=True, exist_ok=True)
+            self.rep.submitting(key)
             try:
-                img = self._with_retries(
-                    "tạo ảnh nhân vật",
-                    lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
-                                                 model=self.sb.image_model, project=project),
-                    opts.max_retries)
+                with self.rep.active(key):
+                    img = self._with_retries(
+                        "tạo ảnh nhân vật",
+                        lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
+                                                     model=self.sb.image_model, project=project),
+                        opts.max_retries)
             except GflowError as exc:
+                self.rep.failed(key)
                 report.failed[c.name] = str(exc)
                 self.log(f"[{c.name}] LỖI: {exc}")
                 if exc.fatal:
+                    self.rep.drop_queued()
                     report.aborted = f"dừng vì lỗi nghiêm trọng (exit {exc.exit_code})"
                     break
                 continue
             if not self.g.dry_run and Path(img) != dest and Path(img).is_file():
                 dest.write_bytes(Path(img).read_bytes())
+            if on_done is not None and not self.g.dry_run:
+                try:
+                    on_done(idx, c, dest)
+                except Exception as exc:  # saving early is a bonus: the job still writes everything at the end
+                    self.log(f"[{c.name}] ⚠ chưa lưu ảnh vào storyboard ngay được: {exc}")
             report.done.append(c.name)
             self.log(f"[{c.name}] OK -> {dest}")
+            self.rep.done(key)
         return report
 
     def _run_keyframes(self, scenes: list[Scene], opts: RunOptions, report: RunReport) -> RunReport:
@@ -414,13 +538,23 @@ class Pipeline:
         if not todo:
             self.log("Không có keyframe nào cần tạo.")
             return report
+        for s in todo:
+            self.rep.queued(f"kf:{s.id}")
         try:
             project = self.ensure_project()
         except GflowError as exc:
+            self.rep.drop_queued()
             report.aborted = str(exc)
             return report
+        try:
+            return self._keyframes_loop(todo, project, opts, report)
+        finally:
+            self.rep.settle()
+
+    def _keyframes_loop(self, todo: list[Scene], project: str, opts: RunOptions, report: RunReport) -> RunReport:
         for idx, s in enumerate(todo):
             if opts.should_stop():
+                self.rep.drop_queued()
                 report.stopped = True
                 self.log("Đã dừng theo yêu cầu.")
                 break
@@ -433,6 +567,7 @@ class Pipeline:
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
                 if exc.fatal:
+                    self.rep.drop_queued()
                     report.aborted = f"dừng vì lỗi nghiêm trọng ở {s.id} (exit {exc.exit_code})"
                     break
                 continue
@@ -678,15 +813,7 @@ class Pipeline:
             kw = dict(out=raw, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
             img = None
             if refs:
-                self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
-                try:
-                    img = self._with_retries("tạo ảnh bìa theo ảnh nhân vật",
-                                             lambda: self.g.image_to_image(self.sb.for_flow(prompt), [p for _, p in refs], **kw),
-                                             opts.max_retries)
-                except GflowError as exc:
-                    if exc.fatal and exc.exit_code != EXIT_NOT_PORTED:
-                        raise
-                    self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
+                img = self._image_with_refs("tạo ảnh bìa theo ảnh nhân vật", prompt, refs, project, kw, opts)
             if img is None:
                 img = self._with_retries("tạo ảnh bìa", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw),
                                          opts.max_retries)

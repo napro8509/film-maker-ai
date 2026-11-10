@@ -16,7 +16,9 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from . import progress as prog
 
 # gflow exit codes worth knowing about (see gflow_cli/errors.py).
 EXIT_AUTH_MISSING = 8
@@ -77,6 +79,58 @@ def _split(cmd: str) -> list[str]:
     return shlex.split(cmd, posix=os.name != "nt")
 
 
+def _stream(args: list[str], timeout: float, on_line: Callable[[str], None],
+            env: dict[str, str] | None = None) -> tuple[int, str, bool]:
+    """Run a command, feeding each stderr line (rstripped) to `on_line` as it comes; return
+    (returncode, stdout, timed_out).
+
+    The child is killed after `timeout` seconds, and also on any exception in this thread (Ctrl+C included),
+    like `subprocess.run` does, so no gflow render is left running orphaned. For the Flow chat driver this is
+    new: before, an exception here left the driver running (Ctrl+C after Approve could still download the clip);
+    now it is killed. SIGINT from a terminal reaches the driver's process group anyway.
+    Exceptions raised by `on_line` are swallowed. The stderr pump is joined with a timeout (a grandchild such as
+    a browser may keep the pipe open), so late lines can still reach `on_line` after this returns."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    timed_out = threading.Event()
+
+    def pump() -> None:
+        try:
+            for line in proc.stderr:
+                try:
+                    on_line(line.rstrip())
+                except Exception:
+                    pass
+        except (OSError, ValueError):
+            pass
+
+    def kill() -> None:
+        timed_out.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    t = threading.Thread(target=pump, daemon=True)
+    timer = threading.Timer(timeout, kill)
+    timer.daemon = True
+    try:
+        t.start()
+        timer.start()
+        stdout = proc.stdout.read()
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        t.join(timeout=5)
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    return proc.returncode, stdout or "", timed_out.is_set()
+
+
 UI_SCRIPT = Path(__file__).with_name("flow_ui.py")
 
 # Names the Flow chat agent understands for gflow's model aliases.
@@ -128,6 +182,11 @@ class Gflow:
     ui_max_credits: int = 0  # reject Flow's offer above this (0 = no limit)
     ui_window: str = "hidden"  # show | hidden | headless (browser window of the Flow chat driver)
     _ui_profile: Any = field(default=None, init=False, repr=False)
+    # Progress hook (web UI): on_event("start" | "downloading" | "percent", data) for the running command.
+    on_event: Callable[[str, dict], None] | None = field(default=None, repr=False)
+    _timings: prog.Timings | None = field(default=None, init=False, repr=False)
+    _live: object | None = field(default=None, init=False, repr=False)  # token of the command now running
+    _elock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def available(self) -> bool:
         return shutil.which(_split(self.binary)[0]) is not None
@@ -138,27 +197,69 @@ class Gflow:
             cmd += ["--profile", self.profile]
         return cmd
 
+    def _timings_obj(self) -> prog.Timings:
+        if self._timings is None:
+            self._timings = prog.Timings(warn=self.log)
+        return self._timings
+
+    def _emit(self, token: object, name: str, **data: Any) -> None:
+        """Send a progress event, only while `token`'s command is the one running (late pump lines are dropped)."""
+        with self._elock:
+            if token is not self._live or not self.on_event:
+                return
+            try:
+                self.on_event(name, data)
+            except Exception:
+                pass
+
+    def _set_live(self, token: object | None) -> None:
+        with self._elock:
+            self._live = token
+
     def run_json(self, *args: str) -> dict[str, Any]:
         cmd = self._cmd(*args, "--json")
         self.log("  $ " + shlex.join(cmd))
         if self.dry_run:
             return {"status": "ok", "dry_run": True}
+        # gflow logs JSON at INFO on stderr: its events tell when Flow is done and the file is downloading.
+        env = {**os.environ, "GFLOW_CLI_LOG_LEVEL": "INFO", "GFLOW_CLI_LOG_FORMAT": "json"}
+        kind = prog.timing_kind(args)
+        token = object()
+        err_lines: list[str] = []
+
+        def on_line(line: str) -> None:
+            if not line:
+                return
+            err_lines.append(line)
+            rec = prog.parse_log_line(line)
+            if rec is not None and prog.gflow_event_phase(rec) == "downloading":
+                self._emit(token, "downloading")
+
+        self._set_live(token)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise GflowError(f"gflow did not finish within {self.timeout}s", exit_code=EXIT_TIMEOUT) from exc
-        payload = _extract_json(proc.stdout)
-        if proc.returncode != 0 or payload is None or payload.get("status") == "fail":
+            t0 = prog.now()
+            if kind:
+                self._emit(token, "start", kind=kind, expected=self._timings_obj().expected(kind), source="estimate")
+            returncode, stdout, timed_out = _stream(cmd, self.timeout, on_line, env)
+        finally:
+            self._set_live(None)
+        if timed_out:
+            raise GflowError(f"gflow did not finish within {self.timeout}s", exit_code=EXIT_TIMEOUT)
+        payload = _extract_json(stdout)
+        if returncode != 0 or payload is None or payload.get("status") == "fail":
             err = (payload or {}).get("error") or {}
-            detail = err.get("detail") or err.get("title") or (proc.stderr or proc.stdout).strip()[-800:]
+            stderr = "\n".join(l for l in err_lines if not prog.is_quiet_log(l))
+            detail = err.get("detail") or err.get("title") or (stderr or stdout).strip()[-800:]
             hint = err.get("remediation_hint")
-            msg = f"gflow exited {proc.returncode}: {detail}" + (f" (hint: {hint})" if hint else "")
+            msg = f"gflow exited {returncode}: {detail}" + (f" (hint: {hint})" if hint else "")
             raise GflowError(
                 msg,
-                exit_code=int(err.get("exit_code") or proc.returncode or 1),
+                exit_code=int(err.get("exit_code") or returncode or 1),
                 retryable=bool(err.get("retryable", False)),
                 payload=payload,
             )
+        if kind:
+            self._timings_obj().record(kind, prog.now() - t0)
         return payload
 
     # --- commands ----------------------------------------------------------
@@ -180,9 +281,32 @@ class Gflow:
             return Path(images[0]["local_path"])
         return out
 
-    def image_to_image(self, prompt: str, refs: list[Path], *, out: Path, aspect: str, model: str,
+    def catalog_images(self, project: str) -> list[dict[str, Any]]:
+        """Images gflow knows about in a Flow project (generated or uploaded), from its local catalog.
+
+        Each row has `media_id` and `local_path`. Best effort: [] if gflow can't list them."""
+        if self.dry_run or not project:
+            return []
+        try:
+            proc = subprocess.run(self._cmd("data", "list", "images", "--all-copies", "--limit", "1000", "--json"),
+                                  capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        rows = []
+        for line in proc.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("project_id") == project and row.get("media_id") and row.get("local_path"):
+                rows.append(row)
+        return rows
+
+    def image_to_image(self, prompt: str, refs: list[Path | str], *, out: Path, aspect: str, model: str,
                        project: str | None) -> Path:
-        """Text-to-image guided by reference images (keeps characters' faces the same)."""
+        """Text-to-image guided by reference images (keeps characters' faces the same).
+
+        A ref is a local file (gflow uploads it into the project) or the media id of an image already in it."""
         args = ["image", "i2i", prompt]
         for r in refs:
             args += ["--ref", str(r)]
@@ -286,40 +410,62 @@ class Gflow:
         self.log("  $ " + shlex.join(args[:2] + ["i2v", "--image", str(image), "…"]))
         if self.dry_run:
             return out, None
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        err_lines: list[str] = []
-
-        def pump() -> None:
-            for line in proc.stderr:  # progress lines from the driver
-                line = line.rstrip()
-                if line:
-                    err_lines.append(line)
-                    self.log(line)
-
-        t = threading.Thread(target=pump, daemon=True)
-        t.start()
-        timed_out = threading.Event()
-
-        def kill() -> None:
-            timed_out.set()
-            proc.kill()
-
-        timer = threading.Timer(self.timeout, kill)
-        timer.start()
-        try:
-            stdout = proc.stdout.read()
-            proc.wait()
-        finally:
-            timer.cancel()
-        t.join(timeout=5)
-        if timed_out.is_set():
-            raise GflowError(f"điều khiển Flow quá {self.timeout}s; video có thể vẫn đang tạo trên Flow",
-                             exit_code=EXIT_TIMEOUT, payload={"error": {"spent": True}})
-        payload = _extract_json(stdout or "")
-        if proc.returncode != 0 or not payload or payload.get("status") != "ok":
-            err = (payload or {}).get("error") or {}
-            detail = err.get("detail") or "\n".join(err_lines[-5:]) or (stdout or "").strip()[-400:]
-            raise GflowError(f"Flow (giao diện chat): {detail}", exit_code=int(err.get("exit_code") or proc.returncode or 1),
-                             retryable=False, payload=payload)
+        payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)
         local = payload.get("local_path")
         return (Path(local) if local else out), payload.get("media_id")
+
+    def ui_image_to_image(self, prompt: str, refs: list[Path], *, out: Path, aspect: str, model: str,
+                          project: str | None) -> Path:
+        """Image guided by the characters' pictures through the Flow chat page (free), for accounts where
+        gflow refuses i2i (agent-only composer, gflow #799)."""
+        cmd = self.ui_command()
+        profile = self.ui_profile_dir()
+        if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):
+            raise GflowError("không tìm thấy Python/profile trình duyệt của gflow-cli để điều khiển Flow", exit_code=2)
+        if not project:
+            raise GflowError("cần project Flow để tạo ảnh qua giao diện chat", exit_code=2)
+        args = [*cmd, "i2i", "--project", project, "--prompt", prompt, "--aspect", aspect, "--model", model,
+                "-o", str(out), "--profile-dir", str(profile or "none"), "--timeout", str(min(600, self.timeout))]
+        for r in refs:
+            args += ["--ref", str(r)]
+        if self.ui_window in ("show", "hidden", "headless"):
+            args += ["--window", self.ui_window]
+        self.log("  $ " + shlex.join(args[:2] + ["i2i", *(a for r in refs for a in ("--ref", str(r))), "…"]))
+        if self.dry_run:
+            return out
+        payload = self._run_ui(args, "ảnh có thể vẫn đang tạo trên Flow", spent=False)
+        local = payload.get("local_path")
+        return Path(local) if local else out
+
+    def _run_ui(self, args: list[str], timeout_note: str, *, spent: bool) -> dict:
+        """Run the Flow chat driver (streams its log and "@@progress" lines) and return its ok payload."""
+        token = object()
+        err_lines: list[str] = []
+
+        def on_line(line: str) -> None:  # progress lines from the driver
+            if not line:
+                return
+            is_prog, pct = prog.parse_progress_line(line)
+            if is_prog:  # "@@progress N": % read on the Flow page, never logged nor part of an error
+                if pct is not None:
+                    self._emit(token, "percent", percent=pct)
+                return
+            err_lines.append(line)
+            self.log(line)
+
+        self._set_live(token)
+        try:
+            self._emit(token, "start", kind=None, expected=None, source=None)
+            returncode, stdout, timed_out = _stream(args, self.timeout, on_line)
+        finally:
+            self._set_live(None)
+        if timed_out:
+            raise GflowError(f"điều khiển Flow quá {self.timeout}s; {timeout_note}",
+                             exit_code=EXIT_TIMEOUT, payload={"error": {"spent": spent}})
+        payload = _extract_json(stdout or "")
+        if returncode != 0 or not payload or payload.get("status") != "ok":
+            err = (payload or {}).get("error") or {}
+            detail = err.get("detail") or "\n".join(err_lines[-5:]) or (stdout or "").strip()[-400:]
+            raise GflowError(f"Flow (giao diện chat): {detail}", exit_code=int(err.get("exit_code") or returncode or 1),
+                             retryable=False, payload=payload)
+        return payload

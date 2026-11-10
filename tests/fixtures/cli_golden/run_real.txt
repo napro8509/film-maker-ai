@@ -1,0 +1,36 @@
+== exit 1
+== stdout
+Tạo project Flow mới: Golden film
+  $ <PY> <REPO>/tests/fake_gflow.py project create --name 'Golden film' --json
+Project: proj-123
+[s01] keyframe: slow push-in
+  $ <PY> <REPO>/tests/fake_gflow.py image t2i 'Lan at a cafe. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 --model nano2 -o <TMP>/output/story/keyframes/s01.png --project proj-123 --json
+  $ <PY> <REPO>/tests/fake_gflow.py video i2v --initial-frame <TMP>/output/story/keyframes/s01.png 'slow push-in. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s01.mp4 --model veo-lite --project proj-123 --json
+  ! gflow từ chối Ảnh → Video trước khi gửi (chưa trừ credit): gflow exited 36: fake video i2v
+  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).
+  $ <PY> <REPO>/tests/fake_flow_ui.py i2v --image <TMP>/output/story/keyframes/s01.png '…'
+  đang tải ảnh lên Flow: fake
+[s01] OK -> <TMP>/output/story/clips/s01.mp4
+  (nghỉ 0s giữa các lần gửi)
+[s02] t2v: Lan walks in the rain
+  $ <PY> <REPO>/tests/fake_gflow.py video t2v 'Lan walks in the rain. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s02.mp4 --model veo-lite --project proj-123 --json
+[s02] OK -> <TMP>/output/story/clips/s02.mp4
+  (nghỉ 0s giữa các lần gửi)
+[s03] i2v: pan left
+  $ <PY> <REPO>/tests/fake_flow_ui.py i2v --image <TMP>/start.png '…'
+  đang tải ảnh lên Flow: fake
+[s03] OK -> <TMP>/output/story/clips/s03.mp4
+  (nghỉ 0s giữa các lần gửi)
+[s04] t2v: the street at night
+  $ <PY> <REPO>/tests/fake_gflow.py video t2v 'the street at night. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 16:9 -o <TMP>/output/story/clips/s04.mp4 --model veo-lite --project proj-123 --json
+[s04] LỖI: gflow exited 1: fake s04.mp4
+
+Xong: 3  |  Bỏ qua (đã có): 0  |  Lỗi: 1
+  ✘ s04: gflow exited 1: fake s04.mp4
+== stderr
+== gflow argv
+["project", "create", "--name", "Golden film", "--json"]
+["image", "t2i", "Lan at a cafe. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.", "--aspect", "16:9", "--model", "nano2", "-o", "<TMP>/output/story/keyframes/s01.png", "--project", "proj-123", "--json"]
+["video", "i2v", "--initial-frame", "<TMP>/output/story/keyframes/s01.png", "slow push-in. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.", "--aspect", "16:9", "-o", "<TMP>/output/story/clips/s01.mp4", "--model", "veo-lite", "--project", "proj-123", "--json"]
+["video", "t2v", "Lan walks in the rain. Lan: short black hair, red scarf. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.", "--aspect", "16:9", "-o", "<TMP>/output/story/clips/s02.mp4", "--model", "veo-lite", "--project", "proj-123", "--json"]
+["video", "t2v", "the street at night. Style: cinematic. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.", "--aspect", "16:9", "-o", "<TMP>/output/story/clips/s04.mp4", "--model", "veo-lite", "--project", "proj-123", "--json"]

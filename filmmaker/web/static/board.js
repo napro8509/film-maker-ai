@@ -131,14 +131,20 @@ function bVideoShown(sc) {
   return B.videos.has(sc.id) || !!st.clip_url || st.status === "interrupted" || bSceneRunning(sc, "vid");
 }
 
+/* With structured job progress (progress.js) the running state comes from `progress`; "queued" is not running.
+   Jobs without it keep the old guess from the log / job title. */
 function bSceneRunning(sc, type) {
+  if (progOn()) return progRunning(`${type}:${sc.id}`);
   if (currentSceneInJob() !== sc.id) return false;
   const kfJob = S.job?.kind === "keyframes";
   return type === "kf" ? (kfJob || bMode(sc) === "keyframe" && !S.cur.scene_state?.[sc.id]?.keyframe_url) : !kfJob;
 }
 
+const PROG_FAILED_MSG = "Tạo lỗi — xem nhật ký job";
+
 /* Names the running portraits job is drawing ("Tạo ảnh nhân vật (A, B)"); no list → every character without a picture. */
 function bCharRunning(c) {
+  if (progOn()) return progRunning(progCharKey(c));
   const j = S.job;
   if (!j || j.status !== "running" || j.kind !== "portraits" || j.project !== S.cur.id) return false;
   const m = /\(([^()]*)\)\s*$/.exec(j.title || "");
@@ -147,6 +153,7 @@ function bCharRunning(c) {
 }
 function bCharFailed(c) {
   const j = S.job;
+  if (jobRunning() && progOn()) return progFailed(progCharKey(c)) ? (j.result?.failed?.[c.name] || PROG_FAILED_MSG) : null;
   if (!j || j.kind !== "portraits" || j.project !== S.cur.id || j.status === "running") return null;
   return j.result?.failed?.[c.name] || null;
 }
@@ -686,7 +693,8 @@ function bCharCard(cd) {
         if (inp) { if (bad) inp.setAttribute("aria-invalid", "true"); else inp.removeAttribute("aria-invalid"); }
         const running = bCharRunning(c), failed = bCharFailed(c);
         bFlags(key, { "is-invalid": bad, "is-running": running, "is-failed": !!failed && !running });
-        return running ? h("span", { class: "badge mini running" }, "Đang tạo…") : failed ? h("span", { class: "badge mini failed" }, "Lỗi") : h("span");
+        return running ? h("span", { class: "badge mini running" }, "Đang tạo…") : failed ? h("span", { class: "badge mini failed" }, "Lỗi")
+          : progQueued(progCharKey(c)) ? h("span", { class: "badge mini queued" }, "Đang chờ…") : h("span");
       }),
       h("span", { class: "spacer" }),
       bMoreBtn(() => [
@@ -699,11 +707,11 @@ function bCharCard(cd) {
       const url = charImageUrl(c), cs = S.cur.characters_state?.[i];
       const missing = !!(c.image && cs && cs.name === c.name && cs.image_missing);
       const box = h("div", { class: "media board-char-media" });
-      if (bCharRunning(c)) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo ảnh…")));
+      if (bCharRunning(c) && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo ảnh…")));
       else if (url) box.append(h("img", { src: url, alt: c.name || "", decoding: "async", onclick: () => lightbox(url) }));
       else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có ảnh")));
       if (missing) box.append(h("span", { class: "tag warn" }, "Không thấy file ảnh"));
-      return box;
+      return progAttach(box, [progCharKey(c)]);
     }),
     h("textarea", { class: "board-desc", rows: 2, value: c.description || "", "aria-label": "Mô tả ngoại hình",
       placeholder: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt…",
@@ -774,6 +782,7 @@ function bKfCard(cd) {
   // shown on the keyframe card only when the scene still has no usable keyframe.
   const failedKf = () => {
     const j = S.job;
+    if (jobRunning() && progOn() && progFailed(`kf:${sid}`)) return j.result?.failed?.[sid] || PROG_FAILED_MSG;
     if (j && j.kind === "keyframes" && j.project === S.cur.id && j.status !== "running" && j.result?.failed?.[sid]) return j.result.failed[sid];
     const s = st();
     return s.status === "failed" && s.error && (!s.keyframe_url || s.keyframe_stale) ? s.error : null;
@@ -783,7 +792,8 @@ function bKfCard(cd) {
       zone(z("badge"), () => {
         const s = st(), running = bSceneRunning(sc, "kf"), failed = !running && !!failedKf();
         bFlags(key, { "is-running": running, "is-failed": failed });
-        const b = running ? badge("running", "Đang tạo…") : failed ? badge("failed", "Lỗi") : !s.keyframe_url ? badge("todo", "Chưa có ảnh")
+        const b = running ? badge("running", "Đang tạo…") : failed ? badge("failed", "Lỗi") : progQueued(`kf:${sid}`) ? badge("queued", "Đang chờ…")
+          : !s.keyframe_url ? badge("todo", "Chưa có ảnh")
           : s.keyframe_stale ? badge("changed", "Ảnh cũ — cần tạo lại") : badge("done", "Xong");
         b.classList.add("mini");
         return b;
@@ -796,12 +806,12 @@ function bKfCard(cd) {
       ], `Thao tác keyframe ${sid}`)],
     [zone(z("media"), () => {
       const s = st(), box = h("div", { class: "media" + (bScenePortrait() ? " portrait" : "") });
-      if (bSceneRunning(sc, "kf") && !s.keyframe_url) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo keyframe…")));
+      if (bSceneRunning(sc, "kf") && !s.keyframe_url && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo keyframe…")));
       else if (s.keyframe_url) {
         box.append(h("img", { src: s.keyframe_url, alt: "keyframe " + sid, decoding: "async", onclick: () => lightbox(s.keyframe_url) }));
         if (s.keyframe_stale) box.append(h("span", { class: "tag warn", title: "Prompt, nhân vật nối vào hoặc ảnh nhân vật đã đổi từ khi tạo ảnh này" }, "Ảnh cũ · cần tạo lại"));
       } else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Bấm “Tạo keyframe” để xem trước (miễn phí)")));
-      return box;
+      return progAttach(box, [`kf:${sid}`]);
     }),
     zone(z("sum"), () => { const t = sc.image_prompt || sc.prompt || ""; return h("p", { class: "board-sum", title: t }, t || h("span", { class: "muted" }, "(chưa có prompt)")); }),
     zone(z("msg"), () => {
@@ -837,7 +847,7 @@ function bVidCard(cd) {
       zone(z("badge"), () => {
         const k = sceneStatusKey(sc), s = st();
         bFlags(key, { "is-running": k === "running", "is-failed": k === "failed" || (s.status === "failed" && !!s.error) });
-        const b = badge(STATUS[k] ? k : "todo");
+        const b = k === "queued" ? badge("queued", "Đang chờ…") : badge(STATUS[k] ? k : "todo");
         b.classList.add("mini");
         return b;
       }),
@@ -858,7 +868,7 @@ function bVidCard(cd) {
       return h("div", { class: "small muted board-meta" }, parts.join(" · "));
     }),
     zone(z("media"), () => {
-      const el = renderSceneMedia(sc, { kfHint: "Bấm “Tạo keyframe” trên card keyframe để xem trước (miễn phí)", lazy: true });
+      const el = renderSceneMedia(sc, { kfHint: "Bấm “Tạo keyframe” trên card keyframe để xem trước (miễn phí)", lazy: true, prog: [`vid:${sid}`] });
       if (!st().clip_url) el.classList.add("board-vid-pending");
       return el;
     }),

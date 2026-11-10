@@ -481,3 +481,29 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 .edit-table tr.edit-tr td { background: var(--surface-2); border-bottom: 1px solid var(--border); padding-top: 4px; padding-bottom: 4px; }
 .edit-table input[type="number"] { min-height: 28px; padding: 2px 6px; }
 .edit-table select { min-height: 28px; max-width: 200px; }
+
+/* Per-item progress overlay on thumbnails (progress.js: progOverlay). Lies inside .media / .char-img, never grows them. */
+.prog-ov {
+  position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: var(--sp-2); text-align: center; pointer-events: none; overflow: hidden;
+  background: rgb(15 15 14 / 62%); color: #fff; font-size: var(--fs-1); font-weight: var(--fw-medium); line-height: 1.3;
+}
+.prog-ov[data-phase="queued"], .prog-ov[data-phase="retry"] { background: rgb(15 15 14 / 45%); }
+.prog-ov .spinner { width: 18px; height: 18px; border-color: rgb(255 255 255 / 30%); border-top-color: #fff; }
+.prog-ov .prog-label { font-weight: var(--fw-bold); }
+.prog-ov .prog-pct { font-variant-numeric: tabular-nums; pointer-events: auto; cursor: help; }
+.prog-ov .prog-pct small { font-size: 11px; opacity: .8; }
+.prog-bar { width: min(160px, 80%); height: 4px; border-radius: var(--r-pill); background: rgb(255 255 255 / 22%); overflow: hidden; flex: none; }
+.prog-bar i { display: block; height: 100%; background: #fff; border-radius: inherit; transition: width .6s ease; }
+.prog-bar.est i { opacity: .7; background: repeating-linear-gradient(-45deg, #fff 0 5px, rgb(255 255 255 / 45%) 5px 10px); }
+.prog-slow { font-size: 11px; opacity: .85; }
+.char-img { position: relative; }
+.char-img .prog-ov { gap: 2px; padding: 4px; font-size: 11px; }
+.char-img .prog-ov span { padding: 0; color: inherit; font-size: inherit; }
+.char-img .prog-ov .spinner { width: 14px; height: 14px; }
+.char-img .prog-ov .prog-slow { display: none; }
+.badge.queued { background: var(--surface-2); color: var(--text-muted); box-shadow: inset 0 0 0 1px var(--border); }
+/* The overlay is see-through: hide the placeholder text under it so it does not mix with the progress text. */
+.media:has(> .prog-ov) > .ph, .media:has(> .prog-ov) > .tag, .char-img:has(> .prog-ov) > span { visibility: hidden; }
+/* A 9:16 frame is as wide as its picture (a placeholder alone collapses it): keep room for the overlay text. */
+.media.portrait:has(> .prog-ov) { min-width: min(180px, 100%); }

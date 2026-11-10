@@ -32,9 +32,10 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import manual_clip, model_change, model_meta, retirement
+from .. import progress as prog
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
-from ..settings import DEFAULT_BACKUP_REMOTE
+from ..settings import DEFAULT_BACKUP_REMOTE, settings_path
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, Scene, Storyboard, clean_dialogue_language, clean_language,
@@ -44,7 +45,7 @@ from . import ui_prefs
 
 STATIC = Path(__file__).parent / "static"
 TEMPLATE = Path(__file__).parent.parent / "templates" / "storyboard.yaml"
-SETTINGS_PATH = Path(os.environ.get("FILMMAKER_SETTINGS", Path.home() / ".config" / "filmmaker" / "settings.json"))
+SETTINGS_PATH = settings_path()
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac"}
 BOARD_MAX_BYTES = 256 * 1024  # PUT /board body limit
@@ -98,6 +99,16 @@ class Job:
     started: float = field(default_factory=time.time)
     finished: float | None = None
     stop_requested: bool = False
+    # Per-item progress (char:<name>, kf:<sid>, vid:<sid>), written by the pipeline thread via set_progress.
+    progress: dict[str, dict] = field(default_factory=dict)
+    _plock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def set_progress(self, key: str, item: dict | None) -> None:
+        with self._plock:
+            if item is None:
+                self.progress.pop(key, None)
+            else:
+                self.progress[key] = dict(item)
 
     def log(self, msg: str) -> None:
         for line in str(msg).splitlines() or [""]:
@@ -111,11 +122,14 @@ class Job:
             time.sleep(min(0.5, end - time.time()))
 
     def public(self, since: int = 0) -> dict[str, Any]:
+        with self._plock:
+            snapshot = {k: dict(v) for k, v in self.progress.items()}
         return {
             "id": self.id, "kind": self.kind, "project": self.project, "title": self.title,
             "status": self.status, "lines": self.lines[since:], "total": len(self.lines),
             "result": self.result, "started": self.started, "finished": self.finished,
             "stop_requested": self.stop_requested,
+            "progress": prog.public_view(snapshot, prog.now()),
         }
 
 
@@ -985,12 +999,25 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             g = gflow(log=job.log)
             if not g.available():
                 raise RuntimeError("không thấy lệnh gflow")
-            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
+            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=job.set_progress)
+            images: dict[str, str] = {}
+
+            def save_one(idx: int, c: Any, dest: Path) -> None:
+                """Store each image as soon as it is made, so the UI shows it before the job ends."""
+                i = picked[idx][0]  # index in the storyboard (names may repeat)
+                with sb_lock(pid):
+                    raw = read_raw(pid)
+                    chars = raw.get("characters") or []
+                    if i < len(chars) and isinstance(chars[i], dict) and chars[i].get("name") == c.name:
+                        rel = dest.relative_to(pdir(pid)).as_posix()
+                        chars[i]["image"] = rel
+                        images[c.name] = rel
+                        write_raw(pid, raw)
+
             report = pipe.generate_portraits([(c, dest) for _, c, dest in picked], RunOptions(
                 max_retries=int(settings.get("retries", 2)),
                 pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
-                should_stop=lambda: job.stop_requested))
-            images: dict[str, str] = {}
+                should_stop=lambda: job.stop_requested), on_done=save_one)
             with sb_lock(pid):  # read-modify-write: a model change must not land in between
                 raw = read_raw(pid)
                 chars = raw.get("characters") or []
@@ -1238,7 +1265,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 raise RuntimeError("không thấy lệnh gflow")
             if dry:
                 job.log("== XEM TRƯỚC: không gửi gì lên Flow ==")
-            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep)
+            pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=None if dry else job.set_progress)
             report = pipe.run(RunOptions(
                 only=set(body.only) or None, force=set(body.force), retry_unknown=False,
                 confirm=set(body.confirm_resend),  # web: an interrupted scene is only resent when ticked
