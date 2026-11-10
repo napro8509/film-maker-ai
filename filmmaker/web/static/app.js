@@ -1435,6 +1435,15 @@ function parseSrt(text) {
 function finalVideo() {
   const video = h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true });
   const want = subTrack();
+  // final.mp4 also carries the three subtitle tracks. WebKit (the desktop app) exposes them and may show one by
+  // itself (macOS "Automatic" captions pick the system language), whatever VI / TH / EN says: keep only ours.
+  const ours = new Set();
+  const muteEmbedded = () => {
+    for (const t of video.textTracks) if (!ours.has(t) && t.mode !== "disabled") t.mode = "disabled";
+  };
+  video.textTracks.addEventListener("addtrack", muteEmbedded);
+  video.textTracks.addEventListener("change", muteEmbedded);
+  video.addEventListener("loadedmetadata", muteEmbedded);
   SUB_TRACKS.forEach(async ([code, label]) => {
     const url = S.cur.srt_urls?.[code];
     if (!url) return;
@@ -1442,6 +1451,7 @@ function finalVideo() {
       const r = await fetch(url);
       if (!r.ok) return;
       const track = video.addTextTrack("subtitles", label, code);
+      ours.add(track);
       for (const c of parseSrt(await r.text())) track.addCue(new VTTCue(c.start, c.end, c.text));
       track.mode = code === want ? "showing" : "hidden";
     } catch { /* subtitles are optional in the preview */ }
