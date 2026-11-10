@@ -324,8 +324,9 @@ chối và cảnh bị lỗi. `duration` để trống (mặc định của Flow
 
 #### Flow báo xếp hàng
 
-Sau khi đồng ý trả credit, nếu Flow trả lời "đang xếp hàng (đông người dùng)" thì app không coi là lỗi mà chờ tiếp
-trong thời gian cho phép (log in số phút còn lại). Hết giờ mà chưa có video, cảnh ở trạng thái bị ngắt kèm cách xử lý:
+Sau khi đồng ý trả credit, nếu Flow trả lời "đang xếp hàng (đông người dùng)" thì app chờ tối đa 3 phút để Flow
+bắt đầu tạo (thấy ô video mới). Flow đã bắt đầu tạo thì chờ tiếp tới hết thời gian cho phép; vẫn xếp hàng sau 3 phút
+thì bỏ qua cảnh đó và render tiếp các cảnh sau. Cảnh bị bỏ qua (hoặc hết giờ) ở trạng thái bị ngắt kèm cách xử lý:
 mở Flow, tải video về `clips/<id>.mp4`, rồi "Dùng clip này" (hoặc chạy lại; app tự nhận clip, không tốn credit).
 App không tự gửi lại cảnh đã trả credit. Dòng lệnh trong log giờ có prompt (rút gọn), model và độ dài đã gửi.
 
