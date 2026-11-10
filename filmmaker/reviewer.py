@@ -117,7 +117,10 @@ You also get the character reference portraits. For each scene check:
   badly), and for 9:16 faces cut off by or sitting in the bottom 20% or at the right edge.
 - Continuity with the other scenes (outfits, place, time of day).
 verdict REVISE only for problems worth a new picture (wrong/missing character, wrong face, text in the picture,
-deformation, wrong setting or framing that breaks the scene). Then give `image_prompt`: the full corrected
+deformation, wrong setting or framing that breaks the scene). Continuity breaks are ALWAYS REVISE, because the video
+inherits them: an outfit, prop, weather or time of day that contradicts the story so far (a raincoat given away
+earlier, rain a year later in a sunny reunion, the old work clothes after the character's life changed). If you
+list such a problem in `issues`, the verdict must be REVISE, never PASS. Then give `image_prompt`: the full corrected
 opening-frame prompt that fixes it (keep what was right). Minor taste issues are PASS."""
 
 CLIP_SYSTEM = COMMON + """
@@ -209,9 +212,11 @@ def _sheet(video: Path, dest: Path, *, cols: int, rows: int, height: int) -> Pat
     if dur <= 0:
         return None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # n frames at the middle of n equal slices: never the black first/last frame
-    rate = n / dur
-    vf = f"fps={rate:.6f}:start_time={dur / n / 2:.3f},scale=-2:{height},tile={cols}x{rows}"
+    # n frames at the middle of n equal slices (never the black first/last frame): from s to dur - s at a rate
+    # that gives exactly n of them, so no tile of the sheet is left empty (an empty tile read as a "black frame")
+    s = dur / n / 2
+    rate = n / max(dur - 2 * s, 0.001)  # a little more than n frames: the tile takes the first n
+    vf = f"fps={rate:.6f}:start_time={s:.3f},scale=-2:{height},tile={cols}x{rows}"
     try:
         proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(video), "-vf", vf, "-frames:v", "1",
                                "-q:v", "4", str(dest)], capture_output=True, timeout=180)

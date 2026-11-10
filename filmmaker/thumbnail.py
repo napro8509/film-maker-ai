@@ -104,7 +104,23 @@ def wrap(text: str, max_chars: int, max_lines: int = 3) -> list[str]:
         lines.append(cur)
     if len(lines) > max_lines:
         lines = lines[: max_lines - 1] + [" ".join(lines[max_lines - 1:])]
+    if 1 < len(lines) <= 3 and all(len(w) <= max_chars for w in words):
+        lines = _balanced(words, len(lines), max_chars) or lines
     return lines
+
+
+def _balanced(words: list[str], n: int, max_chars: int) -> list[str] | None:
+    """The same words in `n` lines with the shortest longest line ("Cơn Mưa / Sài Gòn", not "Cơn Mưa Sài / Gòn")."""
+    best: tuple[int, list[str]] | None = None
+    k = len(words)
+    cuts = [(i,) for i in range(1, k)] if n == 2 else [(i, j) for i in range(1, k) for j in range(i + 1, k)]
+    for c in cuts:
+        bounds = [0, *c, k]
+        lines = [" ".join(words[bounds[x]:bounds[x + 1]]) for x in range(n)]
+        longest = max(len(x) for x in lines)
+        if longest <= max_chars and (best is None or longest < best[0]):
+            best = (longest, lines)
+    return best[1] if best else None
 
 
 def _esc(path: str) -> str:

@@ -59,7 +59,8 @@ def pipe(sb_path, out):
 
 
 def test_wrap_keeps_lines_short_and_count_bounded():
-    assert wrap("Chiếc vòng cổ của mẹ", 18) == ["Chiếc vòng cổ của", "mẹ"]
+    assert wrap("Chiếc vòng cổ của mẹ", 18) == ["Chiếc vòng", "cổ của mẹ"]  # balanced, not greedy
+    assert wrap("Cơn Mưa Sài Gòn", 12) == ["Cơn Mưa", "Sài Gòn"]
     assert wrap("short", 18) == ["short"]
     lines = wrap("สร้อยของแม่ที่หายไปในคืนฝนตกหนัก", 12)
     assert all(len(l) <= 12 for l in lines[:-1]) and "".join(lines).replace(" ", "") == "สร้อยของแม่ที่หายไปในคืนฝนตกหนัก"
