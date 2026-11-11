@@ -106,8 +106,66 @@ json.dump({{"result": {{"language": "th"}}, "transcription": [
     monkeypatch.setattr(qc, "whisper_binary", lambda: str(fake))
     monkeypatch.setattr(qc, "whisper_model", lambda: model)
     monkeypatch.setattr(qc.subprocess, "run", _ffmpeg_ok(qc.subprocess.run))
+    monkeypatch.setattr(qc, "vad_model", lambda: None)
     r = qc.transcribe(tmp_path / "clip.mp4")
-    assert r == {"language": "th", "text": "เราไม่เป็นไร", "segments": [{"start": 0.0, "end": 1.5, "text": "เราไม่เป็นไร"}]}
+    assert r == {"language": "th", "text": "เราไม่เป็นไร", "segments": [{"start": 0.0, "end": 1.5, "text": "เราไม่เป็นไร"}],
+                 "vad": False, "dropped": False}
+
+
+def _fake_whisper(tmp_path, segments):
+    """whisper-cli stand-in: writes these segments and records its arguments."""
+    fake = tmp_path / "whisper-cli"
+    fake.write_text(f"""#!{sys.executable}
+import json, sys
+a = sys.argv
+open({str(tmp_path / 'args.json')!r}, 'w').write(json.dumps(a))
+json.dump({{"result": {{"language": "en"}}, "transcription": {json.dumps(segments)}}}, open(a[a.index('-of') + 1] + '.json', 'w'))
+""")
+    fake.chmod(0o755)
+    return fake
+
+
+def test_made_up_looped_phrase_is_dropped_and_vad_is_used(tmp_path, monkeypatch):
+    # whisper on music/ambient sound: "I'm good." five times in a clip nobody speaks in.
+    segs = [{"offsets": {"from": i * 1000, "to": i * 1000 + 900}, "text": " I'm good."} for i in range(5)]
+    fake = _fake_whisper(tmp_path, segs)
+    model, vad = tmp_path / "m.bin", tmp_path / "vad.bin"
+    model.write_bytes(b"x")
+    vad.write_bytes(b"x")
+    monkeypatch.setattr(qc, "whisper_binary", lambda: str(fake))
+    monkeypatch.setattr(qc, "whisper_model", lambda: model)
+    monkeypatch.setattr(qc, "vad_model", lambda: vad)
+    monkeypatch.setattr(qc.subprocess, "run", _ffmpeg_ok(qc.subprocess.run))
+    r = qc.transcribe(tmp_path / "clip.mp4")
+    assert r["segments"] == [] and r["text"] == "" and r["dropped"] is True and r["vad"] is True
+    args = json.loads((tmp_path / "args.json").read_text())
+    assert "--vad" in args and args[args.index("-vm") + 1] == str(vad)
+
+
+def test_real_lines_are_kept_without_vad(tmp_path, monkeypatch):
+    segs = [{"offsets": {"from": 0, "to": 1500}, "text": " ไม่เป็นไรนะต้น"},
+            {"offsets": {"from": 1500, "to": 3000}, "text": " ฉันอยู่นี่แล้ว"}]
+    fake = _fake_whisper(tmp_path, segs)
+    model = tmp_path / "m.bin"
+    model.write_bytes(b"x")
+    monkeypatch.setattr(qc, "whisper_binary", lambda: str(fake))
+    monkeypatch.setattr(qc, "whisper_model", lambda: model)
+    monkeypatch.setattr(qc, "vad_model", lambda: None)
+    monkeypatch.setattr(qc.subprocess, "run", _ffmpeg_ok(qc.subprocess.run))
+    r = qc.transcribe(tmp_path / "clip.mp4")
+    assert r["text"] == "ไม่เป็นไรนะต้น ฉันอยู่นี่แล้ว" and r["vad"] is False and r["dropped"] is False
+    assert "--vad" not in json.loads((tmp_path / "args.json").read_text())
+
+
+def test_old_flags_from_unfiltered_transcripts_are_checked_again(tmp_path):
+    clip = tmp_path / "s01.mp4"
+    clip.write_bytes(b"v")
+    old = {"verdict": "FAIL", "dialogue_checked": True, "sig": qc.clip_sig(clip)}
+    for sid, extra in {"s01": {}, "s02": {"verdict": "PASS"}, "s03": {"v": qc.QC_VERSION}}.items():
+        qc._save(tmp_path, sid, {**old, **extra})
+    assert qc.current(tmp_path, "s01", clip) is None
+    assert qc.current(tmp_path, "s02", clip)["verdict"] == "PASS"
+    assert qc.current(tmp_path, "s03", clip)["verdict"] == "FAIL"
 
 
 def _ffmpeg_ok(real):
@@ -241,3 +299,41 @@ def test_pipeline_stores_absolute_paths_for_a_relative_out(film, monkeypatch):
                     Gflow(dry_run=True, log=lambda *_: None))
     assert pipe.out.is_absolute() and pipe.out == (d / "output" / "storyboard").resolve()
     assert pipe.clip_path(pipe.sb.scenes[0]).is_absolute()
+
+
+@needs_ffmpeg
+def test_dialogue_scene_gets_frames_taken_while_the_line_is_heard(film, fake_claude, no_whisper, monkeypatch):
+    # Veo gave the son's line to the mother (his back to the camera): QC must see the faces while it is spoken.
+    d, out = film
+    kf, clip = _media(out, "s01")
+    sb = load_storyboard(d / "storyboard.yaml")
+    monkeypatch.setattr(qc, "transcribe", lambda c: {"language": "th", "text": "เราไม่เป็นไร", "vad": True,
+                                                      "dropped": False,
+                                                      "segments": [{"start": 0.2, "end": 1.4, "text": "เราไม่เป็นไร"}]})
+    qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
+    label = fake_claude[0]["images"][-1]
+    assert "while the line is heard" in label and "0.35s" in label and (out / "qcw" / "s01_speaking.jpg").is_file()
+    assert "sai người nói" in qc.SYSTEM
+    fake_claude.clear()
+    qc.check_scene(sb, sb.scenes[1], clip, kf, out / "qcw")  # no dialogue written: no who-speaks frames
+    assert not any("while the line" in x for x in fake_claude[0]["images"])
+
+
+@needs_ffmpeg
+def test_whispered_line_gets_a_more_sensitive_second_listen(film, fake_claude, no_whisper, monkeypatch):
+    d, out = film
+    kf, clip = _media(out, "s01")
+    sb = load_storyboard(d / "storyboard.yaml")
+    calls = []
+
+    def fake(c, vad_threshold=None):
+        calls.append(vad_threshold)
+        segs = [{"start": 0.5, "end": 1.0, "text": "แม่"}] if vad_threshold else []
+        return {"language": "th", "text": "", "segments": segs, "vad": True, "dropped": False}
+
+    monkeypatch.setattr(qc, "transcribe", fake)
+    qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
+    assert calls == [None, qc.FAINT_VAD] and "FAINT" in fake_claude[0]["user"]
+    calls.clear()
+    qc.check_scene(sb, sb.scenes[1], clip, kf, out / "qcw")  # no line expected: one listen is enough
+    assert calls == [None]

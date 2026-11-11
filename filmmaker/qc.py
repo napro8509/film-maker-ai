@@ -31,6 +31,11 @@ from .storyboard import NO_DIALOGUE, Scene, Storyboard
 QC_FILE = "qc.json"
 MODEL_NAME = "ggml-large-v3-turbo-q5_0.bin"
 MODEL_URL = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{MODEL_NAME}"
+# Voice-activity detection: whisper only transcribes where someone speaks. Without it whisper invents speech on
+# music and ambient sound ("I'm good. I'm good…", a Chinese line 6 times), and QC flagged clips nobody speaks in.
+VAD_NAME = "ggml-silero-v5.1.2.bin"
+VAD_URL = f"https://huggingface.co/ggml-org/whisper-vad/resolve/main/{VAD_NAME}"
+QC_VERSION = 2  # 2: transcripts with voice-activity detection, who-speaks frames; older MINOR/FAIL are checked again
 FRAMES = 6
 WRONG_START = 0.75  # first frame vs keyframe below this: the clip was made from another picture
 
@@ -59,16 +64,27 @@ the keyframe (the opening picture Veo was asked to animate), the portraits of th
 6 frames across the clip in time order, and measurements: how well the clip's first frame matches the keyframe
 (1.0 = same picture; under 0.75 means Veo animated ANOTHER picture: always FAIL), the audio levels, and a
 speech-to-text transcript of the clip with the language it heard (the transcript can misspell words, above all
-in Thai and Vietnamese: judge the meaning, not the spelling).
+in Thai and Vietnamese: judge the meaning, not the spelling). Speech-to-text also INVENTS words on music, singing
+and background noise: a short phrase repeated over and over, a language nobody in the film speaks, filler like
+"Ah", "Oh my God", "Thank you", or speech in a quiet clip (mean volume under about -30 dB) is most likely not
+real. Flag extra speech only when the transcript is plausible for the scene (it fits the place and people, uses
+their names, makes sense); when unsure, say so and do not FAIL for it.
 Check:
 - Picture: it is THIS scene (place, people, action from the keyframe), the right characters with the right faces
   and clothes, no morphing faces/bodies, extra limbs, people appearing or vanishing, frozen or black frames, and
   no burned-in subtitles, captions or gibberish text (any readable or fake text in the picture = FAIL).
 - Sound: when the scene has dialogue, the expected lines are spoken (same meaning), in the expected language,
   once, by one speaker at a time; no extra lines nobody wrote, no line said twice, no other language. Silence or
-  only music where a line was expected = FAIL. When the scene has no dialogue, speech in the clip is a flaw
-  (MINOR, FAIL if it is long or says something odd). A clip with no audio at all is FAIL unless sound is not expected.
-- Lip-sync you cannot verify from stills: do not guess about it.
+  only music where a line was expected = FAIL. When the scene has no dialogue, nobody should talk: a
+  character clearly saying words or a sentence (real speech per the rules above) = FAIL ("thoại thừa"), and give a
+  `prompt` that keeps the action and says nobody speaks; only an indistinct background murmur, a single
+  exclamation or crying/breathing = MINOR or PASS. A clip with no audio at all is FAIL unless sound is not expected.
+- Who speaks: when the scene has dialogue you also get frames taken WHILE the line is heard (times from the
+  transcript). Look whose mouth is open or changing shape across them. The line belongs to the character named in
+  the expected dialogue: if another character visibly speaks it (their mouth moves while the speaker's stays shut,
+  or the speaker has their back to the camera and someone else talks), that is FAIL ("sai người nói"), and give a
+  `prompt` that puts the speaker facing the camera and saying the line, with the others listening silently.
+  Exact lip-sync timing you cannot verify from stills: do not guess about it.
 FAIL only for what a viewer would clearly notice; MINOR for small flaws; PASS when it is good.
 Give `prompt` only when a FAIL would likely be fixed by a different action prompt."""
 
@@ -94,23 +110,36 @@ def whisper_model() -> Path | None:
     return None
 
 
+def vad_model() -> Path | None:
+    p = model_dir() / VAD_NAME
+    return p if p.is_file() and p.stat().st_size > 100_000 else None
+
+
 def status() -> dict[str, Any]:
     """What QC can do on this machine."""
     return {"whisper": bool(whisper_binary()), "model": bool(whisper_model()), "model_name": MODEL_NAME,
-            "model_path": str(model_dir() / MODEL_NAME), "ffmpeg": bool(shutil.which("ffmpeg"))}
+            "model_path": str(model_dir() / MODEL_NAME), "vad": bool(vad_model()),
+            "ffmpeg": bool(shutil.which("ffmpeg"))}
 
 
 def download_model(log: Callable[[str], None] = lambda *_: None) -> Path:
-    """Fetch the whisper model once (about 550 MB) into the settings folder."""
-    import urllib.request
-
+    """Fetch the whisper model once (about 550 MB) and the speech detector (about 1 MB) into the settings folder."""
     dest = model_dir() / MODEL_NAME
+    if not vad_model():
+        log(f"Đang tải bộ phát hiện giọng nói ({VAD_NAME}, khoảng 1 MB)…")
+        _fetch(VAD_URL, model_dir() / VAD_NAME, 100_000)
     if whisper_model():
         return dest
+    log(f"Đang tải model nhận dạng giọng nói ({MODEL_NAME}, khoảng 550 MB)…")
+    return _fetch(MODEL_URL, dest, 10_000_000, log)
+
+
+def _fetch(url: str, dest: Path, min_size: int, log: Callable[[str], None] = lambda *_: None) -> Path:
+    import urllib.request
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(".part")
-    log(f"Đang tải model nhận dạng giọng nói ({MODEL_NAME}, khoảng 550 MB)…")
-    with urllib.request.urlopen(MODEL_URL, timeout=60) as r, part.open("wb") as f:
+    with urllib.request.urlopen(url, timeout=60) as r, part.open("wb") as f:
         total, done, step = int(r.headers.get("Content-Length") or 0), 0, 0
         while chunk := r.read(1 << 20):
             f.write(chunk)
@@ -118,7 +147,7 @@ def download_model(log: Callable[[str], None] = lambda *_: None) -> Path:
             if total and done * 10 // total > step:
                 step = done * 10 // total
                 log(f"  {step * 10}%")
-    if part.stat().st_size < 10_000_000:
+    if part.stat().st_size < min_size:
         part.unlink(missing_ok=True)
         raise RuntimeError("tải model không thành công")
     part.replace(dest)
@@ -156,9 +185,19 @@ def audio_stats(clip: Path) -> dict[str, Any]:
     return out
 
 
-def transcribe(clip: Path) -> dict[str, Any] | None:
-    """{"language", "text", "segments": [{"start", "end", "text"}]} via whisper.cpp; None when it is not set up."""
-    binary, model = whisper_binary(), whisper_model()
+def _looped(segs: list[dict[str, Any]]) -> bool:
+    """The same short phrase over and over: whisper's typical made-up output on music or background noise."""
+    texts = ["".join(ch for ch in s["text"].casefold() if ch.isalnum()) for s in segs]
+    return len(texts) >= 3 and len(set(texts)) == 1
+
+
+FAINT_VAD = 0.3  # second, more sensitive listen when a line was expected and nothing was heard (whispers)
+
+
+def transcribe(clip: Path, vad_threshold: float | None = None) -> dict[str, Any] | None:
+    """{"language", "text", "segments": [{"start", "end", "text"}], "vad", "dropped"} via whisper.cpp;
+    None when it is not set up. With the speech detector, only stretches where someone speaks are transcribed."""
+    binary, model, vad = whisper_binary(), whisper_model(), vad_model()
     if not binary or not model:
         return None
     with tempfile.TemporaryDirectory(prefix="fm-qc-") as tmp:
@@ -167,7 +206,9 @@ def transcribe(clip: Path) -> dict[str, Any] | None:
             subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(clip), "-vn", "-ac", "1", "-ar", "16000",
                             str(wav)], check=True, capture_output=True, timeout=120)
             subprocess.run([binary, "-m", str(model), "-f", str(wav), "-l", "auto", "-oj", "-of", str(base), "-np",
-                            "-t", str(max(2, (os.cpu_count() or 4) // 2))],
+                            "-t", str(max(2, (os.cpu_count() or 4) // 2)),
+                            *(["--vad", "-vm", str(vad)] if vad else []),
+                            *(["-vt", str(vad_threshold)] if vad and vad_threshold else [])],
                            check=True, capture_output=True, timeout=600)
             data = json.loads((base.with_suffix(".json")).read_text(encoding="utf-8", errors="replace"))
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -180,10 +221,36 @@ def transcribe(clip: Path) -> dict[str, Any] | None:
             segs.append({"start": round(off.get("from", 0) / 1000, 2), "end": round(off.get("to", 0) / 1000, 2),
                          "text": text})
     lang = (data.get("result") or {}).get("language")
-    return {"language": lang, "text": " ".join(s["text"] for s in segs), "segments": segs}
+    dropped = _looped(segs)
+    if dropped:
+        segs = []
+    return {"language": lang if segs else None, "text": " ".join(s["text"] for s in segs), "segments": segs,
+            "vad": bool(vad), "dropped": dropped}
 
 
 # --- one scene -------------------------------------------------------------------
+
+
+SPEAK_FRAMES = 4
+
+
+def speaking_frames(clip: Path, segments: list[dict[str, Any]], dest: Path) -> tuple[Path, list[float]] | None:
+    """A strip of frames taken while speech is heard (first line), to see whose mouth moves."""
+    segs = [s for s in segments if s["end"] > s["start"]]
+    if not segs:
+        return None
+    a, b = segs[0]["start"], segs[0]["end"]
+    times = [round(a + (b - a) * (i + 0.5) / SPEAK_FRAMES, 2) for i in range(SPEAK_FRAMES)]
+    sel = "+".join(f"lt(prev_pts*TB\\,{x})*gte(pts*TB\\,{x})" for x in times)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(clip), "-vf",
+                               f"select='{sel}',scale=-2:420,tile={SPEAK_FRAMES}x1", "-frames:v", "1",
+                               "-fps_mode", "passthrough", "-q:v", "4", str(dest)],
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (dest, times) if proc.returncode == 0 and dest.is_file() else None
 
 
 def clip_sig(p: Path) -> str:
@@ -213,6 +280,11 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     match = round(raw_match, 3) if raw_match is not None and raw_match == raw_match else None  # None or NaN: unknown
     sound = audio_stats(clip)
     speech = transcribe(clip)
+    has_lines = sb.dialogue_language != NO_DIALOGUE and any(d.line.strip() for d in (s.dialogue or []))
+    if has_lines and speech and speech.get("vad") and not speech["segments"]:
+        soft = transcribe(clip, vad_threshold=FAINT_VAD)  # a whispered line the detector skipped
+        if soft and soft["segments"]:
+            speech = {**soft, "faint": True}
     strip = reviewer._sheet(clip, work / f"{s.id}_frames.jpg", cols=FRAMES, rows=1, height=300)
     images: list[tuple[str, Path]] = []
     if keyframe and keyframe.is_file():
@@ -221,13 +293,21 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     images += [(label, p) for label, p in reviewer.portraits(sb) if label.removeprefix("portrait of ") in names]
     if strip:
         images.append((f"scene {s.id} clip: {FRAMES} frames in time order", strip))
+    talk = speaking_frames(clip, speech["segments"], work / f"{s.id}_speaking.jpg") if speech and has_lines else None
+    if talk:
+        images.append((f"scene {s.id}: {SPEAK_FRAMES} frames while the line is heard (at "
+                       + ", ".join(f"{x}s" for x in talk[1]) + "): whose mouth moves?", talk[0]))
     facts = [f"Start-frame match with the keyframe: {match if match is not None else 'unknown'}",
              f"Audio: {json.dumps(sound)}"]
     if speech is None:
         facts.append("Transcript: not available (speech-to-text is not set up): judge the sound from the audio "
                      "levels only and say the dialogue could not be checked.")
     else:
-        facts.append(f"Transcript (language heard: {speech['language'] or 'unknown'}): "
+        how = ("FAINT: nothing was heard at first, a more sensitive listen found a very soft voice (a whisper?): the "
+               "words may be wrong; do not FAIL for a missing line" if speech.get("faint") else
+               "speech detector on: only stretches with a voice were transcribed" if speech.get("vad") else
+               "no speech detector: on music or ambient sound the transcript may be made up")
+        facts.append(f"Transcript ({how}; language heard: {speech['language'] or 'unknown'}): "
                      + (" | ".join(f"[{x['start']}-{x['end']}s] {x['text']}" for x in speech["segments"]) or "(no speech)"))
     user = "\n".join([
         reviewer.storyboard_brief(sb), "",
@@ -244,7 +324,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     return {"verdict": verdict, "score": ans.score, "issues": issues, "picture": ans.picture, "sound": ans.sound,
             "prompt": ans.prompt, "match": match, "audio": sound,
             "transcript": speech["text"] if speech else None, "language": speech["language"] if speech else None,
-            "dialogue_checked": speech is not None, "clip": clip.name, "sig": clip_sig(clip),
+            "dialogue_checked": speech is not None, "vad": bool(speech and speech.get("vad")), "v": QC_VERSION,
+            "clip": clip.name, "sig": clip_sig(clip),
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -274,6 +355,8 @@ def current(out_dir: Path, sid: str, clip: Path | None) -> dict[str, Any] | None
     r = load(out_dir).get(sid)
     if not r or not clip or not clip.is_file() or r.get("sig") != clip_sig(clip):
         return None
+    if r.get("v", 1) < QC_VERSION and r.get("verdict") != "PASS" and r.get("dialogue_checked"):
+        return None  # judged on a transcript that may have been made up: check again
     return r
 
 
@@ -303,6 +386,12 @@ def run(pipe, *, only: set[str] | None = None, force: bool = False, log: Callabl
         return {}
     if not whisper_model():
         log("⚠ QC chưa kiểm tra được lời thoại: chưa có model nhận dạng giọng nói (Cài đặt → AI QC → Tải model).")
+    elif not vad_model():
+        try:
+            _fetch(VAD_URL, model_dir() / VAD_NAME, 100_000)
+            log("Đã tải bộ phát hiện giọng nói (để QC không nghe nhầm nhạc/tiếng nền thành lời thoại).")
+        except Exception as exc:  # noqa: BLE001 - QC still runs, with the looped-phrase filter only
+            log(f"⚠ Không tải được bộ phát hiện giọng nói ({exc}): QC có thể nghe nhầm nhạc nền thành lời.")
     work = out / "qc_frames"
     work.mkdir(parents=True, exist_ok=True)
     done: dict[str, dict[str, Any]] = {}
