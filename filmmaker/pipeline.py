@@ -96,7 +96,9 @@ class Pipeline:
     def __init__(self, sb: Storyboard, out_dir: Path, gflow: Gflow, log: Callable[[str], None] = print,
                  sleep: Callable[[float], None] = time.sleep, progress: prog.Emit | None = None):
         self.sb = sb
-        self.out = out_dir
+        # Absolute: state.json stores clip/keyframe paths under it, and a relative --out would make them relative
+        # to wherever the CLI ran (the app, running elsewhere, then sees the clips as missing: "changed").
+        self.out = Path(out_dir).resolve()
         self.g = gflow
         self.log = log
         self.sleep = sleep

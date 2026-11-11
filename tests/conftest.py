@@ -79,3 +79,21 @@ def no_ffprobe(monkeypatch):
     manual_clip.clear_cache()
     yield
     manual_clip.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude(monkeypatch):
+    """Tests never call the real Claude: no `claude` binary and no Anthropic API unless a test fakes them.
+    (The web server now runs AI QC after every render; on a machine with Claude Code installed that would
+    reach the real service from a test and take minutes.) A test that wants a backend patches these itself."""
+    from filmmaker import ai, planner
+
+    real = planner.claude_code_binary
+    # A test's own fake (CLAUDE_BIN set by the test) still works; the real `claude` on PATH is hidden.
+    monkeypatch.setattr(planner, "claude_code_binary", lambda: real() if os.environ.get("CLAUDE_BIN") else None)
+
+    def blocked(*_a, **_k):
+        raise RuntimeError("tests: real Anthropic API is blocked")
+
+    monkeypatch.setattr(ai, "_ask_api", blocked)
+    monkeypatch.setattr(ai, "_ask_api_text", blocked)
