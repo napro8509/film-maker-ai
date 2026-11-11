@@ -165,6 +165,55 @@ function langPicker(presets, value, { unset, noNone } = {}) {
   };
   return { el: h("div", { class: "stack tight" }, select, input), select, input, read };
 }
+/* Several subtitle languages: presets as checkboxes + "other" names (comma separated) + which one the narration is
+   written in (the others are translated by Claude). read() -> { ok, values } with the narration's language first. */
+const SUB_LANGS_MAX = 6;
+function langLabel(v) { const hit = SUBTITLE_LANGS.find(([k]) => k.toLowerCase() === String(v).toLowerCase()); return hit ? hit[1] : v; }
+function subLangPicker(values, { onchange } = {}) {
+  const fold = (x) => String(x).toLowerCase();
+  values = (values || []).filter(Boolean);
+  const presetKeys = SUBTITLE_LANGS.map(([k]) => fold(k));
+  const boxes = SUBTITLE_LANGS.map(([k, l]) => ({ k, input: h("input", { type: "checkbox", checked: values.some((v) => fold(v) === fold(k)) }), l }));
+  const others = h("input", { type: "text", maxlength: 200, placeholder: "Ngôn ngữ khác, ví dụ: Japanese, Korean",
+    "aria-label": "Ngôn ngữ phụ đề khác", value: values.filter((v) => !presetKeys.includes(fold(v))).join(", ") });
+  const primary = h("select", { "aria-label": "Lời dẫn viết bằng" });
+  const chosen = () => {
+    const out = [];
+    for (const b of boxes) if (b.input.checked) out.push(b.k);
+    for (const raw of others.value.split(",")) { const v = cleanLang(raw); if (v && !out.some((o) => fold(o) === fold(v))) out.push(v); }
+    return out;
+  };
+  let first = values[0] || null;
+  const fill = () => {
+    const list = chosen();
+    if (!list.some((v) => fold(v) === fold(first || ""))) first = list[0] || null;
+    put(primary, list.map((v) => h("option", { value: v }, langLabel(v))));
+    if (first) primary.value = list.find((v) => fold(v) === fold(first));
+    primary.disabled = list.length < 2;
+  };
+  const changed = () => { fill(); onchange?.(); };
+  boxes.forEach((b) => b.input.addEventListener("change", changed));
+  others.addEventListener("change", changed);
+  primary.addEventListener("change", () => { first = primary.value; onchange?.(); });
+  fill();
+  const read = () => {
+    for (const raw of others.value.split(",")) {
+      if (raw.trim() && !cleanLang(raw)) return { ok: false, msg: `“${raw.trim()}” không hợp lệ (tối đa 40 ký tự, không có ký tự đặc biệt ẩn)` };
+      if (raw.trim().toLowerCase() === "none") return { ok: false, msg: "phụ đề cần một ngôn ngữ cụ thể, không dùng “none”" };
+    }
+    const list = chosen();
+    if (!list.length) return { ok: false, msg: "chọn ít nhất một ngôn ngữ" };
+    if (list.length > SUB_LANGS_MAX) return { ok: false, msg: `tối đa ${SUB_LANGS_MAX} ngôn ngữ` };
+    const main = list.find((v) => fold(v) === fold(primary.value)) || list[0];
+    return { ok: true, values: [main, ...list.filter((v) => v !== main)] };
+  };
+  const el = h("div", { class: "stack tight sub-langs" },
+    h("div", { class: "row" }, boxes.map((b) => h("label", { class: "check" }, b.input, h("span", {}, b.l)))),
+    others,
+    h("div", { class: "row small" }, h("span", { class: "muted" }, "Lời dẫn viết bằng"), primary,
+      h("span", { class: "muted" }, "· các ngôn ngữ khác Claude tự dịch")));
+  return { el, read, focus: () => others.focus() };
+}
 function fmtBytes(n) { return n > 1e6 ? (n / 1e6).toFixed(1) + " MB" : Math.round(n / 1e3) + " KB"; }
 function fmtDur(sec) { sec = Math.round(sec); const m = Math.floor(sec / 60), s = sec % 60; return m ? `${m}p ${String(s).padStart(2, "0")}s` : `${s}s`; }
 function ago(ts) {
@@ -270,13 +319,18 @@ function refreshZones() {
   for (const [id, fn] of S.zones) {
     const old = document.getElementById(id);
     if (!old) { S.zones.delete(id); continue; }
-    // Do not interrupt a clip the user is watching.
+    // Do not interrupt a clip the user is watching, or a field the user is typing in.
     const v = old.querySelector("video");
     if (v && !v.paused) continue;
+    if (typingIn(old)) continue;
     const el = zoneEl(fn);
     el.id = id;
     if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
   }
+}
+function typingIn(el) {
+  const a = document.activeElement;
+  return !!a && el.contains(a) && (a.tagName === "TEXTAREA" || (a.tagName === "INPUT" && a.type === "text"));
 }
 function refreshZone(id) {
   const fn = S.zones.get(id), old = document.getElementById(id);
@@ -1335,6 +1389,7 @@ function renderStory() {
           h("textarea", { rows: 2, value: sb.style || "", placeholder: "cinematic, warm morning light, shallow depth of field, 35mm film grain",
             oninput: (e) => set("style", e.target.value) }), "thêm vào mọi prompt"),
         renderDialogueLang(sb, set),
+        renderSubtitleLangs(sb, set),
         h("div", { class: "stack tight" },
           h("label", { class: "check" },
             h("input", { type: "checkbox", checked: sb.no_text !== false,
@@ -1355,13 +1410,34 @@ function renderStory() {
    Reorders `sb` in place, since other code holds references to it. */
 function placeLangKeys(sb) {
   if (!("aspect" in sb)) return;
-  const entries = Object.entries(sb), langs = ["dialogue_language", "subtitle_language"].filter((k) => k in sb);
+  const entries = Object.entries(sb), langs = ["dialogue_language", "subtitle_language", "subtitle_languages"].filter((k) => k in sb);
   for (const [k] of entries) delete sb[k];
   for (const [k, v] of entries) {
     if (langs.includes(k)) continue;
     sb[k] = v;
     if (k === "aspect") for (const l of langs) sb[l] = entries.find(([x]) => x === l)[1];
   }
+}
+
+/* "Ngôn ngữ phụ đề": the film's subtitle languages (narration's first). Saved like other fields; translations of a
+   removed language stay in the scenes (unused) so adding it back costs nothing. */
+function renderSubtitleLangs(sb, set) {
+  const cur = (sb.subtitle_languages && sb.subtitle_languages.length ? sb.subtitle_languages : [sb.subtitle_language]).filter(Boolean);
+  const p = subLangPicker(cur.length ? cur : [], { onchange: () => {
+    const r = p.read();
+    if (!r.ok) { toast("Ngôn ngữ phụ đề: " + r.msg, "error"); return; }
+    set("subtitle_language", r.values[0]);
+    set("subtitle_languages", r.values.length > 1 ? r.values : undefined);
+    placeLangKeys(sb);
+    refreshZone("sub-langs-note");
+  } });
+  return h("div", { class: "stack tight" },
+    field("Ngôn ngữ phụ đề", p.el, "không gửi lên Flow, không tốn credit"),
+    zone("sub-langs-note", () => {
+      const miss = Object.entries(S.cur.subtitle_missing || {});
+      return h("p", { class: "help", hidden: !miss.length },
+        miss.length ? "Chưa dịch: " + miss.map(([l, ids]) => `${langLabel(l)} (${ids.length} câu)`).join(", ") + " — Claude tự dịch khi dựng phim, hoặc bấm “Dịch phụ đề” ở tab Ghép phim." : "");
+    }));
 }
 
 /* "Nhân vật nói": saved like other fields (autosave only, no job). Scenes that already have a clip keep the old language. */
@@ -1533,7 +1609,7 @@ function renderFinal() {
           h("div", { class: "player" + (portrait ? " portrait" : "") }, h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true })),
           h("div", { class: "row", style: { marginTop: "12px" } },
             h("a", { class: "btn primary sm", href: S.cur.final_url.split("?")[0], download: `${S.cur.id}.mp4` }, icon("download"), "Tải MP4"),
-            S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
+            srtLinks(),
             h("button", { class: "btn sm ghost", onclick: () => api("POST", `/api/projects/${S.cur.id}/reveal`, { path: "output/storyboard/final.mp4" }).catch((e) => toast(e.message, "error")) }, icon("folder"), "Mở trong Finder")));
       }),
       S.cur.final_url ? renderAsk() : null,
@@ -1553,8 +1629,12 @@ function renderFinal() {
             h("input", { type: "range", min: 0, max: 1, step: 0.05, value: p.volume,
               oninput: (e) => { document.getElementById("volv").textContent = Math.round(e.target.value * 100) + "%"; },
               onchange: (e) => saveFinalPrefs({ ...finalPrefs(), volume: +e.target.value }) })) : null,
-          h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
-            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Luôn xuất thêm file .srt riêng nếu có lời dẫn."))),
+          h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => { saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }); renderMain(); } }),
+            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, subLangs().length > 1 ? "Mỗi ngôn ngữ luôn có thêm một file .srt riêng." : "Luôn xuất thêm file .srt riêng nếu có lời dẫn."))),
+          p.burn_subtitles && subLangs().length > 1 ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Ngôn ngữ in lên hình"),
+            h("select", { value: subLangs().find((l) => l.toLowerCase() === String(p.burn_lang || "").toLowerCase()) || subLangs()[0],
+              onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_lang: e.target.value === subLangs()[0] ? null : e.target.value }) },
+            subLangs().map((l, i) => h("option", { value: l }, langLabel(l) + (i === 0 ? " (lời dẫn)" : ""))))) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.allow_missing, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), allow_missing: e.target.checked }) }),
             h("span", {}, "Ghép cả khi còn thiếu cảnh", h("span", { class: "sub" }, "Bỏ qua các cảnh chưa render để xem thử bản nháp."))),
           zone("final-actions", () => {
@@ -1569,10 +1649,84 @@ function renderFinal() {
           }))),
       renderEditPlan(),
       renderThumbnail(),
-      h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề")),
-        (S.cur.storyboard.scenes || []).some((s) => s.narration)
-          ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
-          : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+      zone("subs-zone", renderSubtitlesCard)));
+}
+
+/* ---------- subtitles in several languages ---------- */
+
+function subLangs() {
+  const sb = S.cur?.storyboard || {};
+  const list = (sb.subtitle_languages && sb.subtitle_languages.length ? sb.subtitle_languages : [sb.subtitle_language]).filter(Boolean);
+  return list;
+}
+
+function srtLinks() {
+  const files = (S.cur.subtitle_files || []).filter((f) => f.url);
+  if (files.length > 1) return files.map((f) => h("a", { class: "btn sm", href: f.url.split("?")[0], download: `${S.cur.id}.${f.code}.srt`, title: `Phụ đề ${langLabel(f.lang)}` }, icon("download"), `.srt ${f.code.toUpperCase()}`));
+  return S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null;
+}
+
+async function translateSubs(force = false) {
+  if (!S.cur || S.subBusy) return;
+  const pid = S.cur.id;
+  S.subBusy = true; refreshZone("subs-zone");
+  try {
+    await flushSave();
+    const r = await api("POST", `/api/projects/${pid}/subtitles/translate`, { langs: [], force });
+    if (S.cur?.id === pid) {
+      const keep = S.cur.storyboard;
+      for (const sc of keep.scenes || []) { const fresh = r.storyboard.scenes?.find((x) => x.id === sc.id); if (fresh) sc.subtitles = fresh.subtitles; }
+      S.cur.subtitle_missing = r.subtitle_missing; S.cur.subtitle_files = r.subtitle_files;
+    }
+    toast(r.changed.length ? `Đã dịch ${r.changed.length} cảnh` : "Không có câu nào cần dịch", "ok");
+  } catch (e) { toast(e.message, "error"); }
+  finally { S.subBusy = false; refreshZone("subs-zone"); refreshZone("sub-langs-note"); }
+}
+
+function renderSubtitlesCard() {
+  const sb = S.cur.storyboard, langs = subLangs();
+  const scenes = (sb.scenes || []).filter((s) => s.narration && s.narration.trim());
+  const head = h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề"));
+  if (!scenes.length) return h("div", { class: "card card-pad" }, head, h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."));
+  if (langs.length < 2) {
+    return h("div", { class: "card card-pad" }, head,
+      h("ol", { class: "narr-list" }, scenes.map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration))),
+      h("p", { class: "help" }, "Muốn thêm phụ đề tiếng khác (English, ไทย…)? Chọn thêm ở tab Phong cách & nhân vật → Ngôn ngữ phụ đề."));
+  }
+  const tab = langs.find((l) => l === S.subTab) || langs[0];
+  const miss = S.cur.subtitle_missing || {};
+  const missN = Object.values(miss).reduce((n, ids) => n + ids.length, 0);
+  const isMain = tab === langs[0];
+  const textOf = (sc) => {
+    if (isMain) return sc.narration;
+    const k = Object.keys(sc.subtitles || {}).find((x) => x.toLowerCase() === tab.toLowerCase());
+    return k ? sc.subtitles[k] : "";
+  };
+  const setText = (sc, v) => {
+    if (isMain) { sc.narration = v; changed(); return; }
+    const subs = { ...(sc.subtitles || {}) };
+    for (const k of Object.keys(subs)) if (k.toLowerCase() === tab.toLowerCase()) delete subs[k];
+    if (v.trim()) subs[tab] = v;
+    sc.subtitles = Object.keys(subs).length ? subs : undefined;
+    changed();
+  };
+  return h("div", { class: "card card-pad" },
+    h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề"), h("span", { class: "spacer" }),
+      missN ? h("span", { class: "small muted" }, `${missN} câu chưa dịch`) : null,
+      h("button", { class: "btn sm", disabled: S.subBusy || !missN, title: "Claude dịch các câu còn thiếu (không tốn credit Flow)", onclick: () => translateSubs(false) },
+        S.subBusy ? h("span", { class: "spinner" }) : icon("sparkle"), S.subBusy ? "Đang dịch…" : "Dịch phụ đề"),
+      h("button", { class: "btn sm ghost", disabled: S.subBusy, title: "Dịch lại mọi câu (ghi đè bản dịch đã sửa tay)", onclick: async () => {
+        if (await confirmModal("Dịch lại tất cả?", "Mọi câu ở các ngôn ngữ phụ sẽ được Claude dịch lại, ghi đè cả câu bạn đã sửa tay.", "Dịch lại")) translateSubs(true);
+      } }, icon("refresh"))),
+    h("div", { class: "seg", role: "tablist", style: { marginBottom: "8px" } }, langs.map((l, i) => h("button", { class: l === tab ? "on" : "", role: "tab", "aria-selected": String(l === tab),
+      onclick: () => { S.subTab = l; refreshZone("subs-zone"); } }, langLabel(l), i === 0 ? " · lời dẫn" : (miss[l]?.length ? ` · thiếu ${miss[l].length}` : "")))),
+    h("div", { class: "stack tight" }, scenes.map((sc) => h("label", { class: "sub-row" },
+      h("span", { class: "mono muted" }, sc.id),
+      h("div", { class: "stack tight", style: { flex: "1" } },
+        isMain ? null : h("span", { class: "small muted" }, sc.narration),
+        h("textarea", { rows: 1, value: textOf(sc) || "", placeholder: isMain ? "" : "Chưa dịch", "aria-label": `Phụ đề ${langLabel(tab)} cảnh ${sc.id}`,
+          oninput: (e) => setText(sc, e.target.value) }))))),
+    h("p", { class: "help" }, isMain ? "Sửa lời dẫn ở đây sẽ không tự dịch lại các ngôn ngữ khác: bấm “Dịch lại” nếu cần." : "Bản dịch sửa tay được giữ nguyên khi bấm “Dịch phụ đề”."));
 }
 
 /* ---------- ask AI about the finished film ---------- */
@@ -1808,7 +1962,7 @@ async function openAutopilot(cur) {
       localSet("autoReview", review.checked); localSet("autoSubs", subs.checked);
       try {
         await flushSave();
-        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, music: finalPrefs().music }));
+        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, burn_lang: finalPrefs().burn_lang || null, music: finalPrefs().music }));
         c();
       } catch (e) { toast(e.message, "error"); }
     } }],
@@ -2643,22 +2797,22 @@ function openNewProject() {
     const autoSubs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
     const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
-    const subSaved = cleanLang(localGet("subtitleLang"));
-    const sub = langPicker(SUBTITLE_LANGS, subSaved && subSaved.toLowerCase() !== "none" ? subSaved : "Vietnamese", { noNone: true });
+    const subSaved = (localGet("subtitleLangs") || [cleanLang(localGet("subtitleLang"))]).map(cleanLang).filter((v) => v && v.toLowerCase() !== "none");
+    const sub = subLangPicker(subSaved.length ? subSaved : ["Vietnamese"]);
     setTimeout(() => idea.focus(), 30);
     const goAuto = async (e) => {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
       const a = speak.read(), b = sub.read();
       if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); speak.input.focus(); return; }
-      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.input.focus(); return; }
+      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.focus(); return; }
       const btn = e.currentTarget, scenes = +n.value || 10;
-      localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); localSet("autoScenes", scenes);
+      localSet("dialogueLang", a.value); localSet("subtitleLangs", b.values); localSet("autoScenes", scenes);
       localSet("autoReview", autoReview.checked); localSet("autoSubs", autoSubs.checked);
       if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(scenes, autoReview.checked), "Bắt đầu"))) return;
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
-          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked });
+        const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.values[0],
+          languages: b.values, dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, burn_lang: b.values[0] });
         close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -2666,25 +2820,26 @@ function openNewProject() {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
       const a = speak.read(), b = sub.read();
       if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); speak.input.focus(); return; }
-      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.input.focus(); return; }
+      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.focus(); return; }
       const btn = e.currentTarget;
-      localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); // remembered even if the plan job fails
+      localSet("dialogueLang", a.value); localSet("subtitleLangs", b.values); // remembered even if the plan job fails
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value });
+        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.values[0], languages: b.values, dialogue_language: a.value });
         close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–3 phút…", "", 6000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
     return h("div", { class: "stack" },
       field("Ý tưởng phim", idea),
       h("div", { class: "grid2" }, field("Số cảnh", n), field("Khung hình", aspect)),
-      h("div", { class: "grid2" }, field("Nhân vật nói", speak.el), field("Ngôn ngữ phụ đề", sub.el)),
+      field("Nhân vật nói", speak.el),
+      field("Ngôn ngữ phụ đề", sub.el, "chọn nhiều được: mỗi ngôn ngữ một file .srt, chọn ngôn ngữ in lên video khi dựng phim"),
       h("p", { class: "help" }, "Câu “nhân vật nói …” được thêm vào mọi prompt video gửi Flow để cả phim cùng một thứ tiếng."),
       h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
         S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
       h("div", { class: "auto-opts" },
-        h("label", { class: "check" }, autoReview, h("span", {}, "Agent review từng bước", h("span", { class: "sub" }, "Review storyboard, keyframe (tự tạo lại ảnh lỗi), clip (render lại clip hỏng, tối đa 3) và cả phim."))),
-        h("label", { class: "check" }, autoSubs, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng.")))),
+        h("label", { class: "check" }, autoReview, h("span", {}, "Agent review từng bước", h("span", { class: "sub" }, "Review storyboard, keyframe (tự tạo lại ảnh lỗi), AI QC từng clip (chỉ đánh dấu, không tự render lại) và cả phim."))),
+        h("label", { class: "check" }, autoSubs, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "In ngôn ngữ lời dẫn; luôn có thêm file .srt cho từng ngôn ngữ.")))),
       h("div", { class: "row" }, h("span", { class: "spacer" }),
         h("button", { class: "btn", onclick: go, title: "Chỉ viết storyboard để bạn xem và sửa trước" }, "Chỉ viết storyboard"),
         h("button", { class: "btn primary", onclick: goAuto, title: "Storyboard → nhân vật → keyframe → video → AI dựng phim → thumbnail, có agent review" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));

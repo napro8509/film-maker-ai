@@ -22,6 +22,7 @@ NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title 
            "any dialogue is spoken audio only.")
 # Spoken language forced into every *video* prompt (never into image prompts or the fingerprints).
 LANG_MAX = 40
+SUBTITLE_LANGS_MAX = 6  # subtitle languages per film
 NO_DIALOGUE = "none"  # stored value for "Không thoại"
 DIALOGUE_RULE = "All spoken dialogue is in {lang}; characters speak only {lang}."
 NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
@@ -305,6 +306,23 @@ class SceneDraft(BaseModel):
 class Scene(SceneDraft):
     characters: list[str] | None = Field(
         default=None, description="Names of characters in this scene (overrides name detection).")
+    subtitles: dict[str, str] | None = Field(
+        default=None, description="`narration` translated into the film's other subtitle languages "
+                                  "({language: text}). Only for the film's subtitles: never sent to Flow.")
+
+    @field_validator("subtitles", mode="before")
+    @classmethod
+    def _clean_subtitles(cls, v: object) -> dict[str, str] | None:
+        if not v:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("subtitles phải là {ngôn ngữ: câu phụ đề}")
+        out: dict[str, str] = {}
+        for k, text in v.items():
+            lang = clean_language(k)
+            if lang and isinstance(text, str) and text.strip():
+                out[lang] = text.strip()
+        return out or None
 
     @field_validator("characters")
     @classmethod
@@ -359,6 +377,56 @@ class Storyboard(StoryboardDraft):
                                           "Empty = Veo guesses.")
     subtitle_language: str | None = Field(default=None, description="Language of `narration` chosen when planning. "
                                           "Reference only: never sent to Flow.")
+    subtitle_languages: list[str] | None = Field(
+        default=None, description="Every language the film has subtitles in; the first is `subtitle_language` "
+                                  "(the language `narration` is written in), the others come from scenes' `subtitles`.")
+
+    @field_validator("subtitle_languages", mode="before")
+    @classmethod
+    def _subtitle_languages(cls, v: object) -> list[str] | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list):
+            raise ValueError("subtitle_languages phải là danh sách tên ngôn ngữ")
+        out: list[str] = []
+        for x in v:
+            lang = clean_language(x)
+            if lang and lang.casefold() != NO_DIALOGUE and lang.casefold() not in {o.casefold() for o in out}:
+                out.append(lang)
+        if len(out) > SUBTITLE_LANGS_MAX:
+            raise ValueError(f"tối đa {SUBTITLE_LANGS_MAX} ngôn ngữ phụ đề")
+        return out or None
+
+    @model_validator(mode="after")
+    def _primary_subtitle_language(self) -> "Storyboard":
+        """subtitle_language is always the first of subtitle_languages (the narration's language)."""
+        if self.subtitle_languages:
+            if self.subtitle_language and self.subtitle_language.casefold() != self.subtitle_languages[0].casefold():
+                rest = [x for x in self.subtitle_languages if x.casefold() != self.subtitle_language.casefold()]
+                self.subtitle_languages = [self.subtitle_language, *rest][:SUBTITLE_LANGS_MAX]
+            elif not self.subtitle_language:
+                self.subtitle_language = self.subtitle_languages[0]
+        return self
+
+    def subtitle_langs(self) -> list[str]:
+        """Every subtitle language of the film, the narration's language first ([] when none is known)."""
+        if self.subtitle_languages:
+            return list(self.subtitle_languages)
+        return [self.subtitle_language] if self.subtitle_language else []
+
+    def subtitle_text(self, scene: "Scene", lang: str | None = None) -> str | None:
+        """The scene's subtitle in `lang` (None = the narration's language): narration, or its translation."""
+        langs = self.subtitle_langs()
+        if not scene.narration or not scene.narration.strip():
+            return None
+        if lang is None or not langs or lang.casefold() == langs[0].casefold():
+            return scene.narration.strip()
+        for k, v in (scene.subtitles or {}).items():
+            if k.casefold() == lang.casefold():
+                return v
+        return None
 
     @field_validator("dialogue_language", mode="before")
     @classmethod
@@ -636,7 +704,7 @@ def load_storyboard(path: str | Path) -> Storyboard:
     return sb
 
 
-_LANG_KEYS = ("dialogue_language", "subtitle_language")
+_LANG_KEYS = ("dialogue_language", "subtitle_language", "subtitle_languages")
 
 
 def _dump_dict(sb: Storyboard) -> dict:

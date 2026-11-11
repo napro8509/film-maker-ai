@@ -162,11 +162,12 @@ def test_field_order_unchanged():
     old_scene = ["id", "mode", "prompt", "image_prompt", "image", "end_image", "duration", "model", "narration",
                  "camera"]
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
-    assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language"]
+    # subtitle_languages / scene subtitles (several subtitle languages): appended after them, Storyboard/Scene only
+    assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language", "subtitle_languages"]
     assert list(StoryboardDraft.model_fields) == old_sb
     new_scene = old_scene + ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
-    assert list(Scene.model_fields)[:-1] == new_scene == list(SceneDraft.model_fields)
-    assert list(Scene.model_fields)[-1] == "characters"
+    assert list(Scene.model_fields)[:-2] == new_scene == list(SceneDraft.model_fields)
+    assert list(Scene.model_fields)[-2:] == ["characters", "subtitles"]
 
 
 def test_draft_schema_has_no_scene_characters():

@@ -175,8 +175,8 @@ def _check_durations(storyboard: Path, out: Path | None) -> bool:
 @click.option("-n", "--scenes", default=6, show_default=True, help="Số cảnh.")
 @click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="16:9", show_default=True)
 @click.option("--lang", "language", default=None,
-              help="Ngôn ngữ phụ đề (narration), ví dụ: Vietnamese. Có --dialogue-lang thì được lưu vào "
-                   "`subtitle_language` (chỉ để tham khảo).")
+              help="Ngôn ngữ phụ đề (narration), ví dụ: Vietnamese. Nhiều ngôn ngữ: \"Vietnamese,English,Thai\" "
+                   "(ngôn ngữ đầu là lời dẫn, các ngôn ngữ sau Claude dịch, mỗi ngôn ngữ một file .srt).")
 @click.option("--dialogue-lang", "dialogue_lang", default=None,
               help="Ngôn ngữ nhân vật nói, tên tiếng Anh (vd Vietnamese, English, Thai); 'none' = không thoại. "
                    "Được ép vào mọi prompt video. --lang vẫn là ngôn ngữ phụ đề (narration).")
@@ -187,6 +187,10 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
     """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key)."""
     from .planner import plan_auto
 
+    langs: list[str] = []
+    if language is not None and "," in language:  # several subtitle languages: narration's first
+        langs = _cli_langs(language, "--lang")
+        language = langs[0]
     if dialogue_lang is not None:  # checked before overwriting or calling Claude
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
         if language is not None:
@@ -195,12 +199,45 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
         return
     click.echo("Đang viết storyboard...")
     try:
-        sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
-                          dialogue_language=dialogue_lang)
+        sb, used = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
+                             dialogue_language=dialogue_lang)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
+    sb = _with_subtitle_langs(sb, langs, backend=used, api_key=user_settings.load().get("anthropic_api_key") or None)
     save_storyboard(sb, output)
     click.echo(f"✔ {output}: {len(sb.scenes)} cảnh. Xem/sửa lại rồi chạy: filmmaker run {output} --dry-run")
+
+
+def _cli_langs(value: str, opt: str) -> list[str]:
+    """--lang "Vietnamese,English,Thai" -> cleaned subtitle languages, narration's first, no duplicates."""
+    out: list[str] = []
+    for part in str(value).split(","):
+        lang = _cli_lang(part, opt, clean_language)
+        if lang.casefold() not in {o.casefold() for o in out}:
+            out.append(lang)
+    if len(out) > 6:
+        raise click.BadParameter("tối đa 6 ngôn ngữ phụ đề.", param_hint=f"'{opt}'")
+    return out
+
+
+def _with_subtitle_langs(sb, langs: list[str], backend: str = "auto", api_key: str | None = None):
+    """A new storyboard with several subtitle languages: store them and translate the narration now."""
+    from . import subtitles as subs
+
+    if len(langs) < 2:
+        return sb
+    sb.subtitle_languages = [sb.subtitle_language or langs[0], *langs[1:]]
+    sb.subtitle_language = sb.subtitle_languages[0]
+    click.echo("Claude đang dịch phụ đề sang " + ", ".join(langs[1:]) + "…")
+    try:
+        done = subs.translate(sb, backend=backend, api_key=api_key)
+    except RuntimeError as exc:
+        click.echo(f"⚠ Chưa dịch được phụ đề ({exc}); lần dựng phim sau sẽ thử lại.")
+        return sb
+    for s in sb.scenes:
+        if s.id in done:
+            s.subtitles = {**(s.subtitles or {}), **done[s.id]}
+    return sb
 
 
 def _cli_lang(value: str, opt: str, clean: Callable[[object], str | None]) -> str:
@@ -437,13 +474,39 @@ def _clips(sb, out_dir: Path) -> tuple[list[tuple[str, Path]], list[str]]:
     return clips, missing
 
 
-def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing):
+def _translated(sb, sb_path: Path | None):
+    """Translate missing subtitles into the film's other languages (best effort) and return the storyboard."""
+    from . import ai, subtitles as subs
+
+    if not sb_path or not subs.missing(sb):
+        return sb
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+
+    def edit(fn):
+        import yaml
+
+        raw = yaml.safe_load(sb_path.read_text(encoding="utf-8"))
+        if not fn(raw):
+            return False
+        sb_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False, width=100), encoding="utf-8")
+        return True
+
+    if subs.ensure(sb, edit, backend=ai.pick_backend(s.get("planner") or "auto", key), api_key=key, log=click.echo):
+        return load_storyboard(sb_path)
+    return sb
+
+
+def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
+               burn_lang: str | None = None, sb_path: Path | None = None):
+    sb = _translated(sb, sb_path)
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để ghép phần đã có)")
     output = output or out_dir / "final.mp4"
     try:
-        assemble(sb, clips, output, music=music, music_volume=volume, burn_subtitles=subtitles, log=click.echo)
+        assemble(sb, clips, output, music=music, music_volume=volume, burn_subtitles=subtitles, burn_lang=burn_lang,
+                 log=click.echo)
     except AssembleError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"🎬 Phim hoàn chỉnh: {output}")
@@ -454,6 +517,9 @@ def _stitch_options(f):
     f = click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")(f)
     f = click.option("--music-volume", "volume", default=0.25, show_default=True)(f)
     f = click.option("--burn-subtitles", "subtitles", is_flag=True, help="In phụ đề (narration) lên hình.")(f)
+    f = click.option("--burn-lang", default=None,
+                     help="Ngôn ngữ phụ đề in lên hình (một trong subtitle_languages; mặc định ngôn ngữ chính). "
+                          "Dùng kèm --burn-subtitles.")(f)
     f = click.option("--allow-missing", is_flag=True, help="Vẫn ghép khi còn cảnh chưa có.")(f)
     return f
 
@@ -462,10 +528,11 @@ def _stitch_options(f):
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path))
 @_stitch_options
-def stitch(storyboard: Path, out, output, music, volume, subtitles, allow_missing) -> None:
+def stitch(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing) -> None:
     """Ghép các clip đã tạo thành một phim (ffmpeg, không tốn credit)."""
     sb = load_storyboard(storyboard)
-    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing)
+    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing,
+               burn_lang=burn_lang, sb_path=storyboard)
 
 
 def _ai_ready(backend: str) -> bool:
@@ -480,9 +547,12 @@ def _ai_ready(backend: str) -> bool:
 
 
 def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
-             engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
+             engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False,
+             burn_lang: str | None = None, sb_path: Path | None = None):
     from .editor import edit_film, make_plan, plan_path
 
+    if not plan_only:
+        sb = _translated(sb, sb_path)
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
@@ -494,7 +564,7 @@ def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, a
             click.echo(f"✔ Kế hoạch dựng: {plan_path(out_dir)} (sửa được, rồi chạy `filmmaker edit` để xuất phim)")
             return
         output, _ = edit_film(sb, clips, out_dir, output, music=music, music_volume=volume,
-                              burn_subtitles=subtitles, **kw)
+                              burn_subtitles=subtitles, burn_lang=burn_lang, **kw)
     except (AssembleError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"🎬 Phim đã dựng: {output}")
@@ -514,7 +584,7 @@ def _edit_options(f):
 @_stitch_options
 @_edit_options
 @click.option("--plan-only", is_flag=True, help="Chỉ lập kế hoạch dựng (edit.json), chưa xuất phim.")
-def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing, engine, replan, backend,
+def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing, engine, replan, backend,
          plan_only) -> None:
     """Agent dựng phim: cắt thừa, chuyển cảnh, cân âm, nhạc nền -> phim liền mạch (không tốn credit).
 
@@ -524,7 +594,7 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing,
     """
     sb = load_storyboard(storyboard)
     _do_edit(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing,
-             engine=engine, replan=replan, backend=backend, plan_only=plan_only)
+             engine=engine, replan=replan, backend=backend, plan_only=plan_only, burn_lang=burn_lang, sb_path=storyboard)
 
 
 @main.command()
@@ -533,7 +603,7 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, allow_missing,
 @_stitch_options
 @click.option("--edit/--no-edit", "smart_edit", default=False,
               help="Dựng bằng agent dựng phim (chuyển cảnh, cân âm) thay vì nối thẳng.")
-def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smart_edit, **kw) -> None:
+def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim.
 
     Chặn cảnh dùng model đã ngừng và cảnh có độ dài model không nhận giống `run`.
@@ -544,9 +614,9 @@ def make(storyboard: Path, output, music, volume, subtitles, allow_missing, smar
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
     if smart_edit:
-        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing)
+        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang=burn_lang, sb_path=storyboard)
     else:
-        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing)
+        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang=burn_lang, sb_path=storyboard)
     try:
         _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
     except click.ClickException as exc:  # the film is done; a missing cover is not a failure
@@ -697,7 +767,9 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
               help="Làm tiếp một storyboard có sẵn thay vì viết mới từ ý tưởng.")
 @click.option("-n", "--scenes", default=10, show_default=True, help="Số cảnh.")
 @click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="9:16", show_default=True)
-@click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề.")
+@click.option("--lang", "language", default="Vietnamese", show_default=True,
+              help="Ngôn ngữ phụ đề; nhiều ngôn ngữ cách nhau dấu phẩy, ví dụ \"Vietnamese,English,Thai\".")
+@click.option("--burn-lang", default=None, help="Ngôn ngữ phụ đề in lên video (mặc định ngôn ngữ đầu).")
 @click.option("--dialogue-lang", "dialogue_lang", default="Vietnamese", show_default=True,
               help="Ngôn ngữ nhân vật nói; 'none' = không thoại.")
 @click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
@@ -710,7 +782,7 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 @click.option("--profile", help="gflow profile (tài khoản Google).")
 @click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
 def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause) -> None:
+         burn_subtitles, music, profile, pause, burn_lang) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
@@ -731,13 +803,14 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         sb_path = existing
     else:
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
-        language = _cli_lang(language, "--lang", clean_language)
+        langs = _cli_langs(language, "--lang")
         click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
         try:
-            sb, _ = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=language,
-                              dialogue_language=dialogue_lang)
+            sb, used = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=langs[0],
+                                 dialogue_language=dialogue_lang)
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
+        sb = _with_subtitle_langs(sb, langs, backend=used, api_key=key)
         ws = workspace or Path.home() / "FilmMaker"
         base = slug(sb.title) or "phim"
         d, n = ws / base, 2
@@ -747,7 +820,8 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         sb_path = d / "storyboard.yaml"
         save_storyboard(sb, sb_path)
         click.echo(f"✔ {sb_path}")
-    cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
+    cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, burn_lang=burn_lang,
+                       music=music,
                        api_key=key, pause=_parse_pause(pause))
     pilot = Autopilot(sb_path, _out_dir(sb_path, None), g, settings=cfg, log=click.echo)
     try:

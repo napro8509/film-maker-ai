@@ -60,6 +60,7 @@ class AutoSettings:
     rerender_budget: int = 3  # paid re-renders the clip review may ask for, in the whole film
     resend_interrupted: bool = True  # resend a scene once if Flow was cut off mid-render (may cost a clip twice)
     burn_subtitles: bool = True
+    burn_lang: str | None = None  # subtitle language burned into the picture (None = the narration's)
     music: Path | None = None
     music_volume: float = 0.25
     engine: str = "auto"  # editor: auto | ai | rules
@@ -489,10 +490,16 @@ class Autopilot:
             self.log("Phim đã dựng từ đúng các clip này, dùng lại.")
             result["final"] = str(final)
             return
+        from . import subtitles
+
         sb = self.sb()
+        if subtitles.ensure(sb, self.edit_raw, backend=reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key),
+                            api_key=self.cfg.api_key, log=self.log):
+            sb = self.sb()
         ai_ok = self.cfg.engine != "rules" and reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key) is not None
         output, plan = edit_film(sb, clips, self.out, final, music=self.cfg.music, music_volume=self.cfg.music_volume,
-                                 burn_subtitles=self.cfg.burn_subtitles, engine=self.cfg.engine, replan=True,
+                                 burn_subtitles=self.cfg.burn_subtitles, burn_lang=self.cfg.burn_lang,
+                                 engine=self.cfg.engine, replan=True,
                                  backend=reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key) or "auto",
                                  ai_available=ai_ok, api_key=self.cfg.api_key, log=self.log)
         result["final"] = str(output)

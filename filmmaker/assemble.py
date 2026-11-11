@@ -52,8 +52,53 @@ def write_srt(entries: list[tuple[float, float, str]], path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_subtitles(sb: Storyboard, output: Path, entries_for, log=print) -> dict[str, Path]:
+    """One .srt per subtitle language next to `output`: <stem>.srt is the narration's language (as before),
+    plus <stem>.<code>.srt for every language of the film. `entries_for(lang)` gives the timed lines
+    (lang None = narration). Returns {language or "": path}; files of languages no longer used are removed."""
+    from .subtitles import lang_code
+
+    files: dict[str, Path] = {}
+    main = output.with_suffix(".srt")
+    rows = entries_for(None)
+    if rows:
+        write_srt(rows, main)
+        files[""] = main
+        log(f"Phụ đề: {main}")
+    elif main.exists():
+        main.unlink()
+    langs = sb.subtitle_langs()
+    keep = set()
+    for i, lang in enumerate(langs):
+        path = output.with_name(f"{output.stem}.{lang_code(lang)}.srt")
+        rows = entries_for(None if i == 0 else lang)
+        if not rows:
+            continue
+        if i and len(rows) < len(entries_for(None)):
+            log(f"⚠ Phụ đề {lang} còn thiếu {len(entries_for(None)) - len(rows)} câu (chưa dịch).")
+        write_srt(rows, path)
+        files[lang] = path
+        keep.add(path.name)
+        if i:
+            log(f"Phụ đề {lang}: {path}")
+    for old in output.parent.glob(f"{output.stem}.*.srt"):  # languages removed from the film
+        if old.name not in keep and not old.name.endswith(".editing.srt"):
+            old.unlink(missing_ok=True)
+    return files
+
+
+def burn_path(files: dict[str, Path], burn_lang: str | None) -> Path | None:
+    """The .srt to burn into the picture: the chosen language, else the narration's."""
+    if burn_lang:
+        for lang, p in files.items():
+            if lang and lang.casefold() == burn_lang.casefold():
+                return p
+    return files.get("")
+
+
 def assemble(sb: Storyboard, clips: list[tuple[str, Path]], output: Path, *, music: Path | None = None,
-             music_volume: float = 0.25, burn_subtitles: bool = False, log=print) -> Path:
+             music_volume: float = 0.25, burn_subtitles: bool = False, burn_lang: str | None = None,
+             log=print) -> Path:
     """Concatenate clips in storyboard order. Re-encodes so mixed clips join cleanly."""
     ffmpeg = _need("ffmpeg")
     if not clips:
@@ -61,19 +106,24 @@ def assemble(sb: Storyboard, clips: list[tuple[str, Path]], output: Path, *, mus
     width, height = (1920, 1080) if sb.aspect == "16:9" else (1080, 1920)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    narration = {s.id: s.narration for s in sb.scenes if s.narration}
-    durations, srt = [], []
+    by_id = {s.id: s for s in sb.scenes}
+    durations, spans = [], []
     t = 0.0
     for sid, path in clips:
         d = probe_duration(path)
         durations.append(d)
-        if sid in narration:
-            srt.append((t + 0.2, t + d - 0.2, narration[sid]))
+        spans.append((sid, t, d))
         t += d
-    srt_path = output.with_suffix(".srt")
-    if srt:
-        write_srt(srt, srt_path)
-        log(f"Phụ đề: {srt_path}")
+
+    def entries_for(lang):
+        out = []
+        for sid, start, d in spans:
+            text = sb.subtitle_text(by_id[sid], lang) if sid in by_id else None
+            if text:
+                out.append((start + 0.2, start + d - 0.2, text))
+        return out
+
+    burn = burn_path(write_subtitles(sb, output, entries_for, log), burn_lang) if burn_subtitles else None
 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     for _, p in clips:
@@ -92,8 +142,8 @@ def assemble(sb: Storyboard, clips: list[tuple[str, Path]], output: Path, *, mus
     filters.append(f"{''.join(concat_in)}concat=n={len(clips)}:v=1:a=1[vcat][acat]")
 
     vout, aout = "[vcat]", "[acat]"
-    if burn_subtitles and srt:
-        esc = str(srt_path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+    if burn:
+        esc = str(burn).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
         filters.append(f"[vcat]subtitles='{esc}'[vsub]")
         vout = "[vsub]"
     if music:
