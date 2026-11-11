@@ -1473,6 +1473,8 @@ function renderFinal() {
             S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
             h("button", { class: "btn sm ghost", onclick: () => api("POST", `/api/projects/${S.cur.id}/reveal`, { path: "output/storyboard/final.mp4" }).catch((e) => toast(e.message, "error")) }, icon("folder"), "Mở trong Finder")));
       }),
+      S.cur.final_url ? renderAsk() : null,
+      S.cur.final_url ? renderSocial() : null,
       zone("playlist-zone", renderPlaylist)),
     h("div", { class: "stack" },
       zone("auto-review-zone", renderAutoReview),
@@ -1508,6 +1510,212 @@ function renderFinal() {
         (S.cur.storyboard.scenes || []).some((s) => s.narration)
           ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
           : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+}
+
+/* ---------- ask AI about the finished film ---------- */
+
+const ASK_STARTERS = ["Viết caption + hashtag để đăng TikTok/Shorts", "Cảnh nào nên làm lại, prompt mới ra sao?",
+  "Gợi ý ý tưởng cho tập tiếp theo", "Tóm tắt phim và chi phí đã dùng"];
+
+/* Tiny, safe Markdown: text is escaped first, then **bold**, `code`, headings, lists and paragraphs. */
+function mdToHtml(src) {
+  const inline = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, "$1<em>$2</em>");
+  const out = []; let list = null, code = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const line of String(src || "").split("\n")) {
+    if (line.trim().startsWith("```")) {
+      if (code) { out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`); code = null; } else { close(); code = []; }
+      continue;
+    }
+    if (code) { code.push(line); continue; }
+    let m;
+    if ((m = line.match(/^\s*>\s?(.*)$/))) {
+      if (list !== "blockquote") { close(); out.push("<blockquote>"); list = "blockquote"; }
+      if (m[1].trim()) out.push(`<p>${inline(m[1])}</p>`);
+    } else if ((m = line.match(/^\s*[-*•]\s+(.*)$/)) || (m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      const kind = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (list !== kind) { close(); out.push(`<${kind}>`); list = kind; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^#{1,4}\s+(.*)$/))) { close(); out.push(`<h4>${inline(m[1])}</h4>`); }
+    else if (!line.trim()) close();
+    else { close(); out.push(`<p>${inline(line)}</p>`); }
+  }
+  if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+  close();
+  return out.join("");
+}
+
+async function loadAsk(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.ask && S.ask.pid === pid && S.ask.data) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/ask`);
+    if (S.cur?.id !== pid) return;
+    S.ask = { ...(S.ask?.pid === pid ? S.ask : { pid, draft: "" }), data, error: null };
+  } catch (e) { S.ask = { pid, draft: "", data: null, error: e.message }; }
+  refreshZone("ask-zone");
+}
+
+async function sendAsk(question) {
+  const A = S.ask, pid = S.cur?.id;
+  question = (question || "").trim();
+  if (!A || !pid || A.busy || !question) return;
+  A.busy = true; A.pending = question; A.draft = "";
+  const box = document.getElementById("ask-input"); if (box) box.value = "";
+  refreshZone("ask-zone");
+  try {
+    await flushSave();
+    const data = await api("POST", `/api/projects/${pid}/ask`, { question, pictures: localGet("askPictures", true) });
+    if (S.ask?.pid === pid) A.data = data;
+  } catch (e) {
+    toast(e.message, "error");
+    if (S.ask?.pid === pid && !A.draft) { A.draft = question; const b = document.getElementById("ask-input"); if (b) b.value = question; }
+  } finally {
+    A.busy = false; A.pending = null;
+    refreshZone("ask-zone");
+    const list = document.querySelector("#ask-zone .ask-msgs"); if (list) list.scrollTop = list.scrollHeight;
+  }
+}
+
+async function clearAsk() {
+  const pid = S.cur?.id;
+  if (!pid || !S.ask || S.ask.busy) return;
+  if (!confirm("Xoá toàn bộ cuộc trò chuyện về phim này?")) return;
+  try { S.ask.data = await api("DELETE", `/api/projects/${pid}/ask`); } catch (e) { toast(e.message, "error"); }
+  refreshZone("ask-zone");
+}
+
+function renderAsk() {
+  if (!S.ask || S.ask.pid !== S.cur.id || (!S.ask.data && !S.ask.error)) setTimeout(() => loadAsk(), 0);
+  const input = h("textarea", { id: "ask-input", rows: 2, placeholder: "Hỏi bất cứ điều gì về phim này… (Enter để gửi, Shift+Enter xuống dòng)",
+    "aria-label": "Câu hỏi cho AI", value: S.ask?.pid === S.cur.id ? S.ask.draft || "" : "",
+    oninput: (e) => { if (S.ask) S.ask.draft = e.target.value; },
+    onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendAsk(e.target.value); } } });
+  const pics = h("input", { type: "checkbox", checked: localGet("askPictures", true), onchange: (e) => localSet("askPictures", e.target.checked) });
+  return h("div", { class: "card card-pad ask-card" },
+    h("div", { class: "card-head" }, h("h3", {}, icon("sparkle"), " Hỏi AI về phim"), h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, "Không tốn credit Flow")),
+    zone("ask-zone", () => {
+      const A = S.ask?.pid === S.cur?.id ? S.ask : null;
+      if (!A || (!A.data && !A.error)) return h("div", { class: "help" }, "Đang tải…");
+      if (A.error) return h("div", { class: "help" }, A.error);
+      const msgs = A.data.messages || [], ctx = A.data.context || [];
+      const last = msgs[msgs.length - 1];
+      const chips = A.busy ? [] : msgs.length ? (last?.role === "assistant" ? last.follow_ups || [] : []) : ASK_STARTERS;
+      const kb = Math.round(ctx.reduce((n, c) => n + c.chars, 0) / 1000);
+      return h("div", { class: "stack tight" },
+        h("details", { class: "ask-ctx" }, h("summary", { class: "small muted" }, `AI đọc ${ctx.length} mục tư liệu của phim (~${kb}K ký tự)` + (localGet("askPictures", true) ? " + ảnh nhân vật, bìa, contact sheet" : "")),
+          h("ul", { class: "small muted" }, ctx.map((c) => h("li", {}, c.title)))),
+        msgs.length || A.pending ? h("div", { class: "ask-msgs", role: "log", "aria-live": "polite" },
+          msgs.map((m) => m.role === "user" ? h("div", { class: "ask-msg user" }, m.content)
+            : (() => { const d = h("div", { class: "ask-msg ai md" }); d.innerHTML = mdToHtml(m.content); return d; })()),
+          A.pending ? [h("div", { class: "ask-msg user" }, A.pending), h("div", { class: "ask-msg ai typing" }, "AI đang đọc tư liệu và trả lời…")] : null) : null,
+        chips.length ? h("div", { class: "ask-chips" }, chips.map((q) => h("button", { class: "btn sm ghost ask-chip", onclick: () => sendAsk(q) }, q))) : null,
+        msgs.length && !A.busy ? h("div", { class: "row" }, h("span", { class: "spacer" }),
+          h("button", { class: "btn sm ghost", onclick: clearAsk }, icon("trash"), "Xoá cuộc trò chuyện")) : null);
+    }),
+    h("div", { class: "ask-form" }, input,
+      h("div", { class: "row" },
+        h("label", { class: "check small" }, pics, h("span", {}, "Cho AI xem ảnh (chậm hơn một chút)")),
+        h("span", { class: "spacer" }),
+        h("button", { class: "btn primary sm", onclick: () => sendAsk(input.value) }, "Gửi"))));
+}
+
+/* ---------- posts for social networks ---------- */
+
+const SOCIAL_PLATFORMS = [["tiktok", "TikTok"], ["facebook", "Facebook"], ["instagram", "Instagram"]];
+const SOCIAL_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Thái)"]];
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = h("textarea", { style: { position: "fixed", opacity: "0" } }, text);
+    document.body.append(t); t.select(); document.execCommand("copy"); t.remove();
+  }
+  toast("Đã chép", "", 1500);
+}
+
+function postText(p) {
+  return [p.title, p.caption, (p.hashtags || []).map((t) => "#" + t).join(" ")].filter((x) => x && x.trim()).join("\n\n");
+}
+
+async function loadSocial(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.social && S.social.pid === pid && S.social.data) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/social`);
+    if (S.cur?.id !== pid) return;
+    S.social = { ...(S.social?.pid === pid ? S.social : { pid }), data, error: null };
+  } catch (e) { S.social = { pid, data: null, error: e.message }; }
+  refreshZone("social-zone");
+}
+
+async function makeSocial() {
+  const SO = S.social, pid = S.cur?.id;
+  if (!SO || !pid || SO.busy) return;
+  const platforms = localGet("socialPlatforms", ["tiktok", "facebook", "instagram"]);
+  const languages = localGet("socialLangs", ["Vietnamese"]);
+  if (!platforms.length || !languages.length) { toast("Chọn ít nhất một mạng xã hội và một ngôn ngữ.", "error"); return; }
+  SO.busy = true; refreshZone("social-zone");
+  try {
+    await flushSave();
+    const note = document.getElementById("social-note")?.value || "";
+    const data = await api("POST", `/api/projects/${pid}/social`, { platforms, languages, note, pictures: true });
+    if (S.social?.pid === pid) { SO.data = data; SO.lang = null; }
+    if (data.result?.missing?.length) toast("AI chưa viết: " + data.result.missing.join(", "), "", 6000);
+  } catch (e) { toast(e.message, "error"); }
+  finally { SO.busy = false; refreshZone("social-zone"); }
+}
+
+function toggleChoice(key, value, on, fallback) {
+  const cur = new Set(localGet(key, fallback));
+  if (on) cur.add(value); else cur.delete(value);
+  localSet(key, [...cur]);
+}
+
+function renderSocial() {
+  if (!S.social || S.social.pid !== S.cur.id || (!S.social.data && !S.social.error)) setTimeout(() => loadSocial(), 0);
+  const plats = localGet("socialPlatforms", ["tiktok", "facebook", "instagram"]), langs = localGet("socialLangs", ["Vietnamese"]);
+  return h("div", { class: "card card-pad social-card" },
+    h("div", { class: "card-head" }, h("h3", {}, "Nội dung đăng mạng xã hội"), h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, "Không tốn credit Flow")),
+    h("div", { class: "stack tight" },
+      h("div", { class: "social-opts" },
+        h("span", { class: "lbl" }, "Mạng"),
+        SOCIAL_PLATFORMS.map(([k, l]) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: plats.includes(k), onchange: (e) => toggleChoice("socialPlatforms", k, e.target.checked, plats) }), h("span", {}, l)))),
+      h("div", { class: "social-opts" },
+        h("span", { class: "lbl" }, "Ngôn ngữ"),
+        SOCIAL_LANGS.map(([k, l]) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: langs.includes(k), onchange: (e) => toggleChoice("socialLangs", k, e.target.checked, langs) }), h("span", {}, l)))),
+      h("input", { type: "text", id: "social-note", placeholder: "Yêu cầu thêm (tuỳ chọn): giọng hài hước, nhắc tập 2, tên kênh…", "aria-label": "Yêu cầu thêm" })),
+    zone("social-zone", () => {
+      const SO = S.social?.pid === S.cur?.id ? S.social : null;
+      const res = SO?.data?.result;
+      const btn = h("button", { class: "btn primary sm", disabled: !SO || SO.busy, onclick: makeSocial }, icon("sparkle"),
+        SO?.busy ? "AI đang viết…" : res ? "Viết lại" : "Tạo nội dung");
+      if (!SO) return h("div", { class: "row", style: { marginTop: "10px" } }, btn);
+      if (SO.error) return h("div", { class: "help" }, SO.error);
+      const head = h("div", { class: "row", style: { marginTop: "10px" } }, btn,
+        SO.busy ? h("span", { class: "help" }, "Khoảng 1–2 phút.") : res ? h("span", { class: "help" }, "Viết lúc " + new Date(res.at).toLocaleString()) : null);
+      if (!res) return h("div", {}, head);
+      const langsDone = SOCIAL_LANGS.filter(([k]) => res.posts.some((p) => p.language === k));
+      const lang = langsDone.some(([k]) => k === SO.lang) ? SO.lang : langsDone[0]?.[0];
+      return h("div", { class: "stack tight" }, head,
+        langsDone.length > 1 ? h("div", { class: "seg", role: "tablist" }, langsDone.map(([k, l]) =>
+          h("button", { class: "btn sm" + (k === lang ? " primary" : " ghost"), role: "tab", "aria-selected": k === lang ? "true" : "false",
+            onclick: () => { SO.lang = k; refreshZone("social-zone"); } }, l))) : null,
+        res.posts.filter((p) => p.language === lang).map((p) => h("div", { class: "social-post" },
+          h("div", { class: "row" }, h("strong", {}, SOCIAL_PLATFORMS.find(([k]) => k === p.platform)?.[1] || p.platform), h("span", { class: "spacer" }),
+            h("button", { class: "btn sm", onclick: () => copyText(postText(p)) }, icon("copy"), "Chép bài")),
+          p.hook ? h("div", { class: "small" }, h("span", { class: "muted" }, "Chữ trên video 3s đầu: "), h("b", {}, p.hook)) : null,
+          p.title ? h("div", { class: "social-title" }, p.title) : null,
+          h("div", { class: "social-caption" }, p.caption),
+          p.hashtags?.length ? h("div", { class: "social-tags" }, p.hashtags.map((t) => "#" + t).join(" ")) : null,
+          p.first_comment ? h("div", { class: "small" }, h("span", { class: "muted" }, "Bình luận ghim: "), p.first_comment,
+            " ", h("button", { class: "btn sm ghost icon", title: "Chép bình luận", "aria-label": "Chép bình luận", onclick: () => copyText(p.first_comment) }, icon("copy"))) : null)));
+    }));
 }
 
 /* ---------- autopilot ---------- */

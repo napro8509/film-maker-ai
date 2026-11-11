@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import autopilot, flow_caps, manual_clip, model_change, model_meta, retirement
+from .. import autopilot, film_chat, flow_caps, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -208,6 +208,18 @@ class SaveBody(BaseModel):
 
 class YamlBody(BaseModel):
     text: str
+
+
+class SocialBody(BaseModel):
+    platforms: list[str] = ["tiktok", "facebook", "instagram"]
+    languages: list[str] = ["Vietnamese"]
+    note: str = ""
+    pictures: bool = True
+
+
+class AskBody(BaseModel):
+    question: str
+    pictures: bool = True  # send portraits, cover and a contact sheet of the film along
 
 
 class NewProject(BaseModel):
@@ -796,6 +808,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
+            remember_idea(d, body.idea)
             job.log(f"✔ Xong: “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
             return {"project": pid}
 
@@ -993,6 +1006,70 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"titles": suggest_titles_for(pid, sb)}
         except RuntimeError as exc:
             raise HTTPException(400, str(exc))
+
+    # ---- ask AI about the film ----
+
+    def remember_idea(d: Path, idea: str) -> None:
+        """Keep the idea the film was planned from (ui.json), so “Hỏi AI” knows it later."""
+        idea = (idea or "").strip()[:8000]
+        if idea:
+            ui_prefs.update(d, lambda p: p.__setitem__("idea", idea))
+
+    def ask_view(pid: str) -> dict[str, Any]:
+        sections = film_chat.gather(pdir(pid), out_dir(pid))
+        return {"messages": film_chat.load(out_dir(pid)),
+                "context": [{"title": t, "chars": len(x)} for t, x in sections],
+                "has_final": (out_dir(pid) / "final.mp4").is_file()}
+
+    @app.get("/api/projects/{pid}/ask")
+    def get_ask(pid: str) -> dict[str, Any]:
+        return ask_view(pid)
+
+    @app.post("/api/projects/{pid}/ask")
+    def post_ask(pid: str, body: AskBody) -> dict[str, Any]:
+        """A question about the film (Claude, free on Flow). Not a job: it can run while Flow renders."""
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        if film_chat.lock(out_dir(pid)).locked():
+            raise HTTPException(409, detail={"message": "Đang trả lời câu hỏi trước, đợi một chút.", "reason": "ask_busy"})
+        try:
+            film_chat.ask(pdir(pid), out_dir(pid), body.question, with_pictures=body.pictures, backend=backend,
+                          api_key=load_settings().get("anthropic_api_key") or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+        return ask_view(pid)
+
+    @app.delete("/api/projects/{pid}/ask")
+    def delete_ask(pid: str) -> dict[str, Any]:
+        film_chat.clear(out_dir(pid))
+        return ask_view(pid)
+
+    # ---- posts for social networks ----
+
+    @app.get("/api/projects/{pid}/social")
+    def get_social(pid: str) -> dict[str, Any]:
+        return {"result": social.load(out_dir(pid)), "platforms": social.PLATFORMS, "languages": social.LANGUAGES}
+
+    @app.post("/api/projects/{pid}/social")
+    def post_social(pid: str, body: SocialBody) -> dict[str, Any]:
+        """Write Facebook / TikTok / Instagram posts in the chosen languages (Claude, free on Flow)."""
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        if film_chat.lock(out_dir(pid)).locked():
+            raise HTTPException(409, detail={"message": "AI đang bận với phim này, đợi một chút.", "reason": "ask_busy"})
+        try:
+            social.generate(pdir(pid), out_dir(pid), body.platforms, body.languages, note=body.note,
+                            with_pictures=body.pictures, backend=backend,
+                            api_key=load_settings().get("anthropic_api_key") or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+        return get_social(pid)
 
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
@@ -1556,6 +1633,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
+            remember_idea(d, body.idea)
             job.project = pid  # the UI opens the project while the rest runs
             job.title = f"Tạo tự động: {sb.title}"
             job.log(f"✔ “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
