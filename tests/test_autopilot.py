@@ -388,6 +388,42 @@ def test_a_failed_keyframe_batch_is_split_and_never_skips_the_rest(env, monkeypa
     assert "chưa review được s02" in stage["note"]
     assert tries == [["s01", "s02"], ["s01"], ["s02"], ["s02"]]  # split, then one retry for the stubborn one
     assert any("chia nhỏ" in l for l in lines) and any("hãy tự xem" in l for l in lines)
+    assert not any("max_structured_output_retries" in l for l in lines)  # said in plain words
+    assert any("sai định dạng" in l for l in lines)
+
+
+def test_keyframes_are_reviewed_in_even_groups():
+    from filmmaker.autopilot import _even_chunks
+    assert [len(c) for c in _even_chunks(list(range(9)), 4)] == [3, 3, 3]
+    assert [len(c) for c in _even_chunks(list(range(9)), 5)] == [5, 4]
+    assert [len(c) for c in _even_chunks(list(range(3)), 5)] == [3]
+    assert _even_chunks([], 5) == []
+    assert sum(_even_chunks(list(range(11)), 3), []) == list(range(11))
+
+
+def test_a_failed_group_size_is_not_tried_again(monkeypatch):
+    # 9 keyframes: the first group of 5 fails, so the other 4 waiting are not sent as a group that big again.
+    from filmmaker import autopilot
+    p = autopilot.Autopilot.__new__(autopilot.Autopilot)
+    p._kf_batch = autopilot.REVIEW_BATCH
+    lines: list[str] = []
+    p.log, p.write_review, p.ai_kw = lines.append, lambda *a: None, lambda: {}
+    sizes: list[int] = []
+
+    def ask(sb, chunk, **kw):
+        sizes.append(len(chunk))
+        if len(chunk) > 3:
+            raise RuntimeError("Claude Code không trả lời được: error_max_structured_output_retries")
+        return reviewer.KeyframeReview(summary="", scenes=[
+            reviewer.KeyframeVerdict(id=sid, verdict="PASS", score=8) for sid, _ in chunk])
+
+    monkeypatch.setattr(reviewer, "review_keyframes", ask)
+    items = [(f"s{i:02d}", None) for i in range(1, 10)]
+    unreviewed: set[str] = set()
+    got = p._review_keyframe_batches(None, items, 1, unreviewed)
+    assert sorted(v.id for v in got) == [sid for sid, _ in items] and not unreviewed
+    assert sizes == [5, 3, 3, 3]  # one failure, then the 9 in even groups of 3
+    assert sum("chia nhỏ" in l for l in lines) == 1
 
 
 def test_keyframe_reviewer_checks_who_faces_the_camera():

@@ -46,7 +46,7 @@ STAGES: list[tuple[str, str]] = [
 ]
 LABELS = dict(STAGES)
 RETRY_WAIT = 30  # seconds before the second try of free images that failed
-REVIEW_BATCH = 8  # pictures of scenes per review call (plus the portraits)
+REVIEW_BATCH = 5  # most keyframes per review call (plus the portraits); bigger answers often fail to come back as JSON
 
 
 class AutoError(RuntimeError):
@@ -102,6 +102,7 @@ class Autopilot:
         self.should_stop = should_stop
         self._edit_raw = edit_raw
         self.on_stage = on_stage or (lambda _info: None)
+        self._kf_batch = REVIEW_BATCH  # shrinks when Claude cannot answer a batch, for the rest of this run
         self.state_path = self.out / "autopilot.json"
         self.reviews_dir = self.out / "reviews"
         self.data: dict[str, Any] = {"stages": {}, "keyframe_ok": {}, "clip_reviewed": {}, "rerendered": [],
@@ -336,9 +337,7 @@ class Autopilot:
                 break
             self.log(f"Agent review đang xem {len(items)} keyframe (vòng {rnd}/{rounds})…")
             revise: dict[str, str] = {}
-            verdicts: list = []
-            for chunk in _chunks(items, REVIEW_BATCH):
-                verdicts += self._review_keyframe_chunk(pipe.sb, chunk, rnd, unreviewed)
+            verdicts = self._review_keyframe_batches(pipe.sb, items, rnd, unreviewed)
             files = dict(items)
             for v in verdicts:
                 scores[v.id] = v.score
@@ -372,29 +371,39 @@ class Autopilot:
                      "khi render video.")
         self.mark("review_keyframes", "done", note, remade=remade_total, scores=scores, unreviewed=missed)
 
-    def _review_keyframe_chunk(self, sb, chunk: list, rnd: int, unreviewed: set[str]) -> list:
-        """Verdicts for these keyframes. A failed call (Claude Code sometimes gives up on a big structured answer)
-        is split in halves and tried again, so one bad batch never skips the review of the rest of the film.
-        A single picture gets two tries; then it is left unreviewed (and said so)."""
-        rev, err = None, ""
+    def _review_keyframe_batches(self, sb, items: list, rnd: int, unreviewed: set[str]) -> list:
+        """Verdicts for these keyframes, asked in even groups of at most `self._kf_batch`. When Claude cannot
+        answer a group (Claude Code sometimes gives up on a big structured answer), the group size is halved
+        for everything still waiting, so later groups do not fail the same way. A single picture gets two
+        tries; then it is left unreviewed (and said so)."""
+        verdicts: list = []
+        queue = _even_chunks(items, self._kf_batch)
+        while queue:
+            chunk = queue.pop(0)
+            rev, err = self._ask_keyframe_review(sb, chunk)
+            if rev is not None:
+                self.write_review(f"keyframes_r{rnd}_{chunk[0][0]}", rev)
+                ids = {sid for sid, _ in chunk}
+                verdicts += [v for v in rev.scenes if v.id in ids]
+            elif len(chunk) > 1:
+                self._kf_batch = min(self._kf_batch, (len(chunk) + 1) // 2)
+                rest = chunk + [it for c in queue for it in c]
+                queue = _even_chunks(rest, self._kf_batch)
+                self.log(f"⚠ Claude không trả lời được khi xem {len(chunk)} keyframe cùng lúc ({err}); "
+                         f"chia nhỏ còn {self._kf_batch} ảnh mỗi lượt, xem tiếp {len(rest)} ảnh…")
+            else:
+                self.log(f"⚠ Không review được keyframe {chunk[0][0]} ({err}).")
+                unreviewed.add(chunk[0][0])
+        return verdicts
+
+    def _ask_keyframe_review(self, sb, chunk: list):
+        err = ""
         for _ in range(1 if len(chunk) > 1 else 2):
             try:
-                rev = reviewer.review_keyframes(sb, chunk, **self.ai_kw())
-                break
+                return reviewer.review_keyframes(sb, chunk, **self.ai_kw()), ""
             except (RuntimeError, ValueError) as exc:
-                err = str(exc)[:160]
-        if rev is None:
-            if len(chunk) > 1:
-                half = (len(chunk) + 1) // 2
-                self.log(f"⚠ Review {len(chunk)} keyframe một lần không được ({err}); chia nhỏ để thử lại…")
-                return (self._review_keyframe_chunk(sb, chunk[:half], rnd, unreviewed)
-                        + self._review_keyframe_chunk(sb, chunk[half:], rnd, unreviewed))
-            self.log(f"⚠ Không review được keyframe {chunk[0][0]} ({err}).")
-            unreviewed.add(chunk[0][0])
-            return []
-        self.write_review(f"keyframes_r{rnd}_{chunk[0][0]}", rev)
-        ids = {sid for sid, _ in chunk}
-        return [v for v in rev.scenes if v.id in ids]
+                err = _short_error(exc)
+        return None, err
 
     def _video_run(self, **kw: Any) -> RunReport:
         sb = self.sb()
@@ -632,8 +641,25 @@ class _Stopped(Exception):
     pass
 
 
-def _chunks(items: list, n: int) -> list[list]:
-    return [items[i:i + n] for i in range(0, len(items), n)]
+def _even_chunks(items: list, n: int) -> list[list]:
+    """Groups of at most n, as even as possible: 9 by 4 -> 3 + 3 + 3 (not 4 + 4 + 1)."""
+    if not items:
+        return []
+    groups = -(-len(items) // max(1, n))
+    size, extra = divmod(len(items), groups)
+    out, i = [], 0
+    for g in range(groups):
+        k = size + (1 if g < extra else 0)
+        out.append(items[i:i + k])
+        i += k
+    return out
+
+
+def _short_error(exc: Exception) -> str:
+    msg = str(exc)
+    if "max_structured_output_retries" in msg:
+        return "kết quả sai định dạng nhiều lần"
+    return msg.removeprefix("Claude Code không trả lời được: ")[:160]
 
 
 def load_public(out_dir: Path) -> dict[str, Any] | None:
