@@ -121,8 +121,15 @@ You also get the character reference portraits. For each scene check:
 - Clean and readable: REVISE cluttered, low-contrast frames or heavily overlapping/occluded people (they animate
   badly), and for 9:16 faces cut off by or sitting in the bottom 20% or at the right edge.
 - Continuity with the other scenes (outfits, place, time of day).
+- Who speaks: when the scene has dialogue, the video starts from THIS picture and the line is spoken in the first
+  seconds, so Veo gives it to a face it can see talking. The character who speaks first must face the camera (front
+  or three-quarter view, face and mouth clearly visible) and be the most prominent face. If the speaker is in
+  profile, turned away, hidden or small while another character faces the camera, that other character will be
+  made to say the line: REVISE, with an `image_prompt` that puts the speaker facing the camera and the others
+  turned toward the speaker or listening with the mouth closed.
 verdict REVISE only for problems worth a new picture (wrong/missing character, wrong face, text in the picture,
-deformation, wrong setting or framing that breaks the scene). Continuity breaks are ALWAYS REVISE, because the video
+deformation, wrong setting or framing that breaks the scene, the speaker of a dialogue scene not facing the
+camera). Continuity breaks are ALWAYS REVISE, because the video
 inherits them: an outfit, prop, weather or time of day that contradicts the story so far (a raincoat given away
 earlier, rain a year later in a sunny reunion, the old work clothes after the character's life changed). If you
 list such a problem in `issues`, the verdict must be REVISE, never PASS. Then give `image_prompt`: the full corrected

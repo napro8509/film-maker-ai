@@ -360,3 +360,35 @@ def test_flow_deleted_video_is_seen_after_the_offer():
               "generation has started!")
     assert classify_replies([bubble]) == ("deleted", False)
     assert classify_replies([bubble.replace("Video has been deleted", "")]) == (None, False)
+
+
+def test_a_failed_keyframe_batch_is_split_and_never_skips_the_rest(env, monkeypatch):
+    # Claude Code gave up on a batch (error_max_structured_output_retries) and the whole keyframe review was
+    # skipped: s08 went to Veo with the speaker turned away. Now the batch is split, and only a picture that
+    # still cannot be reviewed is left out, by name.
+    sb_path, calls, asked = env
+    real = reviewer.ai.ask
+    tries: list[list[str]] = []
+
+    def flaky(system, user, schema, *, images=(), **kw):
+        if schema is reviewer.KeyframeReview:
+            ids = [label.split()[1] for label, _ in images if label.endswith("keyframe")]
+            tries.append(ids)
+            if len(ids) > 1 or ids == ["s02"]:
+                raise RuntimeError("Claude Code không trả lời được: error_max_structured_output_retries")
+            return schema(summary="", scenes=[reviewer.KeyframeVerdict(id=i, verdict="PASS", score=9) for i in ids])
+        return real(system, user, schema, images=images, **kw)
+
+    monkeypatch.setattr(reviewer.ai, "ask", flaky)
+    p, lines = _pilot(sb_path)
+    p.run()
+    st = json.loads((sb_path.parent / "output" / "storyboard" / "autopilot.json").read_text())
+    stage = st["stages"]["review_keyframes"]
+    assert stage["status"] == "done" and stage["scores"] == {"s01": 9} and stage["unreviewed"] == ["s02"]
+    assert "chưa review được s02" in stage["note"]
+    assert tries == [["s01", "s02"], ["s01"], ["s02"], ["s02"]]  # split, then one retry for the stubborn one
+    assert any("chia nhỏ" in l for l in lines) and any("hãy tự xem" in l for l in lines)
+
+
+def test_keyframe_reviewer_checks_who_faces_the_camera():
+    assert "Who speaks" in reviewer.KEYFRAME_SYSTEM and "facing the camera" in reviewer.KEYFRAME_SYSTEM

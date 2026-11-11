@@ -328,6 +328,7 @@ class Autopilot:
         rounds = max(1, self.cfg.keyframe_rounds)
         remade_total: list[str] = []
         scores: dict[str, int] = {}
+        unreviewed: set[str] = set()
         for rnd in range(1, rounds + 1):
             pipe = self.pipe()
             items = [(s.id, pipe.keyframe_path(s)) for s in self._keyframe_scenes(pipe.sb)
@@ -336,25 +337,19 @@ class Autopilot:
                 break
             self.log(f"Agent review đang xem {len(items)} keyframe (vòng {rnd}/{rounds})…")
             revise: dict[str, str] = {}
+            verdicts: list = []
             for chunk in _chunks(items, REVIEW_BATCH):
-                try:
-                    rev = reviewer.review_keyframes(pipe.sb, chunk, **self.ai_kw())
-                except (RuntimeError, ValueError) as exc:
-                    self.log(f"⚠ Không review được keyframe ({exc}); làm tiếp.")
-                    self.mark("review_keyframes", "skipped", str(exc)[:200])
-                    return
-                self.write_review(f"keyframes_r{rnd}_{chunk[0][0]}", rev)
-                files = dict(chunk)
-                for v in rev.scenes:
-                    if v.id not in files:
-                        continue
-                    scores[v.id] = v.score
-                    tag = "✔" if v.verdict == "PASS" else "✎"
-                    self.log(f"  {tag} [{v.id}] {v.score}/10" + (f" — {'; '.join(v.issues)}" if v.issues else ""))
-                    if v.verdict == "REVISE" and v.image_prompt and rnd < rounds + 1 and rnd <= rounds - 1:
-                        revise[v.id] = v.image_prompt
-                    else:
-                        ok[v.id] = _file_sig(files[v.id])  # accepted (or out of rounds)
+                verdicts += self._review_keyframe_chunk(pipe.sb, chunk, rnd, unreviewed)
+            files = dict(items)
+            for v in verdicts:
+                scores[v.id] = v.score
+                unreviewed.discard(v.id)
+                tag = "✔" if v.verdict == "PASS" else "✎"
+                self.log(f"  {tag} [{v.id}] {v.score}/10" + (f" — {'; '.join(v.issues)}" if v.issues else ""))
+                if v.verdict == "REVISE" and v.image_prompt and rnd <= rounds - 1:
+                    revise[v.id] = v.image_prompt
+                else:
+                    ok[v.id] = _file_sig(files[v.id])  # accepted (or out of rounds)
             self.save()
             if not revise:
                 break
@@ -366,8 +361,41 @@ class Autopilot:
             self._fatal(report, "tạo lại keyframe")
             remade_total += [sid for sid in revise if sid in report.done]
         avg = round(sum(scores.values()) / len(scores), 1) if scores else None
-        self.mark("review_keyframes", "done", f"điểm TB {avg}/10, làm lại {len(remade_total)}" if avg else
-                  "không có keyframe mới", remade=remade_total, scores=scores)
+        missed = sorted(unreviewed - set(scores))
+        if missed and not scores:
+            self.mark("review_keyframes", "skipped", f"Claude không review được keyframe nào ({', '.join(missed)})",
+                      unreviewed=missed)
+            return
+        note = f"điểm TB {avg}/10, làm lại {len(remade_total)}" if avg else "không có keyframe mới"
+        if missed:
+            note += f"; chưa review được {', '.join(missed)}"
+            self.log(f"⚠ Claude không review được keyframe {', '.join(missed)}: hãy tự xem các ảnh này trước "
+                     "khi render video.")
+        self.mark("review_keyframes", "done", note, remade=remade_total, scores=scores, unreviewed=missed)
+
+    def _review_keyframe_chunk(self, sb, chunk: list, rnd: int, unreviewed: set[str]) -> list:
+        """Verdicts for these keyframes. A failed call (Claude Code sometimes gives up on a big structured answer)
+        is split in halves and tried again, so one bad batch never skips the review of the rest of the film.
+        A single picture gets two tries; then it is left unreviewed (and said so)."""
+        rev, err = None, ""
+        for _ in range(1 if len(chunk) > 1 else 2):
+            try:
+                rev = reviewer.review_keyframes(sb, chunk, **self.ai_kw())
+                break
+            except (RuntimeError, ValueError) as exc:
+                err = str(exc)[:160]
+        if rev is None:
+            if len(chunk) > 1:
+                half = (len(chunk) + 1) // 2
+                self.log(f"⚠ Review {len(chunk)} keyframe một lần không được ({err}); chia nhỏ để thử lại…")
+                return (self._review_keyframe_chunk(sb, chunk[:half], rnd, unreviewed)
+                        + self._review_keyframe_chunk(sb, chunk[half:], rnd, unreviewed))
+            self.log(f"⚠ Không review được keyframe {chunk[0][0]} ({err}).")
+            unreviewed.add(chunk[0][0])
+            return []
+        self.write_review(f"keyframes_r{rnd}_{chunk[0][0]}", rev)
+        ids = {sid for sid, _ in chunk}
+        return [v for v in rev.scenes if v.id in ids]
 
     def _video_run(self, **kw: Any) -> RunReport:
         sb = self.sb()
