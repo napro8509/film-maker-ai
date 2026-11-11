@@ -8,6 +8,8 @@ const S = {
   saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", auth: null,
   zones: new Map(), playIdx: 0,
   charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
+  locSaved: new WeakMap(), // location object → the name scenes[].location use for it (last save)
+  locDescBase: new WeakMap(), // location object → { desc, n } before the first edit of its description (warning)
 };
 const MODES = [
   ["keyframe", "Ảnh → Video", "Tạo ảnh mở đầu trước (miễn phí), duyệt rồi mới render. Giữ nhân vật đồng nhất nhất."],
@@ -135,6 +137,44 @@ const LANG_OTHER = "__other__";
 const DIALOGUE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"],
                         ["none", "Không thoại (chỉ nhạc/âm thanh)"]];
 const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"]];
+
+/* Every film always has three subtitle tracks. `narration` is the line in the primary track's language. */
+const SUB_TRACKS = [["vi", "Tiếng Việt", "Vietnamese"], ["th", "ไทย", "Thai"], ["en", "English", "English"]];
+const SUB_ALIASES = { vi: "vi", vie: "vi", vietnamese: "vi", "tiếng việt": "vi", th: "th", tha: "th", thai: "th", "ไทย": "th", en: "en", eng: "en", english: "en" };
+const normLine = (v) => String(v || "").split(/\s+/).filter(Boolean).join(" ");
+function primarySubCode(sb) {
+  const c = SUB_ALIASES[normLine(sb?.subtitle_language).toLowerCase()];
+  if (c) return c;
+  for (const sc of sb?.scenes || []) {
+    const n = normLine(sc.narration);
+    const hit = n && sc.subtitles && SUB_TRACKS.find(([k]) => sc.subtitles[k] === n);
+    if (hit) return hit[0];
+  }
+  return "vi";
+}
+/* The line shown on track `code`: a missing translation falls back to narration (same as the server). */
+function subLine(sb, sc, code) {
+  const n = normLine(sc.narration);
+  if (code === primarySubCode(sb) && n) return n;
+  return normLine(sc.subtitles?.[code]) || n;
+}
+function setSubLine(sb, sc, code, value) {
+  const primary = primarySubCode(sb);
+  const subs = { ...(sc.subtitles || {}) };
+  if (normLine(value)) subs[code] = value; else delete subs[code];
+  sc.subtitles = Object.keys(subs).length ? subs : undefined;
+  if (code === primary) sc.narration = value || undefined;
+}
+/* Three inputs (vi / th / en) for one scene. */
+function subtitleFields(sb, sc, onChange) {
+  const primary = primarySubCode(sb);
+  return h("div", { class: "grid3" }, SUB_TRACKS.map(([code, label]) => field(
+    `Phụ đề ${label}${code === primary ? " · gốc" : ""}`,
+    h("input", { type: "text", lang: code, value: code === primary ? (sc.narration || "") : (sc.subtitles?.[code] || ""),
+      placeholder: code === primary ? "Không bắt buộc" : "Để trống: tự dịch khi ghép phim",
+      oninput: (e) => { setSubLine(sb, sc, code, e.target.value); onChange(); } }))));
+}
+function subTrack() { const c = localGet("subTrack", "vi"); return SUB_TRACKS.some(([k]) => k === c) ? c : "vi"; }
 /* A valid language name with whitespace collapsed, or null (not a string, empty, has a line break, > 40 chars). */
 function cleanLang(v) {
   if (typeof v !== "string" || /[\r\n]/.test(v)) return null;
@@ -359,7 +399,7 @@ async function openProject(id) {
   await flushSave();
   // Edits that could not be saved (blocked by an empty/duplicate character name, or a save error) would be lost silently.
   if (S.cur && S.cur.id !== id && S.pendingSave && saveFailed()) {
-    const why = S.saveState === "blocked" ? "Có nhân vật tên trống hoặc trùng nên thay đổi gần đây chưa được lưu." : "Thay đổi gần đây chưa lưu được: " + S.saveError;
+    const why = S.saveState === "blocked" ? `Có ${/bối cảnh/.test(S.saveError) ? "bối cảnh" : "nhân vật"} tên trống hoặc trùng nên thay đổi gần đây chưa được lưu.` : "Thay đổi gần đây chưa lưu được: " + S.saveError;
     if (!(await confirmModal("Bỏ thay đổi chưa lưu?", why + " Mở dự án khác thì các thay đổi này sẽ mất.", "Bỏ thay đổi và mở", true))) return false;
     clearTimeout(S.saveTimer); S.pendingSave = false;
   }
@@ -369,7 +409,7 @@ async function openProject(id) {
     S.cur = d; S.assets = a; S.playIdx = 0;
     S.dlChanged = null; // the "N clips keep the old language" warning belongs to this visit only
   } catch (e) { toast(e.message, "error"); return false; }
-  rememberCharNames();
+  rememberCharNames(); rememberLocNames();
   localSet("lastProject", id);
   toggleSidebar(false);
   if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
@@ -426,13 +466,17 @@ async function save() {
   if (listed && charsLocked(sb)) { clearTimeout(S.saveTimer); setSaveState("blocked", "tên nhân vật trống/trùng"); return; }
   // (b) Carry renamed characters into scenes[].characters, so typing a new name never breaks the links.
   if (listed) renameInScenes(sb);
-  const sent = charNamePairs(sb);
+  // Same for locations: scenes[].location must match a location name, so wait while one is empty/duplicate.
+  const located = (sb.scenes || []).some((s) => s.location != null && String(s.location).trim());
+  if (located && locsLocked(sb)) { clearTimeout(S.saveTimer); setSaveState("blocked", "tên bối cảnh trống/trùng"); return; }
+  if (located) renameLocationsInScenes(sb);
+  const sent = charNamePairs(sb), sentLocs = locNamePairs(sb);
   S.saving = true; S.pendingSave = false; setSaveState("saving");
   const pid = S.cur.id;
   try {
-    const d = await api("PUT", `/api/projects/${pid}`, { storyboard: sb });
+    const d = await api("PUT", `/api/projects/${pid}`, { storyboard: withoutBlankLocations(sb) });
     if (S.cur && S.cur.id === pid) {
-      if (S.cur.storyboard === sb) rememberCharNames(sent);
+      if (S.cur.storyboard === sb) { rememberCharNames(sent); rememberLocNames(sentLocs); }
       applyMeta(d);
       if (typeof boardAfterSave === "function") { try { boardAfterSave(); } catch (err) { console.error(err); } }
     }
@@ -441,6 +485,17 @@ async function save() {
     S.pendingSave = true;
     setSaveState("error", e.message);
   } finally { S.saving = false; }
+}
+
+/* A location row just added and still empty is not sent: storyboard.yaml never gets `locations: - {}`
+   (which the server reports as an error). Returns `sb` itself when nothing is left out. */
+function withoutBlankLocations(sb) {
+  const locs = sb.locations;
+  if (!Array.isArray(locs)) return sb;
+  if (!locs.some(blankLocation)) return sb;
+  const kept = locs.filter((l) => !blankLocation(l)), out = { ...sb };
+  if (kept.length) out.locations = kept; else delete out.locations;
+  return out;
 }
 
 async function flushSave() {
@@ -458,7 +513,8 @@ function renderSaveState() {
   const t = { saved: "Đã lưu", pending: "Chưa lưu…", saving: "Đang lưu…", error: "Lỗi lưu: " + S.saveError, blocked: "Chưa lưu: " + S.saveError }[S.saveState];
   const bad = saveFailed();
   return h("span", { class: "savestate" + (bad ? " error" : ""), role: bad ? "alert" : null,
-    title: S.saveState === "blocked" ? "Có cảnh đang chọn nhân vật, nên tên nhân vật phải khác rỗng và không trùng. Sửa tên để lưu tiếp." : "Tự lưu khi bạn sửa · ⌘S để lưu ngay" },
+    title: S.saveState === "blocked" ? (/bối cảnh/.test(S.saveError) ? "Có cảnh đang dùng bối cảnh, nên tên bối cảnh phải khác rỗng và không trùng. Sửa tên để lưu tiếp."
+      : "Có cảnh đang chọn nhân vật, nên tên nhân vật phải khác rỗng và không trùng. Sửa tên để lưu tiếp.") : "Tự lưu khi bạn sửa · ⌘S để lưu ngay" },
     S.saveState === "saved" ? icon("check") : bad ? icon("alert") : S.saveState === "saving" ? h("span", { class: "spinner" }) : null, t);
 }
 /* The last save did not reach the disk: a server error, or blocked by an empty/duplicate character name. */
@@ -545,6 +601,98 @@ async function removeCharacter(i) {
   }
   changed();
   return true;
+}
+
+/* ---------- locations (shared with board.js; pure helpers run under node in tests) ---------- */
+
+/* Same key as character names. The server uses casefold(); toLowerCase() differs only for a few letters (ß…),
+   the same small gap the character names already have. */
+function locKey(n) { return nameKey(n); }
+/* A location with nothing typed in it yet (name, description, image, image_prompt all empty). */
+function blankLocation(l) { return !l || !["name", "description", "image", "image_prompt"].some((k) => String(l[k] ?? "").trim()); }
+/* Indexes of locations whose name is empty or used by another location (blank rows aside). */
+function locNameProblems(sb) {
+  const locs = (sb && sb.locations) || [], seen = new Map(), bad = new Set();
+  locs.forEach((l, i) => {
+    if (blankLocation(l)) return; // a row just added: not sent (withoutBlankLocations), so it blocks nothing
+    const k = locKey(l && l.name);
+    if (!k) { bad.add(i); return; }
+    if (seen.has(k)) { bad.add(i); bad.add(seen.get(k)); } else seen.set(k, i);
+  });
+  return bad;
+}
+function locsLocked(sb) { return locNameProblems(sb).size > 0; }
+/* [location object, name] for every location whose name is valid right now. */
+function locNamePairs(sb) {
+  const bad = locNameProblems(sb);
+  return ((sb && sb.locations) || []).map((l, i) => [l, l.name, i]).filter(([, , i]) => !bad.has(i)).map(([l, n]) => [l, n]);
+}
+/* Remember the names scenes[].location refer to (last save). Empty/duplicate names are not remembered.
+   Without `pairs` (project opened / reloaded / YAML saved) the description baselines of the warning are reset too. */
+function rememberLocNames(pairs) {
+  S.locSaved = new WeakMap();
+  if (!pairs) S.locDescBase = new WeakMap();
+  const sb = S.cur && S.cur.storyboard;
+  if (!sb) return;
+  for (const [l, n] of pairs || locNamePairs(sb)) S.locSaved.set(l, n);
+}
+/* Replace old location names with the new ones in every scenes[].location (all at once, so swapping works). */
+function renameLocationsInScenes(sb) {
+  const map = new Map();
+  for (const l of sb.locations || []) {
+    if (!S.locSaved || !S.locSaved.has(l)) continue; // added since the last save: no scene uses it yet
+    const old = S.locSaved.get(l);
+    if (!locKey(old) || old === l.name) continue;
+    map.set(locKey(old), String(l.name).trim());
+  }
+  if (!map.size) return;
+  for (const sc of sb.scenes || []) {
+    if (sc.location == null) continue;
+    const k = locKey(sc.location);
+    if (map.has(k)) sc.location = map.get(k);
+  }
+  for (const l of sb.locations || []) if (S.locSaved.has(l) && map.has(locKey(S.locSaved.get(l)))) S.locSaved.set(l, String(l.name).trim());
+}
+/* Delete location i (no question asked: the caller confirms). Scenes using it lose `location`, unless another
+   location keeps the same name. Returns the ids of those scenes. */
+function removeLocation(sb, i) {
+  const locs = sb.locations || [], l = locs[i];
+  if (!l) return [];
+  locs.splice(i, 1);
+  const k = locKey(l.name), ids = [];
+  if (k && !locs.some((x) => locKey(x && x.name) === k)) {
+    for (const sc of sb.scenes || []) if (sc.location != null && locKey(sc.location) === k) { delete sc.location; ids.push(sc.id); }
+  }
+  if (!locs.length) delete sb.locations;
+  return ids;
+}
+/* The location a scene really uses (none for i2v or an unknown name), like Storyboard.scene_location. */
+function sceneLoc(sb, sc) {
+  if (!sc || sc.mode === "i2v" || sc.location == null || !locKey(sc.location)) return null;
+  return ((sb && sb.locations) || []).find((l) => locKey(l && l.name) === locKey(sc.location)) || null;
+}
+function sceneHasLoc(sb, sc) { return !!sceneLoc(sb, sc); }
+/* How many character pictures a scene sends: from the server, or 2 with a location / 3 without. */
+function charRefLimit(sc) {
+  const n = S.cur?.scene_state?.[sc && sc.id]?.char_ref_limit;
+  return Number.isFinite(n) ? n : sceneHasLoc(S.cur && S.cur.storyboard, sc) ? 2 : 3;
+}
+/* Number of scenes with a clip ("done", not i2v) that an action turns "Đã đổi".
+   kind "assign": scene gets location name `to` ("" = none); "edit" | "image" | "delete": the location object
+   `location` (or its name) changes; "rename": never. */
+function locationImpact(sb, sceneState, { scene, location, to, kind } = {}) {
+  const done = (sc) => sc && sc.mode !== "i2v" && sceneState?.[sc.id]?.status === "done";
+  if (kind === "assign") {
+    if (!done(scene)) return 0;
+    const old = sceneLoc(sb, scene), next = sceneLoc(sb, { ...scene, location: to || undefined });
+    return locKey(old && old.name) !== locKey(next && next.name) ? 1 : 0;
+  }
+  if (kind !== "edit" && kind !== "image" && kind !== "delete") return 0;
+  const name = typeof location === "string" ? location : location && location.name, k = locKey(name);
+  if (!k) return 0;
+  if (kind === "delete" && location && typeof location === "object"
+    && ((sb && sb.locations) || []).some((x) => x !== location && locKey(x && x.name) === k)) return 0; // a twin keeps the links
+  return ((sb && sb.scenes) || []).filter((sc) => done(sc) && sceneHasLoc(sb, sc) && locKey(sc.location) === k).length;
 }
 
 /* ---------- top bar ---------- */
@@ -993,6 +1141,7 @@ function renderScene(sc, i) {
         text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles… (góc máy chọn ở mục Chỉ đạo hình ảnh)", 3, "nên viết tiếng Anh"),
         renderCamera(sc),
         renderDirection(sc, i),
+        renderSceneLocation(sb, sc, i),
         zone(`chars-${i}`, () => {
           const speakers = (Array.isArray(sc.dialogue) ? sc.dialogue : []).filter((d) => d.line && d.character).map((d) => d.character).join(" ");
           const text = `${sc.prompt || ""} ${sc.mode === "keyframe" ? sc.image_prompt || "" : ""} ${speakers}`;
@@ -1003,22 +1152,22 @@ function renderScene(sc, i) {
           if (!found.length) return h("div");
           const refsOn = sb.use_character_refs !== false && sc.mode !== "i2v";
           let nRefs = 0;
+          const lim = charRefLimit(sc);
           return h("div", { class: "char-chips" }, h("span", { class: "small muted", title: refsOn ? "Mô tả nhân vật được tự thêm vào prompt và ảnh nhân vật được gửi kèm làm tham chiếu" : "Mô tả nhân vật được tự thêm vào prompt" }, (refsOn ? "Nhân vật · mô tả + ảnh" : "Nhân vật · mô tả") + (picked ? " (chọn trên Bảng):" : ":")),
             found.map((c) => {
-              const url = refsOn && c.image && nRefs < 3 ? charImageUrl(c) : null;
+              const url = refsOn && c.image && nRefs < lim ? charImageUrl(c) : null;
               if (url) nRefs++;
               return h("span", { class: "char-chip" + (url ? " has-img" : ""), title: url ? `${c.description}\n(gửi kèm ảnh nhân vật)` : c.description },
                 url ? h("img", { src: url, alt: "" }) : null, c.name);
             }));
         }),
-        h("div", { class: "grid3" },
+        h("div", { class: "grid2" },
           field("Độ dài", durationSelect(sc)),
           field("Model video",
             h("select", { value: sc.model || "", onchange: (e) => { sc.model = e.target.value || undefined; changed(); renderMain(); } },
               h("option", { value: "" }, `Theo phim (${sb.model ? modelLabel(sb.model) : "mặc định"})`),
-              videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label)))),
-          field("Phụ đề / lời dẫn",
-            h("input", { type: "text", value: sc.narration || "", placeholder: "Không bắt buộc", oninput: (e) => { sc.narration = e.target.value; changed(); } }))),
+              videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label))))),
+        subtitleFields(sb, sc, changed),
         zone(`preview-${i}`, () => {
           const st = S.cur.scene_state?.[sc.id];
           if (!st) return h("div");
@@ -1028,6 +1177,43 @@ function renderScene(sc, i) {
             h("div", { class: "small muted" }, "Video"), h("pre", {}, st.video_prompt));
         }),
       )));
+}
+
+/* "Bối cảnh" of a scene: picker (warns when a scene with a clip would turn "Đã đổi"), the per-scene chaining
+   switch and the "a newer keyframe exists" note. i2v scenes never use a location. */
+function renderSceneLocation(sb, sc, i) {
+  const locs = (sb.locations || []).filter((l) => l && String(l.name || "").trim());
+  const i2v = sc.mode === "i2v";
+  if (!locs.length && !sc.location) return null; // no location in this film: keep the scene card as before
+  // i2v ignores the location, but the picker still shows the one it names (locked), not "(không có trong danh sách)".
+  const cur = i2v ? (sc.location != null && locKey(sc.location) ? locs.find((l) => locKey(l.name) === locKey(sc.location)) || null : null)
+    : sceneLoc(sb, sc);
+  const val = cur ? cur.name : sc.location || "";
+  const sel = h("select", { value: val, disabled: i2v || null, "aria-label": "Bối cảnh của cảnh " + sc.id,
+    onchange: async (e) => {
+      const v = e.target.value;
+      const n = locationImpact(sb, S.cur.scene_state, { scene: sc, to: v, kind: "assign" });
+      if (n > 0 && !(await confirmModal("Đổi bối cảnh của cảnh đã có clip?",
+        `Cảnh ${sc.id} đã có clip. Đổi bối cảnh làm cảnh này chuyển “Đã đổi”: keyframe tạo lại miễn phí, nhưng muốn áp dụng vào video thì phải render lại (tốn credit).`,
+        "Đổi bối cảnh"))) { e.target.value = val; return; }
+      sc.location = v || undefined;
+      changed(); renderMain();
+    } },
+    h("option", { value: "" }, "— Không —"),
+    cur || !sc.location ? null : h("option", { value: sc.location }, `${sc.location} (không có trong danh sách)`),
+    locs.map((l) => h("option", { value: l.name }, l.name)));
+  return h("div", { class: "stack tight" },
+    field("Bối cảnh", sel, i2v ? "Ảnh → Video không dùng bối cảnh" : "mô tả + ảnh bối cảnh gửi kèm"),
+    !i2v && sc.location ? h("label", { class: "check" },
+      h("input", { type: "checkbox", checked: sc.continue_previous !== false,
+        onchange: (e) => { sc.continue_previous = e.target.checked ? undefined : false; changed(); } }),
+      h("span", {}, "Nối tiếp keyframe cảnh trước", h("span", { class: "sub" }, "Dùng keyframe cảnh liền trước cùng bối cảnh làm ảnh tham chiếu (miễn phí)."))) : null,
+    zone(`locnote-${i}`, () => {
+      const st = S.cur.scene_state?.[sc.id];
+      const show = !!(st && st.continuity_outdated && st.continuity_source);
+      return h("div", { class: "banner info flush" + (show ? "" : " hidden"), hidden: !show }, icon("info"), h("div", { class: "b-body" },
+        show ? `Có keyframe ${st.continuity_source} mới hơn; có thể tạo lại keyframe này để nối (miễn phí)` : ""));
+    }));
 }
 
 /* Model status comes from the server (/api/models, or models_used for aliases gflow no longer lists). */
@@ -1076,6 +1262,11 @@ function durationSelect(sc) {
 }
 
 function assetUrl(path) { return S.assets.images.find((a) => a.path === path)?.url || null; }
+/* GET /assets lists every image; the location pickers only offer assets/locations/, the others leave them out. */
+const LOC_ASSET_DIR = "assets/locations/";
+function isLocAsset(path) { return String(path || "").startsWith(LOC_ASSET_DIR); }
+function otherImageAssets() { return (S.assets.images || []).filter((a) => !isLocAsset(a.path)); }
+function locImageAssets() { return (S.assets.images || []).filter((a) => isLocAsset(a.path)); }
 
 function imagePicker(sc, attr, label, optional = false) {
   const val = sc[attr] || "";
@@ -1089,14 +1280,15 @@ function imagePicker(sc, attr, label, optional = false) {
       sc[attr] = r.path; changed(); renderMain();
     } catch (err) { toast(err.message, "error"); }
   } });
-  const isAsset = !val || S.assets.images.some((a) => a.path === val);
+  const imgs = otherImageAssets(); // start/end frames: not the empty rooms of assets/locations/
+  const isAsset = !val || imgs.some((a) => a.path === val);
   return h("div", { class: "field" }, h("span", { class: "lbl" }, label),
     h("div", { class: "picker" },
       h("div", { class: "pthumb", title: url ? "Bấm để xem lớn" : null, style: url ? { backgroundImage: `url("${url}")`, cursor: "zoom-in" } : null, onclick: (e) => { if (url) { e.preventDefault(); lightbox(url); } } }),
       h("select", { value: val, onchange: (e) => { sc[attr] = e.target.value || undefined; changed(); renderMain(); } },
         h("option", { value: "" }, optional ? "— không dùng —" : "— chọn ảnh —"),
         isAsset ? null : h("option", { value: val }, val),
-        S.assets.images.map((a) => h("option", { value: a.path }, a.path.replace("assets/", "")))),
+        imgs.map((a) => h("option", { value: a.path }, a.path.replace("assets/", "")))),
       h("button", { class: "btn sm", onclick: (e) => { e.preventDefault(); fileInput.click(); } }, icon("upload"), "Tải lên"), fileInput));
 }
 
@@ -1348,7 +1540,8 @@ function renderStory() {
           field("Dùng lại project có sẵn trên Flow (project_id)",
             h("input", { type: "text", value: sb.project_id || "", placeholder: S.cur.project_id ? `Đang dùng: ${S.cur.project_id}` : "Để trống: tự tạo project mới",
               oninput: (e) => set("project_id", e.target.value || undefined) }))))),
-    renderCharacters(sb));
+    renderCharacters(sb),
+    renderLocations(sb));
 }
 
 /* Key order as backend _dump_dict: language keys right after `aspect` (write_raw dumps in object order).
@@ -1411,7 +1604,7 @@ async function makePortraits(names, force = false) {
   if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
   if (!S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
   try {
-    startJob(await api("POST", `/api/projects/${S.cur.id}/characters/portraits`, { names, force }));
+    startJob(await api("POST", `/api/projects/${S.cur.id}/characters/portraits`, { names: names.map((n) => String(n ?? "").trim()), force }));
   } catch (e) { toast(e.message, "error"); }
 }
 
@@ -1424,7 +1617,7 @@ function renderCharacters(sb) {
       missing.length ? h("button", { class: "btn sm", disabled: busy, title: "Ảnh trên Flow miễn phí",
         onclick: () => makePortraits([]) }, icon("image"), `Tạo ảnh cho ${missing.length} nhân vật`, FREE()) : null,
       h("button", { class: "btn sm", onclick: add }, icon("plus"), "Thêm nhân vật"),
-      h("p", { class: "help" }, "Mô tả ngoại hình một lần và tạo hoặc tải lên một ảnh. Khi tên nhân vật xuất hiện trong prompt của cảnh, mô tả được tự thêm vào và ảnh được gửi kèm làm tham chiếu (tối đa 3 nhân vật mỗi cảnh) để khuôn mặt giống nhau ở mọi cảnh.")),
+      h("p", { class: "help" }, "Mô tả ngoại hình một lần và tạo hoặc tải lên một ảnh. Khi tên nhân vật xuất hiện trong prompt của cảnh, mô tả được tự thêm vào và ảnh được gửi kèm làm tham chiếu (tối đa 3 nhân vật mỗi cảnh; 2 nếu cảnh có bối cảnh) để khuôn mặt giống nhau ở mọi cảnh.")),
     h("label", { class: "check", style: { marginBottom: "16px" } },
       h("input", { type: "checkbox", checked: sb.use_character_refs !== false,
         onchange: (e) => { sb.use_character_refs = e.target.checked ? undefined : false; changed(); renderMain(); } }),
@@ -1447,7 +1640,8 @@ function renderCharacter(sb, c, i, busy) {
     } catch (err) { toast(err.message, "error"); }
   } });
   const canMake = !!(c.name && c.description);
-  const isAsset = !c.image || S.assets.images.some((a) => a.path === c.image);
+  const imgs = otherImageAssets(); // portraits and other images, not the empty rooms of assets/locations/
+  const isAsset = !c.image || imgs.some((a) => a.path === c.image);
   const badName = charNameProblems(sb).has(i);
   // A zone, so a portrait made mid-job (char:<name> → done) shows up without re-rendering the inputs.
   const charImg = () => {
@@ -1473,7 +1667,7 @@ function renderCharacter(sb, c, i, busy) {
           onchange: (e) => { c.image = e.target.value || undefined; changed(); renderMain(); } },
           h("option", { value: "" }, "— không dùng ảnh —"),
           isAsset ? null : h("option", { value: c.image }, c.image),
-          S.assets.images.map((a) => h("option", { value: a.path }, a.path.replace("assets/", "")))),
+          imgs.map((a) => h("option", { value: a.path }, a.path.replace("assets/", "")))),
         fileInput),
       h("details", {}, h("summary", {}, "Prompt tạo ảnh nhân vật"),
         h("textarea", { rows: 3, value: c.image_prompt || "",
@@ -1484,6 +1678,161 @@ function renderCharacter(sb, c, i, busy) {
       if (await removeCharacter(i)) renderMain();
     } }, icon("trash")));
 }
+/* ---------- locations card ---------- */
+
+function locImageUrl(l) {
+  if (!l || !l.image) return null;
+  const i = (S.cur.storyboard.locations || []).indexOf(l);
+  const ls = S.cur.locations_state?.[i];
+  return assetUrl(l.image) || (ls && ls.name === l.name ? ls.image_url : null);
+}
+function locCanMake(l) { return !!(l && String(l.name || "").trim() && (String(l.description || "").trim() || String(l.image_prompt || "").trim())); }
+/* Ask before an action that turns scenes with a clip "Đã đổi". Resolves true when there is nothing to ask. */
+async function confirmLocImpact(n, what) {
+  if (n <= 0) return true;
+  return confirmModal("Cảnh đã có clip sẽ chuyển “Đã đổi”?",
+    `${what} làm ${n} cảnh đã có clip dùng bối cảnh này chuyển “Đã đổi”. Keyframe tạo lại miễn phí; video phải render lại mới áp dụng (tốn credit).`, "Tiếp tục");
+}
+
+async function makeLocationImages(names, force = false) {
+  await flushSave();
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
+  if (!S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
+  try {
+    startJob(await api("POST", `/api/projects/${S.cur.id}/locations/images`, { names: names.map((n) => String(n ?? "").trim()), force }));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderLocations(sb) {
+  const locs = sb.locations || [];
+  const missingNow = () => (sb.locations || []).filter((l) => locCanMake(l) && !locImageUrl(l));
+  // A blank row is not saved yet (save() leaves empty locations out), so "Thêm bối cảnh" alone writes nothing.
+  const add = () => { (sb.locations = sb.locations || []).push({ name: "", description: "" }); renderMain(); };
+  const makeMissing = async () => {
+    const missing = missingNow();
+    const n = missing.reduce((a, l) => a + locationImpact(sb, S.cur.scene_state, { location: l, kind: "image" }), 0);
+    if (!(await confirmLocImpact(n, `Tạo ảnh cho ${missing.length} bối cảnh`))) return;
+    makeLocationImages([]);
+  };
+  return h("div", { class: "card card-pad" },
+    h("div", { class: "card-head" }, h("h3", {}, "Bối cảnh"), h("span", { class: "spacer" }),
+      // A zone, so typing a name + description shows the button at once (refreshLocMake).
+      zone("locmake-all", () => {
+        const missing = missingNow();
+        return missing.length ? h("button", { class: "btn sm", disabled: jobRunning(), title: "Ảnh trên Flow miễn phí", onclick: makeMissing },
+          icon("image"), `Tạo ảnh cho ${missing.length} bối cảnh`, FREE()) : h("span", { hidden: true });
+      }),
+      h("button", { class: "btn sm", onclick: add }, icon("plus"), "Thêm bối cảnh"),
+      h("p", { class: "help" }, "Mô tả mỗi nơi quay một lần (bố cục, đồ đạc, màu, nguồn sáng; nên viết tiếng Anh) và tạo hoặc tải lên một ảnh. Cảnh chọn bối cảnh sẽ có mô tả này trong prompt và ảnh bối cảnh được gửi kèm, để căn phòng giống nhau ở mọi cảnh.")),
+    h("label", { class: "check", style: { marginBottom: "16px" } },
+      h("input", { type: "checkbox", checked: sb.continuity !== false,
+        onchange: (e) => { sb.continuity = e.target.checked ? undefined : false; changed(); } }),
+      h("span", {}, "Nối keyframe cảnh liền trước cùng bối cảnh (miễn phí)",
+        h("span", { class: "sub" }, "Cảnh sau lấy keyframe cảnh trước làm ảnh tham chiếu, nên ánh sáng và chỗ đứng của nhân vật liền mạch."))),
+    locs.length ? locs.map((l, i) => renderLocation(sb, l, i))
+      : h("div", { class: "empty-inline" }, icon("image"), "Chưa có bối cảnh.", h("button", { class: "btn sm", onclick: add }, icon("plus"), "Thêm bối cảnh")));
+}
+
+function renderLocation(sb, l, i) {
+  const ls = S.cur.locations_state?.[i];
+  const portrait = (sb.aspect || "16:9") === "9:16";
+  const impact = (kind) => locationImpact(sb, S.cur.scene_state, { location: l, kind });
+  const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", class: "hidden", onchange: async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    e.target.value = "";
+    const fd = new FormData(); fd.append("file", f); fd.append("kind", "location");
+    try {
+      const r = await api("POST", `/api/projects/${S.cur.id}/upload`, fd, true);
+      S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`);
+      // The file is in assets/locations either way; only using it changes scenes.
+      if (!(await confirmLocImpact(impact("image"), "Dùng ảnh vừa tải lên"))) { renderMain(); return; }
+      l.image = r.path; changed(); renderMain();
+    } catch (err) { toast(err.message, "error"); }
+  } });
+  const imgs = locImageAssets(); // only assets/locations/
+  const isAsset = !l.image || imgs.some((a) => a.path === l.image);
+  const badName = locNameProblems(sb).has(i);
+  const locImg = () => {
+    const u = locImageUrl(l), st = S.cur.locations_state?.[i];
+    const div = h("div", { class: "char-img loc-img" + (portrait ? " portrait" : ""), style: u ? { backgroundImage: `url("${u}")` } : { cursor: "default" },
+      title: u ? "Bấm để xem lớn" : "", onclick: () => { if (u) lightbox(u); } },
+    u ? null : h("span", {}, l.image && st?.image_missing ? "Không thấy file ảnh" : "Chưa có ảnh"));
+    return progAttach(div, [progLocKey(l)]);
+  };
+  return h("div", { class: "char-row loc-row" },
+    zone(`locimg-${i}`, locImg),
+    h("div", { class: "stack tight", style: { minWidth: 0 } },
+      h("input", { type: "text", value: l.name || "", placeholder: "Tên, ví dụ: Phòng khách nhà cũ", "aria-label": "Tên bối cảnh", "data-loc": i,
+        "aria-invalid": badName ? "true" : null, title: badName ? "Tên trống hoặc trùng với bối cảnh khác" : null,
+        oninput: (e) => { l.name = e.target.value; markLocNames(); changed(); refreshLocMake(i); } }),
+      h("textarea", { rows: 3, value: l.description || "", "aria-label": "Mô tả bối cảnh",
+        placeholder: "long dark teak table, six chairs, brass ceiling lamp, window on the left, warm evening light…",
+        oninput: (e) => {
+          // Baseline before the first edit: the count of scenes with a clip that this edit turns "Đã đổi" (after the
+          // autosave they are no longer "done", so the number is taken now and kept).
+          if (!S.locDescBase.has(l)) S.locDescBase.set(l, { desc: l.description || "", n: impact("edit") });
+          l.description = e.target.value; changed(); refreshZone(`locwarn-${i}`); refreshLocMake(i);
+        } }),
+      zone(`locwarn-${i}`, () => {
+        const b = S.locDescBase.get(l), n = b && (l.description || "") !== b.desc ? b.n : 0;
+        return h("div", { class: "banner warn flush" + (n ? "" : " hidden"), hidden: !n }, icon("alert"), h("div", { class: "b-body" },
+          n ? `${n} cảnh đã có clip dùng bối cảnh này sẽ chuyển Đã đổi (render lại tốn credit)` : ""));
+      }),
+      h("div", { class: "row" },
+        zone(`locmake-${i}`, () => {
+          const canMake = locCanMake(l), url = locImageUrl(l);
+          return h("button", { class: "btn sm", disabled: jobRunning() || !canMake, title: canMake ? "Ảnh trên Flow miễn phí" : "Cần nhập tên và mô tả trước",
+            onclick: async () => {
+              if (!(await confirmLocImpact(impact("image"), url ? "Tạo lại ảnh bối cảnh" : "Tạo ảnh bối cảnh"))) return;
+              makeLocationImages([l.name], true);
+            } }, icon(url ? "refresh" : "image"), url ? "Tạo lại ảnh" : "Tạo ảnh", FREE());
+        }),
+        h("button", { class: "btn sm", onclick: () => fileInput.click() }, icon("upload"), "Tải lên"),
+        h("select", { class: "sm", value: l.image || "", title: "Chọn ảnh có sẵn trong dự án", "aria-label": "Ảnh bối cảnh",
+          onchange: async (e) => {
+            const v = e.target.value || undefined;
+            if (v === l.image) return;
+            if (!(await confirmLocImpact(impact("image"), v ? "Đổi ảnh bối cảnh" : "Bỏ ảnh bối cảnh"))) { e.target.value = l.image || ""; return; }
+            l.image = v; changed(); renderMain();
+          } },
+          h("option", { value: "" }, "— không dùng ảnh —"),
+          isAsset ? null : h("option", { value: l.image }, l.image),
+          imgs.map((a) => h("option", { value: a.path }, a.path.replace("assets/locations/", "")))),
+        fileInput),
+      h("details", {}, h("summary", {}, "Prompt tạo ảnh bối cảnh"),
+        h("textarea", { rows: 3, value: l.image_prompt || "",
+          placeholder: ls?.image_prompt || "Để trống: tự tạo từ mô tả (cảnh trống, không người, góc rộng ngang tầm mắt)",
+          oninput: (e) => { l.image_prompt = e.target.value || undefined; changed(); refreshLocMake(i); } }),
+        h("p", { class: "help" }, "Ảnh bối cảnh nên là cảnh trống, không có người. Đổi ảnh hoặc mô tả làm các cảnh dùng bối cảnh này cần tạo lại."))),
+    h("button", { class: "btn ghost icon sm danger", title: "Xoá bối cảnh", "aria-label": "Xoá bối cảnh " + (l.name || ""), onclick: async () => {
+      const k = locKey(l.name);
+      const twin = (sb.locations || []).some((x) => x !== l && k && locKey(x && x.name) === k);
+      const using = twin || !k ? 0 : (sb.scenes || []).filter((sc) => sceneHasLoc(sb, sc) && locKey(sc.location) === k).length;
+      const n = locationImpact(sb, S.cur.scene_state, { location: l, kind: "delete" });
+      const text = `Xoá “${l.name || "bối cảnh chưa đặt tên"}” khỏi storyboard. `
+        + (using ? `Đang dùng ở ${using} cảnh; các cảnh đó sẽ bỏ bối cảnh. ` : "")
+        + (n ? `${n} cảnh đã có clip sẽ chuyển “Đã đổi” (render lại tốn credit). ` : "")
+        + "File ảnh vẫn nằm trong thư mục assets.";
+      if (!(await confirmModal("Xoá bối cảnh?", text, "Xoá", true))) return;
+      const at = (sb.locations || []).indexOf(l); // the list may have changed while the dialog was open
+      if (at < 0) return;
+      removeLocation(sb, at);
+      changed(); renderMain();
+    } }, icon("trash")));
+}
+/* "Tạo ảnh" of row i and "Tạo ảnh cho N bối cảnh" follow the name/description being typed. */
+function refreshLocMake(i) { refreshZone(`locmake-${i}`); refreshZone("locmake-all"); }
+/* Mark empty/duplicate location names while typing, without re-rendering the inputs. */
+function markLocNames() {
+  const bad = locNameProblems(S.cur.storyboard);
+  for (const el of document.querySelectorAll(".loc-row input[data-loc]")) {
+    const on = bad.has(+el.dataset.loc);
+    if (on) { el.setAttribute("aria-invalid", "true"); el.title = "Tên trống hoặc trùng với bối cảnh khác"; }
+    else { el.removeAttribute("aria-invalid"); el.removeAttribute("title"); }
+  }
+}
+
 /* Mark empty/duplicate names while typing, without re-rendering the inputs. */
 function markCharNames() {
   const bad = charNameProblems(S.cur.storyboard);
@@ -1508,6 +1857,51 @@ function readyClips() {
   return (S.cur.storyboard.scenes || []).map((sc) => ({ sc, st: S.cur.scene_state?.[sc.id] })).filter((x) => x.st && x.st.clip_url && x.st.status === "done");
 }
 
+/* VI / TH / EN: which subtitle track the final tab shows (remembered per browser). */
+function subTrackSwitch() {
+  const cur = subTrack();
+  return h("div", { class: "seg sm", role: "group", "aria-label": "Ngôn ngữ phụ đề" }, SUB_TRACKS.map(([code, label]) =>
+    h("button", { class: cur === code ? "on" : "", title: `Phụ đề ${label}`, "aria-pressed": String(cur === code),
+      onclick: () => { localSet("subTrack", code); refreshZone("final-zone"); refreshZone("playlist-zone"); refreshZone("narr-zone"); } }, code.toUpperCase())));
+}
+function parseSrt(text) {
+  const t = (x) => { const [h, m, rest] = x.split(":"); const [sec, ms] = rest.split(","); return +h * 3600 + +m * 60 + +sec + +ms / 1000; };
+  return text.replace(/\r/g, "").split(/\n\s*\n/).map((block) => {
+    const lines = block.trim().split("\n");
+    const i = lines.findIndex((l) => l.includes("-->"));
+    if (i < 0) return null;
+    const [a, b] = lines[i].split("-->").map((x) => x.trim());
+    return { start: t(a), end: t(b), text: lines.slice(i + 1).join("\n") };
+  }).filter(Boolean);
+}
+/* The final film with the three .srt files as text tracks, the chosen one showing (not in the DOM, so zone refreshes stay cheap). */
+function finalVideo() {
+  const video = h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true });
+  const want = subTrack();
+  // final.mp4 also carries the three subtitle tracks. WebKit (the desktop app) exposes them and may show one by
+  // itself (macOS "Automatic" captions pick the system language), whatever VI / TH / EN says: keep only ours.
+  const ours = new Set();
+  const muteEmbedded = () => {
+    for (const t of video.textTracks) if (!ours.has(t) && t.mode !== "disabled") t.mode = "disabled";
+  };
+  video.textTracks.addEventListener("addtrack", muteEmbedded);
+  video.textTracks.addEventListener("change", muteEmbedded);
+  video.addEventListener("loadedmetadata", muteEmbedded);
+  SUB_TRACKS.forEach(async ([code, label]) => {
+    const url = S.cur.srt_urls?.[code];
+    if (!url) return;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return;
+      const track = video.addTextTrack("subtitles", label, code);
+      ours.add(track);
+      for (const c of parseSrt(await r.text())) track.addCue(new VTTCue(c.start, c.end, c.text));
+      track.mode = code === want ? "showing" : "hidden";
+    } catch { /* subtitles are optional in the preview */ }
+  });
+  return video;
+}
+
 function renderFinal() {
   const p = finalPrefs();
   const portrait = S.cur.storyboard.aspect === "9:16";
@@ -1529,11 +1923,15 @@ function renderFinal() {
         if (!S.cur.final_url) return h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh")),
           h("div", { class: "player" + (portrait ? " portrait" : "") }, h("div", { class: "ph" }, icon("film"), h("span", {}, "Chưa ghép phim. Render xong các cảnh rồi bấm “Ghép phim”."))));
         return h("div", { class: "card card-pad" },
-          h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh"), h("span", { class: "spacer" }), S.cur.final_size ? h("span", { class: "small muted" }, fmtBytes(S.cur.final_size)) : null),
-          h("div", { class: "player" + (portrait ? " portrait" : "") }, h("video", { src: S.cur.final_url, controls: true, preload: "metadata", playsinline: true })),
+          h("div", { class: "card-head" }, h("h3", {}, "Phim hoàn chỉnh"), h("span", { class: "spacer" }),
+            S.cur.final_size ? h("span", { class: "small muted" }, fmtBytes(S.cur.final_size)) : null, subTrackSwitch()),
+          h("div", { class: "player" + (portrait ? " portrait" : "") }, finalVideo()),
           h("div", { class: "row", style: { marginTop: "12px" } },
             h("a", { class: "btn primary sm", href: S.cur.final_url.split("?")[0], download: `${S.cur.id}.mp4` }, icon("download"), "Tải MP4"),
-            S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
+            SUB_TRACKS.map(([code, label]) => S.cur.srt_urls?.[code]
+              ? h("a", { class: "btn sm", href: S.cur.srt_urls[code].split("?")[0], download: `${S.cur.id}.${code}.srt`, title: `Phụ đề ${label}` }, icon("download"), `.srt ${code.toUpperCase()}`)
+              : null),
+            !SUB_TRACKS.some(([c]) => S.cur.srt_urls?.[c]) && S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
             h("button", { class: "btn sm ghost", onclick: () => api("POST", `/api/projects/${S.cur.id}/reveal`, { path: "output/storyboard/final.mp4" }).catch((e) => toast(e.message, "error")) }, icon("folder"), "Mở trong Finder")));
       }),
       S.cur.final_url ? renderAsk() : null,
@@ -1554,7 +1952,10 @@ function renderFinal() {
               oninput: (e) => { document.getElementById("volv").textContent = Math.round(e.target.value * 100) + "%"; },
               onchange: (e) => saveFinalPrefs({ ...finalPrefs(), volume: +e.target.value }) })) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
-            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Luôn xuất thêm file .srt riêng nếu có lời dẫn."))),
+            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Phim luôn có 3 track phụ đề Việt / Thái / Anh (bật/tắt trong trình phát) và 3 file .srt. Bản dịch còn thiếu được Claude tự dịch khi ghép."))),
+          p.burn_subtitles ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Track in lên hình"),
+            h("select", { value: p.burn_language || primarySubCode(S.cur.storyboard), onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_language: e.target.value }) },
+              SUB_TRACKS.map(([code, label]) => h("option", { value: code }, label)))) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.allow_missing, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), allow_missing: e.target.checked }) }),
             h("span", {}, "Ghép cả khi còn thiếu cảnh", h("span", { class: "sub" }, "Bỏ qua các cảnh chưa render để xem thử bản nháp."))),
           zone("final-actions", () => {
@@ -1569,10 +1970,18 @@ function renderFinal() {
           }))),
       renderEditPlan(),
       renderThumbnail(),
-      h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Lời dẫn / phụ đề")),
-        (S.cur.storyboard.scenes || []).some((s) => s.narration)
-          ? h("ol", { class: "narr-list" }, S.cur.storyboard.scenes.filter((s) => s.narration).map((s) => h("li", {}, h("span", { class: "mono muted" }, s.id + " "), s.narration)))
-          : h("p", { class: "help" }, "Chưa có. Thêm “Phụ đề / lời dẫn” ở từng cảnh."))));
+      zone("narr-zone", () => {
+        const sb = S.cur.storyboard, code = subTrack(), primary = primarySubCode(sb);
+        const rows = (sb.scenes || []).filter((sc) => normLine(sc.narration));
+        return h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Phụ đề"), h("span", { class: "spacer" }), subTrackSwitch()),
+          rows.length
+            ? h("ol", { class: "narr-list" }, rows.map((sc) => {
+              const own = code === primary || normLine(sc.subtitles?.[code]);
+              return h("li", { lang: code }, h("span", { class: "mono muted" }, sc.id + " "), subLine(sb, sc, code),
+                own ? null : h("span", { class: "small muted" }, " (chưa dịch — tự dịch khi ghép)"));
+            }))
+            : h("p", { class: "help" }, "Chưa có. Thêm phụ đề ở từng cảnh."));
+      })));
 }
 
 /* ---------- ask AI about the finished film ---------- */
@@ -2054,7 +2463,7 @@ function renderPlaylist() {
   const portrait = S.cur.storyboard.aspect === "9:16";
   if (S.playIdx >= clips.length) S.playIdx = 0;
   const cur = clips[S.playIdx];
-  const sub = h("div", { class: "subtitle" }, cur.sc.narration || "");
+  const sub = h("div", { class: "subtitle", lang: subTrack() }, subLine(S.cur.storyboard, cur.sc, subTrack()) || "");
   const video = h("video", { src: cur.st.clip_url, controls: true, preload: "metadata", playsinline: true, poster: cur.st.keyframe_url || null,
     onended: () => { if (S.playIdx < clips.length - 1) { S.playIdx++; const z = document.getElementById("playlist-zone"); const n = renderPlaylist(); n.id = "playlist-zone"; z.replaceWith(n); n.querySelector("video").play(); } } });
   return h("div", { class: "card card-pad" },
@@ -2078,7 +2487,7 @@ function renderYaml() {
       h("button", { class: "btn primary", onclick: async () => {
         try {
           const d = await api("PUT", `/api/projects/${S.cur.id}/yaml`, { text: ta.value });
-          S.cur = d; rememberCharNames(); toast(d.errors.length ? "Đã lưu, nhưng storyboard còn lỗi" : "Đã lưu YAML", d.errors.length ? "error" : "ok");
+          S.cur = d; rememberCharNames(); rememberLocNames(); toast(d.errors.length ? "Đã lưu, nhưng storyboard còn lỗi" : "Đã lưu YAML", d.errors.length ? "error" : "ok");
           renderMain(); loadProjects();
         } catch (e) { toast(e.message, "error"); }
       } }, "Lưu YAML"),
@@ -2096,7 +2505,7 @@ function reloadProject(d) {
   clearTimeout(S.saveTimer);
   S.pendingSave = false;
   Object.assign(S.cur, d);
-  rememberCharNames();
+  rememberCharNames(); rememberLocNames();
   S.saveState = "saved"; S.saveError = "";
   const p = S.projects.find((x) => x.id === d.id);
   if (p) { Object.assign(p, { title: d.title, scenes: d.scenes, done: d.done, has_final: d.has_final, thumb: d.thumb }); renderSidebar(); }
@@ -2466,8 +2875,11 @@ async function pollJob() {
       if (pr.phaseChanged) refreshZones();
       const ended = [...pr.done, ...pr.failed];
       if (ended.length && S.cur && S.cur.id === S.job.project) {
-        const pid = S.cur.id, chars = pr.done.filter((k) => k.startsWith("char:"));
-        refreshCurrent().then(() => { if (chars.length && S.cur && S.cur.id === pid) syncCharImages(chars); });
+        const pid = S.cur.id, chars = pr.done.filter((k) => k.startsWith("char:")), locs = pr.done.filter((k) => k.startsWith("loc:"));
+        refreshCurrent().then(() => {
+          if (chars.length && S.cur && S.cur.id === pid) syncCharImages(chars);
+          if (locs.length && S.cur && S.cur.id === pid) syncLocImages(locs);
+        });
       }
     } else if (fresh.some((l) => /^\[[^\]]+\]/.test(l))) {
       refreshZones();
@@ -2506,6 +2918,14 @@ async function onJobDone() {
     if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
     try { S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`); } catch { /* ignore */ }
   }
+  if (j.kind === "locations" && S.cur && S.cur.id === j.project && j.result?.images) {
+    for (const l of S.cur.storyboard.locations || []) {
+      const rel = j.result.images[l.name] || j.result.images[String(l.name || "").trim()];
+      if (rel) l.image = rel;
+    }
+    if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
+    try { S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`); } catch { /* ignore */ }
+  }
   if (j.kind === "thumbnail" && S.cur && S.cur.id === j.project && j.result?.title) {
     const sb = S.cur.storyboard;
     sb.thumbnail = sb.thumbnail || {};
@@ -2513,7 +2933,7 @@ async function onJobDone() {
   }
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
-    if (j.kind === "portraits" && (S.tab === "story" || S.tab === "board")) renderMain();
+    if ((j.kind === "portraits" || j.kind === "locations") && (S.tab === "story" || S.tab === "board")) renderMain();
     if (j.kind === "edit" || j.kind === "make") await loadEditPlan(true);
     if (j.kind === "stitch" || j.kind === "edit" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
     else if (j.kind === "thumbnail" && S.tab === "final") renderMain();
@@ -2541,6 +2961,29 @@ async function syncCharImages(keys) {
     if (!S.cur || S.cur.id !== pid) return;
     S.assets = a; // fresh ?v=mtime, so "Tạo lại ảnh" with the same file name shows the new picture
     if (touched) changed(); // server saved it; this keeps a pending edit from dropping it
+    refreshZones();
+  } catch { /* network error: onJobDone syncs at the end */ }
+}
+
+/* A location image finished mid-job (loc:<name> → done): same as syncCharImages, for locations[i].image. */
+async function syncLocImages(keys) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  try {
+    const d = await api("GET", `/api/projects/${pid}`);
+    if (!S.cur || S.cur.id !== pid) return;
+    const local = S.cur.storyboard.locations || [], remote = d.storyboard?.locations || [];
+    let touched = false;
+    for (const k of keys) {
+      const name = k.slice("loc:".length);
+      const l = local.find((x) => String(x?.name || "").trim() === name);
+      const r = remote.find((x) => String(x?.name || "").trim() === name);
+      if (l && r && r.image && l.image !== r.image) { l.image = r.image; touched = true; }
+    }
+    const a = await api("GET", `/api/projects/${pid}/assets`);
+    if (!S.cur || S.cur.id !== pid) return;
+    S.assets = a;
+    if (touched) changed();
     refreshZones();
   } catch { /* network error: onJobDone syncs at the end */ }
 }

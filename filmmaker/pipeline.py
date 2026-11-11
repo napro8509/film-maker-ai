@@ -21,7 +21,7 @@ from . import durations as dur
 from . import flow_caps, manual_clip, model_meta
 from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
-from .storyboard import Character, Scene, Storyboard
+from .storyboard import MAX_REFS, Character, Location, RefItem, Scene, Storyboard, file_sha  # noqa: F401
 from .thumbnail import render_cover
 
 DONE = "done"
@@ -34,6 +34,9 @@ ManualClip = Literal["ok", "unverified", "stale", "invalid", "unchecked"]
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_UNSET: Any = object()
 
 
 class State:
@@ -113,6 +116,7 @@ class Pipeline:
                 self.state.data.setdefault(k, v)
         self._flow_media: dict[str, dict[str, str]] = {}  # project -> {sha256 of file: media id}
         self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
+        self._dry_kf: set[str] = set()  # dry-run: keyframes this run "made" already (so the next scene can chain)
 
     def _sha(self, path: Path) -> str | None:
         try:
@@ -142,14 +146,19 @@ class Pipeline:
         return out
 
     def _image_with_refs(self, what: str, prompt: str, refs: list[tuple[str, Path]], project: str,
-                         kw: dict, opts: RunOptions) -> Path | None:
+                         kw: dict, opts: RunOptions, *, log_line: str | None = None) -> Path | None:
         """i2i with the characters' pictures; None when Flow can't do it here (the caller makes a text-only image).
 
         The migrated Flow frontend (flow.google.com) refuses some media ids as references (exit 36, gflow #639)
         but takes local files, so on that error the request is sent again with the files. On the agent-only
         composer gflow refuses i2i altogether (#799): then the Flow chat page is driven instead (flow_ui i2i),
-        and the project remembers it so the next images go there straight away."""
-        self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+        and the project remembers it so the next images go there straight away.
+
+        `log_line` None logs the usual "ảnh tham chiếu nhân vật" line; "" logs nothing (the caller already did)."""
+        if log_line is None:
+            self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+        elif log_line:
+            self.log(log_line)
         files = [p for _, p in refs]
         # Say which picture is whom (Nano Banana follows labelled references better); not part of any fingerprint.
         order = ["first", "second", "third", "fourth"]
@@ -225,6 +234,61 @@ class Pipeline:
             and (st.get("keyframe_refs") or []) == self.sb.refs_signature(s)
             and self.keyframe_path(s).is_file()
         )
+
+    # --- continuity (start a keyframe from the previous scene's keyframe) -------------------------------
+
+    def continuity_check(self, s: Scene, planned: Collection[str] = ()) -> tuple[Scene | None, str]:
+        """(previous scene whose keyframe the keyframe of `s` starts from, or None; why not, in Vietnamese).
+        The reason is "" when `s` is not a keyframe scene with a location. `planned` = scenes whose keyframe this
+        (dry) run makes before `s`. The previous scene is the one right before `s` in the storyboard (not --only)."""
+        loc = self.sb.scene_location(s)
+        if s.mode != "keyframe" or loc is None:
+            return None, ""
+        if self.sb.continuity is False:
+            return None, "phim tắt nối"
+        if s.continue_previous is False:
+            return None, "cảnh này tắt nối"
+        idx = next((i for i, x in enumerate(self.sb.scenes) if x.id == s.id), 0)
+        if idx == 0:
+            return None, "cảnh đầu"
+        prev = self.sb.scenes[idx - 1]
+        if prev.mode != "keyframe":
+            return None, "cảnh trước không phải keyframe"
+        if self.sb.scene_location(prev) is not loc:
+            return None, "cảnh trước khác bối cảnh"
+        if not (prev.id in planned or self.has_keyframe(prev)):
+            return None, f"chưa có keyframe {prev.id} mới nhất"
+        return prev, ""
+
+    def continuity_source(self, s: Scene) -> Scene | None:
+        return self.continuity_check(s)[0]
+
+    def keyframe_ref_items(self, s: Scene, planned: Collection[str] = ()) -> tuple[list[RefItem], Scene | None, str]:
+        """(reference images of the keyframe of `s` in sending order, chained previous scene or None, reason)."""
+        src, why = self.continuity_check(s, planned)
+        prev = (src.id, self.keyframe_path(src)) if src is not None else None
+        return self.sb.scene_ref_items(s, prev=prev), src, why
+
+    def continuity_outdated(self, s: Scene, src: Scene | None = _UNSET) -> bool:
+        """The keyframe of `s` could start from a newer keyframe of the previous scene than the one it used
+        (or used none). `src` = `continuity_source(s)` when already known. A soft hint: never changes the status."""
+        if not self.has_keyframe(s):
+            return False
+        if src is _UNSET:
+            src = self.continuity_source(s)
+        if src is None:
+            return False
+        st = self.state.scene(s.id)
+        return st.get("keyframe_from") != src.id or st.get("keyframe_from_sha") != file_sha(self.keyframe_path(src))
+
+    def _log_refs(self, s: Scene, items: list[RefItem]) -> None:
+        """The reference images of a scene with a location (scenes without one keep the old log line)."""
+        if self.sb.scene_location(s) is None:
+            return
+        if items:
+            self.log(f"  ảnh tham chiếu: {', '.join(it.label for it in items)}")
+        for name in self.sb.dropped_char_refs(s):
+            self.log(f"  bỏ ảnh {name}: hết chỗ (tối đa {MAX_REFS})")
 
     def scene_status(self, s: Scene) -> str:
         """done | changed | interrupted | failed | todo"""
@@ -470,20 +534,42 @@ class Pipeline:
     def _make_keyframe(self, s: Scene, project: str, opts: RunOptions) -> Path:
         kf = self.keyframe_path(s)
         prompt = self.sb.image_prompt(s)
-        refs = self.sb.scene_refs(s)
+        loc = self.sb.scene_location(s)
+        items, src, why = self.keyframe_ref_items(s, self._dry_kf if self.g.dry_run else ())
+        if loc is not None:
+            if src is not None and self.g.dry_run and not self.has_keyframe(src):
+                self.log(f"  sẽ nối keyframe {src.id} (nếu tạo xong)")
+            elif src is not None:
+                self.log(f"  nối keyframe {src.id} (giữ ánh sáng, vị trí người)")
+            elif why:
+                fallback = "dùng ảnh bối cảnh" if self.sb.location_image(loc) else "bối cảnh chưa có ảnh"
+                self.log(f"  không nối keyframe cảnh trước: {why}; {fallback}")
+            self._log_refs(s, items)
+        # The sha of the keyframe chained from, read before the call (`keyframe_from_sha`).
+        src_sha = file_sha(self.keyframe_path(src)) if src is not None else None
+        refs = [(it.label, it.path) for it in items]
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
         img = None
         # Images are free on Flow, so retrying them (or falling back) is safe.
         if refs:
-            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", prompt, refs, project, kw, opts)
+            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", prompt, refs, project, kw, opts,
+                                        log_line="" if loc is not None else None)
+        chained = src is not None and img is not None
         if img is None:
             img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw), opts.max_retries)
         if not self.g.dry_run:
             if Path(img) != kf and Path(img).is_file():  # keep the UI's preview path stable
                 kf.parent.mkdir(parents=True, exist_ok=True)
                 kf.write_bytes(Path(img).read_bytes())
+            extra: dict[str, Any] = {}
+            # Old storyboards (no location) never get the new keys in state.json.
+            if loc is not None or "keyframe_from" in self.state.scene(s.id):
+                extra = dict(keyframe_from=src.id if chained else None,
+                             keyframe_from_sha=src_sha if chained else None)
             self.state.update(s.id, keyframe=str(kf), keyframe_prompt=prompt,
-                              keyframe_refs=self.sb.refs_signature(s))
+                              keyframe_refs=self.sb.refs_signature(s), **extra)
+        else:
+            self._dry_kf.add(s.id)
         return kf
 
     def generate_portraits(self, chars: list[tuple[Character, Path]], opts: RunOptions,
@@ -491,12 +577,24 @@ class Pipeline:
         """Make reference images for characters (free on Flow). `chars` pairs each character with its output file.
 
         `on_done(idx, character, dest)` runs right after each image is saved; `idx` is the index in `chars`."""
+        return self._free_images(chars, opts, on_done, key_prefix="char", label="ảnh nhân vật",
+                                 none_msg="Không có nhân vật nào cần tạo ảnh.", prompt_of=self.sb.portrait_prompt)
+
+    def generate_location_images(self, locs: list[tuple[Location, Path]], opts: RunOptions,
+                                 on_done: Callable[[int, Location, Path], None] | None = None) -> RunReport:
+        """Make reference images for locations (free on Flow), like `generate_portraits` (progress keys loc:<name>)."""
+        return self._free_images(locs, opts, on_done, key_prefix="loc", label="ảnh bối cảnh",
+                                 none_msg="Không có bối cảnh nào cần tạo ảnh.", prompt_of=self.sb.location_prompt)
+
+    def _free_images(self, items: list[tuple[Any, Path]], opts: RunOptions,
+                     on_done: Callable[[int, Any, Path], None] | None, *, key_prefix: str, label: str,
+                     none_msg: str, prompt_of: Callable[[Any], str]) -> RunReport:
         report = RunReport()
-        if not chars:
-            self.log("Không có nhân vật nào cần tạo ảnh.")
+        if not items:
+            self.log(none_msg)
             return report
-        for c, _ in chars:
-            self.rep.queued(f"char:{c.name.strip()}")
+        for c, _ in items:
+            self.rep.queued(f"{key_prefix}:{c.name.strip()}")
         try:
             project = self.ensure_project()
         except GflowError as exc:
@@ -504,14 +602,16 @@ class Pipeline:
             report.aborted = str(exc)
             return report
         try:
-            return self._portraits(chars, project, opts, on_done, report)
+            return self._free_images_loop(items, project, opts, on_done, report, key_prefix=key_prefix,
+                                          label=label, prompt_of=prompt_of)
         finally:
             self.rep.settle()
 
-    def _portraits(self, chars: list[tuple[Character, Path]], project: str, opts: RunOptions,
-                   on_done: Callable[[int, Character, Path], None] | None, report: RunReport) -> RunReport:
-        for idx, (c, dest) in enumerate(chars):
-            key = f"char:{c.name.strip()}"
+    def _free_images_loop(self, items: list[tuple[Any, Path]], project: str, opts: RunOptions,
+                          on_done: Callable[[int, Any, Path], None] | None, report: RunReport, *, key_prefix: str,
+                          label: str, prompt_of: Callable[[Any], str]) -> RunReport:
+        for idx, (c, dest) in enumerate(items):
+            key = f"{key_prefix}:{c.name.strip()}"
             if opts.should_stop():
                 self.rep.drop_queued()
                 report.stopped = True
@@ -519,14 +619,14 @@ class Pipeline:
                 break
             if idx > 0 and not self.g.dry_run:
                 self.sleep(self._image_pause(opts))
-            prompt = self.sb.portrait_prompt(c)
-            self.log(f"[{c.name}] ảnh nhân vật: {prompt[:100]}")
+            prompt = prompt_of(c)
+            self.log(f"[{c.name}] {label}: {prompt[:100]}")
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.rep.submitting(key)
             try:
                 with self.rep.active(key):
                     img = self._with_retries(
-                        "tạo ảnh nhân vật",
+                        f"tạo {label}",
                         lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
                                                      model=self.sb.image_model, project=project),
                         opts.max_retries)
@@ -601,9 +701,12 @@ class Pipeline:
 
     def _text_video(self, s: Scene, prompt: str, common: dict, opts: RunOptions) -> tuple[Path, str | None, str]:
         """Text-to-video, with the characters' reference images (r2v) when there are any."""
-        refs = self.sb.scene_refs(s)
+        refs = self.sb.scene_refs(s)  # location picture + characters; never the previous keyframe
         if refs and not self.state.data.get("r2v_unsupported"):
-            self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+            if self.sb.scene_location(s) is not None:
+                self._log_refs(s, self.sb.scene_ref_items(s))
+            else:
+                self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
             try:
                 video, media_id = self._with_retries(
                     "render video",

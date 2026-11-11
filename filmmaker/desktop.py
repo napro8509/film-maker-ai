@@ -50,6 +50,34 @@ def _notify(title: str, message: str) -> None:
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _check_flow_driver_access() -> None:
+    """Run the Flow chat driver once at startup (`--help`, no browser, no credit).
+
+    It reads flow_ui.py from this checkout, so if the checkout is in ~/Desktop/~/Documents macOS asks
+    for access now, in Film Maker's name, instead of failing mid-render with "Operation not permitted"."""
+    from .gflow import Gflow, _tcc_direct
+
+    cmd = Gflow().ui_command()
+    if not cmd:
+        return
+    args, env = _tcc_direct([*cmd, "--help"])
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[quyền] không chạy được driver Flow: {exc}", flush=True)
+        return
+    if r.returncode == 0:
+        print("[quyền] driver Flow đọc được mã nguồn: OK", flush=True)
+        return
+    err = (r.stderr or r.stdout or "").strip()[-300:]
+    print(f"[quyền] driver Flow lỗi: {err}", flush=True)
+    if "Operation not permitted" in err:
+        _notify("Film Maker cần quyền truy cập thư mục",
+                "Mở Cài đặt hệ thống › Quyền riêng tư & Bảo mật › Tệp và thư mục, bật cho Film Maker rồi mở lại app.")
+        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class Bridge:
     """Functions the page can call as window.pywebview.api.* (things WKWebView
     can't do on its own: notifications and saving downloads)."""
@@ -102,6 +130,8 @@ def main(workspace: Path | None = None) -> None:
         if server.started:
             break
         time.sleep(0.025)
+
+    threading.Thread(target=_check_flow_driver_access, daemon=True).start()
 
     base = f"http://127.0.0.1:{port}/"
     bridge = Bridge(base)

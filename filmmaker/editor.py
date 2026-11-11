@@ -22,7 +22,8 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from .assemble import AssembleError, _need, has_audio, probe_duration, write_srt
+from .assemble import (AssembleError, _need, burn_track, has_audio, probe_duration, subtitle_track_args,
+                       write_subtitle_tracks)
 from .storyboard import Storyboard
 
 Log = Callable[[str], None]
@@ -271,20 +272,27 @@ def timeline(plan: EditPlan, infos: dict[str, ClipInfo]) -> tuple[list[tuple[str
     return rows, t
 
 
-def subtitle_entries(sb: Storyboard, plan: EditPlan, infos: dict[str, ClipInfo]) -> list[tuple[float, float, str]]:
-    narration = {s.id: s.narration for s in sb.scenes if s.narration}
+def subtitle_times(plan: EditPlan, infos: dict[str, ClipInfo]) -> list[tuple[str, float, float]]:
+    """[(scene id, start, end)] where a subtitle line can show, inside the transitions."""
     rows, _ = timeline(plan, infos)
     durs_in = [0.0] + [t.duration for t in plan.transitions]
     durs_out = [t.duration for t in plan.transitions] + [0.0]
     out = []
     for i, (sid, start, length) in enumerate(rows):
-        if sid not in narration:
-            continue
         a = start + max(0.2, durs_in[i] / 2)
         b = start + length - max(0.2, durs_out[i] / 2)
         if b - a > 0.3:
-            out.append((round(a, 3), round(b, 3), narration[sid]))
+            out.append((sid, round(a, 3), round(b, 3)))
     return out
+
+
+def subtitle_entries(sb: Storyboard, plan: EditPlan, infos: dict[str, ClipInfo],
+                     code: str | None = None) -> list[tuple[float, float, str]]:
+    """Timed lines of one track (default: the primary language)."""
+    code = code or sb.primary_subtitle_code()
+    scenes = {s.id: s for s in sb.scenes}
+    return [(a, b, line) for sid, a, b in subtitle_times(plan, infos)
+            if sid in scenes and (line := sb.subtitle_line(scenes[sid], code))]
 
 
 # --- render -------------------------------------------------------------------
@@ -362,19 +370,14 @@ def build_filtergraph(plan: EditPlan, infos: dict[str, ClipInfo], *, width: int,
 
 def render(sb: Storyboard, clips: list[tuple[str, Path]], plan: EditPlan, infos: dict[str, ClipInfo], output: Path,
            *, music: Path | None = None, music_volume: float = 0.25, burn_subtitles: bool = False,
-           log: Log = print) -> Path:
+           burn_language: str | None = None, log: Log = print) -> Path:
     ffmpeg = _need("ffmpeg")
     paths = dict(clips)
     width, height = (1920, 1080) if sb.aspect == "16:9" else (1080, 1920)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    srt = subtitle_entries(sb, plan, infos)
-    srt_path = output.with_suffix(".srt")
-    if srt:
-        write_srt(srt, srt_path)
-        log(f"Phụ đề: {srt_path}")
-    elif srt_path.exists():
-        srt_path.unlink()
+    tracks = write_subtitle_tracks(sb, subtitle_times(plan, infos), output, log=log)
+    burn = burn_track(sb, tracks, burn_language) if burn_subtitles else None
 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     for c in plan.clips:
@@ -384,10 +387,12 @@ def render(sb: Storyboard, clips: list[tuple[str, Path]], plan: EditPlan, infos:
         cmd += ["-stream_loop", "-1", "-i", str(music)]
         music_input = len(plan.clips)
     graph, v, a = build_filtergraph(plan, infos, width=width, height=height, music_input=music_input,
-                                    music_volume=music_volume, subtitles=srt_path if (burn_subtitles and srt) else None)
+                                    music_volume=music_volume, subtitles=burn)
+    sub_in, sub_out = subtitle_track_args(tracks, len(plan.clips) + (1 if music else 0))
+    cmd += sub_in
     _, total = timeline(plan, infos)
     tmp = output.with_name(output.stem + ".editing" + output.suffix)
-    cmd += ["-filter_complex", graph, "-map", v, "-map", a, "-t", f"{total:.3f}",
+    cmd += ["-filter_complex", graph, "-map", v, "-map", a, *sub_out, "-t", f"{total:.3f}",
             "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(tmp)]
     cuts = sum(1 for t in plan.transitions if t.type == "cut")
@@ -566,13 +571,13 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
 
 def edit_film(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, output: Path | None = None, *,
               music: Path | None = None, music_volume: float = 0.25, burn_subtitles: bool = False,
-              engine: str = "auto", replan: bool = False, backend: str = "auto", api_key: str | None = None,
+              burn_language: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", api_key: str | None = None,
               ai_available: bool = True, log: Log = print) -> tuple[Path, EditPlan]:
     plan, infos = make_plan(sb, clips, out_dir, engine=engine, replan=replan, has_music=bool(music),
                             backend=backend, api_key=api_key, ai_available=ai_available, log=log)
     output = output or out_dir / "final.mp4"
     render(sb, clips, plan, infos, output, music=music, music_volume=music_volume,
-           burn_subtitles=burn_subtitles, log=log)
+           burn_subtitles=burn_subtitles, burn_language=burn_language, log=log)
     return output, plan
 
 
@@ -581,5 +586,5 @@ def transition_catalog() -> list[dict[str, str]]:
 
 
 __all__ = ["EditPlan", "ClipEdit", "Transition", "ClipInfo", "TRANSITIONS", "analyze", "auto_plan", "ai_plan",
-           "sanitize", "timeline", "subtitle_entries", "build_filtergraph", "render", "make_plan", "edit_film",
+           "sanitize", "timeline", "subtitle_times", "subtitle_entries", "build_filtergraph", "render", "make_plan", "edit_film",
            "load_plan", "save_plan", "plan_path", "transition_catalog"]

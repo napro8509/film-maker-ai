@@ -195,6 +195,7 @@ input[type=range] { accent-color: var(--accent); width: 100%; }
   font-weight: var(--fw-medium); color: var(--text-muted); border-radius: var(--r-1); white-space: nowrap;
 }
 .seg button:hover { color: var(--text); }
+.seg.sm button { height: 20px; padding: 0 var(--sp-2); font-size: 11px; }
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: var(--sh-1); font-weight: var(--fw-bold); }
 
 details > summary { cursor: pointer; font-size: var(--fs-1); color: var(--text-muted); width: fit-content; list-style: none; display: inline-flex; align-items: center; gap: var(--sp-1); }
@@ -327,6 +328,8 @@ details.prompt-preview pre { white-space: pre-wrap; word-break: break-word; back
 .char-img span { font-size: var(--fs-1); color: var(--text-muted); text-align: center; padding: var(--sp-2); }
 .char-row select.sm { max-width: 200px; width: auto; }
 .char-row input[aria-invalid="true"] { border-color: var(--err); }
+/* Locations reuse the character row; an empty room reads better filling the frame. */
+.loc-img { background-size: cover; }
 .options { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); background: var(--surface-2); border-radius: var(--r-2); margin-bottom: var(--sp-4); }
 
 /* ============ final ============ */

@@ -121,7 +121,9 @@ function linkKind(name, sid, ci = bResolve(name)) {
   const c = bChars()[ci];
   const old = c && S.charSaved && typeof S.charSaved.get === "function" ? S.charSaved.get(c) : null;
   if (refs.some((r) => bKey(r) === bKey(name) || (old && bKey(r) === bKey(old)))) return { desc: false, reason: "" };
-  if (c && charImageUrl(c) && refs.length >= 3) return { desc: true, reason: `đã đủ 3 ảnh: ${refs.join(", ")}` };
+  // 2 pictures when the scene has a location (slot 1 is the location / previous keyframe), else 3 (app.js charRefLimit).
+  const lim = charRefLimit((sb.scenes || []).find((x) => x.id === sid) || { id: sid });
+  if (c && charImageUrl(c) && refs.length >= lim) return { desc: true, reason: `đã đủ ${lim} ảnh nhân vật: ${refs.join(", ")}` };
   return { desc: true, reason: "chưa có ảnh" };
 }
 
@@ -746,7 +748,7 @@ function bCharCard(cd) {
 }
 
 function bPickImage(c) {
-  const imgs = S.assets.images || [];
+  const imgs = otherImageAssets(); // app.js: leaves out the location images (assets/locations/)
   const isAsset = !c.image || imgs.some((a) => a.path === c.image);
   const sel = h("select", { value: c.image || "", "aria-label": "Ảnh nhân vật" },
     h("option", { value: "" }, "— không dùng ảnh —"),
@@ -768,7 +770,8 @@ function bSceneCharMsgs(sc) {
     const refs = st.refs || [];
     const linked = L.idx.map((i) => bChars()[i]).filter(Boolean);
     const withImg = linked.filter((c) => charImageUrl(c));
-    if (withImg.length > 3 && refs.length) kids.push(h("div", { class: "scene-msg warn" }, `Chỉ gửi ảnh của 3 nhân vật: ${refs.join(", ")}`));
+    const lim = charRefLimit(sc);
+    if (withImg.length > lim && refs.length) kids.push(h("div", { class: "scene-msg warn" }, `Chỉ gửi ảnh của ${lim} nhân vật: ${refs.join(", ")}`));
     for (const c of linked) if (!charImageUrl(c)) kids.push(h("div", { class: "scene-msg warn" }, `${c.name} chưa có ảnh tham chiếu — chỉ dùng mô tả`));
   }
   return kids;
@@ -888,8 +891,7 @@ function bEditPrompt(sc, key) {
     body: h("div", { class: "stack" },
       ta("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, ai đứng đâu, bối cảnh…"),
       ta("prompt", "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles…"),
-      field("Phụ đề / lời dẫn", h("input", { type: "text", value: sc.narration || "", placeholder: "Không bắt buộc",
-        oninput: (e) => { sc.narration = e.target.value; changed(); } })),
+      subtitleFields(S.cur.storyboard, sc, changed),
       h("p", { class: "help" }, "Tự lưu khi bạn gõ. Sửa prompt có thể làm keyframe đã có thành “Ảnh cũ”.")),
     buttons: [{ label: "Xong", cls: "primary" }] });
 }

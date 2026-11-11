@@ -108,6 +108,8 @@ def _ask_claude_code(system: str, user: str, schema: type[T] | None, images: lis
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=_subscription_env())
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Claude Code chạy quá lâu.") from exc
+    except OSError as exc:  # the `claude` binary vanished or cannot run
+        raise RuntimeError(f"Không chạy được Claude Code: {exc}") from exc
     try:
         data = json.loads(proc.stdout)
     except ValueError:

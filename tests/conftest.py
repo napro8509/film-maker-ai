@@ -97,3 +97,15 @@ def _no_real_claude(monkeypatch):
 
     monkeypatch.setattr(ai, "_ask_api", blocked)
     monkeypatch.setattr(ai, "_ask_api_text", blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_subtitle_translation(monkeypatch):
+    # Stitch / edit translate missing vi / th / en subtitle lines with Claude; tests never reach the real one
+    # (a test that wants translations patches `planner._translate_items` itself).
+    from filmmaker import planner
+
+    def blocked(*_a, **_k):
+        raise RuntimeError("tests: real Claude translation is blocked")
+
+    monkeypatch.setattr(planner, "_translate_items", blocked)

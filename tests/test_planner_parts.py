@@ -62,3 +62,22 @@ def test_plan_with_claude_code_long_film(monkeypatch):
     monkeypatch.setattr(planner, "_draft_claude_code", lambda user, timeout=900: _fake_draft(calls)(user))
     sb = planner.plan_with_claude_code("x", scenes=55, aspect="16:9", durations=None)
     assert len(sb.scenes) == 55 and len(calls) == 4
+
+
+def test_parts_keep_locations_and_add_only_new_ones():
+    calls = []
+
+    def draft(user):
+        calls.append(user)
+        m = re.search(r"write ONLY scenes s(\d+)-s(\d+)", user)
+        a, b = int(m.group(1)), int(m.group(2))
+        locs = [{"name": "Cave", "description": "wet rock"}]
+        if len(calls) == 2:
+            locs += [{"name": "cave", "description": "dup"}, {"name": "Camp", "description": "tents"}]
+        return {"title": "t", "locations": locs,
+                "scenes": [{"id": "x", "prompt": f"beat {i}", "location": "Cave"} for i in range(a, b + 1)]}
+
+    out = planner._draft_in_parts(draft, "Idea: x", 20)
+    assert [loc["name"] for loc in out["locations"]] == ["Cave", "Camp"]
+    assert "Location Cave: wet rock" in calls[1] and "s01 [at Cave]: beat 1" in calls[1]
+    assert "EVERY location" in calls[0]

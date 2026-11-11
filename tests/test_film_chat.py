@@ -255,3 +255,10 @@ def test_web_social(web, monkeypatch):
     assert r.status_code == 200, r.text
     assert r.json()["result"]["posts"][0]["platform"] == "instagram"
     assert web.post("/api/projects/film/social", json={"platforms": [], "languages": ["English"]}).status_code == 400
+
+
+def test_claude_code_that_cannot_start_is_a_runtime_error(monkeypatch):
+    from filmmaker import ai, planner
+    monkeypatch.setattr(planner, "claude_code_binary", lambda: "/nonexistent/claude")
+    with pytest.raises(RuntimeError, match="Không chạy được Claude Code"):
+        ai.ask_text("s", "u", backend="claude_code")

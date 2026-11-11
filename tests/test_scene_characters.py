@@ -160,12 +160,18 @@ def test_field_order_unchanged():
     old_sb = ["title", "aspect", "model", "image_model", "style", "project_id", "characters", "thumbnail",
               "use_character_refs", "no_text", "fallback_t2v", "scenes"]
     old_scene = ["id", "mode", "prompt", "image_prompt", "image", "end_image", "duration", "model", "narration",
-                 "camera"]
+                 "camera", "subtitles"]  # subtitles (vi / th / en tracks) appended after every old field
+    # scene-continuity: locations / continuity right after characters (the schema order is the order Claude writes
+    # in: places before the scenes using them), location / continue_previous appended after every old scene field;
+    # all on the Draft classes so the planner can fill them. Old YAML is unchanged (unset = not written).
+    i = old_sb.index("characters") + 1
+    new_sb = old_sb[:i] + ["locations", "continuity"] + old_sb[i:]
+    new_scene = ["location", "continue_previous"]
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
-    assert list(Storyboard.model_fields) == old_sb + ["dialogue_language", "subtitle_language"]
-    assert list(StoryboardDraft.model_fields) == old_sb
-    new_scene = old_scene + ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
-    assert list(Scene.model_fields)[:-1] == new_scene == list(SceneDraft.model_fields)
+    assert list(Storyboard.model_fields) == new_sb + ["dialogue_language", "subtitle_language"]
+    assert list(StoryboardDraft.model_fields) == new_sb
+    new_scene += ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
+    assert list(Scene.model_fields)[:-1] == old_scene + new_scene == list(SceneDraft.model_fields)
     assert list(Scene.model_fields)[-1] == "characters"
 
 
