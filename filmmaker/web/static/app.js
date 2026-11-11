@@ -820,7 +820,7 @@ function nextSceneId() {
 function renderScenes() {
   const sb = S.cur.storyboard;
   sb.scenes = sb.scenes || [];
-  const list = h("div", { class: "scenes" }, sb.scenes.map((sc, i) => renderScene(sc, i)));
+  const list = h("div", { class: "scenes" }, zone("qc-summary", renderQCSummary), sb.scenes.map((sc, i) => renderScene(sc, i)));
   list.append(h("button", { class: "add-scene", onclick: () => {
     sb.scenes.push({ id: nextSceneId(), mode: "keyframe", image_prompt: "", prompt: "" });
     changed(); renderMain();
@@ -1207,7 +1207,68 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
   if (st.clip_url && st.keyframe_url) row.append(h("button", { class: "btn sm ghost icon", title: "Xem ảnh keyframe", "aria-label": "Xem ảnh keyframe", onclick: () => lightbox(st.keyframe_url) }, icon("image")));
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
   kids.push(row);
+  if (done && st.clip_url) kids.push(renderQC(sc, st, busy));
   return h("div", { class: "stack tight" }, kids);
+}
+
+/* ---------- AI QC of a rendered clip ---------- */
+
+const QC_LABEL = { PASS: ["ok", "QC đạt"], MINOR: ["warn", "QC: lỗi nhỏ"], FAIL: ["bad", "QC: cần làm lại"] };
+
+async function runQC(only = [], force = false) {
+  if (!S.cur) return;
+  try {
+    await flushSave();
+    startJob(await api("POST", `/api/projects/${S.cur.id}/qc`, { only, force }));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderQC(sc, st, busy) {
+  const q = st.qc;
+  if (!q) {
+    return h("div", { class: "qc-box none" }, h("span", { class: "small muted" }, "Clip này chưa được AI QC."),
+      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([sc.id]) }, icon("sparkle"), "AI QC", FREE()));
+  }
+  const [cls, label] = QC_LABEL[q.verdict] || ["", q.verdict];
+  const usePrompt = q.prompt && q.prompt.trim() !== (sc.prompt || "").trim()
+    ? h("button", { class: "btn sm", title: "Thay ô “Hành động” bằng prompt AI gợi ý, rồi bấm Render lại (tốn credit)",
+      onclick: () => { sc.prompt = q.prompt; changed(); renderMain(); toast("Đã thay prompt — bấm “Render lại” khi sẵn sàng", "ok"); } }, "Dùng prompt gợi ý")
+    : null;
+  return h("div", { class: "qc-box " + cls },
+    h("div", { class: "row" },
+      h("span", { class: "qc-tag " + cls }, label), h("span", { class: "small muted" }, `${q.score}/10`),
+      q.match != null ? h("span", { class: "small muted", title: "Khung hình đầu clip so với keyframe (1 = trùng khớp)" }, `· khớp keyframe ${q.match.toFixed(2)}`) : null,
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn sm ghost", disabled: busy, title: "Xem và nghe lại clip này (miễn phí)", onclick: () => runQC([sc.id], true) }, icon("refresh"), "QC lại")),
+    q.issues?.length ? h("ul", { class: "rev-list bad" }, q.issues.map((x) => h("li", {}, x))) : null,
+    q.picture ? h("div", { class: "small" }, h("b", {}, "Hình: "), q.picture) : null,
+    q.sound ? h("div", { class: "small" }, h("b", {}, "Âm thanh: "), q.sound) : null,
+    q.transcript != null ? h("details", { class: "small" }, h("summary", {}, `Nghe được${q.language ? ` (${q.language})` : ""}`),
+      h("div", { class: "qc-transcript" }, q.transcript || "(không có lời nói)"))
+      : (q.dialogue_checked === false ? h("div", { class: "small muted" }, "Chưa kiểm tra lời thoại (chưa có model nhận dạng giọng nói — xem Cài đặt → AI QC).") : null),
+    q.prompt && q.verdict !== "PASS" ? h("details", { class: "small" }, h("summary", {}, "Prompt gợi ý để render lại"),
+      h("div", { class: "qc-transcript" }, q.prompt), usePrompt) : null);
+}
+
+function renderQCSummary() {
+  const sb = S.cur.storyboard;
+  const rows = (sb.scenes || []).map((sc) => S.cur.scene_state?.[sc.id]).filter((st) => st && st.status === "done" && st.clip_url);
+  if (!rows.length) return h("div", { hidden: true });
+  const n = { PASS: 0, MINOR: 0, FAIL: 0 }; let none = 0;
+  for (const st of rows) { if (st.qc) n[st.qc.verdict] = (n[st.qc.verdict] || 0) + 1; else none++; }
+  const busy = jobRunning();
+  const fails = (sb.scenes || []).filter((sc) => S.cur.scene_state?.[sc.id]?.qc?.verdict === "FAIL").map((sc) => sc.id);
+  return h("div", { class: "card card-pad qc-summary" },
+    h("div", { class: "row" },
+      h("b", {}, "AI QC clip"),
+      h("span", { class: "qc-tag ok" }, `${n.PASS} đạt`),
+      n.MINOR ? h("span", { class: "qc-tag warn" }, `${n.MINOR} lỗi nhỏ`) : null,
+      n.FAIL ? h("span", { class: "qc-tag bad", title: fails.join(", ") }, `${n.FAIL} cần làm lại: ${fails.join(", ")}`) : null,
+      none ? h("span", { class: "small muted" }, `${none} chưa QC`) : null,
+      h("span", { class: "spacer" }),
+      none ? h("button", { class: "btn sm", disabled: busy, onclick: () => runQC([]) }, icon("sparkle"), `QC ${none} clip mới`, FREE()) : null,
+      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([], true) }, icon("refresh"), "QC lại tất cả")),
+    S.env?.qc && !S.env.qc.model ? h("p", { class: "help" }, "Chưa có model nhận dạng giọng nói nên QC chưa kiểm tra lời thoại — Cài đặt → AI QC → Tải model.") : null);
 }
 
 // What we know about the clip the user may have downloaded by hand into clips/<id>.mp4 (st.manual_clip from the server).
@@ -1723,13 +1784,13 @@ function renderSocial() {
 /* ---------- autopilot ---------- */
 
 const AUTO_STEPS = [["storyboard", "Storyboard"], ["review_storyboard", "Review kịch bản"], ["characters", "Nhân vật"],
-  ["keyframes", "Keyframe"], ["review_keyframes", "Review keyframe"], ["videos", "Video"], ["review_clips", "Review clip"],
+  ["keyframes", "Keyframe"], ["review_keyframes", "Review keyframe"], ["videos", "Video"], ["review_clips", "AI QC clip"],
   ["edit", "AI dựng phim"], ["thumbnail", "Thumbnail"], ["review_film", "Review cả phim"]];
 
 function autoCostText(scenes, review) {
   return `Chạy liền: viết storyboard → ${review ? "agent review → " : ""}ảnh nhân vật → keyframe → ${review ? "review keyframe → " : ""}`
-    + `render ${scenes} clip video → ${review ? "review clip → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
-    + `Video TỐN CREDIT (veo-lite khoảng 10 credit/clip ≈ ${scenes * 10} credit${review ? ", cộng tối đa 3 clip agent render lại" : ""}). `
+    + `render ${scenes} clip video → ${review ? "AI QC từng clip (chỉ đánh dấu, không tự render lại) → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
+    + `Video TỐN CREDIT (veo-lite khoảng 10 credit/clip ≈ ${scenes * 10} credit). `
     + "Ảnh và dựng phim miễn phí. Có thể bấm Dừng bất cứ lúc nào; bấm “Tạo tự động” lần nữa để làm tiếp từ chỗ dừng.";
 }
 
@@ -2439,6 +2500,7 @@ async function onJobDone() {
     return;
   }
   if (j.kind === "restore" && j.status === "done" && j.result?.id) { await openProject(j.result.id); return; }
+  if (j.kind === "qc_model") { try { S.env = await api("GET", "/api/env"); } catch { /* ignore */ } }
   if (j.kind === "portraits" && S.cur && S.cur.id === j.project && j.result?.images) {
     for (const c of S.cur.storyboard.characters || []) if (j.result.images[c.name]) c.image = j.result.images[c.name];
     if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
@@ -2682,6 +2744,16 @@ async function openSettings() {
     h("option", { value: "api" }, "Anthropic API key — tính phí riêng"));
   const remote = h("input", { type: "text", value: s.backup_remote || "gdrive:FilmMaker", placeholder: "gdrive:FilmMaker" });
   const autoBackup = h("input", { type: "checkbox", checked: !!s.auto_backup });
+  const autoQC = h("input", { type: "checkbox", checked: s.auto_qc !== false });
+  const qcEnv = S.env?.qc || {};
+  const qcModel = qcEnv.model
+    ? h("p", { class: "help" }, "✓ Đã có model nhận dạng giọng nói: QC kiểm tra cả lời thoại (đúng câu, đúng ngôn ngữ, không lặp).")
+    : h("div", { class: "row" }, h("span", { class: "help", style: { flex: "1" } }, qcEnv.whisper
+      ? "Chưa có model nhận dạng giọng nói: QC chỉ xem hình và mức âm thanh, chưa kiểm tra lời thoại."
+      : "Chưa có whisper-cli (chạy “brew install whisper-cpp” trong Terminal) nên QC chưa kiểm tra được lời thoại."),
+      qcEnv.whisper ? h("button", { class: "btn sm", onclick: async (e) => {
+        try { startJob(await api("POST", "/api/qc/model")); e.target.disabled = true; } catch (err) { toast(err.message, "error"); }
+      } }, icon("download"), "Tải model (~550 MB)") : null);
   const backupState = h("div", { class: "row small" }, h("span", { class: "spinner" }), h("span", { class: "muted" }, "Đang kiểm tra rclone…"));
   const checkBackup = () => api("GET", "/api/backup").then((b) => {
     const name = (b.remote.split(":")[0] || "gdrive");
@@ -2736,12 +2808,17 @@ async function openSettings() {
           h("label", { class: "check" }, autoBackup, h("span", {}, "Tự backup sau mỗi clip render xong và khi ghép phim",
             h("span", { class: "sub" }, "Chạy ngầm, không làm chậm việc render. Backup lỗi thì chỉ báo, video vẫn an toàn trên máy."))),
           h("p", { class: "help" }, "Chỉ gửi file mới hoặc đã đổi, không bao giờ xoá gì trên Drive. Clip bị render lại thì bản cũ được giữ trong thư mục .versions. Khôi phục: Phim mới → Từ Drive."))),
+      h("section", { class: "settings-sec" }, h("h3", {}, "AI QC clip"),
+        h("div", { class: "stack" },
+          h("label", { class: "check" }, autoQC, h("span", {}, "Tự QC mỗi clip vừa render",
+            h("span", { class: "sub" }, "AI xem hình (so với keyframe, nhân vật, lỗi hình, chữ trên hình) và nghe âm thanh, lời thoại. Miễn phí, chỉ đánh dấu — không tự render lại."))),
+          qcModel)),
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
         await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
-          backup_remote: remote.value.trim(), auto_backup: autoBackup.checked,
+          backup_remote: remote.value.trim(), auto_backup: autoBackup.checked, auto_qc: autoQC.checked,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
         S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }

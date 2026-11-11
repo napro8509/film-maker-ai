@@ -573,3 +573,16 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 .social-title { font-weight: var(--fw-bold); }
 .social-caption { white-space: pre-wrap; font-size: var(--fs-3); line-height: 1.55; overflow-wrap: anywhere; }
 .social-tags { color: var(--info-ink); font-size: var(--fs-2); overflow-wrap: anywhere; }
+
+/* AI QC of clips */
+.qc-box { border: 1px solid var(--border); border-radius: var(--r-2); padding: var(--sp-2) var(--sp-3); display: grid; gap: 6px; background: var(--surface-2); }
+.qc-box.bad { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: var(--err-soft); }
+.qc-box.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.qc-box.none { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.qc-tag { font-size: var(--fs-1); font-weight: var(--fw-bold); padding: 2px 8px; border-radius: var(--r-pill); background: var(--surface-3); }
+.qc-tag.ok { color: var(--ok-ink); background: var(--ok-soft); }
+.qc-tag.warn { color: var(--warn-ink); background: var(--warn-soft); }
+.qc-tag.bad { color: var(--err-ink); background: var(--err-soft); }
+.qc-transcript { white-space: pre-wrap; padding: 6px 8px; margin-top: 4px; border-radius: var(--r-1); background: var(--surface); border: 1px solid var(--border); }
+.qc-summary { margin-bottom: var(--sp-3); }
+.qc-summary .row { flex-wrap: wrap; gap: 8px; }

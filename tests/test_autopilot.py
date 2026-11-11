@@ -76,6 +76,10 @@ def env(tmp_path, monkeypatch):
                                      prompt="Gentle rain on an empty street") for i in ids])
         if schema is reviewer.FilmReview:
             return schema(verdict="PASS", score=8, summary="tốt")
+        if schema.__name__ == "QCAnswer":
+            sid = user.split("QC scene ")[1].split()[0]
+            return schema(verdict="FAIL" if sid == "s03" else "PASS", score=4 if sid == "s03" else 9,
+                          issues=["sai cảnh"] if sid == "s03" else [], prompt="Gentle rain on an empty street")
         raise AssertionError(schema)
 
     monkeypatch.setattr(reviewer.ai, "ask", fake_ask)
@@ -107,14 +111,17 @@ def test_autopilot_makes_the_whole_film(env):
     assert s01["duration"] == 6  # 5 is not accepted by veo-lite: rounded up before anything was sent
     assert s02["prompt"] == "Lan sips hot coffee slowly"  # storyboard review fix
     assert s01["image_prompt"] == "Lan at a cafe, face to camera"  # keyframe review fix, remade for free
-    assert s03["prompt"] == "Gentle rain on an empty street"  # clip review re-render
+    assert s03["prompt"] != "Gentle rain on an empty street"  # QC only flags: no paid re-render by itself
     assert raw["characters"][0]["image"].startswith("assets/characters/")
     st = json.loads((out / "autopilot.json").read_text())
-    assert st["rerendered"] == ["s03"]
+    assert st["rerendered"] == [] and st["stages"]["review_clips"]["failed"] == ["s03"]
+    assert res["qc_failed"] == ["s03"] and any("AI QC đánh FAIL: s03" in l for l in lines)
+    qc = json.loads((out / "qc.json").read_text())
+    assert qc["s03"]["verdict"] == "FAIL" and qc["s01"]["verdict"] == "PASS" and qc["s01"]["sig"]
     assert all(st["stages"][k]["status"] in ("done",) for k, _ in autopilot.STAGES)
     assert (out / "reviews" / "report.md").is_file()
     videos = [c for c in calls() if c[0] == "video"]
-    assert len(videos) == 4  # 3 scenes + one re-render
+    assert len(videos) == 3  # 3 scenes, no re-render
     assert asked.count("KeyframeReview") == 2  # the remade keyframe was checked again
 
 

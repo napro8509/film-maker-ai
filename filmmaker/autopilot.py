@@ -1,7 +1,7 @@
 """Autopilot: one button from an idea to a finished film with its cover, reviewed by AI agents on the way.
 
     storyboard -> review storyboard -> character portraits -> keyframes -> review keyframes (remake the bad ones)
-    -> videos -> review clips (re-render clearly broken ones, within a credit budget) -> AI edit (final.mp4)
+    -> videos -> AI QC of each clip (flags problems, never pays for a re-render) -> AI edit (final.mp4)
     -> thumbnail -> review the whole film
 
 Every step is resumable: the Pipeline skips what is already made, and `<out>/autopilot.json` remembers the
@@ -39,7 +39,7 @@ STAGES: list[tuple[str, str]] = [
     ("keyframes", "Tạo keyframe"),
     ("review_keyframes", "Agent review keyframe"),
     ("videos", "Render video"),
-    ("review_clips", "Agent review clip"),
+    ("review_clips", "AI QC clip"),
     ("edit", "AI dựng phim"),
     ("thumbnail", "Tạo thumbnail"),
     ("review_film", "Agent review cả phim"),
@@ -443,68 +443,30 @@ class Autopilot:
         self._video_run(only=set(fixed), confirm=set(fixed))
 
     def _stage_review_clips(self, result: dict) -> None:
+        """AI QC of every new clip (picture vs keyframe, characters, sound, dialogue). It only flags: a FAIL
+        clip is listed for the user, who decides whether to pay for a re-render (Phim → Cảnh → Render lại)."""
         if not self.cfg.review:
             self.mark("review_clips", "skipped", "tắt review")
             return
-        reviewed: dict[str, str] = self.data.setdefault("clip_reviewed", {})
+        from . import qc
+
         pipe = self.pipe()
-        todo = []
-        for s in pipe.sb.scenes:
-            if not pipe.is_done(s):
-                continue
-            clip = Path(pipe.state.scene(s.id)["video"])
-            if reviewed.get(s.id) != _file_sig(clip):
-                todo.append((s.id, clip))
-        if not todo:
-            self.log("Không có clip mới cần review.")
-            if not self.stage("review_clips").get("status"):
-                self.mark("review_clips", "done", "không có clip mới")
+        self.log("AI QC đang xem và nghe từng clip mới…")
+        qc.run(pipe, log=self.log, stop=self.should_stop, **self.ai_kw())
+        self.check_stop()
+        results = {s.id: qc.current(self.out, s.id, qc.clip_of(pipe, s)) for s in pipe.sb.scenes if pipe.is_done(s)}
+        results = {k: v for k, v in results.items() if v}
+        if not results:
+            self.mark("review_clips", "skipped", "không QC được clip nào")
             return
-        frames_dir = self.reviews_dir / "frames"
-        strips = []
-        for sid, clip in todo:
-            p = reviewer.frame_strip(clip, frames_dir / f"{sid}.jpg")
-            if p:
-                strips.append((sid, p))
-        self.log(f"Agent review đang xem {len(strips)} clip (3 khung hình mỗi clip)…")
-        rerender: dict[str, str] = {}
-        scores: dict[str, int] = dict(self.stage("review_clips").get("scores") or {})
-        budget = self.cfg.rerender_budget - len(self.data["rerendered"])
-        clips = dict(todo)
-        for chunk in _chunks(strips, REVIEW_BATCH):
-            try:
-                rev = reviewer.review_clips(pipe.sb, chunk, **self.ai_kw())
-            except (RuntimeError, ValueError) as exc:
-                self.log(f"⚠ Không review được clip ({exc}); làm tiếp.")
-                self.mark("review_clips", "skipped", str(exc)[:200])
-                return
-            self.write_review(f"clips_{chunk[0][0]}", rev)
-            for v in rev.scenes:
-                if v.id not in clips:
-                    continue
-                scores[v.id] = v.score
-                tag = {"PASS": "✔", "MINOR": "~", "RERENDER": "✘"}[v.verdict]
-                self.log(f"  {tag} [{v.id}] {v.score}/10" + (f" — {'; '.join(v.issues)}" if v.issues else ""))
-                reviewed[v.id] = _file_sig(clips[v.id])
-                if (v.verdict == "RERENDER" and v.prompt and v.id not in self.data["rerendered"]
-                        and len(rerender) < budget):
-                    rerender[v.id] = v.prompt
-        self.save()
-        if rerender:
-            self.log(f"Render lại (tốn credit, còn {budget} lượt): {', '.join(rerender)}")
-            self.edit_raw(lambda raw: any([reviewer.set_scene_field(raw, sid, "prompt", txt)
-                                           for sid, txt in rerender.items()]))
-            self.data["rerendered"] += list(rerender)
-            self.save()
-            report = self._video_run(only=set(rerender), confirm=set())
-            for sid in report.done:  # the new clip is accepted without another paid round
-                p = self.pipe()
-                s = next(x for x in p.sb.scenes if x.id == sid)
-                reviewed[sid] = _file_sig(Path(p.state.scene(s.id).get("video", "")))
-            self.save()
-        avg = round(sum(scores.values()) / len(scores), 1) if scores else None
-        self.mark("review_clips", "done", f"điểm TB {avg}/10, render lại {len(rerender)}", scores=scores,
-                  rerendered=list(rerender))
+        scores = {k: v["score"] for k, v in results.items()}
+        failed = sorted(k for k, v in results.items() if v["verdict"] == "FAIL")
+        avg = round(sum(scores.values()) / len(scores), 1)
+        if failed:
+            self.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở tab Cảnh và bấm “Render lại” nếu muốn "
+                     "(tốn credit). Phim vẫn được dựng từ các clip hiện có.")
+        result["qc_failed"] = failed
+        self.mark("review_clips", "done", f"QC điểm TB {avg}/10, FAIL {len(failed)}", scores=scores, failed=failed)
 
     def _clips(self) -> list[tuple[str, Path]]:
         pipe = self.pipe()

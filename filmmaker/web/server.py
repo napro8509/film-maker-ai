@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import autopilot, film_chat, flow_caps, social, manual_clip, model_change, model_meta, retirement
+from .. import autopilot, film_chat, flow_caps, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -60,7 +60,8 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
                     "flow_ui_window": "hidden",  # show | hidden | headless
                     "backup_remote": DEFAULT_BACKUP_REMOTE,  # rclone remote:folder (Google Drive)
-                    "auto_backup": False}  # back up after every rendered clip and at the end of each job
+                    "auto_backup": False,  # back up after every rendered clip and at the end of each job
+                    "auto_qc": True}  # AI QC of every new clip after a render (free; only flags problems)
 
 
 def load_settings() -> dict[str, Any]:
@@ -215,6 +216,11 @@ class SocialBody(BaseModel):
     languages: list[str] = ["Vietnamese"]
     note: str = ""
     pictures: bool = True
+
+
+class QCBody(BaseModel):
+    only: list[str] = []
+    force: bool = False
 
 
 class AskBody(BaseModel):
@@ -435,6 +441,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "updated": sb_path(pid).stat().st_mtime,
         }
 
+    def qc_view(pid: str, r: dict[str, Any] | None, video: str | None) -> dict[str, Any] | None:
+        """The scene's QC for the UI, only when it is about the clip that is there now."""
+        if not r or not video:
+            return None
+        clip = Path(video)
+        if not clip.is_absolute():  # the CLI run with a relative --out stores relative paths
+            clip = pdir(pid) / clip
+        if r.get("sig") != qc.clip_sig(clip):
+            return None
+        keep = ("verdict", "score", "issues", "picture", "sound", "prompt", "match", "transcript", "language",
+                "dialogue_checked", "at")
+        return {k: r.get(k) for k in keep}
+
     def detail(pid: str) -> dict[str, Any]:
         raw = read_raw(pid)
         errors: list[str] = []
@@ -465,6 +484,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                           "model_note": retirement.model_note(pipe),
                           "models_used": retirement.models_used(pipe, meta)}
             talk = sb.dialogue_warnings()
+            qc_all = qc.load(out_dir(pid))
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
@@ -495,6 +515,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "dialogue_warnings": talk.get(s.id, []),
                     # ffprobe only for "submitting" scenes with a file, never while a job runs here
                     "manual_clip": None if busy else pipe.manual_clip_state(s),
+                    "qc": qc_view(pid, qc_all.get(s.id), st.get("video")),
                 }
         final = out_dir(pid) / "final.mp4"
         srt = final.with_suffix(".srt")
@@ -588,6 +609,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "profile": s.get("profile") or None,
             "platform": sys.platform,
             "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
+            "qc": qc.status(),
         }
 
     @app.post("/api/env/auth")
@@ -682,7 +704,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
         for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
-                  "auto_backup"):
+                  "auto_backup", "auto_qc"):
             if k in body:
                 s[k] = body[k]
         if "backup_remote" in body:
@@ -691,6 +713,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             except BackupError as exc:
                 raise HTTPException(400, str(exc))
         s["auto_backup"] = bool(s.get("auto_backup"))
+        s["auto_qc"] = bool(s.get("auto_qc", True))
         if body.get("anthropic_api_key"):
             s["anthropic_api_key"] = body["anthropic_api_key"].strip()
         if body.get("clear_anthropic_key"):
@@ -1551,6 +1574,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if body.action == "edit":
                 return do_edit(job)
             res = do_run(job, dry=False, keyframes_only=False)
+            if res.get("done") and not job.stop_requested and settings.get("auto_qc", True):
+                run_qc(job, pid, set(res["done"]), force=False)
             if body.action == "make" and not job.stop_requested:
                 if res.get("error") and not body.allow_missing:
                     job.log("Có cảnh lỗi nên chưa ghép phim.")
@@ -1564,6 +1589,51 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
+
+    # ---- AI QC of rendered clips ----
+
+    def run_qc(job: Job, pid: str, only: set[str] | None, force: bool) -> dict[str, Any]:
+        backend = planner_backend()
+        if not backend:
+            job.log("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
+            return {}
+        sb = load_storyboard(sb_path(pid))
+        pipe = Pipeline(sb, out_dir(pid), gflow(True))
+        job.log("")
+        job.log("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
+        done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
+                      backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
+        failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
+        if failed:
+            job.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở từng cảnh; “Render lại” nếu muốn (tốn credit).")
+        return {"qc": {k: v["verdict"] for k, v in done.items()}, "qc_failed": failed}
+
+    @app.post("/api/projects/{pid}/qc")
+    def qc_project(pid: str, body: QCBody) -> dict[str, Any]:
+        """AI QC of the rendered clips (all new ones, or `only`; `force` = check again). Free on Flow."""
+        try:
+            load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        if not planner_backend():
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        scope = f" ({', '.join(body.only)})" if body.only else ""
+        return jobs.start("qc", "AI QC clip" + scope, pid,
+                          lambda job: run_qc(job, pid, set(body.only) or None, body.force)).public()
+
+    @app.post("/api/qc/model")
+    def qc_model() -> dict[str, Any]:
+        """Download the speech-to-text model QC uses to check dialogue (once, about 550 MB)."""
+        if not qc.whisper_binary():
+            raise HTTPException(400, "Chưa có whisper-cli: chạy `brew install whisper-cpp` trong Terminal.")
+
+        def work(job: Job) -> dict[str, Any]:
+            path = qc.download_model(log=job.log)
+            job.log(f"✔ Đã có model: {path}")
+            return {"model": str(path)}
+
+        return jobs.start("qc_model", "Tải model nhận dạng giọng nói", None, work).public()
 
     # ---- autopilot: one button from the idea to the finished film ----
 
