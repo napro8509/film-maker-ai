@@ -67,6 +67,8 @@ class AutoSettings:
     api_key: str | None = None
     max_retries: int = 2
     pause: tuple[float, float] = (8.0, 20.0)
+    publish_platforms: list[str] = field(default_factory=list)  # e.g. ["facebook_reel", "youtube"]
+    publish_config: Any = None  # publisher.PublishConfig
 
 
 def _now() -> str:
@@ -193,7 +195,34 @@ class Autopilot:
         if result.get("film_score") is not None:
             self.log(f"⭐ Agent chấm cả phim: {result['film_score']}/10 — {result.get('film_verdict')}")
         result["minutes"] = round(mins, 1)
+        if self.cfg.publish_platforms and result.get("final"):
+            self._auto_publish(result)
         return result
+
+    def _auto_publish(self, result: dict) -> None:
+        """Optional post-completion auto-publish to Facebook Reels and YouTube."""
+        from . import publisher, settings as user_settings
+
+        self.log("")
+        self.log("=== Tự động đăng video lên mạng xã hội ===")
+        cfg = self.cfg.publish_config or publisher.config_from_settings(user_settings.load())
+        backend = reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key)
+        try:
+            pub_res = publisher.publish_film(
+                self.sb_path.parent,
+                self.out,
+                self.cfg.publish_platforms,
+                cfg,
+                ai_backend=backend,
+                api_key=self.cfg.api_key,
+                log=self.log,
+            )
+            result["published"] = pub_res["results"]
+            if pub_res["errors"]:
+                result["publish_errors"] = pub_res["errors"]
+        except Exception as exc:
+            self.log(f"⚠ Không tự động đăng được video: {exc}")
+            result["publish_errors"] = {"general": str(exc)}
 
     # --- stages ----------------------------------------------------------------------
 

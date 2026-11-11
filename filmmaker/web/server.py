@@ -60,7 +60,10 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
                     "flow_ui_window": "hidden",  # show | hidden | headless
                     "backup_remote": DEFAULT_BACKUP_REMOTE,  # rclone remote:folder (Google Drive)
-                    "auto_backup": False}  # back up after every rendered clip and at the end of each job
+                    "auto_backup": False,  # back up after every rendered clip and at the end of each job
+                    "fb_page_id": "", "fb_access_token": "",
+                    "yt_client_id": "", "yt_client_secret": "", "yt_refresh_token": "",
+                    "yt_privacy": "public", "auto_publish": False, "auto_publish_platforms": []}
 
 
 def load_settings() -> dict[str, Any]:
@@ -253,11 +256,21 @@ class RunBody(BaseModel):
     smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
 
 
+class PublishBody(BaseModel):
+    platforms: list[str] = ["facebook_reel", "youtube"]
+    privacy: str | None = None
+    title: str = ""
+    description: str = ""
+    force: bool = False
+    dry_run: bool = False
+
+
 class AutoBody(BaseModel):
     review: bool = True  # AI agents review storyboard, keyframes, clips and the finished film
     burn_subtitles: bool = True
     rerender_budget: int = 3  # clips the clip review may render again (credits)
     music: str | None = None
+    publish_platforms: list[str] = []
 
 
 class AutoPlanBody(PlanBody, AutoBody):
@@ -674,6 +687,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s["anthropic_key_set"] = bool(key)
         s["anthropic_key_hint"] = f"…{key[-4:]}" if key else ""
         s["anthropic_key_from_env"] = bool(os.environ.get("ANTHROPIC_API_KEY")) and not key
+        for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
+            val = s.get(sec) or ""
+            s[sec] = ""
+            s[f"{sec}_set"] = bool(val)
+            s[f"{sec}_hint"] = f"…{val[-4:]}" if len(val) >= 4 else ("***" if val else "")
         return s
 
     @app.put("/api/settings")
@@ -682,7 +700,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
         for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
-                  "auto_backup"):
+                  "auto_backup", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
             if k in body:
                 s[k] = body[k]
         if "backup_remote" in body:
@@ -691,10 +709,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             except BackupError as exc:
                 raise HTTPException(400, str(exc))
         s["auto_backup"] = bool(s.get("auto_backup"))
+        s["auto_publish"] = bool(s.get("auto_publish"))
+        if isinstance(s.get("auto_publish_platforms"), list):
+            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "youtube")]
+        else:
+            s["auto_publish_platforms"] = []
+        if s.get("yt_privacy") not in ("public", "unlisted", "private"):
+            s["yt_privacy"] = "public"
         if body.get("anthropic_api_key"):
             s["anthropic_api_key"] = body["anthropic_api_key"].strip()
         if body.get("clear_anthropic_key"):
             s["anthropic_api_key"] = ""
+        for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
+            if body.get(sec):
+                s[sec] = str(body[sec]).strip()
+            if body.get(f"clear_{sec}"):
+                s[sec] = ""
         s["pause_min"] = max(0.0, float(s.get("pause_min") or 0))
         s["pause_max"] = max(float(s["pause_min"]), float(s.get("pause_max") or 0))
         s["retries"] = max(0, min(5, int(s.get("retries") or 0)))
@@ -1107,6 +1137,75 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if target_zip.is_file():
             return FileResponse(target_zip, filename=target_zip.name, media_type="application/zip")
         raise HTTPException(404, "Chưa có file nén phát hành (.zip). Hãy xuất gói kèm tùy chọn zip_archive.")
+
+    # ---- auto-publish to Facebook Reels & YouTube ----
+
+    @app.get("/api/projects/{pid}/publish")
+    def get_publish(pid: str) -> dict[str, Any]:
+        from .. import publisher
+
+        s = load_settings()
+        cfg = publisher.config_from_settings(s)
+        sb = None
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except Exception:
+            pass
+        preview = {}
+        if sb:
+            for plat in publisher.PUBLISH_PLATFORMS:
+                preview[plat] = publisher.build_metadata(sb, out_dir(pid), plat)
+        return {
+            "state": publisher.load_state(out_dir(pid)),
+            "platforms": publisher.PUBLISH_PLATFORMS,
+            "configured": {k: publisher.platform_configured(cfg, k) for k in publisher.PUBLISH_PLATFORMS},
+            "yt_privacy": cfg.yt_privacy,
+            "auto_publish": cfg.auto_publish,
+            "auto_publish_platforms": cfg.auto_publish_platforms,
+            "preview": preview,
+        }
+
+    @app.post("/api/projects/{pid}/publish")
+    def post_publish(pid: str, body: PublishBody) -> dict[str, Any]:
+        from .. import publisher
+
+        pdir(pid)
+        if not (out_dir(pid) / "final.mp4").is_file():
+            raise HTTPException(400, "Chưa có phim hoàn chỉnh (final.mp4). Hãy ghép hoặc dựng phim trước khi đăng.")
+        s = load_settings()
+        cfg = publisher.config_from_settings(s)
+        if body.privacy in ("public", "unlisted", "private"):
+            cfg.yt_privacy = body.privacy  # type: ignore[assignment]
+        picked = [p for p in publisher.PUBLISH_PLATFORMS if p in set(body.platforms)]
+        if not picked:
+            raise HTTPException(400, "Chọn ít nhất một nền tảng (Facebook Reels hoặc YouTube).")
+        if not body.dry_run:
+            unconfigured = [publisher.PUBLISH_PLATFORMS[p] for p in picked if not publisher.platform_configured(cfg, p)]
+            if unconfigured:
+                raise HTTPException(400, f"Chưa cấu hình tài khoản cho: {', '.join(unconfigured)}. Hãy mở Cài đặt để điền thông tin kết nối.")
+
+        def work(job: Job) -> dict[str, Any]:
+            backend = planner_backend()
+            res = publisher.publish_film(
+                pdir(pid),
+                out_dir(pid),
+                picked,
+                cfg,
+                force=body.force,
+                dry_run=body.dry_run,
+                custom_title=body.title,
+                custom_description=body.description,
+                ai_backend=backend,
+                api_key=s.get("anthropic_api_key") or None,
+                log=job.log,
+            )
+            out_res: dict[str, Any] = {"published": res["results"], "errors": res["errors"]}
+            if res["errors"]:
+                out_res["error"] = "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+            return out_res
+
+        label = ", ".join(publisher.PUBLISH_PLATFORMS[p] for p in picked)
+        return jobs.start("publish", f"Đăng video ({label})", pid, work).public()
 
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
@@ -1598,16 +1697,42 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                         res.update(do_thumbnail(job, False))
                     except Exception as exc:  # the film is done; a missing cover is not a failure
                         job.log(f"⚠ Chưa làm được thumbnail: {exc}")
+                maybe_auto_publish_job(job, pid, res)
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
 
+    def maybe_auto_publish_job(job: Job, pid: str, res: dict[str, Any], explicit_platforms: list[str] | None = None) -> None:
+        from .. import publisher
+
+        s = load_settings()
+        pub_cfg = publisher.config_from_settings(s)
+        plats = explicit_platforms if explicit_platforms is not None else (pub_cfg.auto_publish_platforms if pub_cfg.auto_publish else [])
+        plats = [p for p in plats if p in publisher.PUBLISH_PLATFORMS]
+        if not plats or not (out_dir(pid) / "final.mp4").is_file():
+            return
+        job.log("")
+        job.log("=== Tự động đăng video lên mạng xã hội ===")
+        try:
+            pub_res = publisher.publish_film(
+                pdir(pid), out_dir(pid), plats, pub_cfg,
+                ai_backend=planner_backend(), api_key=s.get("anthropic_api_key") or None, log=job.log,
+            )
+            res["published"] = pub_res["results"]
+            if pub_res["errors"]:
+                res["publish_errors"] = pub_res["errors"]
+        except Exception as exc:
+            job.log(f"⚠ Không tự động đăng được video: {exc}")
+
     # ---- autopilot: one button from the idea to the finished film ----
 
     def auto_work(job: Job, pid: str, body: AutoBody) -> dict[str, Any]:
+        from .. import publisher
         from ..autopilot import AutoError, Autopilot, AutoSettings
 
         settings = load_settings()
+        pub_cfg = publisher.config_from_settings(settings)
+        pub_plats = body.publish_platforms if body.publish_platforms else (pub_cfg.auto_publish_platforms if pub_cfg.auto_publish else [])
         g = gflow(log=job.log)
         if not g.available():
             raise RuntimeError("không thấy lệnh gflow")
@@ -1633,7 +1758,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
             ai_backend=settings.get("planner") or "auto", api_key=settings.get("anthropic_api_key") or None,
             max_retries=int(settings.get("retries", 2)),
-            pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20)))),
+            pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
+            publish_platforms=pub_plats, publish_config=pub_cfg),
             log=job.log, sleep=job.sleep, progress=job.set_progress, should_stop=lambda: job.stop_requested,
             edit_raw=edit_raw, on_stage=on_stage)
         ab = auto_backup(pid, job)

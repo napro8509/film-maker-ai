@@ -146,3 +146,65 @@ def test_web_export_endpoints(project_dir):
     assert dl.status_code == 200
     assert dl.headers["content-type"] == "application/zip"
     assert len(dl.content) > 0
+
+
+# --- Auto-Publish tests ------------------------------------------------------
+
+
+def test_build_metadata_for_platforms(project_dir):
+    from filmmaker.publisher import build_metadata
+
+    _, out = project_dir
+    sb = Storyboard.model_validate(SB_DATA)
+
+    yt_meta = build_metadata(sb, out, "youtube")
+    assert "#Shorts" in yt_meta["title"]
+    assert yt_meta["is_short"] is True
+    assert "Shorts" in yt_meta["tags"]
+    assert "#goixoi" in yt_meta["description"]
+
+    fb_meta = build_metadata(sb, out, "facebook_reel")
+    assert "Gói xôi 10k và câu chuyện ấm lòng" in fb_meta["title"]
+    assert "Mỗi sáng góc phố ấy" in fb_meta["description"]
+    assert "#Reels" in fb_meta["description"]
+
+
+def test_cli_publish_dry_run(project_dir):
+    d, out = project_dir
+    runner = CliRunner()
+    res = runner.invoke(main, ["publish", str(d / "storyboard.yaml"), "--out", str(out), "--dry-run"])
+    assert res.exit_code == 0
+    assert "[DRY RUN] Sẽ đăng lên Facebook Reels:" in res.output
+    assert "[DRY RUN] Sẽ đăng lên YouTube (Shorts / Video):" in res.output
+
+
+def test_web_publish_endpoints(project_dir):
+    import time
+
+    d, out = project_dir
+    ws = d.parent
+    client = TestClient(create_app(ws))
+    hdr = {"x-token": client.app.state.token}
+    pid = d.name
+
+    r0 = client.get(f"/api/projects/{pid}/publish")
+    assert r0.status_code == 200
+    assert "facebook_reel" in r0.json()["platforms"]
+    assert "youtube" in r0.json()["platforms"]
+
+    r_pub = client.post(
+        f"/api/projects/{pid}/publish",
+        headers=hdr,
+        json={"platforms": ["facebook_reel", "youtube"], "dry_run": True},
+    )
+    assert r_pub.status_code == 200
+    job_id = r_pub.json()["id"]
+    for _ in range(30):
+        j = client.get(f"/api/jobs/{job_id}").json()
+        if j["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert j["status"] == "done"
+    assert "facebook_reel" in j["result"]["published"]
+    assert "youtube" in j["result"]["published"]
+
