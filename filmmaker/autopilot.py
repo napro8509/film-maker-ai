@@ -406,16 +406,24 @@ class Autopilot:
         self.mark("videos", "done" if not missing else "partial", f"{done}/{len(pipe.sb.scenes)} clip", missing=missing)
 
     def _soften_blocked(self) -> None:
-        """Scenes whose clip Flow made and then deleted (safety filter): sending the same prompt again would be
-        deleted again. Claude rewrites the scene gently, then it is sent once more (counts as its one resend)."""
+        """Scenes Flow blocked after it started (credits spent): it made the clip and then deleted it (safety
+        filter), or it could not make the clip's sound ("Audio generation failed"). Sending the same scene again
+        fails the same way, so Claude rewrites it gently, then it is sent once more (counts as its one resend)."""
         pipe = self.pipe()
-        blocked = [s for s in pipe.sb.scenes if not pipe.is_done(s) and s.id not in self.data["resent"]
-                   and BLOCKED_MARK in str(pipe.state.scene(s.id).get("error") or "")]
+        blocked = []
+        for s in pipe.sb.scenes:
+            err = str(pipe.state.scene(s.id).get("error") or "")
+            if pipe.is_done(s) or s.id in self.data["resent"]:
+                continue
+            if BLOCKED_MARK in err:
+                blocked.append((s, "Flow đã xoá video (bộ lọc an toàn)"))
+            elif reviewer.AUDIO_FAILED in err.lower():
+                blocked.append((s, "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"))
         if not blocked:
             return
         fixed: list[str] = []
-        for s in blocked:
-            self.log(f"[{s.id}] Flow đã xoá video (bộ lọc an toàn): nhờ Claude viết lại cảnh nhẹ nhàng hơn…")
+        for s, why in blocked:
+            self.log(f"[{s.id}] {why}: nhờ Claude viết lại cảnh nhẹ nhàng hơn…")
             try:
                 fix = reviewer.soften_scene(pipe.sb, s.id, str(pipe.state.scene(s.id).get("error")), **self.ai_kw())
             except (RuntimeError, ValueError) as exc:
@@ -424,6 +432,8 @@ class Autopilot:
             fix.id = s.id
             if self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix]))):
                 self.log(f"  prompt mới: {(fix.prompt or fix.image_prompt or '')[:160]}")
+                if fix.dialogue is not None:
+                    self.log("  thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue) or "(bỏ thoại)"))
                 fixed.append(s.id)
         if not fixed:
             return

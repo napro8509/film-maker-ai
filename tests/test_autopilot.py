@@ -302,6 +302,50 @@ def test_scene_deleted_by_flow_is_rewritten_then_sent_once(env, monkeypatch):
     assert len([c for c in calls() if c[0] == "video"]) == n + 1
 
 
+def test_audio_failure_is_rewritten_with_gentler_dialogue_then_sent_once(env, monkeypatch):
+    from filmmaker.pipeline import State
+    sb_path, calls, _ = env
+    _pilot(sb_path, review=False)[0].run()
+    out = sb_path.parent / "output" / "storyboard"
+    st = State(out / "state.json")
+    st.update("s02", status="submitting", submitted_at="2026-11-11T00:00:00+00:00",
+              error="Flow (giao diện chat): Flow báo tạo video lỗi: warning\nFailed\nAudio generation failed. "
+                    "Please try a different prompt or send feedback.")
+    (out / "clips" / "s02.mp4").unlink()
+    name = yaml.safe_load(sb_path.read_text())["characters"][0]["name"]
+    seen = {}
+
+    def soften(sb, sid, err, **kw):
+        seen["err"] = err
+        return reviewer.SceneFix(id=sid, prompt="She smiles softly at the window",
+                                 dialogue=[reviewer.DialogueFix(character=name, line="Mình ổn mà", delivery="calm, soft")])
+
+    monkeypatch.setattr(reviewer, "soften_scene", soften)
+    n = len([c for c in calls() if c[0] == "video"])
+    p, lines = _pilot(sb_path, review=False)
+    p._stage_videos({})
+    scene = yaml.safe_load(sb_path.read_text())["scenes"][1]
+    assert scene["prompt"] == "She smiles softly at the window"
+    assert scene["dialogue"] == [{"character": name, "line": "Mình ổn mà", "delivery": "calm, soft"}]
+    assert "Audio generation failed" in seen["err"]
+    assert any("không tạo được âm thanh" in l for l in lines) and any("thoại mới" in l for l in lines)
+    assert len([c for c in calls() if c[0] == "video"]) == n + 1  # one rewritten resend, not the old scene again
+    assert p.data["resent"] == ["s02"]
+
+
+def test_soften_prompt_mentions_audio_only_for_audio_failures(monkeypatch):
+    from filmmaker.storyboard import Storyboard
+    sb = Storyboard.model_validate({"title": "x", "model": "veo-lite", "scenes": [
+        {"id": "s01", "mode": "t2v", "prompt": "rain", "duration": 4}]})
+    got = []
+    monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw: got.append((system, user)) or schema(id="s01"))
+    reviewer.soften_scene(sb, "s01", "Failed\nAudio generation failed. Please try a different prompt")
+    reviewer.soften_scene(sb, "s01", "Flow xoá video: deleted")
+    assert "Audio generation failed" in got[0][1] and "rewrite the dialogue" in got[0][1]
+    assert "rewrite the dialogue" not in got[1][1]
+    assert "children" in got[0][0] and "Audio generation failed" in got[0][0]
+
+
 def test_flow_deleted_video_is_seen_after_the_offer():
     from filmmaker.flow_ui import classify_replies
     bubble = ("Show thinking\nI must not violate anything. Would you like me to kick off this 1 video generation, "

@@ -102,6 +102,11 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
   Lip-sync works best with ONE speaker per scene whose face is visible: fix scenes where two characters both
   speak by keeping one speaker (move the reply to the next scene's dialogue if it matters).
 - No visible text, captions or written words asked for anywhere.
+- Content Google Flow refuses or fails on (credits are lost: "Audio generation failed", or the clip is deleted):
+  insults or slurs (above all about disability), threats, shouting, fights, bullying up close, injuries, pain,
+  blood, weapons, and above all children in distress (hurt, crying hard, mocked, fighting). Rewrite such scenes
+  mildly, keeping the story beat: dialogue without insults, calm/soft `delivery` instead of fierce or raised,
+  action and image_prompt without pain or violence (feelings through faces and small gestures).
 Fix only what clearly needs fixing; keep everything else exactly. For a scene you change, return only the
 fields that change (full new text for each), plus the issues. verdict PASS when it can be produced as is
 (small fixes still allowed), REVISE when the story or several scenes have real problems."""
@@ -141,6 +146,8 @@ recognisable from scene to scene, any visible failures, is the cover eye-catchin
 verdict PASS when it is ready to publish, REVISE when something should be fixed first; say exactly what."""
 
 
+AUDIO_FAILED = "audio generation failed"  # Flow's words when it could not make a clip's sound
+
 SOFTEN_SYSTEM = COMMON + """
 Google Flow generated the clip of this scene and then deleted it (its safety filter), or refused it.
 Rewrite the scene so the same story beat gets through: keep the characters, place and emotion, but remove
@@ -148,7 +155,17 @@ what likely tripped the filter (touching or feeding children, a child in bed or 
 blood, weapons, violence, nudity, medical procedures, brand names, real people). Prefer showing the emotion
 through faces, looks and gentle gestures at a respectful distance. Return the scene id, the new `prompt` (the
 motion from the opening frame) and, only if the opening frame itself is the problem, a new `image_prompt`.
-Keep the dialogue unless a line is the problem (then give the full corrected dialogue)."""
+Keep the dialogue unless a line is the problem (then give the full corrected dialogue).
+
+When the error says "Audio generation failed", Flow could not make the SOUND (voice and ambience) of the
+clip, which is also a safety check. It is triggered by what is said AND by what is shown, most often children
+in distress. Then change all of these that apply:
+- Dialogue: no insults, slurs or mocking words (above all about disability, body, race or family), no threats,
+  no shouting. Give the full corrected dialogue: the same story point said plainly and gently.
+- Delivery: calm, quiet, sincere or soft, never fierce, sneering, screaming, crying hard or "raised voice".
+- Action and ambience: no fight, confrontation, bullying up close, pain, injury, limping, gritted teeth,
+  sweat and tears together, or crowds jeering; keep the emotion (sad, worried, brave, kind) with faces, looks
+  and small gestures. With children, keep it especially mild and warm."""
 
 
 # --- storyboard text -------------------------------------------------------------
@@ -268,6 +285,9 @@ def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extr
 def soften_scene(sb: Storyboard, sid: str, error: str, **kw) -> SceneFix:
     user = (storyboard_brief(sb) + f"\n\nScene {sid} was blocked by Flow: {error[:500]}\n"
             f"Rewrite scene {sid} so it can be generated.")
+    if AUDIO_FAILED in error.lower():
+        user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
+                 "the instructions say, keeping the story point.")
     return ai.ask(SOFTEN_SYSTEM, user, SceneFix, **kw)
 
 
