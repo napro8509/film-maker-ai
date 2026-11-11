@@ -310,6 +310,8 @@ class Camera(BaseModel):
 
 DIALOGUE_MAX = 12  # lines per scene (a clip is only a few seconds)
 SPEAKER_LOOK_WORDS = 40  # words of a character description used to tell who is who
+BACKGROUND_NO_WORDS = ("Nobody else says any words: people in the background only cheer, laugh or murmur "
+                       "without words, and the line is never shared, echoed or finished by anyone else.")
 DIALOGUE_TURNS = ("Each line is spoken exactly once, only by the character named before it; no character repeats, "
                   "echoes or says another character's line, and they never speak at the same time.")
 
@@ -608,24 +610,32 @@ class Storyboard(StoryboardDraft):
             return ""
         return NO_DIALOGUE_RULE if lang.casefold() == NO_DIALOGUE else DIALOGUE_RULE.format(lang=lang)
 
-    def speaker_cues(self, scene: Scene) -> str:
-        """Who is who for the dialogue of a keyframe / image-to-video scene ("" when there is none).
-        There the prompt only names the characters, and Veo, which sees a picture and no names, gave a line to
-        whoever faced the camera (the mother said her son's line). So: what each one looks like, the speaker
-        faces the camera with moving lips, the others keep their mouths closed."""
+    def _dialogue_cast(self, scene: Scene) -> tuple[list[str], list[str]]:
+        """(speakers in the order they first speak, everyone in the scene including the speakers) for a
+        keyframe / image-to-video scene with dialogue; ([], []) otherwise."""
         if scene.mode not in ("keyframe", "i2v") or not self.speaks():
-            return ""
+            return [], []
         speakers: list[str] = []
         for d in scene.spoken_lines():
             if d.character.strip() and d.character.strip().casefold() not in {x.casefold() for x in speakers}:
                 speakers.append(d.character.strip())
         if not speakers:
-            return ""
-        by_name = {c.name.strip().casefold(): c for c in self.characters if c.name.strip()}
+            return [], []
         cast = [c.name.strip() for c in self.scene_characters(scene)]
         for n in speakers:
             if n.casefold() not in {x.casefold() for x in cast}:
                 cast.append(n)
+        return speakers, cast
+
+    def speaker_cues(self, scene: Scene) -> str:
+        """Who is who for the dialogue of a keyframe / image-to-video scene ("" when there is none).
+        There the prompt only names the characters, and Veo, which sees a picture and no names, gave a line to
+        whoever faced the camera (the mother said her son's line). So: what each one looks like, the speaker
+        faces the camera with moving lips, the others keep their mouths closed."""
+        speakers, cast = self._dialogue_cast(scene)
+        if not speakers:
+            return ""
+        by_name = {c.name.strip().casefold(): c for c in self.characters if c.name.strip()}
         looks = []
         for n in cast:
             c = by_name.get(n.casefold())
@@ -644,7 +654,41 @@ class Storyboard(StoryboardDraft):
         if silent:
             parts.append(f"{' and '.join(silent)} {'keeps' if len(silent) == 1 else 'keep'} the mouth closed the "
                          "whole time and only listen" + ("s." if len(silent) == 1 else "."))
+        # Ambient "chatter" or a cheering crowd made Veo give part of the line to a listener (s05: the coach
+        # mouthed the boy's "Thầy ơi…"): the background makes sounds, never words.
+        parts.append(BACKGROUND_NO_WORDS)
         return " ".join(parts)
+
+    def keyframe_staging(self, scene: Scene) -> str:
+        """How the opening frame of a dialogue scene is staged ("" when it has none). Veo gives the line to the
+        biggest face it sees talking, so the first speaker is the main face, toward the camera, and everyone
+        else is smaller with the mouth closed. A listener in the foreground with an open-mouthed grin was made
+        to say the speaker's line."""
+        speakers, cast = self._dialogue_cast(scene)
+        if not speakers:
+            return ""
+        first = speakers[0]
+        others = [n for n in cast if n.casefold() != first.casefold()]
+        text = (f"Staging for the dialogue that follows: {first} is the main subject, in the foreground with the "
+                "largest, closest face, turned toward the camera (front or three-quarter view), face and mouth "
+                "clearly visible.")
+        if others:
+            many = len(others) > 1
+            text += (f" {' and '.join(others)} {'are' if many else 'is'} smaller in the frame or further back, "
+                     f"turned toward {first}, mouth closed (a closed-mouth smile at most), listening.")
+        text += " Anyone in the background is small, with the mouth closed."
+        return text
+
+    def for_flow_keyframe(self, prompt: str, scene: Scene | None = None) -> str:
+        """A keyframe prompt as actually sent to Flow: the dialogue staging (`keyframe_staging`), then
+        `for_flow`. Not part of the fingerprints, so adding it remakes nothing that is already made."""
+        staging = self.keyframe_staging(scene) if scene is not None else ""
+        if staging and "Staging for the dialogue" not in prompt:
+            base = prompt.rstrip()
+            if base and base[-1] not in ".!?":
+                base += "."
+            prompt = f"{base} {staging}" if base else staging
+        return self.for_flow(prompt)
 
     def _speech_in_prompt(self, prompt: str) -> bool:
         """Speech written straight into the prompt ("Minh: …", "Lan says hello", "they talk"): such a scene does

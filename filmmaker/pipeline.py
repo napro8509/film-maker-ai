@@ -549,14 +549,15 @@ class Pipeline:
         src_sha = file_sha(self.keyframe_path(src)) if src is not None else None
         refs = [(it.label, it.path) for it in items]
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
+        sent = self.sb.for_flow_keyframe(prompt, s)  # + dialogue staging; state keeps `prompt` (fingerprint)
         img = None
         # Images are free on Flow, so retrying them (or falling back) is safe.
         if refs:
-            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", prompt, refs, project, kw, opts,
+            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", sent, refs, project, kw, opts,
                                         log_line="" if loc is not None else None)
         chained = src is not None and img is not None
         if img is None:
-            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(self.sb.for_flow(prompt), **kw), opts.max_retries)
+            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(sent, **kw), opts.max_retries)
         if not self.g.dry_run:
             if Path(img) != kf and Path(img).is_file():  # keep the UI's preview path stable
                 kf.parent.mkdir(parents=True, exist_ok=True)

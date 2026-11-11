@@ -127,9 +127,15 @@ You also get the character reference portraits. For each scene check:
   profile, turned away, hidden or small while another character faces the camera, that other character will be
   made to say the line: REVISE, with an `image_prompt` that puts the speaker facing the camera and the others
   turned toward the speaker or listening with the mouth closed.
+  Veo also gives the line to a listener who is bigger or closer than the speaker, or whose mouth is open
+  (talking, shouting, laughing, an open-mouthed grin), even when the speaker faces the camera too. So REVISE
+  when a character who does not speak is the largest / closest face, or has the mouth open: the speaker must be
+  the main face and every listener (and the crowd behind) must have the mouth closed. A listener turned
+  sideways does not make it fine. The `image_prompt` then puts the speaker in the foreground facing the camera,
+  the listeners smaller or further back with closed-mouth expressions.
 verdict REVISE only for problems worth a new picture (wrong/missing character, wrong face, text in the picture,
 deformation, wrong setting or framing that breaks the scene, the speaker of a dialogue scene not facing the
-camera). Continuity breaks are ALWAYS REVISE, because the video
+camera or not the main face, a listener with an open mouth). Continuity breaks are ALWAYS REVISE, because the video
 inherits them: an outfit, prop, weather or time of day that contradicts the story so far (a raincoat given away
 earlier, rain a year later in a sunny reunion, the old work clothes after the character's life changed). If you
 list such a problem in `issues`, the verdict must be REVISE, never PASS. Then give `image_prompt`: the full corrected

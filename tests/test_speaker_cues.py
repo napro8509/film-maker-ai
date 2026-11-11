@@ -88,3 +88,31 @@ def test_speech_typed_in_the_prompt_is_not_silenced():
         assert sb._speech_in_prompt(prompt), prompt
     for prompt in ("TonTeen steps away from Malee.", "Ambient noise: rain. Camera movement: handheld."):
         assert not sb._speech_in_prompt(prompt), prompt
+
+
+def test_keyframe_is_staged_with_the_speaker_as_the_main_face(tmp_path, monkeypatch):
+    # s05 of "18 ngày": the coach stood in the foreground with an open grin and mouthed the boy's line.
+    from filmmaker.pipeline import RunOptions
+    from filmmaker.storyboard import BACKGROUND_NO_WORDS
+
+    sb = _sb()
+    s = sb.scenes[0]
+    staging = sb.keyframe_staging(s)
+    assert "TonTeen is the main subject, in the foreground with the largest, closest face" in staging
+    assert "Malee is smaller in the frame or further back, turned toward TonTeen, mouth closed" in staging
+    assert sb.keyframe_staging(sb.scenes[1]) == "" and sb.keyframe_staging(sb.scenes[2]) == ""
+    assert _sb(dialogue_language="none").keyframe_staging(s) == ""
+    sent = sb.for_flow_keyframe(sb.image_prompt(s), s)
+    assert staging in sent and sent.index(staging) < sent.index(NO_TEXT)
+    assert sb.for_flow_keyframe(sent, s) == sent
+    assert BACKGROUND_NO_WORDS in sb.speaker_cues(s)
+
+    # sent to Flow, but never stored as the keyframe prompt: made keyframes and clips stay valid
+    before = sb.scene_fingerprint(s)
+    assert "Staging" not in sb.image_prompt(s) and sb.scene_fingerprint(s) == before
+    g = Gflow(dry_run=True, log=lambda *_: None)
+    got = []
+    monkeypatch.setattr(g, "text_to_image", lambda prompt, **kw: (got.append(prompt), kw["out"])[1])
+    pipe = Pipeline(sb, tmp_path / "out", g)
+    pipe._make_keyframe(s, "proj", RunOptions())
+    assert got and staging in got[0]

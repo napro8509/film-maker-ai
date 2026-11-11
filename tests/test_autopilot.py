@@ -428,3 +428,5 @@ def test_a_failed_group_size_is_not_tried_again(monkeypatch):
 
 def test_keyframe_reviewer_checks_who_faces_the_camera():
     assert "Who speaks" in reviewer.KEYFRAME_SYSTEM and "facing the camera" in reviewer.KEYFRAME_SYSTEM
+    # a listener who is the biggest face or has an open mouth is mouthing the line in the video
+    assert "largest / closest face" in reviewer.KEYFRAME_SYSTEM and "open-mouthed grin" in reviewer.KEYFRAME_SYSTEM
