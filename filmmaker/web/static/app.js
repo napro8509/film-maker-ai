@@ -260,10 +260,12 @@ function lightbox(url) {
 /* "zones" are small parts of the page that re-render when status changes, without touching form inputs. */
 function zone(id, fn) {
   S.zones.set(id, fn);
-  const el = fn();
+  const el = zoneEl(fn);
   el.id = id;
   return el;
 }
+/* A zone with nothing to show (fn returns null) is an empty hidden div, so it can still be refreshed later. */
+function zoneEl(fn) { return fn() || h("div", { hidden: true }); }
 function refreshZones() {
   for (const [id, fn] of S.zones) {
     const old = document.getElementById(id);
@@ -271,7 +273,7 @@ function refreshZones() {
     // Do not interrupt a clip the user is watching.
     const v = old.querySelector("video");
     if (v && !v.paused) continue;
-    const el = fn();
+    const el = zoneEl(fn);
     el.id = id;
     if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
   }
@@ -279,7 +281,7 @@ function refreshZones() {
 function refreshZone(id) {
   const fn = S.zones.get(id), old = document.getElementById(id);
   if (!fn || !old) return;
-  const el = fn(); el.id = id;
+  const el = zoneEl(fn); el.id = id;
   if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
 }
 /* A clip opened from lazyVideo() stays open (even paused) while the zone would only show it again as a poster. */
