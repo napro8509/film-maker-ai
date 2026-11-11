@@ -54,14 +54,15 @@ class FakeLocator:
     def click(self, **_kw) -> None:
         self.page.clicks.append(self.sel)
 
-    def evaluate(self, _js: str):
+    def evaluate(self, _js: str, _arg=None):
         self.page.clicks.append(self.sel)
 
     def is_visible(self) -> bool:
         return True
 
     def is_enabled(self) -> bool:
-        return True
+        v = self.page.enabled.get(self.sel, True)
+        return v() if callable(v) else v
 
     def is_disabled(self) -> bool:
         return False
@@ -108,9 +109,11 @@ class FakePage:
     """bubbles: list of texts, or a callable () -> list (e.g. depending on the fake clock)."""
 
     def __init__(self, *, bubbles=None, counts: dict | None = None, texts: dict | None = None,
-                 url: str = "https://flow.google.com/project/p", default_count: int = 0, goto=None):
+                 url: str = "https://flow.google.com/project/p", default_count: int = 0, goto=None,
+                 enabled: dict | None = None):
         self.bubbles = bubbles if bubbles is not None else []
         self.counts = dict(counts or {})
+        self.enabled = dict(enabled or {})  # selector -> bool or () -> bool (is_enabled)
         self.texts = dict(texts or {})
         self.url = url
         self.default_count = default_count

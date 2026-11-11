@@ -289,10 +289,16 @@ def test_open_project_auth_first(ft):
     assert ei.value.code == flow_ui.EXIT_AUTH
 
 
+def _png(tmp_path):
+    p = tmp_path / "k.png"
+    p.write_bytes(b"\x89PNG\r\n\x1a\n")
+    return p
+
+
 def test_attach_expired_first_wait_is_9(ft, tmp_path):
     page = FakePage()
     with pytest.raises(flow_ui.Fail) as ei:
-        flow_ui._attach(page, tmp_path / "k.png", flow_ui.Deadline(100))
+        flow_ui._attach(page, _png(tmp_path), flow_ui.Deadline(100))
     assert ei.value.code == flow_ui.EXIT_TIMEOUT and ei.value.spent is False
     assert "Escape" in page.keys and ft.t <= 101
 
@@ -301,7 +307,7 @@ def test_attach_expired_second_wait_is_9(ft, tmp_path):
     items = f"{flow_ui.ADD_MENU} >> button[role=option].asset-item"
     page = FakePage(counts={items: lambda: 0 if ft.t < 5 else 1})
     with pytest.raises(flow_ui.Fail) as ei:
-        flow_ui._attach(page, tmp_path / "k.png", flow_ui.Deadline(30))
+        flow_ui._attach(page, _png(tmp_path), flow_ui.Deadline(30))
     assert ei.value.code == flow_ui.EXIT_TIMEOUT and ei.value.spent is False
     assert any("Add to prompt" in c or "button" in c for c in page.clicks)
     assert ft.t <= 31
@@ -309,7 +315,7 @@ def test_attach_expired_second_wait_is_9(ft, tmp_path):
 
 def test_attach_no_deadline_still_drift(ft, tmp_path):
     with pytest.raises(flow_ui.Fail) as ei:
-        flow_ui._attach(FakePage(), tmp_path / "k.png")
+        flow_ui._attach(FakePage(), _png(tmp_path))
     assert ei.value.code == flow_ui.EXIT_DRIFT
 
 
