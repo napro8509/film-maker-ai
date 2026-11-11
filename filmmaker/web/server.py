@@ -1071,6 +1071,43 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(502, str(exc))
         return get_social(pid)
 
+    # ---- export & release packaging ----
+
+    @app.post("/api/projects/{pid}/export")
+    def post_export(pid: str, zip_archive: bool = False) -> dict[str, Any]:
+        """Package the finished film and its publishing materials into a release folder or .zip."""
+        from ..export import ExportError, export_package
+
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except Exception as exc:
+            raise HTTPException(400, f"Storyboard lỗi: {exc}")
+        try:
+            res_path = export_package(sb, out_dir(pid), zip_archive=zip_archive)
+        except ExportError as exc:
+            raise HTTPException(400, str(exc))
+        return {
+            "path": str(res_path),
+            "is_zip": zip_archive,
+            "filename": res_path.name,
+            "download_url": f"/api/projects/{pid}/export/download",
+        }
+
+    @app.get("/api/projects/{pid}/export/download")
+    def download_export(pid: str):
+        """Download the exported release zip archive."""
+        from ..export import _safe_filename
+
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except Exception as exc:
+            raise HTTPException(400, f"Storyboard lỗi: {exc}")
+        slug = _safe_filename(sb.title or pid, default=pid)
+        target_zip = out_dir(pid) / "exports" / f"{slug}_release.zip"
+        if target_zip.is_file():
+            return FileResponse(target_zip, filename=target_zip.name, media_type="application/zip")
+        raise HTTPException(404, "Chưa có file nén phát hành (.zip). Hãy xuất gói kèm tùy chọn zip_archive.")
+
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
         """Generate reference images for characters (free on Flow) and store them in the storyboard."""

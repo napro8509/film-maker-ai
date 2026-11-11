@@ -822,6 +822,28 @@ def restore(name: str, target: Path | None, remote, overwrite) -> None:
 
 
 @main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
+@click.option("--dest", type=click.Path(file_okay=False, path_type=Path), help="Thư mục xuất gói (mặc định <out>/exports).")
+@click.option("--zip/--no-zip", "zip_archive", default=False, show_default=True, help="Nén thành file .zip để chia sẻ.")
+@click.option("--open", "open_dir", is_flag=True, help="Mở thư mục xuất trong Finder sau khi xong.")
+def export(storyboard: Path, out: Path | None, dest: Path | None, zip_archive: bool, open_dir: bool) -> None:
+    """Đóng gói phim hoàn chỉnh để đăng mạng xã hội và lưu trữ (video, phụ đề, ảnh bìa, bài đăng)."""
+    from .export import ExportError, export_package
+
+    sb = load_storyboard(storyboard)
+    out_dir = _out_dir(storyboard, out)
+    try:
+        path = export_package(sb, out_dir, dest=dest, zip_archive=zip_archive, log=click.echo)
+    except ExportError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✔ Đã đóng gói: {path}")
+    if open_dir:
+        import subprocess
+        subprocess.run(["open", str(path if path.is_dir() else path.parent)])
+
+
+@main.command()
 @click.argument("output", type=click.Path(path_type=Path), default=Path("storyboard.yaml"))
 def template(output: Path) -> None:
     """Tạo file storyboard mẫu."""
