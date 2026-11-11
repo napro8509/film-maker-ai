@@ -221,6 +221,20 @@ class PlanBody(BaseModel):
     dialogue_language: str | None = None  # language every character speaks; "none" = no dialogue
 
 
+def _credits(out: Path) -> str | None:
+    """Credits of the web music / sounds in the last CapCut edit (what to paste under the video)."""
+    try:
+        return (out / "edit_assets" / "CREDITS.txt").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _capcut_installed(settings: dict[str, Any]) -> bool:
+    from ..capcut import installed
+
+    return installed(settings.get("capcut_drafts_dir") or None)
+
+
 class RunBody(BaseModel):
     action: str  # dry | keyframes | video | stitch | make
     only: list[str] = []
@@ -238,6 +252,7 @@ class RunBody(BaseModel):
     engine: str = "auto"  # action=edit: auto | ai | rules
     replan: bool = False  # action=edit: ignore the saved edit plan, let the agent make a new one
     smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
+    open_capcut: bool = True  # action=capcut: bring CapCut up when the project is written
 
 
 class RestoreBody(BaseModel):
@@ -590,6 +605,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "flow_ui": g.ui_available(),
             "ffmpeg": shutil.which("ffmpeg"),
             "ffprobe": shutil.which("ffprobe"),
+            "capcut": _capcut_installed(s),
             "anthropic_key": bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
             "claude_code": claude_code(refresh=refresh),
             "planner": planner_backend(),
@@ -1375,6 +1391,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     # ---- editor agent: edit plan (edit.json) ----
 
     def edit_view(pid: str) -> dict[str, Any]:
+        from ..capcut import FROM_FFMPEG, catalog
+        from ..capcut import transition_catalog as capcut_catalog
         from ..editor import ClipInfo, load_plan, timeline, transition_catalog
 
         od = out_dir(pid)
@@ -1389,6 +1407,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if plan and all(c.id in infos for c in plan.clips) and plan.clips:
             total = round(timeline(plan, infos)[1], 2)
         return {"plan": plan.model_dump() if plan else None, "transitions": transition_catalog(),
+                "capcut_transitions": capcut_catalog(), "capcut_default": FROM_FFMPEG,
+                "capcut_filters": list(catalog()["filters"]), "capcut_effects": list(catalog()["effects"]),
+                "credits": _credits(od),
                 "clips": {k: {"duration": v.duration, "has_audio": v.has_audio} for k, v in infos.items()},
                 "total": total}
 
@@ -1434,7 +1455,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
         check_ids(sb, body)
-        if body.action not in {"dry", "keyframes", "video", "stitch", "edit", "make", "thumbnail"}:
+        if body.action not in {"dry", "keyframes", "video", "stitch", "edit", "capcut", "make", "thumbnail"}:
             raise HTTPException(400, "action không hợp lệ")
         if body.engine not in {"auto", "ai", "rules"}:
             raise HTTPException(400, "action không hợp lệ")
@@ -1462,7 +1483,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if pdir(pid).resolve() not in music.parents or not music.is_file():
                 raise HTTPException(400, "Không thấy file nhạc.")
         titles = {"dry": "Xem trước (không tốn credit)", "keyframes": "Tạo ảnh keyframe",
-                  "video": "Render video", "stitch": "Ghép phim", "edit": "AI dựng phim", "make": "Render + ghép phim",
+                  "video": "Render video", "stitch": "Ghép phim", "edit": "AI dựng phim", "capcut": "AI dựng phim bằng CapCut",
+                  "make": "Render + ghép phim",
                   "thumbnail": "Tạo thumbnail"}
         scope = f" ({', '.join(body.only)})" if body.only else ""
 
@@ -1553,6 +1575,23 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log(f"🎬 Phim đã dựng: {output}")
             return {"final": str(output), "edit_source": plan.source}
 
+        def do_capcut(job: Job) -> dict[str, Any]:
+            from .. import capcut as cc
+
+            clips = ready_clips(job)
+            if body.burn_subtitles:
+                fill_subtitles(job)
+            backend = planner_backend()
+            folder, plan = cc.export_film(
+                sb, clips, out_dir(pid), music=music, music_volume=body.volume, subtitles=body.burn_subtitles,
+                subtitle_language=body.burn_language, root=settings.get("capcut_drafts_dir") or None,
+                engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
+                api_key=settings.get("anthropic_api_key") or None, log=job.log)
+            opened = body.open_capcut and cc.open_capcut()
+            job.log(f"🎬 Dự án CapCut “{folder.name}” đã sẵn sàng. {'Đã mở CapCut: c' if opened else 'Mở CapCut và c'}họn "
+                    "dự án ở màn hình chính (chưa thấy thì đóng rồi mở lại CapCut), chỉnh thêm rồi bấm Export.")
+            return {"capcut_project": folder.name, "capcut_dir": str(folder), "edit_source": plan.source}
+
         def do_stitch(job: Job) -> dict[str, Any]:
             clips = ready_clips(job)
             fill_subtitles(job)
@@ -1613,6 +1652,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 return do_stitch(job)
             if body.action == "edit":
                 return do_edit(job)
+            if body.action == "capcut":
+                return do_capcut(job)
             res = do_run(job, dry=False, keyframes_only=False)
             if body.action == "make" and not job.stop_requested:
                 if res.get("error") and not body.allow_missing:

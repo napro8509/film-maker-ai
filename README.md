@@ -133,6 +133,44 @@ output/cafe/
 └── final.vi.srt, final.th.srt, final.en.srt
 ```
 
+### Dựng phim bằng CapCut
+
+```bash
+# Agent dựng phim (Claude) lập kế hoạch dựng rồi xếp sẵn thành một dự án CapCut (không tốn credit)
+filmmaker capcut cafe.yaml --music nhac.mp3          # [--lang vi|th|en] [--no-subtitles] [--name "Tên dự án"]
+filmmaker capcut cafe.yaml --replan                  # agent làm bản dựng mới
+```
+
+Trên giao diện: tab **Ghép phim & ảnh bìa** → **AI dựng bằng CapCut**, hoặc **Mở bằng CapCut** ở thẻ “Bản dựng của agent” sau khi
+chỉnh tay. Cần CapCut bản máy tính đã mở ít nhất một lần (đã kiểm tra với CapCut 9.7.1 trên macOS).
+
+- Khi máy có CapCut, nút dựng chính trên giao diện là **AI dựng phim (CapCut)**; bản ffmpeg cũ thành
+  **Dựng nhanh (ffmpeg)**.
+- Agent làm việc như một editor kiêm chỉnh màu và thiết kế âm thanh. Nó **xem hình thật của từng cảnh** (bảng ảnh
+  đầu / giữa / cuối mỗi clip, lưu ở `<out>/edit_frames/`) rồi quyết định cho từng cảnh:
+  - chỗ cắt và chuyển cảnh, chọn trong 35 chuyển cảnh miễn phí của CapCut (hồi ức, loang mực, chớp mắt…);
+  - **màu phim** chung cho cả phim và màu riêng cho cảnh hồi tưởng, chọn trong 112 bộ lọc miễn phí của CapCut;
+  - **hiệu ứng hình** (314 hiệu ứng miễn phí, dùng rất tiết chế) và **chuyển động máy** đẩy vào / kéo ra;
+  - **mức nhạc nền từng cảnh**: hạ dưới thoại, tắt hẳn ở khoảnh khắc sốc, trả lại ở cảnh không lời;
+  - **tiếng động** (tối đa 12 cho một phim) và **nhạc nền** khi bạn chưa chọn nhạc, tìm trên mạng;
+  - tiêu đề mở đầu và kiểu xuất hiện của phụ đề.
+- Nhạc và tiếng động lấy từ Openverse (Freesound, Jamendo…), chỉ loại cho dùng thương mại và chỉnh sửa: CC0 trước,
+  rồi CC BY. File lưu ở `<out>/edit_assets/`, kèm `CREDITS.txt`; mục CC BY **phải ghi tên tác giả** khi đăng video.
+  Chỉ cụm từ tìm kiếm (vd “door slam”) được gửi đi, không gửi gì về phim. Agent không nghe được âm thanh: nó chọn
+  theo tên và nhãn, nên hãy nghe lại trong CapCut. Tắt tìm kiếm trên mạng: `FILMMAKER_OFFLINE=1`.
+- Mọi lựa chọn nằm trong `edit.json` và sửa được ở thẻ “Bản dựng của agent” (màu phim, tiêu đề, chuyển động máy,
+  hiệu ứng, mức nhạc, bỏ tiếng động) rồi **Mở bằng CapCut** lại, không cần agent chạy lại. Bản dựng cũ chưa có
+  lớp này được agent tự dựng lại; bản bạn đã sửa tay thì giữ nguyên (bấm “Dựng lại từ đầu” để agent làm bản mới).
+- Chưa có Claude thì chỉ có bản cơ bản: cắt, hoà tan, mở/kết mờ, cân âm.
+- Mở CapCut, chọn dự án ở màn hình chính (chưa thấy thì đóng rồi mở lại CapCut), chỉnh thêm hiệu ứng / âm thanh
+  rồi bấm **Export** ở đó. Film Maker không tự bấm Export nên không có `final.mp4` ở bước này.
+- Clip được đặt trong thư mục dự án CapCut (hard link, không tốn thêm dung lượng). Dự án đang mở hoặc đã sửa trong
+  CapCut không bị ghi đè: lần dựng sau lưu thành “Tên (2)”.
+- Khác với bản ffmpeg: chuyển cảnh CapCut không làm phim ngắn lại.
+- CapCut không tự hiện dự án được tạo trong lúc bạn đang mở một dự án khác: thoát hẳn CapCut rồi mở lại.
+- Thư mục dự án CapCut khác mặc định: `--capcut-dir`, biến `FILMMAKER_CAPCUT_DRAFTS`, hoặc `capcut_drafts_dir`
+  trong `settings.json`.
+
 ## Backup lên Google Drive
 
 Clip Veo tốn credit, nên nên có bản sao trên Drive (gói Google AI Pro/Ultra có sẵn nhiều dung lượng).

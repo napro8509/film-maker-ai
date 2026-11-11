@@ -28,11 +28,21 @@ _BLOCKED_BIN.chmod(0o755)
 _REAL_RCLONE = shutil.which("rclone")  # for `local_rclone` only
 for _name in ("GFLOW_BIN", "RCLONE_BIN"):
     os.environ.setdefault(_name, str(_BLOCKED_BIN))
+os.environ["FILMMAKER_OFFLINE"] = "1"  # the editor never searches the web for sounds in tests
+# CapCut: never write into the real CapCut projects folder (a missing folder = "CapCut not installed").
+os.environ["FILMMAKER_CAPCUT_DRAFTS"] = str(_SAFE_SETTINGS.parent / "no-capcut")
 atexit.register(shutil.rmtree, _SAFE_SETTINGS.parent, ignore_errors=True)
 
 import pytest  # noqa: E402
 
 from filmmaker import manual_clip, model_meta  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _never_open_capcut(monkeypatch):
+    from filmmaker import capcut
+
+    monkeypatch.setattr(capcut, "open_capcut", lambda: False)
 
 
 @pytest.fixture(autouse=True)

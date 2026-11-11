@@ -1818,7 +1818,7 @@ function renderFinal() {
               oninput: (e) => { document.getElementById("volv").textContent = Math.round(e.target.value * 100) + "%"; },
               onchange: (e) => saveFinalPrefs({ ...finalPrefs(), volume: +e.target.value }) })) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
-            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Phim luôn có 3 track phụ đề Việt / Thái / Anh (bật/tắt trong trình phát) và 3 file .srt. Bản dịch còn thiếu được Claude tự dịch khi ghép."))),
+            h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Phim luôn có 3 track phụ đề Việt / Thái / Anh (bật/tắt trong trình phát) và 3 file .srt. Bản dịch còn thiếu được Claude tự dịch khi ghép. Khi dựng bằng CapCut, bật mục này để phụ đề thành track chữ sửa được trong CapCut."))),
           p.burn_subtitles ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Track in lên hình"),
             h("select", { value: p.burn_language || primarySubCode(S.cur.storyboard), onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_language: e.target.value }) },
               SUB_TRACKS.map(([code, label]) => h("option", { value: code }, label)))) : null,
@@ -1829,7 +1829,11 @@ function renderFinal() {
             return h("div", { class: "stack tight" },
               h("div", { class: "divider" }),
               h("div", { class: "row" },
-                h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("edit"), title: "Agent dựng phim: cắt phần thừa, chuyển cảnh, cân âm lượng, nhạc nền → phim liền mạch" }, icon("sparkle"), "AI dựng phim", FREE()),
+                S.env.capcut
+                  ? h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("capcut"),
+                      title: "Agent dựng phim như một editor: xem hình từng cảnh, chọn chỗ cắt, chuyển cảnh, màu phim, hiệu ứng, chuyển động máy trong kho CapCut; tự tìm nhạc nền và tiếng động trên mạng; hạ nhạc dưới thoại. Kết quả là dự án CapCut để xem, chỉnh và xuất phim." }, icon("sparkle"), "AI dựng phim (CapCut)", FREE())
+                  : h("button", { class: "btn primary", disabled: busy || !n, onclick: () => runAction("edit"), title: "Agent dựng phim: cắt phần thừa, chuyển cảnh, cân âm lượng, nhạc nền → phim liền mạch. Cài CapCut bản máy tính (mở nó một lần) để agent dựng đầy đủ màu phim, hiệu ứng và âm thanh." }, icon("sparkle"), "AI dựng phim", FREE()),
+                S.env.capcut ? h("button", { class: "btn", disabled: busy || !n, onclick: () => runAction("edit"), title: "Dựng nhanh ra final.mp4 bằng ffmpeg: cắt, chuyển cảnh cơ bản, cân âm, nhạc nền. Không có màu phim, hiệu ứng và tiếng động." }, icon("film"), "Dựng nhanh (ffmpeg)", FREE()) : null,
                 h("button", { class: "btn", disabled: busy || !n, onclick: () => runAction("stitch"), title: "Nối thẳng các clip, không chuyển cảnh" }, icon("stitch"), "Ghép thẳng"),
                 h("button", { class: "btn", disabled: busy, onclick: () => runAction("make"), title: "Render các cảnh còn thiếu rồi dựng phim" }, "Render nốt + dựng", PAID())),
               h("div", { class: "help" }, `${n}/${total} cảnh đã có clip.`));
@@ -1878,8 +1882,10 @@ function editPlanView() {
   const plan = E?.data?.plan;
   if (!E) return h("div", { class: "help" }, "Đang tải…");
   if (!plan) return h("div", { class: "stack tight" },
-    h("p", { class: "help" }, "Chưa có bản dựng. Bấm “AI dựng phim” để agent dựng phim từ các clip đã render."));
+    h("p", { class: "help" }, "Chưa có bản dựng. Bấm “AI dựng phim” để agent xem các clip đã render và dựng phim."));
   const catalog = E.data.transitions || [];
+  const capcutCatalog = E.data.capcut_transitions || [], capcutDefault = E.data.capcut_default || {};
+  const capcutLabel = Object.fromEntries(capcutCatalog.map((o) => [o.id, o.label]));
   const scenes = Object.fromEntries((S.cur.storyboard.scenes || []).map((s) => [s.id, s]));
   const clipLen = (c) => { const d = E.data.clips?.[c.id]?.duration; return d ? Math.max(0, d - c.trim_start - c.trim_end) : null; };
   const touch = () => { E.dirty = true; refreshZone("edit-zone"); };
@@ -1896,16 +1902,36 @@ function editPlanView() {
       h("td", {}, num(c.trim_end, 0, 3, 0.1, (v) => { c.trim_end = v; }, `Cắt cuối ${c.id}`)),
       h("td", {}, num(c.volume, 0, 2, 0.1, (v) => { c.volume = v; }, `Âm lượng ${c.id}`)),
       h("td", { class: "small muted" }, len != null ? len.toFixed(1) + "s" : "")));
+    if (plan.pro) rows.push(h("tr", { class: "edit-tr" },
+      h("td", { colspan: 6 },
+        h("div", { class: "row", style: { gap: "8px" } },
+          h("span", { class: "muted" }, "✦"),
+          h("select", { "aria-label": `Chuyển động máy ${c.id}`, value: c.motion || "none", title: "Chuyển động máy thêm lúc dựng", onchange: (e) => { c.motion = e.target.value; touch(); } },
+            [["none", "Máy đứng yên"], ["push_in", "Đẩy máy vào"], ["pull_out", "Kéo máy ra"]].map(([v, l]) => h("option", { value: v }, l))),
+          h("select", { "aria-label": `Hiệu ứng hình ${c.id}`, value: c.effect || "", title: "Hiệu ứng hình CapCut phủ lên cảnh này", style: { maxWidth: "150px" }, onchange: (e) => { c.effect = e.target.value || null; touch(); } },
+            h("option", { value: "" }, "Không hiệu ứng"), (E.data.capcut_effects || []).map((n) => h("option", { value: n }, n))),
+          h("select", { "aria-label": `Màu riêng ${c.id}`, value: c.filter || "", title: "Màu riêng cho cảnh này (khác màu chung của phim)", style: { maxWidth: "150px" }, onchange: (e) => { c.filter = e.target.value || null; touch(); } },
+            h("option", { value: "" }, "Theo màu phim"), (E.data.capcut_filters || []).map((n) => h("option", { value: n }, n))),
+          h("span", { class: "small muted" }, "Nhạc"),
+          num(Math.round((c.music ?? 1) * 100), 0, 100, 5, (v) => { c.music = v / 100; }, `Mức nhạc nền ${c.id}`),
+          h("span", { class: "small muted" }, "%"),
+          (c.sounds || []).map((x, k) => h("span", { class: "badge", title: `Tiếng động tìm trên mạng, bắt đầu ở giây ${x.at}. Bấm để bỏ.`, style: { cursor: "pointer" },
+            onclick: () => { c.sounds.splice(k, 1); touch(); } }, "♪ " + x.query + " ×")),
+          c.note ? h("span", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: c.note }, c.note) : null))));
     const t = plan.transitions[i];
     if (!t) return;
     rows.push(h("tr", { class: "edit-tr" },
       h("td", { colspan: 6 },
         h("div", { class: "row", style: { flexWrap: "nowrap", gap: "8px" } },
           h("span", { class: "muted" }, "↳"),
-          h("select", { "aria-label": `Chuyển cảnh sau ${t.after}`, value: t.type, onchange: (e) => { t.type = e.target.value; if (t.type !== "cut" && !t.duration) t.duration = 0.5; t.reason = ""; touch(); } },
+          h("select", { "aria-label": `Chuyển cảnh sau ${t.after}`, value: t.type, onchange: (e) => { t.type = e.target.value; if (t.type !== "cut" && !t.duration) t.duration = 0.5; t.reason = ""; t.capcut = null; touch(); } },
             catalog.map((o) => h("option", { value: o.id }, o.label))),
           t.type !== "cut" ? num(t.duration, 0.2, 2, 0.1, (v) => { t.duration = v; }, `Độ dài chuyển cảnh sau ${t.after}`) : null,
           t.type !== "cut" ? h("span", { class: "small muted" }, "s") : null,
+          t.type !== "cut" && capcutCatalog.length ? h("select", { "aria-label": `Chuyển cảnh CapCut sau ${t.after}`, value: t.capcut || "",
+            title: "Hiệu ứng dùng khi dựng bằng CapCut", onchange: (e) => { t.capcut = e.target.value || null; touch(); } },
+            h("option", { value: "" }, "CapCut: " + (capcutLabel[capcutDefault[t.type]] || "tự chọn")),
+            capcutCatalog.map((o) => h("option", { value: o.id }, "CapCut: " + o.label))) : null,
           t.reason ? h("span", { class: "small muted", style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: t.reason }, t.reason) : null))));
   });
   const save = async (render) => {
@@ -1913,7 +1939,7 @@ function editPlanView() {
       const data = await api("PUT", `/api/projects/${S.cur.id}/edit-plan`, plan);
       S.edit = { pid: S.cur.id, data, dirty: false };
       refreshZone("edit-zone");
-      if (render) runAction("edit");
+      if (render) runAction(render === "capcut" ? "capcut" : "edit");
       else toast("Đã lưu bản dựng");
     } catch (e) { toast(e.message, "error"); }
   };
@@ -1929,6 +1955,19 @@ function editPlanView() {
     h("div", { class: "row" },
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Mở đầu mờ (s)"), num(plan.fade_in, 0, 3, 0.1, (v) => { plan.fade_in = v; }, "Mở đầu mờ")),
       h("label", { class: "field" }, h("span", { class: "lbl" }, "Kết mờ (s)"), num(plan.fade_out, 0, 4, 0.1, (v) => { plan.fade_out = v; }, "Kết mờ"))),
+    plan.pro ? h("div", { class: "stack tight" },
+      h("div", { class: "row" },
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Màu phim (CapCut)"),
+          h("select", { "aria-label": "Màu phim", value: plan.look || "", onchange: (e) => { plan.look = e.target.value || null; touch(); } },
+            h("option", { value: "" }, "Giữ màu gốc"), (E.data.capcut_filters || []).map((n) => h("option", { value: n }, n)))),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Độ đậm màu (%)"),
+          num(Math.round((plan.look_strength ?? 0.6) * 100), 10, 100, 5, (v) => { plan.look_strength = v / 100; }, "Độ đậm màu phim")),
+        h("label", { class: "field", style: { flex: "1" } }, h("span", { class: "lbl" }, "Tiêu đề mở đầu"),
+          h("input", { type: "text", "aria-label": "Tiêu đề mở đầu", value: plan.title || "", placeholder: "Không có", onchange: (e) => { plan.title = e.target.value.trim() || null; touch(); } }))),
+      h("label", { class: "field" }, h("span", { class: "lbl" }, "Nhạc nền agent tìm trên mạng (khi chưa chọn nhạc ở trên)"),
+        h("input", { type: "text", "aria-label": "Từ khoá tìm nhạc nền", value: plan.music_query || "", placeholder: "vd: sad piano cinematic (tiếng Anh)", onchange: (e) => { plan.music_query = e.target.value.trim() || null; touch(); } })),
+      E.data.credits ? h("details", {}, h("summary", { class: "small" }, "Nguồn nhạc / tiếng động (ghi nguồn khi đăng)"),
+        h("pre", { class: "small", style: { whiteSpace: "pre-wrap", userSelect: "text" } }, E.data.credits)) : null) : null,
     h("label", { class: "check" }, h("input", { type: "checkbox", checked: plan.even_loudness, onchange: (e) => { plan.even_loudness = e.target.checked; touch(); } }),
       h("span", {}, "Cân bằng âm lượng giữa các clip", h("span", { class: "sub" }, "Clip to/nhỏ khác nhau sẽ được kéo về cùng mức."))),
     h("label", { class: "check" }, h("input", { type: "checkbox", checked: plan.duck_music, onchange: (e) => { plan.duck_music = e.target.checked; touch(); } }),
@@ -1937,6 +1976,7 @@ function editPlanView() {
       h("span", {}, "Chuẩn hoá độ lớn cho mạng xã hội", h("span", { class: "sub" }, "-14 LUFS, như YouTube / TikTok / Facebook."))),
     h("div", { class: "row" },
       h("button", { class: "btn primary sm", disabled: busy, onclick: () => save(true) }, icon("film"), E.dirty ? "Lưu & xuất lại" : "Xuất lại theo bản này", FREE()),
+      S.env.capcut ? h("button", { class: "btn sm", disabled: busy, title: "Xuất bản dựng này thành dự án CapCut", onclick: () => save("capcut") }, icon("sparkle"), E.dirty ? "Lưu & mở bằng CapCut" : "Mở bằng CapCut") : null,
       E.dirty ? h("button", { class: "btn sm", onclick: () => save(false) }, icon("check"), "Chỉ lưu") : null,
       E.dirty ? h("button", { class: "btn sm ghost", onclick: () => loadEditPlan(true) }, "Bỏ thay đổi") : null,
       h("span", { class: "spacer" }),
@@ -2225,11 +2265,11 @@ async function runAction(action, extra = {}, ctx = {}) {
   await flushSave();
   if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
   if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
-  if (action !== "dry" && action !== "stitch" && action !== "edit" && !S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
-  if ((action === "stitch" || action === "edit" || action === "make") && !S.env.ffmpeg) { toast("Chưa cài ffmpeg nên không ghép phim được", "error"); return; }
-  if (action === "edit" && S.edit?.dirty && !extra.replan && !(await confirmModal("Bỏ thay đổi chưa lưu?", "Bản dựng có chỉnh sửa chưa lưu. Bấm “Lưu & xuất lại” để giữ chúng.", "Vẫn dựng"))) return;
+  if (action !== "dry" && action !== "stitch" && action !== "edit" && action !== "capcut" && !S.env.gflow) { toast("Chưa cài gflow-cli", "error"); return; }
+  if ((action === "stitch" || action === "edit" || action === "capcut" || action === "make") && !S.env.ffmpeg) { toast("Chưa cài ffmpeg nên không ghép phim được", "error"); return; }
+  if ((action === "edit" || action === "capcut") && S.edit?.dirty && !extra.replan && !(await confirmModal("Bỏ thay đổi chưa lưu?", "Bản dựng có chỉnh sửa chưa lưu. Bấm “Lưu & xuất lại” để giữ chúng.", "Vẫn dựng"))) return;
   const body = { action, only: [], force: [], force_keyframes: [], ...extra };
-  if (action === "stitch" || action === "edit" || action === "make") Object.assign(body, finalPrefs(), extra);
+  if (action === "stitch" || action === "edit" || action === "capcut" || action === "make") Object.assign(body, finalPrefs(), extra);
   if (action === "video" || action === "make") {
     const ok = await confirmPaid(body, ctx);
     if (!ok) return;
@@ -2500,7 +2540,8 @@ async function onJobDone() {
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
     if ((j.kind === "portraits" || j.kind === "locations") && (S.tab === "story" || S.tab === "board")) renderMain();
-    if (j.kind === "edit" || j.kind === "make") await loadEditPlan(true);
+    if (j.kind === "edit" || j.kind === "capcut" || j.kind === "make") await loadEditPlan(true);
+    if (j.kind === "capcut" && j.result?.capcut_project) toast(`Đã tạo dự án CapCut “${j.result.capcut_project}”. Mở CapCut để xem, chỉnh và xuất phim.`);
     if (j.kind === "stitch" || j.kind === "edit" || (j.kind === "make" && j.result?.final)) { S.tab = "final"; renderMain(); }
     else if (j.kind === "thumbnail" && S.tab === "final") renderMain();
   }
