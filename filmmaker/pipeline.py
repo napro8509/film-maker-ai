@@ -607,7 +607,7 @@ class Pipeline:
             try:
                 video, media_id = self._with_retries(
                     "render video",
-                    lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt), [p for _, p in refs], **common), opts.max_retries)
+                    lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), [p for _, p in refs], **common), opts.max_retries)
                 return video, media_id, "r2v"
             except GflowError as exc:
                 if exc.exit_code != EXIT_NOT_PORTED:
@@ -618,7 +618,7 @@ class Pipeline:
                 self.state.data["r2v_unsupported"] = True
                 self.state.save()
                 self._remember(r2v_unsupported=True)
-        video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(self.sb.for_flow_video(prompt), **common),
+        video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(self.sb.for_flow_video(prompt, s), **common),
                                              opts.max_retries)
         return video, media_id, "t2v"
 
@@ -668,7 +668,7 @@ class Pipeline:
             return Path(video)
         if ui:
             return self._render_via_ui(s, start_image, prompt, common)
-        call = lambda: self.g.image_to_video(start_image, self.sb.for_flow_video(prompt), end_image=s.end_image, **common)
+        call = lambda: self.g.image_to_video(start_image, self.sb.for_flow_video(prompt, s), end_image=s.end_image, **common)
         try:
             video, media_id = self._with_retries("render video", call, opts.max_retries)
         except GflowError as exc:
@@ -785,7 +785,7 @@ class Pipeline:
         if not self.g.dry_run:
             self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
                               submitted_at=manual_clip.stamp_now())
-        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt), **common)
+        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s), **common)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"không thấy file video {video}", exit_code=1)

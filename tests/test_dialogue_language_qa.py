@@ -59,6 +59,13 @@ scenes:
 """
 
 
+
+def _said_once(text, rule):
+    """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+
 def _story(lang: str | None) -> str:
     if lang is None:
         return STORY.replace("dialogue_language: Vietnamese\n", "")
@@ -113,12 +120,14 @@ def test_flow_ui_prompts_get_rule_once(env, monkeypatch):
     assert len(ui_calls) == 3 and all(c[0] == "i2v" for c in ui_calls)  # s01 keyframe, s03, s04
     for c in ui_calls:
         p = _prompt(c)
-        assert p.count(VI) == 1, p  # s03 already had the sentence pasted: still once
-        assert p.index(VI) < p.index(NO_TEXT), p
+        assert _said_once(p, VI), p  # s03 already had the sentence pasted: still once
+        from filmmaker.storyboard import SILENT_SCENE_RULE
+
+        assert p.index(VI if VI in p else SILENT_SCENE_RULE) < p.index(NO_TEXT), p
     assert any("Minh waits" in _prompt(c) for c in ui_calls)
     # the t2v scene still went through gflow, with the rule
     videos = [c for c in calls() if c[0] == "video"]
-    assert videos and all(" ".join(c).count(VI) == 1 for c in videos)
+    assert videos and all(_said_once(" ".join(c), VI) for c in videos)
     _no_rule_in_images(calls)
 
 
@@ -157,7 +166,7 @@ def test_dry_run_shows_rule_once_in_every_video(env):
     assert {"i2v", "r2v"} <= kinds, kinds  # s01 keyframe / s03 / s04 = i2v, s02 = r2v (Lan has an image)
     assert len(videos) == 4
     for c in videos:
-        assert " ".join(c).count(VI) == 1, c
+        assert _said_once(" ".join(c), VI), c
     for c in cmds:
         if "image" in c:
             assert VI not in " ".join(c), c

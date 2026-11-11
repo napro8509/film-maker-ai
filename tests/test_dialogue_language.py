@@ -18,6 +18,13 @@ FAKE = Path(__file__).parent / "fake_gflow.py"
 VI = DIALOGUE_RULE.format(lang="Vietnamese")
 
 
+
+def _said_once(text, rule):
+    """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+
 def _sb(**kw) -> Storyboard:
     data = {"title": "T", "scenes": [{"id": "s01", "mode": "t2v", "prompt": "Lan walks"}]}
     data.update(kw)
@@ -85,10 +92,10 @@ def test_rule_before_no_text():
     sb = _sb(dialogue_language="Vietnamese")
     out = sb.for_flow_video("Lan walks")
     assert out == f"Lan walks. {VI} {NO_TEXT}"
-    assert out.count(VI) == 1 and out.index(VI) < out.index(NO_TEXT)
+    assert _said_once(out, VI) and out.index(VI) < out.index(NO_TEXT)
     # the user pasted NO_TEXT into the prompt: the rule still comes before it
     out = sb.for_flow_video(f"Lan walks. {NO_TEXT} Rain.")
-    assert out.count(VI) == 1 and out.count(NO_TEXT) == 1 and out.index(VI) < out.index(NO_TEXT)
+    assert _said_once(out, VI) and out.count(NO_TEXT) == 1 and out.index(VI) < out.index(NO_TEXT)
     assert sb.for_flow_video("") == f"{VI} {NO_TEXT}"
 
 
@@ -210,7 +217,7 @@ def _check(calls, rule, kinds):
     videos = [c for c in calls() if c[0] == "video"]
     assert sorted({c[1] for c in videos}) == sorted(kinds)
     for c in videos:
-        assert " ".join(c).count(rule) == 1, c
+        assert _said_once(" ".join(c), rule), c
     for c in calls():
         if c[0] == "image":
             assert "spoken dialogue" not in " ".join(c).lower(), c
@@ -246,7 +253,7 @@ def test_pipeline_fallback_t2v_gets_rule(env, monkeypatch):
     assert any("Lan at a cafe" in " ".join(c) for c in text)
     for c in calls():
         if c[0] == "video":
-            assert " ".join(c).count(VI) == 1, c
+            assert _said_once(" ".join(c), VI), c
 
 
 # --- review fix: control / format characters ----------------------------------

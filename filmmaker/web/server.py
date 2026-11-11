@@ -509,7 +509,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
-                    "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s)),
+                    "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s), s),
                     "rendered_as": st.get("rendered_as"),
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,

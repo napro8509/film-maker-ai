@@ -125,7 +125,7 @@ def _flow_prompts(sb_path: Path) -> str | None:
         try:
             if s.mode == "keyframe":
                 part.append("Ảnh mở cảnh (image prompt):\n" + sb.for_flow(sb.image_prompt(s)))
-            part.append("Video prompt:\n" + sb.for_flow_video(sb.video_prompt(s)))
+            part.append("Video prompt:\n" + sb.for_flow_video(sb.video_prompt(s), s))
         except Exception:
             continue
         lines.append("\n".join(part))

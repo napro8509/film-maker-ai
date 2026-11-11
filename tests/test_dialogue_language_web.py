@@ -20,6 +20,13 @@ FAKE = Path(__file__).parent / "fake_gflow.py"
 VI_RULE = DIALOGUE_RULE.format(lang="Vietnamese")
 
 
+
+def _said_once(text, rule):
+    """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """Copied from tests/test_web.py (no shared fixture), plus a fake planner reachable via the "api" backend."""
@@ -205,7 +212,7 @@ def test_detail_video_prompt_has_rule(client):
     make_project(client, dialogue_language="Vietnamese")
     st = client.get("/api/projects/film").json()["scene_state"]
     for sid in ("s01", "s02"):
-        assert st[sid]["video_prompt"].count(VI_RULE) == 1
+        assert _said_once(st[sid]["video_prompt"], VI_RULE)
     assert VI_RULE not in st["s02"]["image_prompt"]
 
 
