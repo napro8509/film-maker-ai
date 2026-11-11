@@ -53,11 +53,10 @@ def test_language_constants():
 
 def test_new_film_popup_fields_and_storage():  # AC1, AC3
     f = _ai_form()
-    assert 'field("Nhân vật nói", speak.el)' in f and 'field("Ngôn ngữ phụ đề", sub.el' in f
+    assert 'field("Nhân vật nói", speak.el)' in f and 'field("Ngôn ngữ phụ đề", sub.el)' in f
     assert 'langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese")' in f
-    # several subtitle languages; an older single "subtitleLang" is still read, "none" dropped -> Vietnamese
-    assert 'localGet("subtitleLangs") || [cleanLang(localGet("subtitleLang"))]' in f and "subLangPicker(" in f
-    assert '!== "none"' in f and '["Vietnamese"]' in f
+    assert 'cleanLang(localGet("subtitleLang"))' in f and "langPicker(SUBTITLE_LANGS" in f
+    assert '!== "none"' in f  # "none" left in subtitleLang falls back to Vietnamese
     assert "localStorage" not in f  # only through localGet/localSet ("fm." prefix)
 
 
@@ -67,7 +66,7 @@ def test_new_film_popup_validates_then_stores_then_posts():  # AC2, AC3, AC4
     i_read = go.index("speak.read(), b = sub.read()")
     i_bad_a = go.index('if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error");')
     i_bad_b = go.index('if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error");')
-    i_store = go.index('localSet("dialogueLang", a.value); localSet("subtitleLangs", b.values);')
+    i_store = go.index('localSet("dialogueLang", a.value); localSet("subtitleLang", b.value);')
     i_post = go.index('api("POST", "/api/projects/plan"')
     assert i_read < i_bad_a < i_bad_b < i_store < i_post
     # each bad branch returns before storing anything
@@ -75,7 +74,7 @@ def test_new_film_popup_validates_then_stores_then_posts():  # AC2, AC3, AC4
         line = go[i:go.index("\n", i)]
         assert line.rstrip().endswith("return; }"), line
     body = go[i_post:go.index("\n", i_post)]
-    assert "language: b.values[0]" in body and "languages: b.values" in body and "dialogue_language: a.value" in body
+    assert "language: b.value" in body and "dialogue_language: a.value" in body  # AC4
     # the store sits outside the try: kept even when the plan request / job fails
     assert go.index("try {") > i_store
 

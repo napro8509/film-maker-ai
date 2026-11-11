@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import autopilot, film_chat, flow_caps, qc, social, subtitles, manual_clip, model_change, model_meta, retirement
+from .. import autopilot, film_chat, flow_caps, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -218,11 +218,6 @@ class SocialBody(BaseModel):
     pictures: bool = True
 
 
-class TranslateBody(BaseModel):
-    langs: list[str] = []  # empty = every other subtitle language of the film
-    force: bool = False  # translate again lines that already have a translation
-
-
 class QCBody(BaseModel):
     only: list[str] = []
     force: bool = False
@@ -243,7 +238,6 @@ class PlanBody(BaseModel):
     scenes: int = 6
     aspect: str = "16:9"
     language: str = "Vietnamese"  # subtitle (narration) language
-    languages: list[str] | None = None  # every subtitle language, narration's first (overrides `language`)
     dialogue_language: str | None = None  # language every character speaks; "none" = no dialogue
 
 
@@ -258,7 +252,6 @@ class RunBody(BaseModel):
     music: str | None = None
     volume: float = 0.25
     burn_subtitles: bool = False
-    burn_lang: str | None = None  # subtitle language burned into the picture (None = the narration's)
     allow_missing: bool = False
     remake_thumbnail: bool = False  # action=thumbnail: new picture on Flow, not just the title
     engine: str = "auto"  # action=edit: auto | ai | rules
@@ -269,8 +262,7 @@ class RunBody(BaseModel):
 class AutoBody(BaseModel):
     review: bool = True  # AI agents review storyboard, keyframes, clips and the finished film
     burn_subtitles: bool = True
-    burn_lang: str | None = None
-    rerender_budget: int = 3  # unused: AI QC only flags clips
+    rerender_budget: int = 3  # clips the clip review may render again (credits)
     music: str | None = None
 
 
@@ -304,7 +296,6 @@ class FinalSettings(BaseModel):
     music: str | None = None
     volume: float = 0.25
     burn_subtitles: bool = False
-    burn_lang: str | None = None
     allow_missing: bool = False
     smart_edit: bool = True
 
@@ -544,8 +535,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "clips_rendered": clips_rendered,
             "project_id": project_id,
             "final_url": file_url(pid, final),
-            "subtitle_files": subtitle_files(pid, sb),
-            "subtitle_missing": subtitles.missing(sb) if sb else {},
             "final_size": final.stat().st_size if final.is_file() else None,
             "srt_url": file_url(pid, srt),
             "final_prefs": ui_prefs.read(pdir(pid)).get("final", {}),
@@ -558,17 +547,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             **model_info,
             "path": str(pdir(pid)),
         }
-
-    def subtitle_files(pid: str, sb: Storyboard | None) -> list[dict[str, Any]]:
-        """The .srt of each subtitle language next to final.mp4 (narration's language first)."""
-        final = out_dir(pid) / "final.mp4"
-        out = []
-        for i, lang in enumerate(sb.subtitle_langs() if sb else []):
-            url = file_url(pid, final.with_name(f"final.{subtitles.lang_code(lang)}.srt"))
-            if not url and i == 0:
-                url = file_url(pid, final.with_suffix(".srt"))
-            out.append({"lang": lang, "code": subtitles.lang_code(lang), "url": url})
-        return out
 
     def characters_state(pid: str, raw: dict[str, Any], sb: Storyboard | None) -> list[dict[str, Any]]:
         out = []
@@ -820,58 +798,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         the "save a broken draft" behaviour, so the whole model is NOT validated here.
         With `on_disk`, a key left unchanged is not checked: a bad value hand-written in the YAML must not
         block every autosave of the other fields (it is still reported by the model errors)."""
-        def clean_list(v: object) -> object:
-            if v is None:
-                return None
-            if not isinstance(v, list):
-                raise ValueError("phải là danh sách tên ngôn ngữ")
-            return [clean_language(x) for x in v]
-
         for key, label, clean in (("dialogue_language", "Ngôn ngữ thoại", clean_dialogue_language),
-                                  ("subtitle_language", "Ngôn ngữ phụ đề", clean_language),
-                                  ("subtitle_languages", "Ngôn ngữ phụ đề", clean_list)):
+                                  ("subtitle_language", "Ngôn ngữ phụ đề", clean_language)):
             if key in data and not (on_disk is not None and key in on_disk and on_disk[key] == data[key]):
                 try:
                     clean(data[key])
                 except ValueError as exc:
                     raise HTTPException(400, f"{label}: {exc}.")
 
-    def sub_langs_or_400(body: PlanBody) -> list[str]:
-        """The subtitle languages of the "Phim mới" form (narration's first), deduplicated."""
-        raw = body.languages if body.languages else [body.language]
-        out: list[str] = []
-        for v in raw:
-            lang = _lang_or_400(v, "Ngôn ngữ phụ đề", dialogue=False)
-            if lang.casefold() == NO_DIALOGUE:
-                raise HTTPException(400, "Ngôn ngữ phụ đề: cần một ngôn ngữ cụ thể, không dùng “none”.")
-            if lang.casefold() not in {o.casefold() for o in out}:
-                out.append(lang)
-        if len(out) > 6:
-            raise HTTPException(400, "Ngôn ngữ phụ đề: tối đa 6 ngôn ngữ.")
-        return out
-
-    def add_subtitle_langs(sb: Storyboard, langs: list[str], backend: str | None, key: str | None,
-                           log: Callable[[str], None]) -> None:
-        """A new storyboard with several subtitle languages: store them and translate the narration now."""
-        if len(langs) < 2:
-            return
-        sb.subtitle_languages = [sb.subtitle_language or langs[0], *langs[1:]]
-        log("Claude đang dịch phụ đề sang " + ", ".join(langs[1:]) + "…")
-        try:
-            done = subtitles.translate(sb, backend=backend or "auto", api_key=key)
-        except (RuntimeError, ValueError) as exc:
-            log(f"⚠ Chưa dịch được phụ đề ({exc}); dịch lại sau ở tab Ghép phim.")
-            return
-        for s in sb.scenes:
-            if s.id in done:
-                s.subtitles = {**(s.subtitles or {}), **done[s.id]}
-
     @app.post("/api/projects/plan")
     def plan_project(body: PlanBody) -> dict[str, Any]:
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
-        langs = sub_langs_or_400(body)
-        language = langs[0]
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
         backend = planner_backend()
@@ -895,7 +834,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
             sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
-            add_subtitle_langs(sb, langs, backend, key, job.log)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
@@ -1160,34 +1098,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
         return get_social(pid)
-
-    # ---- subtitles in several languages ----
-
-    @app.post("/api/projects/{pid}/subtitles/translate")
-    def translate_subtitles(pid: str, body: TranslateBody) -> dict[str, Any]:
-        """Claude translates the narration into the film's other subtitle languages. Free on Flow."""
-        try:
-            sb = load_storyboard(sb_path(pid))
-        except (ValidationError, ValueError) as exc:
-            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
-                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-        if len(sb.subtitle_langs()) < 2:
-            raise HTTPException(400, "Phim mới có một ngôn ngữ phụ đề: thêm ngôn ngữ ở tab Phong cách & nhân vật.")
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        langs = [clean_language(x) for x in body.langs if clean_language(x)]
-        try:
-            done = subtitles.translate(sb, langs=langs or None, only_missing=not body.force, backend=backend,
-                                       api_key=load_settings().get("anthropic_api_key") or None)
-        except RuntimeError as exc:
-            raise HTTPException(502, str(exc))
-        with sb_lock(pid):
-            raw = read_raw(pid)
-            changed = subtitles.apply(raw, done)
-            if changed:
-                write_raw(pid, raw)
-        return {"changed": changed, **detail(pid)}
 
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
@@ -1597,31 +1507,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 job.log(f"Bỏ qua cảnh chưa có: {', '.join(missing)}")
             return clips
 
-        def fresh_sb(job: Job) -> Storyboard:
-            """Translate missing subtitles first (best effort), then the storyboard as saved."""
-            def edit(fn: Callable[[dict], bool]) -> bool:
-                with sb_lock(pid):
-                    raw = read_raw(pid)
-                    if not fn(raw):
-                        return False
-                    write_raw(pid, raw)
-                    return True
-
-            cur = load_storyboard(sb_path(pid))
-            if subtitles.ensure(cur, edit, backend=planner_backend(),
-                                api_key=settings.get("anthropic_api_key") or None, log=job.log):
-                cur = load_storyboard(sb_path(pid))
-            return cur
-
         def do_edit(job: Job) -> dict[str, Any]:
             from ..editor import edit_film
 
             clips = ready_clips(job)
-            sb = fresh_sb(job)
             backend = planner_backend()
             output, plan = edit_film(
                 sb, clips, out_dir(pid), music=music, music_volume=body.volume, burn_subtitles=body.burn_subtitles,
-                burn_lang=body.burn_lang,
                 engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
                 api_key=settings.get("anthropic_api_key") or None, log=job.log)
             job.log(f"🎬 Phim đã dựng: {output}")
@@ -1630,8 +1522,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         def do_stitch(job: Job) -> dict[str, Any]:
             clips = ready_clips(job)
             output = out_dir(pid) / "final.mp4"
-            assemble(fresh_sb(job), clips, output, music=music, music_volume=body.volume,
-                     burn_subtitles=body.burn_subtitles, burn_lang=body.burn_lang, log=job.log)
+            assemble(sb, clips, output, music=music, music_volume=body.volume,
+                     burn_subtitles=body.burn_subtitles, log=job.log)
             job.log(f"🎬 Phim hoàn chỉnh: {output}")
             return {"final": str(output)}
 
@@ -1775,7 +1667,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.stage = {**job.stage, **info}
 
         pilot = Autopilot(sb_path(pid), out_dir(pid), g, settings=AutoSettings(
-            review=body.review, burn_subtitles=body.burn_subtitles, burn_lang=body.burn_lang,
+            review=body.review, burn_subtitles=body.burn_subtitles,
             rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
             ai_backend=settings.get("planner") or "auto", api_key=settings.get("anthropic_api_key") or None,
             max_retries=int(settings.get("retries", 2)),
@@ -1798,8 +1690,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
-        langs = sub_langs_or_400(body)
-        language = langs[0]
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
         backend = planner_backend()
@@ -1820,7 +1711,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
             sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
-            add_subtitle_langs(sb, langs, backend, key, job.log)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)

@@ -22,7 +22,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from .assemble import AssembleError, _need, burn_path, has_audio, probe_duration, write_srt, write_subtitles
+from .assemble import AssembleError, _need, has_audio, probe_duration, write_srt
 from .storyboard import Storyboard
 
 Log = Callable[[str], None]
@@ -271,10 +271,8 @@ def timeline(plan: EditPlan, infos: dict[str, ClipInfo]) -> tuple[list[tuple[str
     return rows, t
 
 
-def subtitle_entries(sb: Storyboard, plan: EditPlan, infos: dict[str, ClipInfo],
-                     lang: str | None = None) -> list[tuple[float, float, str]]:
-    """Timed subtitle lines in `lang` (None = the narration's language)."""
-    narration = {s.id: t for s in sb.scenes if (t := sb.subtitle_text(s, lang))}
+def subtitle_entries(sb: Storyboard, plan: EditPlan, infos: dict[str, ClipInfo]) -> list[tuple[float, float, str]]:
+    narration = {s.id: s.narration for s in sb.scenes if s.narration}
     rows, _ = timeline(plan, infos)
     durs_in = [0.0] + [t.duration for t in plan.transitions]
     durs_out = [t.duration for t in plan.transitions] + [0.0]
@@ -364,14 +362,19 @@ def build_filtergraph(plan: EditPlan, infos: dict[str, ClipInfo], *, width: int,
 
 def render(sb: Storyboard, clips: list[tuple[str, Path]], plan: EditPlan, infos: dict[str, ClipInfo], output: Path,
            *, music: Path | None = None, music_volume: float = 0.25, burn_subtitles: bool = False,
-           burn_lang: str | None = None, log: Log = print) -> Path:
+           log: Log = print) -> Path:
     ffmpeg = _need("ffmpeg")
     paths = dict(clips)
     width, height = (1920, 1080) if sb.aspect == "16:9" else (1080, 1920)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    files = write_subtitles(sb, output, lambda lang: subtitle_entries(sb, plan, infos, lang), log)
-    burn = burn_path(files, burn_lang) if burn_subtitles else None
+    srt = subtitle_entries(sb, plan, infos)
+    srt_path = output.with_suffix(".srt")
+    if srt:
+        write_srt(srt, srt_path)
+        log(f"Phụ đề: {srt_path}")
+    elif srt_path.exists():
+        srt_path.unlink()
 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     for c in plan.clips:
@@ -381,7 +384,7 @@ def render(sb: Storyboard, clips: list[tuple[str, Path]], plan: EditPlan, infos:
         cmd += ["-stream_loop", "-1", "-i", str(music)]
         music_input = len(plan.clips)
     graph, v, a = build_filtergraph(plan, infos, width=width, height=height, music_input=music_input,
-                                    music_volume=music_volume, subtitles=burn)
+                                    music_volume=music_volume, subtitles=srt_path if (burn_subtitles and srt) else None)
     _, total = timeline(plan, infos)
     tmp = output.with_name(output.stem + ".editing" + output.suffix)
     cmd += ["-filter_complex", graph, "-map", v, "-map", a, "-t", f"{total:.3f}",
@@ -563,13 +566,13 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
 
 def edit_film(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, output: Path | None = None, *,
               music: Path | None = None, music_volume: float = 0.25, burn_subtitles: bool = False,
-              burn_lang: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", api_key: str | None = None,
+              engine: str = "auto", replan: bool = False, backend: str = "auto", api_key: str | None = None,
               ai_available: bool = True, log: Log = print) -> tuple[Path, EditPlan]:
     plan, infos = make_plan(sb, clips, out_dir, engine=engine, replan=replan, has_music=bool(music),
                             backend=backend, api_key=api_key, ai_available=ai_available, log=log)
     output = output or out_dir / "final.mp4"
     render(sb, clips, plan, infos, output, music=music, music_volume=music_volume,
-           burn_subtitles=burn_subtitles, burn_lang=burn_lang, log=log)
+           burn_subtitles=burn_subtitles, log=log)
     return output, plan
 
 
