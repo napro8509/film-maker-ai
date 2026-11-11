@@ -2792,7 +2792,7 @@ function openNewProject() {
         : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
       h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")));
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
-    const n = h("input", { type: "number", min: 1, max: 20, value: localGet("autoScenes", 10) });
+    const n = h("input", { type: "number", min: 1, max: 80, value: localGet("autoScenes", 10) });
     const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
     const autoSubs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));

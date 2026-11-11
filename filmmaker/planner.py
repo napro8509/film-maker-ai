@@ -103,6 +103,87 @@ def _durations_arg(durations: "list[int] | None | object") -> list[int] | None:
     return default_durations() if durations is _DEFAULT else durations  # type: ignore[return-value]
 
 
+# Long films: Claude writes the storyboard in parts of at most PART_SCENES scenes (one reply cannot hold
+# 50+ scenes), each part seeing what was already written. MAX_SCENES caps a request.
+PART_SCENES = 15
+MAX_SCENES = 80
+
+
+def _sid(i: int) -> str:
+    return f"s{i:02d}"
+
+
+def _written_so_far(draft: dict) -> str:
+    """Compact recap of the parts already written, for the next part's message."""
+    lines = [f"Title: {draft.get('title', '')}"]
+    if draft.get("style"):
+        lines.append(f"Style: {draft['style']}")
+    for c in draft.get("characters") or []:
+        lines.append(f"Character {c.get('name')}: {c.get('description', '')}")
+    for sc in draft.get("scenes") or []:
+        what = sc.get("content_direction") or sc.get("prompt") or ""
+        lines.append(f"{sc.get('id')}: {' '.join(str(what).split())[:220]}")
+        for row in sc.get("dialogue") or []:
+            if isinstance(row, dict) and row.get("line"):
+                lines.append(f"   {row.get('character')}: {row.get('line')}")
+    return "\n".join(lines)
+
+
+def _part_message(base: str, total: int, start: int, count: int, draft: dict | None) -> str:
+    """The user message for scenes start..start+count-1 (1-based) of a `total`-scene film."""
+    first, last = _sid(start), _sid(start + count - 1)
+    end = start + count - 1
+    if draft is None:
+        return (f"{base}\n\nThis film is long, so it is written in parts. Plan the whole story arc across all "
+                f"{total} scenes, but in this reply write ONLY scenes {first}-{last} (the opening of the story), "
+                "plus title, style, thumbnail and EVERY character the whole film needs.")
+    tail = ("This is the LAST part: bring the story to its ending and emotional payoff."
+            if end >= total else
+            f"Scenes after {last} come in a later part, so do not end the story yet.")
+    return (f"{base}\n\nThis film is long, so it is written in parts. Scenes {_sid(1)}-{_sid(start - 1)} are "
+            f"already written (summary below). In this reply write ONLY scenes {first}-{last} of {total}, "
+            "continuing the story right where it stopped. Keep the same title, style and characters (exact "
+            "names and looks; add a character only if the story needs someone new). Do not repeat any beat or "
+            f"dialogue line from the earlier scenes. {tail}\n\nAlready written:\n{_written_so_far(draft)}")
+
+
+def _draft_in_parts(draft_fn, base: str, total: int, log=None) -> dict:
+    """Ask `draft_fn(user_message) -> draft dict` for the storyboard, in parts when `total` is large."""
+    if total <= PART_SCENES:
+        return draft_fn(base)
+    parts = -(-total // PART_SCENES)
+    merged: dict | None = None
+    tries = 0
+    while merged is None or len(merged["scenes"]) < total:
+        done = 0 if merged is None else len(merged["scenes"])
+        count = min(PART_SCENES, total - done)
+        part_no = done // PART_SCENES + 1
+        if log:
+            log(f"Phần {part_no}/{parts}: viết cảnh {_sid(done + 1)}–{_sid(done + count)}…")
+        out = draft_fn(_part_message(base, total, done + 1, count, merged))
+        new = [sc for sc in (out.get("scenes") or []) if isinstance(sc, dict)][:count]
+        if merged is None:
+            merged = {k: v for k, v in out.items() if k != "scenes"}
+            merged["scenes"] = []
+        else:  # keep part 1's title/style/thumbnail; add only characters that are new
+            known = {str(c.get("name", "")).casefold() for c in merged.get("characters") or []}
+            for c in out.get("characters") or []:
+                if str(c.get("name", "")).casefold() not in known:
+                    merged.setdefault("characters", []).append(c)
+        for sc in new:
+            sc["id"] = _sid(len(merged["scenes"]) + 1)
+            merged["scenes"].append(sc)
+        if not new:
+            tries += 1
+            if tries >= 2:
+                raise RuntimeError(f"Claude dừng ở {len(merged['scenes'])}/{total} cảnh; hãy thử lại.")
+        else:
+            tries = 0
+    if log:
+        log(f"Đã ghép {len(merged['scenes'])} cảnh từ {parts} phần.")
+    return merged
+
+
 def claude_code_binary() -> str | None:
     return shutil.which(os.environ.get("CLAUDE_BIN", "claude"))
 
@@ -127,17 +208,13 @@ def claude_code_status() -> dict:
     return {"available": True, "logged_in": bool(data.get("loggedIn")), "method": data.get("authMethod")}
 
 
-def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-                          dialogue_language: str | None = None, timeout: int = 900,
-                          durations: list[int] | None | object = _DEFAULT) -> Storyboard:
-    """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
+def _draft_claude_code(user: str, timeout: int = 900) -> dict:
+    """One planner call through the local `claude` CLI -> the raw draft dict."""
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
     schema = json.dumps(StoryboardDraft.model_json_schema())
-    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint, dialogue_language,
-                                       _durations_arg(durations)),
-           "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
+    cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     with tempfile.TemporaryDirectory() as cwd:  # keep any project CLAUDE.md out of the prompt
         try:
@@ -155,7 +232,15 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
         if "login" in msg.lower() or "auth" in msg.lower():
             msg += " — chạy `claude` trong Terminal và đăng nhập (/login) bằng tài khoản Claude của bạn."
         raise RuntimeError(f"Claude Code không viết được storyboard: {msg}")
-    sb = _to_storyboard(data["structured_output"])
+    return data["structured_output"]
+
+
+def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+                          dialogue_language: str | None = None, timeout: int = 900,
+                          durations: list[int] | None | object = _DEFAULT, log=None) -> Storyboard:
+    """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
+    base = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
+    sb = _to_storyboard(_draft_in_parts(lambda user: _draft_claude_code(user, timeout), base, scenes, log))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 
@@ -187,16 +272,14 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
     return durations_mod.round_new_storyboard(sb, meta), used
 
 
-def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-         dialogue_language: str | None = None, durations: list[int] | None | object = _DEFAULT) -> Storyboard:
+def _draft_api(user: str) -> dict:
+    """One planner call through the Anthropic API -> the raw draft dict."""
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
-    user = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
-
     response = client.messages.parse(
         model=MODEL,
         max_tokens=16000,
@@ -212,7 +295,14 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
         raise RuntimeError("Claude từ chối ý tưởng này; hãy thử diễn đạt lại.")
     if response.stop_reason == "max_tokens":
         raise RuntimeError("Kịch bản quá dài; hãy giảm số cảnh.")
-    sb = _to_storyboard(response.parsed_output.model_dump(exclude_none=True))
+    return response.parsed_output.model_dump(exclude_none=True)
+
+
+def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+         dialogue_language: str | None = None, durations: list[int] | None | object = _DEFAULT,
+         log=None) -> Storyboard:
+    base = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
+    sb = _to_storyboard(_draft_in_parts(_draft_api, base, scenes, log))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 

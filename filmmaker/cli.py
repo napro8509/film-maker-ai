@@ -200,7 +200,7 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
     click.echo("Đang viết storyboard...")
     try:
         sb, used = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
-                             dialogue_language=dialogue_lang)
+                             dialogue_language=dialogue_lang, log=click.echo)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     sb = _with_subtitle_langs(sb, langs, backend=used, api_key=user_settings.load().get("anthropic_api_key") or None)
@@ -807,7 +807,7 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
         try:
             sb, used = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=langs[0],
-                                 dialogue_language=dialogue_lang)
+                                 dialogue_language=dialogue_lang, log=click.echo)
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
         sb = _with_subtitle_langs(sb, langs, backend=used, api_key=key)

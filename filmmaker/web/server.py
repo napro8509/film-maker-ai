@@ -888,7 +888,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
                         else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
             job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: {language}")
-            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
+            from ..planner import MAX_SCENES
+
+            n = max(1, min(MAX_SCENES, body.scenes))
+            if n != body.scenes:
+                job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             add_subtitle_langs(sb, langs, backend, key, job.log)
             pid, d = new_project_dir(sb.title)
@@ -1808,7 +1813,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.stage = {"key": "storyboard", "label": "Viết storyboard", "status": "running", "index": 1, "total": 10}
             job.log(f"=== Bước 1/10: Viết storyboard ({body.scenes} cảnh) ===")
             job.log(f"Ý tưởng: {body.idea[:300]}")
-            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
+            from ..planner import MAX_SCENES
+
+            n = max(1, min(MAX_SCENES, body.scenes))
+            if n != body.scenes:
+                job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             add_subtitle_langs(sb, langs, backend, key, job.log)
             pid, d = new_project_dir(sb.title)
