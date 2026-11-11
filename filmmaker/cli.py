@@ -897,6 +897,48 @@ def template(output: Path) -> None:
 
 
 @main.command()
+@click.argument("source")
+@click.option("-o", "--out", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục lưu bản phân tích (mặc định ~/FilmMaker/.analyses/<ngày>-<tên>, cũng hiện trong web UI).")
+@click.option("--no-rea", is_flag=True, help="Không chạy rea-video dù đã cài.")
+@click.option("--film", "film", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Viết luôn storyboard phim mới theo phong cách này vào file .yaml này.")
+@click.option("--idea", default="", help="Ý tưởng cho phim mới (trống: Claude tự nghĩ câu chuyện cùng thể loại).")
+@click.option("--scenes", type=int, default=None, help="Số cảnh phim mới (mặc định: gợi ý theo video mẫu).")
+@click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề phim mới.")
+@click.option("--dialogue-lang", "dialogue_lang", default=None, help="Ngôn ngữ nhân vật nói ('none' = không thoại).")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True)
+def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea: str, scenes: int | None,
+            language: str, dialogue_lang: str | None, backend: str) -> None:
+    """Phân tích một video mẫu (link hoặc file): nhịp dựng, chuyển cảnh, máy quay, màu, âm thanh, chữ, nhân vật,
+    nhịp truyện → report.md + analysis.json; --film viết storyboard phim mới cùng phong cách."""
+    from . import video_analysis as va
+
+    if dialogue_lang is not None:
+        dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
+    language = _cli_lang(language, "--lang", clean_language)
+    folder = out or Path.home() / "FilmMaker" / ".analyses" / va.new_id(Path(source).stem if not va.is_url(source) else
+                                                                          source.split("//", 1)[-1].split("/")[0])
+    try:
+        data = va.analyze(source, folder, use_rea=not no_rea, backend=backend, allow_local=True, log=click.echo)
+    except (va.AnalysisError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✔ {folder / 'report.md'}")
+    if film:
+        if film.exists() and not click.confirm(f"{film} đã tồn tại. Ghi đè?"):
+            return
+        click.echo("Đang viết storyboard theo phong cách video mẫu...")
+        try:
+            sb, _ = va.plan_from_analysis(data, idea, scenes=scenes, language_hint=language,
+                                          dialogue_language=dialogue_lang, backend=backend)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        save_storyboard(sb, film)
+        va.copy_reference(folder, film.parent)
+        click.echo(f"✔ {film}: {len(sb.scenes)} cảnh ({sb.aspect}). Xem/sửa rồi chạy: filmmaker run {film} --dry-run")
+
+
+@main.command()
 @click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
               help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
 @click.option("--port", default=8765, show_default=True)

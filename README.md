@@ -171,6 +171,35 @@ chỉnh tay. Cần CapCut bản máy tính đã mở ít nhất một lần (đ�
 - Thư mục dự án CapCut khác mặc định: `--capcut-dir`, biến `FILMMAKER_CAPCUT_DRAFTS`, hoặc `capcut_drafts_dir`
   trong `settings.json`.
 
+### Phân tích video mẫu → phim mới cùng phong cách
+
+Bấm **Phân tích video** (dưới nút Phim mới), dán link một video trên mạng. Film Maker tải video về, tìm từng
+điểm cắt, đo âm thanh theo từng giây, trích ảnh mọi shot cho Claude xem rồi viết bản phân tích: danh sách shot
+(thời gian, độ dài, cỡ cảnh, góc, chuyển động máy, cách vào cảnh, chữ trên hình), nhịp dựng, chuyển cảnh, màu
+và ánh sáng, nhạc / giọng / tiếng động (chỗ dồn lên, chỗ lặng), kiểu phụ đề, nhân vật, bối cảnh, nhịp truyện.
+Sau đó **Tạo phim theo phong cách này** viết storyboard mới (câu chuyện, nhân vật mới; cùng nhịp truyện, góc máy,
+`style`) và lưu `edit_style`: hướng dẫn dựng mà agent dựng phim (Dựng phim / CapCut) làm theo. Mất 3–10 phút,
+không tốn credit Flow (dùng gói Claude hoặc API key). Bản phân tích lưu ở `~/FilmMaker/.analyses/`, bản sao ở
+`<dự án>/reference/`.
+
+```bash
+filmmaker analyze "https://www.youtube.com/shorts/..."                        # chỉ phân tích → report.md
+filmmaker analyze video.mp4 --film phim-moi/storyboard.yaml --idea "..."      # phân tích + viết storyboard
+```
+
+- Link YouTube / TikTok / Facebook… cần **yt-dlp**: `brew install yt-dlp` (không có thì chỉ tải được link thẳng
+  tới file .mp4 / .mov). Phụ đề của trang (nếu có) được lấy để biết lời thoại.
+- Tuỳ chọn: **[rea-video](https://github.com/JuneYaooo/rea-video)** (Apache-2.0, chạy CPU, không cần key) cho
+  lớp phân tích sâu hơn: cắt shot chuẩn hơn, chuyển động máy, tách giọng / nhạc / tiếng động, BPM, đọc chữ trên
+  hình. Cài vào venv riêng, Film Maker tự tìm thấy (hoặc đặt `REA_VIDEO_BIN`):
+
+  ```bash
+  git clone https://github.com/JuneYaooo/rea-video ~/FilmMaker/.tools/rea-video
+  cd ~/FilmMaker/.tools/rea-video && python3.12 -m venv .venv && .venv/bin/pip install -e ".[ocr]"
+  ```
+
+  Lần đầu nó tải ~200 MB model. Không cài thì Film Maker dùng ffmpeg + Claude.
+
 ## Backup lên Google Drive
 
 Clip Veo tốn credit, nên nên có bản sao trên Drive (gói Google AI Pro/Ultra có sẵn nhiều dung lượng).

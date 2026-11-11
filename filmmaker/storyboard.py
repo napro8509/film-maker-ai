@@ -392,6 +392,9 @@ class Storyboard(StoryboardDraft):
                                           "Empty = Veo guesses.")
     subtitle_language: str | None = Field(default=None, description="Language of `narration` chosen when planning. "
                                           "Reference only: never sent to Flow.")
+    edit_style: str | None = Field(default=None, description="How to cut this film, learnt from a reference video "
+                                   "(Phân tích video): rhythm, transitions, look, music and sound. The editor agent "
+                                   "follows it. Never sent to Flow.")
 
     @field_validator("dialogue_language", mode="before")
     @classmethod

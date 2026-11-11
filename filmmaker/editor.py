@@ -500,7 +500,11 @@ in Vietnamese.
 Also: fade_in (0.3-1.0 s from black), fade_out (0.8-2.5 s ending), duck_music (true when there is music and the
 clips have dialogue or important sound), even_loudness (normally true), normalize (normally true).
 `notes`: 2-4 sentences in Vietnamese explaining the rhythm and the choices, for the user.
-Return exactly one clips entry per scene and one transitions entry per neighbouring pair, using the given ids."""
+Return exactly one clips entry per scene and one transitions entry per neighbouring pair, using the given ids.
+If the brief has an "Edit style to imitate" section, the user wants this film cut like a reference video they
+analysed: follow it for the rhythm (how long shots stay, where to cut harder), the kinds of transitions, the
+fades, the music level and where it rises or drops, and (when finishing) the colour look and sound effects.
+The rules above still win where the guide would break them (never cut into speech or the key action)."""
 
 
 def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_music: bool) -> str:
@@ -509,6 +513,8 @@ def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_mus
     if sb.style:
         lines.append(f"Style: {sb.style}")
     lines.append(f"Background music: {'yes' if has_music else 'no'}")
+    if (sb.edit_style or "").strip():
+        lines.append("Edit style to imitate (learnt from a reference video):\n" + sb.edit_style.strip()[:4000])
     lines.append("Scenes in film order:")
     for sid in order:
         s, i = scenes[sid], infos[sid]

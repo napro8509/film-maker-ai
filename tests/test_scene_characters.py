@@ -168,7 +168,8 @@ def test_field_order_unchanged():
     new_sb = old_sb[:i] + ["locations", "continuity"] + old_sb[i:]
     new_scene = ["location", "continue_previous"]
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
-    assert list(Storyboard.model_fields) == new_sb + ["dialogue_language", "subtitle_language"]
+    # edit_style (video-analysis) also only on Storyboard, appended last
+    assert list(Storyboard.model_fields) == new_sb + ["dialogue_language", "subtitle_language", "edit_style"]
     assert list(StoryboardDraft.model_fields) == new_sb
     assert list(Scene.model_fields)[:-1] == old_scene + new_scene == list(SceneDraft.model_fields)
     assert list(Scene.model_fields)[-1] == "characters"

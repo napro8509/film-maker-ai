@@ -42,6 +42,7 @@ from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, Scene, Storyboard, clean_dialogue_language, clean_language,
                           load_storyboard, merge_subtitles_raw, save_storyboard)
 from ..thumbnail import ThumbnailError
+from .. import video_analysis as va
 from . import ui_prefs
 
 STATIC = Path(__file__).parent / "static"
@@ -211,6 +212,18 @@ class YamlBody(BaseModel):
 class NewProject(BaseModel):
     title: str = "Phim mới"
     source: str = "blank"  # blank | template
+
+
+class AnalyzeBody(BaseModel):
+    url: str
+    use_rea: bool = True  # also run rea-video when it is installed
+
+
+class StyleFilmBody(BaseModel):
+    idea: str = ""  # empty: Claude invents a new story in the same format
+    scenes: int | None = None  # None: suggested from the reference
+    language: str = "Vietnamese"  # subtitle (narration) language
+    dialogue_language: str | None = None
 
 
 class PlanBody(BaseModel):
@@ -613,6 +626,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "profile": s.get("profile") or None,
             "platform": sys.platform,
             "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
+            "video_analysis": {"ytdlp": bool(va.ytdlp_command()), "rea_video": bool(va.rea_binary())},
         }
 
     @app.post("/api/env/auth")
@@ -1746,6 +1760,116 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"id": name}
 
         return jobs.start("restore", f"Khôi phục {name} từ Drive", name, work).public()
+
+    # ---- video analysis (Phân tích video) ----
+
+    analyses_root = workspace / ".analyses"
+
+    def adir(aid: str) -> Path:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", aid) or not (analyses_root / aid / "analysis.json").is_file():
+            raise HTTPException(404, "không có bản phân tích này")
+        return analyses_root / aid
+
+    def analysis_url(aid: str, rel: str | None) -> str | None:
+        return f"/api/analyses/{aid}/file/{rel}" if rel else None
+
+    @app.get("/api/analyses")
+    def analyses() -> list[dict[str, Any]]:
+        out = va.list_analyses(analyses_root)
+        for a in out:
+            a["thumb"] = analysis_url(a["id"], a.get("thumb"))
+        return out
+
+    @app.post("/api/analyses")
+    def start_analysis(body: AnalyzeBody) -> dict[str, Any]:
+        url = body.url.strip()
+        if not va.is_url(url):
+            raise HTTPException(400, "Hãy dán một link http(s) tới video.")
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
+        aid = va.new_id(re.sub(r"^https?://(www\.)?", "", url).split("/")[0])
+        folder = analyses_root / aid
+
+        def work(job: Job) -> dict[str, Any]:
+            job.log(f"Phân tích video: {url}")
+            try:
+                data = va.analyze(url, folder, use_rea=body.use_rea, backend=backend, api_key=key,
+                                  allow_local=False, log=job.log, should_stop=lambda: job.stop_requested)
+            except va.AnalysisStopped:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise Stopped() from None
+            except va.AnalysisError as exc:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise RuntimeError(str(exc)) from None
+            except Exception:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
+            return {"analysis": aid, "title": data["ai"].get("title_vi", "")}
+
+        return jobs.start("analyze", "Phân tích video", None, work).public()
+
+    @app.get("/api/analyses/{aid}")
+    def get_analysis(aid: str) -> dict[str, Any]:
+        d = adir(aid)
+        data = va.load(d)
+        src = data.get("source") or {}
+        data["video_url"] = analysis_url(aid, src.get("file")) if (d / str(src.get("file") or "-")).is_file() else None
+        for s in data.get("sheets") or []:
+            s["url"] = analysis_url(aid, s["file"])
+        data["suggested_scenes"] = va.suggested_scenes(data)
+        data["folder"] = str(d)
+        rea_report = d / "rea" / "report.html"
+        data["rea_report"] = analysis_url(aid, "rea/report.html") if rea_report.is_file() else None
+        return data
+
+    @app.get("/api/analyses/{aid}/file/{rel:path}")
+    def analysis_file(aid: str, rel: str):
+        base = adir(aid).resolve()
+        p = (base / rel).resolve()
+        if base not in p.parents or not p.is_file():
+            raise HTTPException(404)
+        return FileResponse(p)
+
+    @app.delete("/api/analyses/{aid}")
+    def delete_analysis(aid: str) -> dict[str, Any]:
+        d = adir(aid)
+        if jobs.current and jobs.current.status == "running" and jobs.current.kind == "analyze":
+            raise HTTPException(409, detail={"message": "Đang có phân tích chạy; chờ xong rồi xoá.",
+                                             "reason": "job_running"})
+        shutil.rmtree(d)
+        return {"ok": True}
+
+    @app.post("/api/analyses/{aid}/film")
+    def film_from_analysis(aid: str, body: StyleFilmBody) -> dict[str, Any]:
+        d = adir(aid)
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
+        dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
+                    if body.dialogue_language is not None else None)
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
+        data = va.load(d)
+
+        def work(job: Job) -> dict[str, Any]:
+            n = body.scenes or va.suggested_scenes(data)
+            job.log(f"Claude đang viết storyboard {n} cảnh theo phong cách “{data['ai'].get('title_vi', aid)}”…")
+            if body.idea.strip():
+                job.log(f"Ý tưởng: {body.idea.strip()[:300]}")
+            else:
+                job.log("Chưa có ý tưởng: Claude tự nghĩ một câu chuyện mới cùng thể loại.")
+            sb, _ = va.plan_from_analysis(data, body.idea, scenes=n, language_hint=language,
+                                          dialogue_language=dialogue, backend=backend, api_key=key)
+            pid, pd = new_project_dir(sb.title)
+            save_storyboard(sb, pd / "storyboard.yaml")
+            va.copy_reference(d, pd)
+            job.log(f"✔ Xong: “{sb.title}” — {len(sb.scenes)} cảnh, khung {sb.aspect}. "
+                    "Hướng dẫn dựng theo video mẫu đã lưu trong storyboard (edit_style) cho agent dựng phim.")
+            return {"project": pid}
+
+        return jobs.start("plan", "Viết phim theo video mẫu", None, work).public()
 
     # ---- jobs ----
 
