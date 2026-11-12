@@ -348,6 +348,9 @@ async function init() {
   $(".brand .logo").append(icon("play"));
   $("#btn-menu").append(icon("menu"));
   $("#btn-menu").onclick = () => toggleSidebar();
+  document.body.classList.toggle("side-collapsed", !!localGet("sideCollapsed", false));
+  window.matchMedia("(max-width: 720px)").addEventListener("change", syncMenuButton);
+  syncMenuButton();
   $("#scrim").onclick = () => toggleSidebar(false);
   document.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); flushSave().then(() => toast("Đã lưu", "ok", 1500)); }
@@ -392,9 +395,28 @@ async function init() {
   setInterval(tickElapsed, 1000);
 }
 
+const NARROW = () => window.matchMedia("(max-width: 720px)").matches;
+
+/* Narrow window: the project list is a drawer over the page. Wide window: it collapses to a rail of covers
+   (remembered), so the work area gets the room. */
 function toggleSidebar(open) {
-  const on = document.body.classList.toggle("side-open", open);
-  $("#btn-menu").setAttribute("aria-expanded", String(on));
+  if (NARROW() || (open === false && document.body.classList.contains("side-open"))) {
+    document.body.classList.toggle("side-open", open);
+  } else {
+    const collapsed = open === undefined ? !document.body.classList.contains("side-collapsed") : !open;
+    document.body.classList.toggle("side-collapsed", collapsed);
+    localSet("sideCollapsed", collapsed);
+  }
+  syncMenuButton();
+}
+
+function syncMenuButton() {
+  const b = $("#btn-menu");
+  const shown = NARROW() ? document.body.classList.contains("side-open") : !document.body.classList.contains("side-collapsed");
+  b.setAttribute("aria-expanded", String(shown));
+  const label = shown ? "Thu gọn danh sách dự án" : "Mở rộng danh sách dự án";
+  b.setAttribute("aria-label", label);
+  b.title = label;
 }
 
 async function loadProjects() {
@@ -418,7 +440,7 @@ async function openProject(id) {
   } catch (e) { toast(e.message, "error"); return false; }
   rememberCharNames(); rememberLocNames();
   localSet("lastProject", id);
-  toggleSidebar(false);
+  if (document.body.classList.contains("side-open")) toggleSidebar(false); // close the drawer; never collapse the rail
   if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
   S.saveState = "saved";
   renderSidebar();
@@ -704,7 +726,27 @@ function locationImpact(sb, sceneState, { scene, location, to, kind } = {}) {
 
 /* ---------- top bar ---------- */
 
+/* Credit button: the Flow balance once it was read, minus an estimate for every clip rendered since. */
+function renderCreditButton() {
+  const b = $("#btn-credits"), c = S.env?.credit_balance;
+  const label = b.querySelector(".lbl-text");
+  if (!c) { label.textContent = "Credit"; b.title = "Xem số credit còn lại trên Google Flow"; b.classList.remove("has-balance"); return; }
+  const est = Math.round(c.estimate), approx = c.spent > 0 || c.unpriced > 0;
+  label.textContent = `${approx ? "~" : ""}${est.toLocaleString("vi-VN")} credit`;
+  b.classList.add("has-balance");
+  const when = c.checked_at ? ago(c.checked_at) : "";
+  b.title = `Flow báo ${c.balance.toLocaleString("vi-VN")} credit${when ? " (" + when + ")" : ""}.`
+    + (c.clips ? ` Đã trừ ước lượng ${c.spent.toLocaleString("vi-VN")} credit cho ${c.clips} clip render từ lúc đó`
+      + (c.unpriced ? ` (${c.unpriced} clip chưa có giá nên chưa trừ)` : "") + "." : "")
+    + " Bấm để đọc lại số dư thật.";
+}
+
+async function refreshCredits() {
+  try { const r = await api("GET", "/api/credits"); if (S.env) { S.env.credit_balance = r.balance; renderCreditButton(); } } catch { /* keep the old figure */ }
+}
+
 function renderTopbar() {
+  renderCreditButton();
   const e = S.env, box = $("#envchips");
   put(box,
     authChip(),
@@ -784,14 +826,14 @@ function renderSidebar() {
   const sb = $("#sidebar");
   const running = S.job && S.job.status === "running" ? S.job.project : null;
   put(sb,
-    h("button", { class: "btn primary block", onclick: openNewProject }, icon("plus"), "Phim mới"),
-    h("button", { class: "btn block" + (S.ana ? " on" : ""), style: { marginTop: "8px" }, onclick: openAnalyzeVideo, title: "Dán link một video trên mạng: Film Maker phân tích cách dựng, màu, âm thanh… rồi làm phim mới cùng phong cách" }, icon("scan"), "Phân tích video"),
+    h("button", { class: "btn primary block", onclick: openNewProject, title: "Phim mới", "aria-label": "Phim mới" }, icon("plus"), h("span", { class: "new-label" }, "Phim mới")),
+    h("button", { class: "btn block" + (S.ana ? " on" : ""), style: { marginTop: "8px" }, onclick: openAnalyzeVideo, "aria-label": "Phân tích video", title: "Dán link một video trên mạng: Film Maker phân tích cách dựng, màu, âm thanh… rồi làm phim mới cùng phong cách" }, icon("scan"), h("span", { class: "new-label" }, "Phân tích video")),
     h("div", { class: "side-title" }, h("span", { class: "spacer" }, "Dự án"), h("span", {}, S.projects.length || "")),
     S.projects.length ? null : h("p", { class: "muted small", style: { padding: "0 8px" } }, "Chưa có dự án nào."),
     S.projects.map((p) => {
       const pct = p.scenes ? Math.round((p.done / p.scenes) * 100) : 0;
       const active = S.cur && S.cur.id === p.id;
-      return h("button", { class: "proj" + (active ? " active" : ""), onclick: () => openProject(p.id), title: p.title, "aria-current": active ? "page" : null },
+      return h("button", { class: "proj" + (active ? " active" : "") + (running === p.id ? " running" : ""), onclick: () => openProject(p.id), title: p.title, "aria-label": p.title, "aria-current": active ? "page" : null },
         h("div", { class: "thumb", style: p.thumb ? { backgroundImage: `url("${p.thumb}")` } : null }, p.thumb ? null : icon("film")),
         h("div", { class: "meta" },
           h("div", { class: "name" }, p.title),
@@ -923,7 +965,11 @@ function renderErrors() {
   const errs = S.cur.errors || [];
   const sb = S.cur.storyboard;
   const fb = !!sb.fallback_t2v;
-  const i2v = S.cur.i2v_unsupported ? h("div", { class: "banner " + (S.env?.flow_ui ? "info" : "warn") }, icon(S.env?.flow_ui ? "info" : "alert"),
+  const i2vKey = `i2vHidden.${S.cur.id}`, i2vSig = `${S.cur.i2v_error || "x"}|${!!S.env?.flow_ui}|${fb}`;
+  const i2vShown = S.cur.i2v_unsupported && localGet(i2vKey) !== i2vSig;
+  const i2v = i2vShown ? h("div", { class: "banner dismissible " + (S.env?.flow_ui ? "info" : "warn") }, icon(S.env?.flow_ui ? "info" : "alert"),
+    h("button", { class: "btn icon ghost sm banner-close", title: "Ẩn thông báo này", "aria-label": "Ẩn thông báo này",
+      onclick: () => { localSet(i2vKey, i2vSig); renderMain(); } }, icon("x")),
     h("div", { class: "b-body" },
       h("div", {}, h("b", {}, "gflow chưa tạo được video từ ảnh trên tài khoản Flow này. "),
         S.env?.flow_ui ? "Film Maker sẽ tự làm Ảnh → Video qua giao diện chat của Flow (tải ảnh lên, gõ prompt, bấm Approve) bằng trình duyệt đã đăng nhập của gflow." : fb ? "Bạn đã bật “Tự chuyển sang Chữ → Video”, nên các cảnh “Ảnh → Video” đang được render bằng Chữ → Video (ảnh keyframe chỉ để tham khảo)."
@@ -3052,12 +3098,14 @@ async function pollJob() {
       refreshZones();
       if (fresh.some((l) => /\] OK -> /.test(l)) && S.cur && S.cur.id === S.job.project) refreshCurrent();
     }
+    if (fresh.some((l) => /\] OK -> /.test(l))) refreshCredits(); // a clip was rendered: the estimate went down
     if (d.status === "running") S.pollT = setTimeout(pollJob, 1000);
     else if (wasRunning) onJobDone();
   } catch { S.pollT = setTimeout(pollJob, 3000); }
 }
 
 async function onJobDone() {
+  refreshCredits();
   document.querySelectorAll(".prog-ov").forEach((e) => e.remove()); // job over: no overlay left, even if no key changed
   const j = S.job;
   document.title = "Film Maker";
@@ -3654,6 +3702,7 @@ async function openCredits() {
   modal({ title: "Credit Google Flow", body });
   try {
     const r = await api("POST", "/api/env/credits");
+    if (r.ok && r.balance && S.env) { S.env.credit_balance = r.balance; renderCreditButton(); }
     if (r.ok) {
       const nums = [];
       const walk = (o, path) => {

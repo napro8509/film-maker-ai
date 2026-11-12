@@ -9,6 +9,7 @@ FAKE_GFLOW_ENV_LOG: file where each call appends {GFLOW_CLI_LOG_LEVEL, GFLOW_CLI
 FAKE_GFLOW_EVENTS: "migrated" | "uiauto" | path of a JSONL file: JSON log lines printed on stderr by `video`
   commands (real events mixed with unrelated ones, like gflow-cli at GFLOW_CLI_LOG_LEVEL=INFO).
 FAKE_GFLOW_DELAY: seconds; image/video commands sleep 80% of it, print the events, then sleep the other 20%.
+FAKE_GFLOW_CREDITS: the balance printed by `credits user` (default 1000).
 FAKE_GFLOW_RAW_FAIL: comma list of "<substring>:<exit_code>": info log lines + "boom: real error" on stderr,
   then exit <exit_code> with no JSON payload.
 """
@@ -31,6 +32,9 @@ if env_log:
         f.write(json.dumps({k: os.environ.get(k) for k in ("GFLOW_CLI_LOG_LEVEL", "GFLOW_CLI_LOG_FORMAT")}) + "\n")
 
 joined = " ".join(argv)
+if argv[:2] == ["credits", "user"]:  # FAKE_GFLOW_CREDITS: the balance Flow reports (default 1000)
+    print(json.dumps({"status": "ok", "authenticated": True, "credits": int(os.environ.get("FAKE_GFLOW_CREDITS", "1000"))}))
+    sys.exit(0)
 
 
 def info(event, **kw):

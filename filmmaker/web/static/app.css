@@ -96,10 +96,12 @@ code { font-family: var(--mono); font-size: .92em; background: var(--surface-2);
 .brand { display: flex; align-items: center; gap: var(--sp-2); font-weight: var(--fw-bold); font-size: var(--fs-4); white-space: nowrap; }
 .brand .logo { width: 26px; height: 26px; border-radius: var(--r-1); background: var(--accent); color: var(--on-accent); display: grid; place-items: center; }
 .brand .logo .ico { width: 16px; height: 16px; vertical-align: 0; }
-#btn-menu { display: none; }
+#btn-menu { display: inline-flex; }
 .env { display: flex; gap: var(--sp-1); flex-wrap: nowrap; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; margin-left: var(--sp-3); }
 .env::-webkit-scrollbar { display: none; }
 .top-actions { display: flex; gap: var(--sp-1); }
+#btn-credits.has-balance .lbl-text { font-variant-numeric: tabular-nums; font-weight: var(--fw-bold); }
+@media (max-width: 900px) { #btn-credits.has-balance .lbl-text { display: inline; } }
 
 /* status pill: one style for every environment check */
 .pill {
@@ -118,7 +120,8 @@ button.pill:hover { background: var(--surface-2); border-color: var(--border-str
 .pill.busy::before { display: none; }
 
 /* ============ layout ============ */
-.layout { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); height: calc(100vh - var(--topbar-h)); }
+.layout { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); height: calc(100vh - var(--topbar-h));
+  transition: grid-template-columns .18s ease; }
 #sidebar { border-right: 1px solid var(--border); background: var(--surface); overflow-y: auto; padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-1); }
 #main { overflow-y: auto; padding: var(--sp-5) var(--sp-5) 120px; min-width: 0; }
 .main-inner { max-width: 1160px; margin: 0 auto; }
@@ -221,6 +224,20 @@ details > :not(summary) { margin-top: var(--sp-2); }
 .side-foot { margin-top: auto; padding: var(--sp-4) var(--sp-2) 0; font-size: var(--fs-1); color: var(--text-muted); }
 .side-foot .mono { word-break: break-all; display: block; margin-top: 2px; }
 .env-side { display: none; flex-wrap: wrap; gap: var(--sp-1); margin-bottom: var(--sp-3); }
+.proj.running .thumb { position: relative; }
+.proj.running .thumb::after { content: ""; position: absolute; top: -3px; right: -3px; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent); border: 2px solid var(--surface); }
+
+/* Collapsed: a narrow rail with the project covers only, so the work area gets the width. */
+@media (min-width: 721px) {
+  body.side-collapsed { --sidebar-w: 72px; }
+  body.side-collapsed #sidebar { padding: var(--sp-3) var(--sp-2); align-items: center; overflow-x: hidden; }
+  body.side-collapsed #sidebar .side-title, body.side-collapsed #sidebar .side-foot,
+  body.side-collapsed #sidebar .proj .meta, body.side-collapsed #sidebar .new-label { display: none; }
+  body.side-collapsed #sidebar .btn.primary.block { width: 44px; padding: 0; justify-content: center; margin-bottom: var(--sp-3); }
+  body.side-collapsed #sidebar .proj { width: auto; padding: 6px; justify-content: center; }
+}
+@media (prefers-reduced-motion: reduce) { .layout { transition: none; } }
 .bar { height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--ok); border-radius: 4px; transition: width .3s; }
 
@@ -257,6 +274,8 @@ details > :not(summary) { margin-top: var(--sp-2); }
 .banner details > summary { color: inherit; opacity: .85; }
 .banner pre { white-space: pre-wrap; margin: 0; font-family: var(--mono); font-size: var(--fs-1); }
 .banner.flush { margin: 0; }
+.banner .banner-close { order: 3; flex: none; margin: -6px -10px -6px 0; color: inherit; opacity: .7; }
+.banner .banner-close:hover { opacity: 1; }
 
 /* ============ cards ============ */
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-3); box-shadow: var(--sh-1); min-width: 0; }
@@ -458,7 +477,6 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 }
 @media (max-width: 720px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
-  #btn-menu { display: inline-flex; }
   #sidebar {
     position: fixed; top: var(--topbar-h); bottom: 0; left: 0; width: 280px; z-index: 40; border-right: 1px solid var(--border);
     transform: translateX(-100%); transition: transform .18s ease; box-shadow: var(--sh-3);

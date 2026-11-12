@@ -77,6 +77,60 @@ def load_settings() -> dict[str, Any]:
     return data
 
 
+# ---- Flow credit balance: the last real reading, minus an estimate for every clip rendered since ----
+
+
+def _ledger_path() -> Path:
+    return SETTINGS_PATH.with_name("flow_credits.json")
+
+
+def _read_ledger() -> dict[str, Any]:
+    try:
+        data = json.loads(_ledger_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and isinstance(data.get("balance"), (int, float)) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_ledger(data: dict[str, Any]) -> None:
+    _ledger_path().parent.mkdir(parents=True, exist_ok=True)
+    _ledger_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+_ledger_lock = threading.Lock()
+
+
+def credit_view() -> dict[str, Any] | None:
+    """{balance read from Flow, estimate now, spent since, unpriced clips, checked_at}; None if never read."""
+    d = _read_ledger()
+    if not d:
+        return None
+    spent = float(d.get("spent") or 0)
+    return {"balance": d["balance"], "estimate": round(d["balance"] - spent, 1), "spent": round(spent, 1),
+            "clips": int(d.get("clips") or 0), "unpriced": int(d.get("unpriced") or 0),
+            "checked_at": d.get("checked_at")}
+
+
+def record_balance(balance: float) -> dict[str, Any] | None:
+    with _ledger_lock:
+        _write_ledger({"balance": balance, "checked_at": time.time(), "spent": 0, "clips": 0, "unpriced": 0})
+    return credit_view()
+
+
+def record_spend(cost: float | None) -> None:
+    """One clip was rendered on Flow: take its estimated price off the balance (no reading yet: nothing to do)."""
+    with _ledger_lock:
+        d = _read_ledger()
+        if not d:
+            return
+        d["clips"] = int(d.get("clips") or 0) + 1
+        if cost is None:
+            d["unpriced"] = int(d.get("unpriced") or 0) + 1
+        else:
+            d["spent"] = float(d.get("spent") or 0) + float(cost)
+        _write_ledger(d)
+
+
 def save_settings(data: dict[str, Any]) -> None:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -687,6 +741,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "ffmpeg": shutil.which("ffmpeg"),
             "ffprobe": shutil.which("ffprobe"),
             "capcut": _capcut_installed(s),
+            "credit_balance": credit_view(),
             "anthropic_key": bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
             "claude_code": claude_code(refresh=refresh),
             "planner": planner_backend(),
@@ -730,7 +785,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except GflowError as exc:
             hint = (exc.payload.get("error") or {}).get("remediation_hint") if exc.payload else None
             return {"ok": False, "error": str(exc), "hint": hint}
-        return {"ok": True, "data": payload}
+        balance = payload.get("credits") if isinstance(payload, dict) else None
+        view = record_balance(balance) if isinstance(balance, (int, float)) and not isinstance(balance, bool) else None
+        return {"ok": True, "data": payload, "balance": view}
+
+    @app.get("/api/credits")
+    def credit_balance() -> dict[str, Any]:
+        return {"balance": credit_view()}
 
     def raw_models() -> dict[str, Any] | None:
         """`gflow models --json`, cached for the process. None (and nothing cached) if gflow fails."""
@@ -1848,6 +1909,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if dry:
                 job.log("== XEM TRƯỚC: không gửi gì lên Flow ==")
             pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=None if dry else job.set_progress)
+            meta = model_meta.load()
+
+            def after_clip(p: Pipeline, sid: str) -> None:
+                if ab:
+                    ab.trigger()
+                st = p.state.scene(sid)
+                if st.get("rendered_as") != "manual":  # a clip downloaded by hand cost nothing now
+                    scene = next((x for x in sb.scenes if x.id == sid), None)
+                    record_spend(meta.credits(scene.model or sb.model) if scene else None)
+
             retired = retirement.refuse_retired(sb) if not dry else (lambda _s: None)
             bad = dur.refuse_bad_duration(sb) if not dry else (lambda _s: None)
             report = pipe.run(RunOptions(
@@ -1858,7 +1929,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 fail_fast=body.fail_fast, keyframes_only=keyframes_only,
                 force_keyframes=set(body.force_keyframes),
                 should_stop=lambda: job.stop_requested,
-                after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
+                after_scene=lambda sid: after_clip(pipe, sid),
                 refuse=lambda s: retired(s) or bad(s),  # retired model first, then the duration
             ))
             job.log("")
