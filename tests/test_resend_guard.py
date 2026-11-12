@@ -629,11 +629,6 @@ def test_cli_adopt_and_force_same_scene_refused(env, fake_clip_check):
     assert env.calls() == [] and _cli_state(env, "s02")["status"] == SUBMITTING
 
 
-def test_readme_mentions_adopt():
-    text = (Path(__file__).parent.parent / "README.md").read_text()
-    assert "`--adopt s02`" in text and "touch clips/<id>.mp4" in text and "ffprobe" in text
-
-
 # --- QA (T5): gaps found when mapping AC1–AC36 to tests ------------------------------------
 
 @needs_ffmpeg

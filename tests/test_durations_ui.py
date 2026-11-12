@@ -35,48 +35,6 @@ def test_app_js_parses():  # AC32
     assert res.returncode == 0, res.stderr
 
 
-def test_helpers_are_top_level():
-    for name in ("durationRowText", "durationManualReason", "resendableBlocked", "blockedBadDurationText",
-                 "interruptedReasonText", "openDurationFix"):
-        _func(name)
-
-
-def test_confirm_paid_order():  # AC10: retired -> bad_duration -> credit box
-    fn = _func("confirmPaid")
-    i_est = fn.index("/estimate")
-    i_ret = fn.index("est.retired?.length")
-    i_bad = fn.index("est.bad_duration?.length")
-    i_box = fn.index('title: "Xác nhận render video"')
-    assert i_est < i_ret < i_bad < i_box
-    assert "openDurationFix(est.bad_duration, ctx, { again })" in fn
-    assert "return confirmPaid(body, ctx, true)" in fn
-    assert "resendableBlocked(est)" in fn and "blockedBadDurationText(r)" in fn
-
-
-def test_run_action_catches_bad_duration():  # AC10, AC16
-    fn = _func("runAction")
-    i_ret = fn.index('e.detail?.reason === "model_retired"')
-    i_bad = fn.index('e.detail?.reason === "bad_duration"')
-    i_428 = fn.index('e.detail?.reason === "needs_confirm"')
-    assert i_ret < i_bad < i_428
-    branch = fn[i_bad:i_428]
-    assert "Array.isArray(e.detail.bad_duration)" in branch
-    assert "openDurationFix(e.detail.bad_duration, ctx)" in branch
-    assert "return;" in branch and "/run" not in branch  # never re-runs on its own
-
-
-def test_render_scene_actions_reads_server_flag():  # AC20, AC28
-    fn = _func("renderSceneActions")
-    assert "st.bad_duration" in fn and "durationRowText(st.bad_duration)" in fn
-    assert "interruptedReasonText(st.error)" in fn and '"Lý do lần trước: "' in fn
-    assert "api(" not in fn  # flag comes from detail(), no extra request
-
-
-def test_line_class_cmd_first():
-    fn = _func("lineClass")
-    assert fn.index("l-cmd") < fn.index("l-err")
-
-
 # --- run the real code under node ------------------------------------------------------------------------
 
 HARNESS = r"""

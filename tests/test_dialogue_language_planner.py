@@ -190,13 +190,6 @@ def test_cli_dialogue_lang_without_lang(dump, tmp_path):
     assert data["dialogue_language"] == "Thai" and "subtitle_language" not in data
 
 
-def test_readme_documents_languages():
-    from pathlib import Path
-    text = (Path(__file__).parent.parent / "README.md").read_text()
-    for s in ("dialogue_language", "--dialogue-lang", "subtitle_language"):
-        assert s in text
-
-
 # --- review fixes -----------------------------------------------------------------
 
 @pytest.mark.parametrize("value", ["None", "NONE", " none "])

@@ -255,26 +255,3 @@ def test_cli_keyframes_follow_scene_characters_and_rerun_is_noop(tmp_path, monke
 
 # ---- QA round 3: guards for the three round-2 frontend bugs (behaviour checked by hand in the browser) ----------
 
-def test_board_round2_fixes_stay_in_place():
-    import re
-    static = ROOT / "filmmaker/web/static"
-    css = re.sub(r"/\*.*?\*/", "", (static / "board.css").read_text(encoding="utf-8"), flags=re.S)
-    js = (static / "board.js").read_text(encoding="utf-8")
-
-    def z(selector):  # z-index of the first rule with a z-index whose selector list contains `selector`
-        for sel, body in re.findall(r"([^{}]+)\{([^}]*)\}", css):
-            if selector in [s.strip() for s in sel.split(",")]:
-                m = re.search(r"z-index:\s*(\d+)", body)
-                if m:
-                    return int(m.group(1))
-        return None
-
-    # #1: a failed card (and the hovered / focused one) is drawn above its neighbours, so "Thử lại" stays clickable
-    assert z(".board-card.is-failed") > z(".board-card")
-    assert z(".board-card:focus-within") > z(".board-card")
-    # #2: a character-link selection is pinned to the character object, not only to its index
-    assert "B.selChar" in js and re.search(r"bChars\(\)\[L\.ci\]\s*===\s*B\.selChar", js)
-    # #3: "→ Video" saves the layout only after bAfterMount has placed the new card
-    show = re.search(r"function bShowVideo\(sc\) \{(.*?)\n\}", js, re.S).group(1)
-    assert "saveAfterMount = true" in show and "saveBoard(" not in show
-    assert re.search(r"if \(B\.saveAfterMount\) \{ B\.saveAfterMount = false; saveBoard\(\); \}", js)

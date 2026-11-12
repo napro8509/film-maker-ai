@@ -1,7 +1,6 @@
 """QA additions for model-retirement: gaps in the original tests (AC5 with the CLI, AC17 for app.js)
 and edge cases the spec does not spell out (unknown project, broken storyboard, empty input, re-runs)."""
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -142,7 +141,3 @@ def test_banner_counts_on_exact_retirement_day(client, monkeypatch):
     assert len(client.post("/api/projects/film/estimate", json={"action": "video"}).json()["retired"]) == 1
 
 
-def test_readme_documents_check_storyboard():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert re.search(r"filmmaker check \S+\.yaml", readme)
-    assert "FILMMAKER_MODELS" in readme

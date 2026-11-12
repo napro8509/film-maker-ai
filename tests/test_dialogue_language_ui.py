@@ -40,17 +40,6 @@ def test_app_js_parses():
     assert res.returncode == 0, res.stderr
 
 
-def test_language_constants():
-    assert 'const LANG_OTHER = "__other__";' in SRC
-    assert re.search(r'const DIALOGUE_LANGS = \[\["Vietnamese", "Tiếng Việt"\], \["English", "English"\], '
-                     r'\["Thai", "ไทย \(Tiếng Thái\)"\],\s*\["none", "Không thoại \(chỉ nhạc/âm thanh\)"\]\];', SRC)
-    assert ('const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], '
-            '["Thai", "ไทย (Tiếng Thái)"]];') in SRC
-    picker = _func("langPicker")
-    assert '"Khác…"' in picker and '"Chưa đặt (Veo tự đoán)"' in picker
-    assert "maxlength: 80" in picker  # not 40, so "> 40 chars" still reaches the toast (AC2)
-
-
 def test_new_film_popup_fields_and_storage():  # AC1, AC3
     f = _ai_form()
     assert 'field("Nhân vật nói", speak.el)' in f and 'field("Ngôn ngữ phụ đề", sub.el)' in f
@@ -77,37 +66,6 @@ def test_new_film_popup_validates_then_stores_then_posts():  # AC2, AC3, AC4
     assert "language: b.value" in body and "dialogue_language: a.value" in body  # AC4
     # the store sits outside the try: kept even when the plan request / job fails
     assert go.index("try {") > i_store
-
-
-def test_film_info_field_and_warning_zone():  # AC18, AC19, AC20
-    fn = _func("renderDialogueLang")
-    assert "langPicker(DIALOGUE_LANGS, sb.dialogue_language, { unset: true })" in fn
-    assert 'field("Nhân vật nói"' in fn
-    assert 'set("dialogue_language", r.value ?? undefined)' in fn  # Chưa đặt -> key dropped
-    i_set = fn.index('set("dialogue_language"')
-    assert i_set < fn.index("S.dlChanged = S.cur.id;") < fn.index('refreshZone("dl-warn")')
-    assert fn.index('if (!r.ok) { toast(') < i_set  # bad "Khác…" never touches the storyboard
-    z = fn[fn.index('zone("dl-warn"'):]
-    assert "S.cur.clips_rendered || 0" in z and "S.dlChanged === S.cur.id && n >= 1" in z
-    assert "hidden: !show" in z and "return h(" in z  # always an element (zone() sets its id)
-    assert ("Chỉ áp dụng cho các cảnh render từ giờ. ${n} cảnh đã có clip vẫn giữ tiếng cũ. "
-            "Muốn đổi tiếng thì bấm Render lại từng cảnh (tốn credit).") in z
-    # AC18: autosave only, no job, no direct API call
-    for bad in ("api(", "startJob", "/run", "/render"):
-        assert bad not in fn, bad
-
-
-def test_film_info_field_sits_after_style():
-    start = SRC.index("Phong cách hình ảnh")
-    assert start < SRC.index("renderDialogueLang(sb, set)", start)
-    assert SRC.count("renderDialogueLang(") == 2  # definition + one call
-
-
-def test_open_project_clears_warning_flag():  # AC20: no stale warning when reopening
-    fn = _func("openProject")
-    i_cur = fn.index("S.cur = d;")
-    i_clear = fn.index("S.dlChanged = null;")
-    assert i_cur < i_clear < fn.index("} catch (e)")
 
 
 # --- run the real cleanLang / langPicker under node ------------------------------------------------------

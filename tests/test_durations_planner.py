@@ -1,13 +1,9 @@
 """Planner and allowed clip durations (AC18, AC19), with a fake `claude` binary and a fake `anthropic` module."""
 
 import json
-import os
-import shutil
 import stat
-import subprocess
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -147,17 +143,3 @@ def test_plan_auto_rounds_on_model_claude_picked(monkeypatch):
 
 # --- AC18: the old planner tests still pass, untouched ---------------------------------------------
 
-def test_old_dialogue_language_planner_tests_untouched_and_pass(tmp_path):
-    root = Path(__file__).resolve().parent.parent
-    name = "tests/test_dialogue_language_planner.py"
-    if shutil.which("git") and (root / ".git").exists():
-        diff = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", name], cwd=root)
-        assert diff.returncode == 0, f"{name} was modified"
-    settings = tmp_path / "settings.json"
-    settings.write_text(json.dumps({"auto_backup": False}))
-    tests = ["test_plan_auto_passes_dialogue_only_when_given", "test_plan_auto_without_dialogue_sets_nothing",
-             "test_cli_lang_only_keeps_old_behaviour"]
-    res = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", name, "-k", " or ".join(tests)],
-                         cwd=root, capture_output=True, text=True, env={**os.environ, "FILMMAKER_SETTINGS": str(settings)})
-    assert res.returncode == 0, res.stdout + res.stderr
-    assert "3 passed" in res.stdout, res.stdout

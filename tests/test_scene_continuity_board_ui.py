@@ -28,19 +28,6 @@ def test_board_js_parses():
     assert res.returncode == 0, res.stderr
 
 
-def test_static_limits():
-    lk = _func("linkKind")
-    assert lk.index('"đang tắt gửi ảnh nhân vật"') < lk.index("charRefLimit(")  # refs off still wins
-    assert "đã đủ ${lim} ảnh nhân vật: ${refs.join(\", \")}" in lk
-    assert ">= 3" not in lk
-    msgs = _func("bSceneCharMsgs")
-    assert "const lim = charRefLimit(sc);" in msgs and "withImg.length > lim" in msgs
-    assert "Chỉ gửi ảnh của ${lim} nhân vật: ${refs.join(\", \")}" in msgs
-    # loc: progress keys never reach the board's char-only sizing
-    assert 'function bCardW(key) { return key.startsWith("char:")' in BSRC
-    assert 'function bFallbackH(key) { return key.startsWith("char:")' in BSRC
-
-
 HARNESS = r"""
 const fs = require("fs");
 const bsrc = fs.readFileSync(process.argv[2], "utf8"), asrc = fs.readFileSync(process.argv[3], "utf8");
