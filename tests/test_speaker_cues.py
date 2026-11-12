@@ -1,0 +1,153 @@
+"""Who-is-who for dialogue in keyframe scenes: Veo sees a picture, not names, and gave the son's line to the
+mother (the only face toward the camera). The cues are added only when sending, never to the fingerprints."""
+from filmmaker.gflow import Gflow
+from filmmaker.pipeline import Pipeline
+from filmmaker.storyboard import NO_TEXT, Storyboard
+
+SB = {"title": "Mother", "model": "veo-lite", "aspect": "9:16", "dialogue_language": "Thai",
+      "characters": [{"name": "Malee", "description": "A gentle Thai mother, black hair in a low bun, pink floral blouse."},
+                     {"name": "TonTeen", "description": "A Thai teenage boy around 16, gray school shirt, white earbuds."}],
+      "scenes": [{"id": "s08", "mode": "keyframe", "image_prompt": "TonTeen and Malee at a school gate",
+                  "prompt": "TonTeen steps away from Malee.", "duration": 8,
+                  "dialogue": [{"character": "TonTeen", "line": "แม่ไม่ต้องมาส่งผมแล้ว", "delivery": "low"}]},
+                 {"id": "s09", "mode": "keyframe", "image_prompt": "Malee alone", "prompt": "Malee waits.", "duration": 6},
+                 {"id": "s10", "mode": "t2v", "prompt": "TonTeen talks to Malee.", "duration": 6,
+                  "dialogue": [{"character": "TonTeen", "line": "ครับ"}]}]}
+
+
+def _sb(**kw):
+    return Storyboard.model_validate({**SB, **kw})
+
+
+def test_cues_say_who_speaks_and_who_stays_silent():
+    sb = _sb()
+    s = sb.scenes[0]
+    cues = sb.speaker_cues(s)
+    assert "Malee is a gentle Thai mother" in cues and "pink floral blouse" in cues
+    assert "TonTeen is a Thai teenage boy" in cues
+    assert "Only TonTeen speaks" in cues and "TonTeen turns the face toward the camera" in cues
+    assert "Malee keeps the mouth closed" in cues
+    sent = sb.for_flow_video(sb.video_prompt(s), s)
+    assert cues in sent and sent.index(cues) < sent.index("Spoken language: Thai") < sent.index(NO_TEXT)
+    assert sb.for_flow_video(sent, s) == sent  # sending the sent prompt again adds nothing
+
+
+def test_no_cues_without_lines_for_t2v_or_a_silent_film():
+    sb = _sb()
+    assert sb.speaker_cues(sb.scenes[1]) == ""  # nobody speaks
+    assert sb.speaker_cues(sb.scenes[2]) == ""  # text-to-video already describes the characters
+    quiet = _sb(dialogue_language="none")
+    assert quiet.speaker_cues(quiet.scenes[0]) == ""
+
+
+def test_cues_never_change_the_fingerprint(tmp_path):
+    # Rendered clips of every film must not turn "changed" (and be rendered again) because of this.
+    sb = _sb()
+    before = {s.id: sb.scene_fingerprint(s) for s in sb.scenes}
+    assert "Who is who" not in sb.video_prompt(sb.scenes[0])
+    assert {s.id: sb.scene_fingerprint(s) for s in sb.scenes} == before
+
+
+def test_pipeline_sends_the_cues(tmp_path, monkeypatch):
+    sb = _sb()
+    sent = []
+    g = Gflow(dry_run=True, log=lambda *_: None)
+    monkeypatch.setattr(g, "image_to_video", lambda img, prompt, **kw: (sent.append(prompt), (tmp_path / "v.mp4", None))[1])
+    pipe = Pipeline(sb, tmp_path / "out", g)
+    kf = tmp_path / "kf.png"
+    kf.write_bytes(b"png")
+    monkeypatch.setattr(pipe, "_keyframe", lambda *a, **k: kf)
+    from filmmaker.pipeline import RunOptions
+
+    try:
+        pipe._render_scene(sb.scenes[0], "proj", RunOptions())
+    except Exception:  # what happens after sending (checking the clip) is not under test here
+        pass
+    assert sent and "Only TonTeen speaks" in sent[0]
+
+
+def test_a_scene_without_lines_is_told_nobody_speaks():
+    # The language rule alone ("characters speak only Thai") made Veo invent lines in silent scenes.
+    from filmmaker.storyboard import DIALOGUE_RULE, SILENT_SCENE_RULE
+
+    sb = _sb()
+    quiet, talking = sb.scenes[1], sb.scenes[0]
+    sent = sb.for_flow_video(sb.video_prompt(quiet), quiet)
+    assert SILENT_SCENE_RULE in sent and "Spoken language: Thai" not in sent
+    assert sb.for_flow_video(sent, quiet) == sent
+    assert DIALOGUE_RULE.format(lang="Thai") in sb.for_flow_video(sb.video_prompt(talking), talking)
+    before = sb.scene_fingerprint(quiet)
+    assert "Nobody speaks" not in sb.video_prompt(quiet) and sb.scene_fingerprint(quiet) == before
+    nolang = _sb(dialogue_language=None)  # no film language set: nothing is added, as before
+    assert "Nobody speaks" not in nolang.for_flow_video(nolang.video_prompt(nolang.scenes[1]), nolang.scenes[1])
+
+
+def test_speech_typed_in_the_prompt_is_not_silenced():
+    sb = _sb()
+    for prompt in ("Malee: con ăn đi.", "Malee says hello.", "They talk quietly.", "TonTeen (soft): ครับ"):
+        assert sb._speech_in_prompt(prompt), prompt
+    for prompt in ("TonTeen steps away from Malee.", "Ambient noise: rain. Camera movement: handheld."):
+        assert not sb._speech_in_prompt(prompt), prompt
+
+
+def test_keyframe_is_staged_with_the_speaker_as_the_main_face(tmp_path, monkeypatch):
+    # s05 of "18 ngày": the coach stood in the foreground with an open grin and mouthed the boy's line.
+    from filmmaker.pipeline import RunOptions
+    from filmmaker.storyboard import BACKGROUND_NO_WORDS
+
+    sb = _sb()
+    s = sb.scenes[0]
+    staging = sb.keyframe_staging(s)
+    assert "TonTeen is the main subject, in the foreground with the largest, closest face" in staging
+    assert "Malee is smaller in the frame or further back, turned toward TonTeen, mouth closed" in staging
+    assert sb.keyframe_staging(sb.scenes[1]) == "" and sb.keyframe_staging(sb.scenes[2]) == ""
+    assert _sb(dialogue_language="none").keyframe_staging(s) == ""
+    sent = sb.for_flow_keyframe(sb.image_prompt(s), s)
+    assert staging in sent and sent.index(staging) < sent.index(NO_TEXT)
+    assert sb.for_flow_keyframe(sent, s) == sent
+    assert BACKGROUND_NO_WORDS in sb.speaker_cues(s)
+
+    # sent to Flow, but never stored as the keyframe prompt: made keyframes and clips stay valid
+    before = sb.scene_fingerprint(s)
+    assert "Staging" not in sb.image_prompt(s) and sb.scene_fingerprint(s) == before
+    g = Gflow(dry_run=True, log=lambda *_: None)
+    got = []
+    monkeypatch.setattr(g, "text_to_image", lambda prompt, **kw: (got.append(prompt), kw["out"])[1])
+    pipe = Pipeline(sb, tmp_path / "out", g)
+    pipe._make_keyframe(s, "proj", RunOptions())
+    assert got and staging in got[0]
+
+
+def test_a_scene_without_lines_never_gets_the_language_rule():
+    # s10 of "18 ngày": "boys softly singing" counted as speech, the scene got "characters speak only Vietnamese"
+    # and Veo made up four lines.
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    sb = _sb()
+    quiet = sb.scenes[1]
+
+    def sent(prompt):
+        quiet.prompt = prompt
+        return sb.for_flow_video(sb.video_prompt(quiet), quiet)
+
+    singing = sent("The boys softly sing and laugh around the flashlight.")
+    assert SILENT_SCENE_RULE in singing and "Spoken language: Thai" not in singing
+    talking = sent("Malee says hello.")  # someone does talk: the language rule stays
+    assert "Spoken language: Thai" in talking and SILENT_SCENE_RULE not in talking
+    typed = sent("Malee: con ăn đi.")  # a line typed into the prompt is dialogue
+    assert "Spoken language: Thai" in typed
+    assert not sb._speech_in_prompt("The boys are singing.")
+
+
+def test_language_rule_names_the_language_not_who_talks():
+    # "characters speak only Vietnamese" read as everyone talking: listeners echoed the speaker's line.
+    from filmmaker.storyboard import DIALOGUE_RULE
+
+    sb = _sb()
+    s = sb.scenes[0]
+    sent = sb.for_flow_video(sb.video_prompt(s), s)
+    assert DIALOGUE_RULE.format(lang="Thai") in sent and "characters speak" not in sent
+    assert "only by the character it belongs to" in sent
+    s.prompt = "TonTeen steps away. All spoken dialogue is in Thai; characters speak only Thai. He sighs."
+    old = sb.for_flow_video(sb.video_prompt(s), s)  # the old sentence in a stored prompt is swapped, not doubled
+    assert "characters speak" not in old and old.count("Spoken language: Thai") == 1

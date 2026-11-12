@@ -198,7 +198,7 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
     click.echo("Đang viết storyboard...")
     try:
         sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
-                          dialogue_language=dialogue_lang)
+                          dialogue_language=dialogue_lang, log=click.echo)
     except RuntimeError as exc:
         raise click.ClickException(str(exc)) from exc
     save_storyboard(sb, output)
@@ -375,8 +375,55 @@ def run(storyboard: Path, **kw) -> None:
 
     Cảnh bị ngắt từ bản cũ có clip tải tay trong clips/: --adopt <id> để dùng clip đó (không tốn credit).
     """
-    _, _, report = _do_run(storyboard, **kw)
+    sb, out_dir, report = _do_run(storyboard, **kw)
+    if report.done and not kw.get("dry_run") and not kw.get("keyframes_only") and user_settings.load().get("auto_qc", True):
+        _qc(sb, out_dir, set(report.done), force=False, profile=kw.get("profile"))
     sys.exit(0 if report.ok else 1)
+
+
+def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str | None = None) -> dict:
+    from . import ai, qc
+
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    if not backend:
+        click.echo("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
+        return {}
+    click.echo("")
+    click.echo("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
+    pipe = Pipeline(sb, out_dir, Gflow(profile=profile, dry_run=True, log=lambda *_: None), log=lambda *_: None)
+    done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key)
+    failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
+    if failed:
+        click.echo(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — render lại nếu muốn: "
+                   f"filmmaker run STORYBOARD --force {' --force '.join(failed)} (tốn credit)")
+    return done
+
+
+@main.command("qc")
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(file_okay=False, path_type=Path), help="Thư mục kết quả.")
+@click.option("--only", multiple=True, help="Chỉ QC cảnh này (lặp lại được).")
+@click.option("--force", is_flag=True, help="QC lại cả clip đã QC rồi.")
+@click.option("--download-model", is_flag=True, help="Tải model nhận dạng giọng nói (một lần, ~550 MB) rồi QC.")
+def qc_command(storyboard: Path, out, only, force, download_model) -> None:
+    """AI QC các clip đã render: đúng cảnh/keyframe, đúng nhân vật, hình lỗi, chữ trên hình, âm thanh và lời thoại.
+
+    Miễn phí (không gửi gì lên Flow), chỉ đánh dấu PASS / MINOR / FAIL; kết quả lưu ở <out>/qc.json.
+    """
+    from . import qc
+
+    if download_model:
+        qc.download_model(log=click.echo)
+    sb = load_storyboard(storyboard)
+    unknown = set(only) - {s.id for s in sb.scenes}
+    if unknown:
+        raise click.ClickException(f"không có cảnh: {', '.join(sorted(unknown))}")
+    done = _qc(sb, _out_dir(storyboard, out), set(only) or None, force=force)
+    if not done:
+        click.echo("Không có clip mới cần QC (thêm --force để QC lại).")
+    sys.exit(1 if any(v["verdict"] == "FAIL" for v in done.values()) else 0)
 
 
 def _clips(sb, out_dir: Path) -> tuple[list[tuple[str, Path]], list[str]]:
@@ -722,6 +769,75 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
     if report.aborted:
         click.echo(f"⚠ {report.aborted}")
     sys.exit(0 if not report.failed and not report.aborted else 1)
+
+
+@main.command()
+@click.argument("idea", required=False)
+@click.option("--storyboard", "existing", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Làm tiếp một storyboard có sẵn thay vì viết mới từ ý tưởng.")
+@click.option("-n", "--scenes", default=10, show_default=True, help="Số cảnh.")
+@click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="9:16", show_default=True)
+@click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề.")
+@click.option("--dialogue-lang", "dialogue_lang", default="Vietnamese", show_default=True,
+              help="Ngôn ngữ nhân vật nói; 'none' = không thoại.")
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa dự án (mặc định ~/FilmMaker, dùng chung với app).")
+@click.option("--review/--no-review", default=True, show_default=True, help="Agent review từng công đoạn.")
+@click.option("--rerender-budget", default=3, show_default=True,
+              help="(Không còn dùng: AI QC chỉ đánh dấu clip lỗi, không tự render lại.)")
+@click.option("--burn-subtitles/--no-burn-subtitles", default=True, show_default=True)
+@click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
+def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
+         burn_subtitles, music, profile, pause) -> None:
+    """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
+
+    \b
+    Agent review storyboard, keyframe (tạo lại ảnh lỗi, miễn phí), AI QC từng clip (hình, âm thanh, lời thoại;
+    chỉ đánh dấu, không tự render lại) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
+    """
+    from .autopilot import AutoError, Autopilot, AutoSettings, slug
+    from .planner import plan_auto
+
+    if not idea and not existing:
+        raise click.UsageError("cần IDEA hoặc --storyboard")
+    g = Gflow(profile=profile, log=click.echo)
+    if not g.available():
+        raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+    if existing:
+        sb_path = existing
+    else:
+        dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
+        language = _cli_lang(language, "--lang", clean_language)
+        click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
+        try:
+            sb, _ = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=language,
+                              dialogue_language=dialogue_lang, log=click.echo)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        ws = workspace or Path.home() / "FilmMaker"
+        base = slug(sb.title) or "phim"
+        d, n = ws / base, 2
+        while d.exists():
+            d, n = ws / f"{base}-{n}", n + 1
+        (d / "assets").mkdir(parents=True)
+        sb_path = d / "storyboard.yaml"
+        save_storyboard(sb, sb_path)
+        click.echo(f"✔ {sb_path}")
+    cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
+                       api_key=key, pause=_parse_pause(pause))
+    pilot = Autopilot(sb_path, _out_dir(sb_path, None), g, settings=cfg, log=click.echo)
+    try:
+        result = pilot.run()
+    except AutoError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except (GflowError, ThumbnailError, AssembleError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result.get("stopped"):
+        sys.exit(1)
 
 
 @main.command()

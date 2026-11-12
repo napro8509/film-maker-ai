@@ -107,3 +107,22 @@ def test_assemble_embeds_three_tracks(tmp_path):
                                        "stream_tags=language", "-of", "json", str(out)],
                                       capture_output=True, text=True, check=True).stdout)
     assert [s["tags"]["language"] for s in probe["streams"]] == ["vie", "tha", "eng"]
+
+
+def test_old_language_name_keys_become_track_codes(tmp_path):
+    """Storyboards saved with subtitles keyed by language name ({"Thai": ...}) still load, as track codes."""
+    from filmmaker.storyboard import load_storyboard, merge_subtitles_raw
+
+    p = tmp_path / "storyboard.yaml"
+    p.write_text(
+        "title: t\nsubtitle_language: Vietnamese\nsubtitle_languages: [Vietnamese, Thai, Japanese]\n"
+        "scenes:\n- id: s01\n  prompt: p\n  narration: Xin chào\n"
+        "  subtitles: {Thai: สวัสดี, Japanese: こんにちは}\n", encoding="utf-8")
+    sb = load_storyboard(p)
+    sc = sb.scenes[0]
+    assert sc.subtitles.th == "สวัสดี" and sc.subtitles.vi is None and sc.subtitles.en is None
+    assert sb.primary_subtitle_code() == "vi"
+    assert sb.missing_subtitles() == {"s01": ["en"]}
+    raw = {"scenes": [{"id": "s01", "subtitles": {"Thai": "สวัสดี"}}]}
+    assert merge_subtitles_raw(raw, {"s01": {"en": "Hello", "th": "other"}})
+    assert raw["scenes"][0]["subtitles"] == {"th": "สวัสดี", "en": "Hello"}

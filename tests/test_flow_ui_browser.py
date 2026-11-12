@@ -85,3 +85,55 @@ def test_old_clip_is_never_taken(page, tmp_path):
     page.set_content(PAGE % {"ready": "true", "uuid": UUID})
     assert flow_ui._new_tile(page, ["New clip", "Old clip"]) is None
     assert flow_ui._new_tile(page, ["Old clip"]) == "New clip"
+
+
+# --- attaching an upload: never "the first item", only the one just uploaded -----------------------------------
+
+ATTACH_PAGE = """
+<flow-creative-agent-prompt-box>
+  <button aria-label="Add ingredients to the prompt box" onclick="draw()">+</button>
+  <div id="chips"></div>
+</flow-creative-agent-prompt-box>
+<div id="pop"></div>
+<input type="file" id="file" style="display:none" onchange="uploaded(this.files[0].name)">
+<script>
+  // Like Flow (seen 2026-11-11): an "Uploading" placeholder on top, the new upload listed below it with a
+  // spinner for PROCESS_MS, the last-used OLDER upload still selected (so "Add to prompt" is on before we pick
+  // ours), selection shown by the class asset-item-active (aria-selected stays "false"), one selected at a time
+  // (a click moves it, a click on the selected one keeps it), and a click on a processing upload does nothing.
+  const PROCESS_MS = %(process_ms)d;
+  let items = [{name: "s08.png", ready: true, on: %(preselected)s}];
+  function draw() {
+    const any = items.some(it => it.on);
+    document.getElementById('pop').innerHTML = `<flow-add-menu-popover-content>
+      <div role="tab">Uploads</div>
+      <button onclick="document.getElementById('file').click()">Upload media</button>
+      ${items.map((it, i) => `<button role="option" class="asset-item${it.on ? ' asset-item-active' : ''}"
+          aria-selected="false" onclick="pick(${i})"><span class="asset-title">${it.name}</span>
+          ${it.ready ? '' : '<mat-spinner></mat-spinner>'}</button>`).join('')}
+      <button id="add" ${any ? '' : 'disabled'} onclick="addIt()">Add to prompt</button>
+    </flow-add-menu-popover-content>`;
+  }
+  function pick(i) { if (!items[i].ready) return; items.forEach(it => it.on = false); items[i].on = true; draw(); }
+  function uploaded(name) {
+    items.unshift({name: "Uploading", ready: false, on: false}); draw();
+    setTimeout(() => { items[0] = {name, ready: false, on: false}; items.unshift({name: "image", ready: true, on: false});
+      draw(); setTimeout(() => { items[1].ready = true; draw(); }, PROCESS_MS); }, 500);
+  }
+  function addIt() {
+    items.filter(it => it.on).forEach(it => document.getElementById('chips').insertAdjacentHTML('beforeend',
+      `<flow-ingredient-chip>${it.name}</flow-ingredient-chip>`));
+    document.getElementById('pop').innerHTML = '';
+  }
+</script>
+"""
+
+
+def test_attach_picks_only_the_new_upload_never_an_older_one(page, tmp_path):
+    img = tmp_path / "s07.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    page.set_content(ATTACH_PAGE % {"process_ms": 6000, "preselected": "true"})
+    flow_ui._attach(page, img, flow_ui.Deadline(120))
+    chips = page.locator(flow_ui.CHIP).all_inner_texts()
+    assert len(chips) == 1
+    assert chips[0].startswith("fm-s07-") and chips[0].endswith(".png"), chips  # never "s08.png"

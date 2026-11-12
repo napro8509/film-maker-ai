@@ -49,6 +49,43 @@ Tải file dùng hộp thoại Lưu của macOS; thông báo khi render xong hi�
 Log ở `~/Library/Logs/FilmMaker.log`. Chạy lại script nếu di chuyển thư mục dự án hoặc tạo lại `.venv`.
 Không cần build app: `filmmaker app`.
 
+## Tạo tự động toàn bộ (một nút)
+
+Trong app: **Phim mới → Từ ý tưởng → Tạo tự động toàn bộ**. Với dự án có sẵn: nút **Tạo tự động** ở đầu dự án
+(làm mọi bước còn thiếu). Dòng lệnh:
+
+```bash
+filmmaker auto "Bà Tư bán xôi ở góc phố Hà Nội..." -n 10 --aspect 9:16 --dialogue-lang Vietnamese --lang Vietnamese
+filmmaker auto --storyboard ~/FilmMaker/goi-xoi-cua-ba-tu/storyboard.yaml   # làm tiếp chỗ dừng
+```
+
+| # | Bước | Ai làm | Tốn credit |
+|---|---|---|---|
+| 1 | Viết storyboard (+ làm tròn độ dài model không nhận) | Claude | không |
+| 2 | **Agent review storyboard**: hook, nhịp, liên tục, prompt, thoại; tự sửa cảnh có vấn đề | Claude | không |
+| 3 | Ảnh nhân vật (tham chiếu) | Flow | không |
+| 4 | Keyframe từng cảnh | Flow | không |
+| 5 | **Agent review keyframe**: xem ảnh + ảnh nhân vật, ảnh sai mặt/sai nhân vật/có chữ/méo thì sửa prompt và tạo lại (tối đa 2 vòng) | Claude + Flow | không |
+| 6 | Render video (cảnh lỗi tạm được thử lại; cảnh bị ngắt khi Flow đang render được gửi lại **một** lần) | Flow | **có** |
+| 7 | **Agent review clip**: xem 3 khung hình mỗi clip; clip hỏng rõ ràng được render lại với prompt đã sửa (tối đa 3 clip/phim) | Claude + Flow | **có** (chỉ clip render lại) |
+| 8 | AI dựng phim (`edit`): cắt thừa, chuyển cảnh, cân âm, phụ đề | Claude + ffmpeg | không |
+| 9 | Thumbnail: tiêu đề (Claude) + ảnh bìa (Flow) | Claude + Flow | không |
+| 10 | **Agent review cả phim**: xem khung hình toàn phim + ảnh bìa, chấm điểm, nêu việc nên sửa | Claude | không |
+
+- Bấm **Dừng** lúc nào cũng được; bấm lại để làm tiếp. Không có gì đã làm bị làm lại, kể cả các lượt review
+  (nhớ ở `output/<tên>/autopilot.json`). Kết quả review ở `output/<tên>/reviews/` (`report.md`, `film.json`...),
+  trong app ở thẻ **Agent review** (tab Ghép phim) và thanh 10 bước dưới tên phim.
+- Review không chạy được (chưa có Claude) thì bỏ qua bước đó, không dừng phim. Hết credit / mất đăng nhập thì dừng.
+- Phim 10 cảnh với veo-lite: khoảng 100 credit (+ tối đa 30 credit nếu agent render lại clip).
+- `--no-review` tắt các agent review; `--rerender-budget 0` không bao giờ render lại; `--no-burn-subtitles` chỉ xuất `.srt`.
+
+### Tối ưu khi gọi Flow
+
+- **Nhớ khả năng tài khoản**: tài khoản Flow nào gflow không làm được ảnh theo ảnh nhân vật / Ảnh → Video thì app ghi nhớ
+  (`~/.config/filmmaker/flow_caps.json`) và dự án mới đi thẳng đường giao diện chat của Flow, không mất một lần
+  thử gflow lỗi (mở trình duyệt 20–60 giây) cho mỗi loại yêu cầu. Nút "Thử lại Ảnh → Video" xoá ghi nhớ này.
+- **Nghỉ ngắn cho ảnh miễn phí**: giữa các lần tạo ảnh nhân vật/keyframe chỉ nghỉ 1/4 thời gian nghỉ giữa các video.
+
 ## Giao diện web
 
 ```bash

@@ -28,19 +28,29 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
   `shot` (wide shot, medium shot, close-up, extreme close-up, over-the-shoulder shot, point-of-view shot...), `angle` (eye-level, low angle, high angle, bird's-eye view, dutch angle...),
   `movement` (exactly ONE move: static locked-off camera, slow dolly-in, tracking shot, pan, tilt, orbit, crane up, handheld...), `lens` (24mm wide-angle, 50mm, 85mm portrait, macro, anamorphic...),
   and when useful `focus` (shallow depth of field, rack focus...), `composition` (rule of thirds, symmetry, foreground framing, silhouette...), `lighting` for this shot, `speed` (slow motion, time-lapse), `notes`.
-- Edit like a film: open with a wide/establishing shot, vary shot sizes between consecutive scenes (wide -> medium -> close-up), go closer for emotion, use low angles for power and high angles for vulnerability, keep the 180-degree rule in dialogue (over-the-shoulder / reverse shots), and match the camera move to the mood (static or slow for calm, handheld or tracking for tension).
-- Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts.
+- Hook first: scene s01 starts mid-conflict (a striking face reaction, a shocking action or a provocative line) within its first 2 seconds, in a medium or close shot, not a calm establishing shot; the stakes are clear by about 7 seconds; give a twist or reveal in the middle; the last scene lands an emotional payoff or a twist that makes people comment or rewatch. Establish places with a short shot later when needed.
+- For 9:16, keep faces and key action in the upper-middle of the frame; leave the bottom fifth and the right edge free of important content (platform buttons and subtitles go there).
+- Edit like a film: vary shot sizes between consecutive scenes (wide -> medium -> close-up), go closer for emotion, use low angles for power and high angles for vulnerability, keep the 180-degree rule in dialogue (over-the-shoulder / reverse shots), and match the camera move to the mood (static or slow for calm, handheld or tracking for tension).
+- Define recurring people in `characters` with a fixed, specific look, and refer to them by exact name in prompts. Give every main character a distinct silhouette, hair and signature clothing item, so they never look alike. In `prompt`, also name people by what the camera sees (e.g. "Lan, the woman in the red coat on the left"): the video model sees the picture, not names.
 - Define every place that appears in the film once in `locations` with a fixed, specific `description` (layout, main furniture, props, colors, fixed light sources); set each scene's `location` to the exact location name.
 - In every `image_prompt` (and the `prompt` of t2v scenes) state where we are, the time of day and the light source, and every character visible in the frame by exact name with their position (left/right, foreground/background, sitting/standing), including people blurred in the background. Never name a character who is not in the frame.
 - Continuity: each scene starts from the end state of the previous scene: the same positions of people, objects that were moved stay moved, the same light and time of day unless the story deliberately jumps.
 - After a time jump set `continue_previous: false`; when the place changes, change `location`.
+- Write sound in `prompt` as "SFX: ..." and "Ambient noise: ...".
 - Put the shared visual look in `style` once instead of repeating it.
 - `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. If the message says "Subtitles: none", the film has no subtitles: leave `narration` and `subtitles` empty in every scene. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
 - The film always has three subtitle tracks: whenever a scene has `narration`, also fill `subtitles` with that same line in Vietnamese (`vi`), Thai (`th`) and English (`en`); the one in the narration's own language is exactly the `narration` text, the other two are natural translations (not transliterations).
 - Direct the content of every scene in `content_direction` (English, 1-2 sentences): what the audience must understand and feel in this clip, the emotional beat, and how each character in it acts and reacts (expression, body language). Make each scene move the story forward.
-- Spoken lines go ONLY in `dialogue`, never in `prompt` / `image_prompt`: one row per line in the order spoken, `character` = exact character name, `line` = the exact words, `delivery` = how it is said in English (emotion, tone, volume, pace, e.g. "whispering, holding back tears"). Keep it short enough for the clip (about 2-3 short lines in 8 seconds). Characters take turns: one speaker per row, nobody talks at the same time.
+- Spoken lines go ONLY in `dialogue`, never in `prompt` / `image_prompt`: one row per line in the order spoken, `character` = exact character name, `line` = the exact words, `delivery` = how it is said in English (emotion, tone, volume, pace, e.g. "whispering, holding back tears"). Keep it short enough for the clip (about 2-3 short lines in 8 seconds). Characters take turns: one speaker per row, nobody talks at the same time. Best lip-sync: in each scene only ONE character speaks (at most 2 short lines, about 6-12 words in total) with that speaker's face clearly visible (close-up or medium close-up); show a back-and-forth as shot / reverse-shot across separate scenes, the others in frame only react. Give each speaker a distinct voice in `delivery` (pitch, age, tone).
 - Never repeat dialogue: no character says or echoes a line another character already said, nobody says the same line twice, and no line repeats one from an earlier scene. Each line adds something new (an answer, a question, a reveal).
 - Spoken audio language: if the message gives a "Spoken dialogue language", write every `line` in ONLY that language. If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene: leave `dialogue` empty everywhere and describe only ambient sound, sound effects and music in `prompt`. If neither is given, write `line` in the language the characters would naturally speak (the idea's language when unclear) and name that language in `delivery` (instead of "she says angrily in Thai, voice only" in the prompt, delivery = "angrily, in Thai"). Never put spoken words in quotation marks anywhere: Veo tends to burn quoted lines into the picture as subtitles.
+- Google Flow refuses or silently fails some content, and the credits are lost ("Audio generation failed" when it
+  will not make the sound; the clip deleted after rendering): insults or slurs (above all about disability, body,
+  race or family), threats, shouting matches, fights, bullying shown up close, injuries, pain, blood, weapons, and
+  above all CHILDREN in distress (hurt, crying hard, mocked, fighting, sick up close). Keep hard story beats, but
+  show them mildly: a hurtful moment as a look, a whisper or a turned back; a bully's line as mild teasing; pain
+  as tiredness; conflict as a calm, firm stand. Use calm, quiet, sincere or soft `delivery`, never fierce,
+  sneering, screaming or "raised". The hook can be a worried face or a surprising moment instead of cruelty.
 - Scene ids: s01, s02, ...
 - Fill `thumbnail`: `text` = a short, catchy video title (max ~6 words) written in the spoken dialogue language when the message gives one; when it says "Spoken dialogue: none", in the subtitle language, or, without a subtitle line, in the language of `narration` (the user's idea); when neither is given, in the language the characters speak in the video (if unclear, the narration language); `prompt` = an English description of an eye-catching cover picture with the main characters by exact name at the story's most dramatic moment (no text in the picture).
 - Do not set project_id, image/end_image, or `image` of locations."""
@@ -131,6 +141,92 @@ def _durations_arg(durations: "list[int] | None | object") -> list[int] | None:
     return default_durations() if durations is _DEFAULT else durations  # type: ignore[return-value]
 
 
+# Long films: Claude writes the storyboard in parts of at most PART_SCENES scenes (one reply cannot hold
+# 50+ scenes), each part seeing what was already written. MAX_SCENES caps a request.
+PART_SCENES = 15
+MAX_SCENES = 80
+
+
+def _sid(i: int) -> str:
+    return f"s{i:02d}"
+
+
+def _written_so_far(draft: dict) -> str:
+    """Compact recap of the parts already written, for the next part's message."""
+    lines = [f"Title: {draft.get('title', '')}"]
+    if draft.get("style"):
+        lines.append(f"Style: {draft['style']}")
+    for c in draft.get("characters") or []:
+        lines.append(f"Character {c.get('name')}: {c.get('description', '')}")
+    for loc in draft.get("locations") or []:
+        lines.append(f"Location {loc.get('name')}: {loc.get('description', '')}")
+    for sc in draft.get("scenes") or []:
+        what = sc.get("content_direction") or sc.get("prompt") or ""
+        where = f" [at {sc['location']}]" if sc.get("location") else ""
+        lines.append(f"{sc.get('id')}{where}: {' '.join(str(what).split())[:220]}")
+        for row in sc.get("dialogue") or []:
+            if isinstance(row, dict) and row.get("line"):
+                lines.append(f"   {row.get('character')}: {row.get('line')}")
+    return "\n".join(lines)
+
+
+def _part_message(base: str, total: int, start: int, count: int, draft: dict | None) -> str:
+    """The user message for scenes start..start+count-1 (1-based) of a `total`-scene film."""
+    first, last = _sid(start), _sid(start + count - 1)
+    end = start + count - 1
+    if draft is None:
+        return (f"{base}\n\nThis film is long, so it is written in parts. Plan the whole story arc across all "
+                f"{total} scenes, but in this reply write ONLY scenes {first}-{last} (the opening of the story), "
+                "plus title, style, thumbnail, EVERY character and EVERY location the whole film needs.")
+    tail = ("This is the LAST part: bring the story to its ending and emotional payoff."
+            if end >= total else
+            f"Scenes after {last} come in a later part, so do not end the story yet.")
+    return (f"{base}\n\nThis film is long, so it is written in parts. Scenes {_sid(1)}-{_sid(start - 1)} are "
+            f"already written (summary below). In this reply write ONLY scenes {first}-{last} of {total}, "
+            "continuing the story right where it stopped. Keep the same title, style, characters and locations "
+            "(exact names and looks; add a character or location only if the story needs a new one). Do not repeat any beat or "
+            f"dialogue line from the earlier scenes. {tail}\n\nAlready written:\n{_written_so_far(draft)}")
+
+
+def _draft_in_parts(draft_fn, base: str, total: int, log=None) -> dict:
+    """Ask `draft_fn(user_message) -> draft dict` for the storyboard, in parts when `total` is large."""
+    if total <= PART_SCENES:
+        return draft_fn(base)
+    parts = -(-total // PART_SCENES)
+    merged: dict | None = None
+    tries = 0
+    while merged is None or len(merged["scenes"]) < total:
+        done = 0 if merged is None else len(merged["scenes"])
+        count = min(PART_SCENES, total - done)
+        part_no = done // PART_SCENES + 1
+        if log:
+            log(f"Phần {part_no}/{parts}: viết cảnh {_sid(done + 1)}–{_sid(done + count)}…")
+        out = draft_fn(_part_message(base, total, done + 1, count, merged))
+        new = [sc for sc in (out.get("scenes") or []) if isinstance(sc, dict)][:count]
+        if merged is None:
+            merged = {k: v for k, v in out.items() if k != "scenes"}
+            merged["scenes"] = []
+        else:  # keep part 1's title/style/thumbnail; add only characters and locations that are new
+            for field in ("characters", "locations"):
+                known = {str(x.get("name", "")).casefold() for x in merged.get(field) or []}
+                for x in out.get(field) or []:
+                    if isinstance(x, dict) and str(x.get("name", "")).casefold() not in known:
+                        merged.setdefault(field, []).append(x)
+                        known.add(str(x.get("name", "")).casefold())
+        for sc in new:
+            sc["id"] = _sid(len(merged["scenes"]) + 1)
+            merged["scenes"].append(sc)
+        if not new:
+            tries += 1
+            if tries >= 2:
+                raise RuntimeError(f"Claude dừng ở {len(merged['scenes'])}/{total} cảnh; hãy thử lại.")
+        else:
+            tries = 0
+    if log:
+        log(f"Đã ghép {len(merged['scenes'])} cảnh từ {parts} phần.")
+    return merged
+
+
 def claude_code_binary() -> str | None:
     return shutil.which(os.environ.get("CLAUDE_BIN", "claude"))
 
@@ -155,17 +251,13 @@ def claude_code_status() -> dict:
     return {"available": True, "logged_in": bool(data.get("loggedIn")), "method": data.get("authMethod")}
 
 
-def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-                          dialogue_language: str | None = None, timeout: int = 900,
-                          durations: list[int] | None | object = _DEFAULT) -> Storyboard:
-    """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
+def _draft_claude_code(user: str, timeout: int = 900) -> dict:
+    """One planner call through the local `claude` CLI -> the raw draft dict."""
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
     schema = json.dumps(StoryboardDraft.model_json_schema())
-    cmd = [binary, "-p", _user_message(idea, scenes, aspect, language_hint, dialogue_language,
-                                       _durations_arg(durations)),
-           "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
+    cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     with tempfile.TemporaryDirectory() as cwd:  # keep any project CLAUDE.md out of the prompt
         try:
@@ -183,7 +275,15 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
         if "login" in msg.lower() or "auth" in msg.lower():
             msg += " — chạy `claude` trong Terminal và đăng nhập (/login) bằng tài khoản Claude của bạn."
         raise RuntimeError(f"Claude Code không viết được storyboard: {msg}")
-    sb = _to_storyboard(data["structured_output"])
+    return data["structured_output"]
+
+
+def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+                          dialogue_language: str | None = None, timeout: int = 900,
+                          durations: list[int] | None | object = _DEFAULT, log=None) -> Storyboard:
+    """Same as plan(), but through the local `claude` CLI so it runs on the user's Claude subscription."""
+    base = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
+    sb = _to_storyboard(_draft_in_parts(lambda user: _draft_claude_code(user, timeout), base, scenes, log))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 
@@ -219,16 +319,14 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
     return durations_mod.round_new_storyboard(sb, meta), used
 
 
-def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
-         dialogue_language: str | None = None, durations: list[int] | None | object = _DEFAULT) -> Storyboard:
+def _draft_api(user: str) -> dict:
+    """One planner call through the Anthropic API -> the raw draft dict."""
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
-    user = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
-
     response = client.messages.parse(
         model=MODEL,
         max_tokens=16000,
@@ -244,7 +342,14 @@ def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str
         raise RuntimeError("Claude từ chối ý tưởng này; hãy thử diễn đạt lại.")
     if response.stop_reason == "max_tokens":
         raise RuntimeError("Kịch bản quá dài; hãy giảm số cảnh.")
-    sb = _to_storyboard(response.parsed_output.model_dump(exclude_none=True))
+    return response.parsed_output.model_dump(exclude_none=True)
+
+
+def plan(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+         dialogue_language: str | None = None, durations: list[int] | None | object = _DEFAULT,
+         log=None) -> Storyboard:
+    base = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
+    sb = _to_storyboard(_draft_in_parts(_draft_api, base, scenes, log))
     sb.aspect = aspect  # type: ignore[assignment]
     return sb
 

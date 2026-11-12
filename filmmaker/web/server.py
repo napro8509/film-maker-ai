@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import manual_clip, model_change, model_meta, retirement
+from .. import autopilot, film_chat, flow_caps, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -61,7 +61,8 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
                     "flow_ui_window": "hidden",  # show | hidden | headless
                     "backup_remote": DEFAULT_BACKUP_REMOTE,  # rclone remote:folder (Google Drive)
-                    "auto_backup": False}  # back up after every rendered clip and at the end of each job
+                    "auto_backup": False,  # back up after every rendered clip and at the end of each job
+                    "auto_qc": True}  # AI QC of every new clip after a render (free; only flags problems)
 
 
 def load_settings() -> dict[str, Any]:
@@ -103,6 +104,7 @@ class Job:
     stop_requested: bool = False
     # Per-item progress (char:<name>, kf:<sid>, vid:<sid>), written by the pipeline thread via set_progress.
     progress: dict[str, dict] = field(default_factory=dict)
+    stage: dict[str, Any] = field(default_factory=dict)  # autopilot: the step now running
     _plock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_progress(self, key: str, item: dict | None) -> None:
@@ -132,6 +134,7 @@ class Job:
             "result": self.result, "started": self.started, "finished": self.finished,
             "stop_requested": self.stop_requested,
             "progress": prog.public_view(snapshot, prog.now()),
+            "stage": dict(self.stage),
         }
 
 
@@ -209,6 +212,27 @@ class YamlBody(BaseModel):
     text: str
 
 
+class SocialBody(BaseModel):
+    platforms: list[str] = ["tiktok", "facebook", "instagram"]
+    languages: list[str] = ["Vietnamese"]
+    note: str = ""
+    pictures: bool = True
+
+
+class QCBody(BaseModel):
+    only: list[str] = []
+    force: bool = False
+
+
+class RewriteBody(BaseModel):
+    restage: bool = False  # re-stage the shot (new framing, no chaining), not just reword it
+
+
+class AskBody(BaseModel):
+    question: str
+    pictures: bool = True  # send portraits, cover and a contact sheet of the film along
+
+
 class NewProject(BaseModel):
     title: str = "Phim mới"
     source: str = "blank"  # blank | template
@@ -266,6 +290,17 @@ class RunBody(BaseModel):
     replan: bool = False  # action=edit: ignore the saved edit plan, let the agent make a new one
     smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
     open_capcut: bool = True  # action=capcut: bring CapCut up when the project is written
+
+
+class AutoBody(BaseModel):
+    review: bool = True  # AI agents review storyboard, keyframes, clips and the finished film
+    burn_subtitles: bool = True
+    rerender_budget: int = 3  # clips the clip review may render again (credits)
+    music: str | None = None
+
+
+class AutoPlanBody(PlanBody, AutoBody):
+    scenes: int = 10
 
 
 class RestoreBody(BaseModel):
@@ -445,6 +480,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "updated": sb_path(pid).stat().st_mtime,
         }
 
+    def qc_view(pid: str, r: dict[str, Any] | None, video: str | None) -> dict[str, Any] | None:
+        """The scene's QC for the UI, only when it is about the clip that is there now."""
+        if not r or not video:
+            return None
+        clip = Path(video)
+        if not clip.is_absolute():  # the CLI run with a relative --out stores relative paths
+            clip = pdir(pid) / clip
+        if r.get("sig") != qc.clip_sig(clip):
+            return None
+        keep = ("verdict", "score", "issues", "picture", "sound", "prompt", "match", "transcript", "language",
+                "dialogue_checked", "at")
+        return {k: r.get(k) for k in keep}
+
     def detail(pid: str) -> dict[str, Any]:
         raw = read_raw(pid)
         errors: list[str] = []
@@ -475,6 +523,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                           "model_note": retirement.model_note(pipe),
                           "models_used": retirement.models_used(pipe, meta)}
             talk = sb.dialogue_warnings()
+            qc_all = qc.load(out_dir(pid))
+            rewrites = ui_prefs.read(pdir(pid)).get("rewrites") or {}
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
@@ -496,8 +546,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
-                    "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s)),
+                    "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s), s),
                     "rendered_as": st.get("rendered_as"),
+                    "rewrites": len(rewrites.get(s.id) or []) if isinstance(rewrites, dict) else 0,
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
                     "model_status": meta.status(eff),
@@ -517,6 +568,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "dialogue_warnings": talk.get(s.id, []),
                     # ffprobe only for "submitting" scenes with a file, never while a job runs here
                     "manual_clip": None if busy else pipe.manual_clip_state(s),
+                    "qc": qc_view(pid, qc_all.get(s.id), st.get("video")),
                 }
         final = out_dir(pid) / "final.mp4"
         srt = final.with_suffix(".srt")
@@ -546,6 +598,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "locations_state": locations_state(pid, raw, sb),
             "thumbnail": thumb_info,
             "backup": last_backup(out_dir(pid)),
+            "autopilot": autopilot.load_public(out_dir(pid)),
             **model_info,
             "path": str(pdir(pid)),
         }
@@ -629,6 +682,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "platform": sys.platform,
             "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
             "video_analysis": {"ytdlp": bool(va.ytdlp_command()), "rea_video": bool(va.rea_binary())},
+            "qc": qc.status(),
         }
 
     @app.post("/api/env/auth")
@@ -723,7 +777,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
         for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
-                  "auto_backup"):
+                  "auto_backup", "auto_qc"):
             if k in body:
                 s[k] = body[k]
         if "backup_remote" in body:
@@ -732,6 +786,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             except BackupError as exc:
                 raise HTTPException(400, str(exc))
         s["auto_backup"] = bool(s.get("auto_backup"))
+        s["auto_qc"] = bool(s.get("auto_qc", True))
         if body.get("anthropic_api_key"):
             s["anthropic_api_key"] = body["anthropic_api_key"].strip()
         if body.get("clear_anthropic_key"):
@@ -855,10 +910,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                         else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
             job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: "
                     f"{'không phụ đề' if language.casefold() == NO_SUBTITLES else language}")
-            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
+            from ..planner import MAX_SCENES
+
+            n = max(1, min(MAX_SCENES, body.scenes))
+            if n != body.scenes:
+                job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
+            remember_idea(d, body.idea)
             job.log(f"✔ Xong: “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
             return {"project": pid}
 
@@ -1017,6 +1078,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         state.data.pop("i2v_unsupported", None)
         state.data.pop("i2v_error", None)
         state.save()
+        g = gflow(True)
+        flow_caps.remember(g.binary, g.profile, i2v_unsupported=None, i2v_error=None)  # the next project tries too
         return detail(pid)
 
     @app.put("/api/projects/{pid}/final-settings")
@@ -1057,6 +1120,70 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"titles": suggest_titles_for(pid, sb)}
         except RuntimeError as exc:
             raise HTTPException(400, str(exc))
+
+    # ---- ask AI about the film ----
+
+    def remember_idea(d: Path, idea: str) -> None:
+        """Keep the idea the film was planned from (ui.json), so “Hỏi AI” knows it later."""
+        idea = (idea or "").strip()[:8000]
+        if idea:
+            ui_prefs.update(d, lambda p: p.__setitem__("idea", idea))
+
+    def ask_view(pid: str) -> dict[str, Any]:
+        sections = film_chat.gather(pdir(pid), out_dir(pid))
+        return {"messages": film_chat.load(out_dir(pid)),
+                "context": [{"title": t, "chars": len(x)} for t, x in sections],
+                "has_final": (out_dir(pid) / "final.mp4").is_file()}
+
+    @app.get("/api/projects/{pid}/ask")
+    def get_ask(pid: str) -> dict[str, Any]:
+        return ask_view(pid)
+
+    @app.post("/api/projects/{pid}/ask")
+    def post_ask(pid: str, body: AskBody) -> dict[str, Any]:
+        """A question about the film (Claude, free on Flow). Not a job: it can run while Flow renders."""
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        if film_chat.lock(out_dir(pid)).locked():
+            raise HTTPException(409, detail={"message": "Đang trả lời câu hỏi trước, đợi một chút.", "reason": "ask_busy"})
+        try:
+            film_chat.ask(pdir(pid), out_dir(pid), body.question, with_pictures=body.pictures, backend=backend,
+                          api_key=load_settings().get("anthropic_api_key") or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+        return ask_view(pid)
+
+    @app.delete("/api/projects/{pid}/ask")
+    def delete_ask(pid: str) -> dict[str, Any]:
+        film_chat.clear(out_dir(pid))
+        return ask_view(pid)
+
+    # ---- posts for social networks ----
+
+    @app.get("/api/projects/{pid}/social")
+    def get_social(pid: str) -> dict[str, Any]:
+        return {"result": social.load(out_dir(pid)), "platforms": social.PLATFORMS, "languages": social.LANGUAGES}
+
+    @app.post("/api/projects/{pid}/social")
+    def post_social(pid: str, body: SocialBody) -> dict[str, Any]:
+        """Write Facebook / TikTok / Instagram posts in the chosen languages (Claude, free on Flow)."""
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        if film_chat.lock(out_dir(pid)).locked():
+            raise HTTPException(409, detail={"message": "AI đang bận với phim này, đợi một chút.", "reason": "ask_busy"})
+        try:
+            social.generate(pdir(pid), out_dir(pid), body.platforms, body.languages, note=body.note,
+                            with_pictures=body.pictures, backend=backend,
+                            api_key=load_settings().get("anthropic_api_key") or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc))
+        return get_social(pid)
 
     @app.post("/api/projects/{pid}/characters/portraits")
     def portraits(pid: str, body: PortraitBody) -> dict[str, Any]:
@@ -1405,6 +1532,79 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(409, detail={"message": f"[{sid}] {msg}", "reason": reason})
         return detail(pid)  # outside jobs.lock: ffprobe/retirement for the whole project need no lock
 
+    def _when(stamp: Any) -> float:
+        try:
+            return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _scene_snapshot(scene: dict) -> dict[str, Any]:
+        return {k: scene.get(k) for k in ("prompt", "image_prompt", "dialogue", "camera")}
+
+    @app.post("/api/projects/{pid}/scenes/{sid}/rewrite-prompt")
+    def rewrite_prompt(pid: str, sid: str, body: RewriteBody | None = None) -> dict[str, Any]:
+        """“Viết lại prompt”: Flow refused the scene (prominent people, harmful content, audio failed, clip
+        deleted…). Claude rewrites the scene from the error so the same beat gets through. Not a job: nothing
+        is sent to Flow; the user renders again when ready.
+
+        Every rewrite is kept in ui.json (`rewrites`). Those Flow refused afterwards are sent back to Claude, who
+        then re-stages the shot (new framing, no chaining from the previous keyframe) instead of rewording it:
+        rewording alone does not get past a refusal Flow makes on the picture or the moment as a whole."""
+        from .. import reviewer
+
+        restage = bool(body and body.restage)
+        pdir(pid)
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        if not any(x.id == sid for x in sb.scenes):
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        st = State(out_dir(pid) / "state.json").scene(sid)
+        error = str(st.get("error") or "").strip()
+        if not error:
+            raise HTTPException(400, f"[{sid}] Cảnh này không có lỗi từ Flow để viết lại.")
+        raw = read_raw(pid)
+        scene = next((x for x in raw.get("scenes") or [] if isinstance(x, dict) and x.get("id") == sid), None)
+        if scene is None:
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        hist = [e for e in (ui_prefs.read(pdir(pid)).get("rewrites") or {}).get(sid) or [] if isinstance(e, dict)]
+        sent = _when(st.get("submitted_at") or st.get("updated_at"))
+        earlier = [e for e in hist if _when(e.get("at")) < sent]  # rewrites that were rendered and refused
+        if restage and not earlier:
+            earlier = [_scene_snapshot(scene)]  # the version that just failed
+        try:
+            fix = reviewer.soften_scene(sb, sid, error, earlier=earlier or None, backend=backend,
+                                        api_key=load_settings().get("anthropic_api_key") or None)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(502, f"Claude không viết lại được: {exc}")
+        fix.id = sid
+        changed = reviewer.apply_scene_fixes(raw, [fix])
+        restaged = bool(changed and earlier)
+        if restaged and scene.get("continue_previous") is not False:
+            scene["continue_previous"] = False  # a new framing: do not start from the previous scene's picture
+        if restaged and fix.camera is None and isinstance(scene.get("camera"), dict):
+            # the old shot size / lens / composition describe the refused framing: keep only the move and speed
+            kept = {k: v for k, v in scene["camera"].items() if k in ("movement", "speed")}
+            if kept:
+                scene["camera"] = kept
+            else:
+                scene.pop("camera", None)
+        if changed:
+            write_raw(pid, raw)
+            entry = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **_scene_snapshot(scene)}
+            ui_prefs.update(pdir(pid), lambda p: p.setdefault("rewrites", {}).__setitem__(
+                sid, ((p.get("rewrites") or {}).get(sid) or [])[-9:] + [entry]))
+        out = detail(pid)
+        out["rewrite"] = {"scene": sid, "changed": bool(changed), "restaged": restaged, "attempt": len(hist) + 1,
+                          "issues": fix.issues, "prompt": fix.prompt, "image_prompt": fix.image_prompt,
+                          "dialogue": [d.model_dump(exclude_none=True) for d in fix.dialogue] if fix.dialogue is not None else None}
+        return out
+
     # ---- editor agent: edit plan (edit.json) ----
 
     def edit_view(pid: str) -> dict[str, Any]:
@@ -1672,6 +1872,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if body.action == "capcut":
                 return do_capcut(job)
             res = do_run(job, dry=False, keyframes_only=False)
+            if res.get("done") and not job.stop_requested and settings.get("auto_qc", True):
+                try:
+                    run_qc(job, pid, set(res["done"]), force=False)
+                except Exception as exc:  # noqa: BLE001 - the clips are rendered; QC is a bonus
+                    job.log(f"⚠ AI QC không chạy được: {exc}")
             if body.action == "make" and not job.stop_requested:
                 if res.get("error") and not body.allow_missing:
                     job.log("Có cảnh lỗi nên chưa ghép phim.")
@@ -1685,6 +1890,146 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return res
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
+
+    # ---- AI QC of rendered clips ----
+
+    def run_qc(job: Job, pid: str, only: set[str] | None, force: bool) -> dict[str, Any]:
+        backend = planner_backend()
+        if not backend:
+            job.log("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
+            return {}
+        sb = load_storyboard(sb_path(pid))
+        pipe = Pipeline(sb, out_dir(pid), gflow(True))
+        job.log("")
+        job.log("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
+        done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
+                      backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
+        failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
+        if failed:
+            job.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở từng cảnh; “Render lại” nếu muốn (tốn credit).")
+        return {"qc": {k: v["verdict"] for k, v in done.items()}, "qc_failed": failed}
+
+    @app.post("/api/projects/{pid}/qc")
+    def qc_project(pid: str, body: QCBody) -> dict[str, Any]:
+        """AI QC of the rendered clips (all new ones, or `only`; `force` = check again). Free on Flow."""
+        try:
+            load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        if not planner_backend():
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        scope = f" ({', '.join(body.only)})" if body.only else ""
+        return jobs.start("qc", "AI QC clip" + scope, pid,
+                          lambda job: run_qc(job, pid, set(body.only) or None, body.force)).public()
+
+    @app.post("/api/qc/model")
+    def qc_model() -> dict[str, Any]:
+        """Download the speech-to-text model QC uses to check dialogue (once, about 550 MB)."""
+        if not qc.whisper_binary():
+            raise HTTPException(400, "Chưa có whisper-cli: chạy `brew install whisper-cpp` trong Terminal.")
+
+        def work(job: Job) -> dict[str, Any]:
+            path = qc.download_model(log=job.log)
+            job.log(f"✔ Đã có model: {path}")
+            return {"model": str(path)}
+
+        return jobs.start("qc_model", "Tải model nhận dạng giọng nói", None, work).public()
+
+    # ---- autopilot: one button from the idea to the finished film ----
+
+    def auto_work(job: Job, pid: str, body: AutoBody) -> dict[str, Any]:
+        from ..autopilot import AutoError, Autopilot, AutoSettings
+
+        settings = load_settings()
+        g = gflow(log=job.log)
+        if not g.available():
+            raise RuntimeError("không thấy lệnh gflow")
+        music = None
+        if body.music:
+            music = (pdir(pid) / body.music).resolve()
+            if pdir(pid).resolve() not in music.parents or not music.is_file():
+                music = None
+
+        def edit_raw(fn: Callable[[dict], bool]) -> bool:
+            with sb_lock(pid):
+                raw = read_raw(pid)
+                if not fn(raw):
+                    return False
+                write_raw(pid, raw)
+                return True
+
+        def on_stage(info: dict) -> None:
+            job.stage = {**job.stage, **info}
+
+        pilot = Autopilot(sb_path(pid), out_dir(pid), g, settings=AutoSettings(
+            review=body.review, burn_subtitles=body.burn_subtitles,
+            rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
+            ai_backend=settings.get("planner") or "auto", api_key=settings.get("anthropic_api_key") or None,
+            max_retries=int(settings.get("retries", 2)),
+            pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20)))),
+            log=job.log, sleep=job.sleep, progress=job.set_progress, should_stop=lambda: job.stop_requested,
+            edit_raw=edit_raw, on_stage=on_stage)
+        ab = auto_backup(pid, job)
+        try:
+            res = pilot.run()
+        except AutoError as exc:
+            job.log(f"✘ {exc}")
+            return {"error": str(exc), "project": pid}
+        finally:
+            if ab:
+                ab.finish()
+        return {**res, "project": pid}
+
+    @app.post("/api/projects/autopilot")
+    def autopilot_new(body: AutoPlanBody) -> dict[str, Any]:
+        """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
+        if not body.idea.strip():
+            raise HTTPException(400, "Hãy nhập ý tưởng.")
+        language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
+        dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
+                    if body.dialogue_language is not None else None)
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
+
+        def work(job: Job) -> dict[str, Any]:
+            from ..planner import plan_auto
+
+            job.stage = {"key": "storyboard", "label": "Viết storyboard", "status": "running", "index": 1, "total": 10}
+            job.log(f"=== Bước 1/10: Viết storyboard ({body.scenes} cảnh) ===")
+            job.log(f"Ý tưởng: {body.idea[:300]}")
+            from ..planner import MAX_SCENES
+
+            n = max(1, min(MAX_SCENES, body.scenes))
+            if n != body.scenes:
+                job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
+            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
+                              aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+            pid, d = new_project_dir(sb.title)
+            save_storyboard(sb, d / "storyboard.yaml")
+            remember_idea(d, body.idea)
+            job.project = pid  # the UI opens the project while the rest runs
+            job.title = f"Tạo tự động: {sb.title}"
+            job.log(f"✔ “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
+            return auto_work(job, pid, body)
+
+        return jobs.start("auto", "Tạo tự động toàn bộ", None, work).public()
+
+    @app.post("/api/projects/{pid}/autopilot")
+    def autopilot_resume(pid: str, body: AutoBody) -> dict[str, Any]:
+        """“Tạo tự động” on an existing project: every step still missing, reviews included."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        wp = web_video_plan(Pipeline(sb, out_dir(pid), gflow(True)), RunBody(action="video"))
+        if wp.retired:
+            raise HTTPException(409, detail={"message": f"Không thể render: {len(wp.retired)} cảnh dùng model đã ngừng",
+                                             "reason": "model_retired", "retired": wp.retired})
+        return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body)).public()
 
     # ---- backup (Google Drive via rclone) ----
 

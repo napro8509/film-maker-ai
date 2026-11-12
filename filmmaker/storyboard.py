@@ -24,8 +24,19 @@ NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title 
 LANG_MAX = 40
 NO_DIALOGUE = "none"  # stored value for "Không thoại"
 NO_SUBTITLES = "none"  # subtitle_language for "Không phụ đề": the film has no subtitles at all
-DIALOGUE_RULE = "All spoken dialogue is in {lang}; characters speak only {lang}."
+# Says the language of the lines, never that "characters speak": "characters speak only Thai" read as everyone
+# talking, and listeners mouthed or echoed the speaker's line.
+DIALOGUE_RULE = ("Spoken language: {lang}. Each line is said in {lang} only by the character it belongs to; "
+                 "nobody else repeats it, mouths it or talks along.")
+# The sentence used before; prompts that still carry it get the new one instead.
+OLD_DIALOGUE_RULE = re.compile(r"All spoken dialogue is in [^;.]+; characters speak only [^.]+\.?")
 NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
+# A scene without lines in a film with dialogue. Sending the language rule there ("characters speak only Thai")
+# made Veo invent lines in half of such scenes (a mother saying "it's ok, I'm here" in a scene meant to be silent).
+SILENT_SCENE_RULE = ("Nobody speaks in this scene: no dialogue, no words, no voice-over; the characters stay silent "
+                     "(breathing, sighs, crying, laughing and wordless humming are fine); background voices, if any, "
+                     "are an indistinct murmur; "
+                     "only ambient sound and sound effects.")
 
 
 def clean_language(value: object) -> str | None:
@@ -103,6 +114,22 @@ class Subtitles(BaseModel):
     @classmethod
     def _strip(cls, v: object) -> object:
         return (" ".join(v.split()) or None) if isinstance(v, str) else v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _language_names(cls, v: object) -> object:
+        return subtitle_codes_dict(v) if isinstance(v, dict) else v
+
+
+def subtitle_codes_dict(subs: dict) -> dict:
+    """Older storyboards keyed scene subtitles by language name ({"Thai": ...}); turn those keys into track
+    codes ({"th": ...}). A code already present wins; languages other than the three tracks are dropped."""
+    out: dict = {}
+    for k, v in subs.items():
+        code = k if k in SUBTITLE_CODES else subtitle_code(k)
+        if code and (code not in out or (k == code and v)):
+            out[code] = v
+    return out
 
 
 class Character(BaseModel):
@@ -289,6 +316,9 @@ class Camera(BaseModel):
 
 
 DIALOGUE_MAX = 12  # lines per scene (a clip is only a few seconds)
+SPEAKER_LOOK_WORDS = 40  # words of a character description used to tell who is who
+BACKGROUND_NO_WORDS = ("Nobody else says any words: people in the background only cheer, laugh or murmur "
+                       "without words, and the line is never shared, echoed or finished by anyone else.")
 DIALOGUE_TURNS = ("Each line is spoken exactly once, only by the character named before it; no character repeats, "
                   "echoes or says another character's line, and they never speak at the same time.")
 
@@ -596,10 +626,116 @@ class Storyboard(StoryboardDraft):
             return ""
         return NO_DIALOGUE_RULE if lang.casefold() == NO_DIALOGUE else DIALOGUE_RULE.format(lang=lang)
 
-    def for_flow_video(self, prompt: str) -> str:
-        """A video prompt as actually sent to Flow: the spoken-language sentence, then `for_flow` (NO_TEXT).
-        Like NO_TEXT it is not part of the fingerprints, so changing the language re-renders nothing."""
+    def _dialogue_cast(self, scene: Scene) -> tuple[list[str], list[str]]:
+        """(speakers in the order they first speak, everyone in the scene including the speakers) for a
+        keyframe / image-to-video scene with dialogue; ([], []) otherwise."""
+        if scene.mode not in ("keyframe", "i2v") or not self.speaks():
+            return [], []
+        speakers: list[str] = []
+        for d in scene.spoken_lines():
+            if d.character.strip() and d.character.strip().casefold() not in {x.casefold() for x in speakers}:
+                speakers.append(d.character.strip())
+        if not speakers:
+            return [], []
+        cast = [c.name.strip() for c in self.scene_characters(scene)]
+        for n in speakers:
+            if n.casefold() not in {x.casefold() for x in cast}:
+                cast.append(n)
+        return speakers, cast
+
+    def speaker_cues(self, scene: Scene) -> str:
+        """Who is who for the dialogue of a keyframe / image-to-video scene ("" when there is none).
+        There the prompt only names the characters, and Veo, which sees a picture and no names, gave a line to
+        whoever faced the camera (the mother said her son's line). So: what each one looks like, the speaker
+        faces the camera with moving lips, the others keep their mouths closed."""
+        speakers, cast = self._dialogue_cast(scene)
+        if not speakers:
+            return ""
+        by_name = {c.name.strip().casefold(): c for c in self.characters if c.name.strip()}
+        looks = []
+        for n in cast:
+            c = by_name.get(n.casefold())
+            if c and c.description.strip():
+                words = c.description.strip().rstrip(".").split()
+                look = " ".join(words[:SPEAKER_LOOK_WORDS]).rstrip(",;")
+                if words[0] in ("A", "An", "The"):
+                    look = look[0].lower() + look[1:]
+                looks.append(f"{n} is {look}")
+        silent = [n for n in cast if n.casefold() not in {x.casefold() for x in speakers}]
+        parts = [f"Who is who in the picture: {'; '.join(looks)}."] if looks else []
+        who = " and ".join(speakers)
+        parts.append(f"Only {who} speak{'s' if len(speakers) == 1 else ''}: while speaking, "
+                     f"{'the speaker turns' if len(speakers) > 1 else who + ' turns'} the face toward the camera "
+                     "and the lips visibly move with the words.")
+        if silent:
+            parts.append(f"{' and '.join(silent)} {'keeps' if len(silent) == 1 else 'keep'} the mouth closed the "
+                         "whole time and only listen" + ("s." if len(silent) == 1 else "."))
+        # Ambient "chatter" or a cheering crowd made Veo give part of the line to a listener (s05: the coach
+        # mouthed the boy's "Thầy ơi…"): the background makes sounds, never words.
+        parts.append(BACKGROUND_NO_WORDS)
+        return " ".join(parts)
+
+    def keyframe_staging(self, scene: Scene) -> str:
+        """How the opening frame of a dialogue scene is staged ("" when it has none). Veo gives the line to the
+        biggest face it sees talking, so the first speaker is the main face, toward the camera, and everyone
+        else is smaller with the mouth closed. A listener in the foreground with an open-mouthed grin was made
+        to say the speaker's line."""
+        speakers, cast = self._dialogue_cast(scene)
+        if not speakers:
+            return ""
+        first = speakers[0]
+        others = [n for n in cast if n.casefold() != first.casefold()]
+        text = (f"Staging for the dialogue that follows: {first} is the main subject, in the foreground with the "
+                "largest, closest face, turned toward the camera (front or three-quarter view), face and mouth "
+                "clearly visible.")
+        if others:
+            many = len(others) > 1
+            text += (f" {' and '.join(others)} {'are' if many else 'is'} smaller in the frame or further back, "
+                     f"turned toward {first}, mouth closed (a closed-mouth smile at most), listening.")
+        text += " Anyone in the background is small, with the mouth closed."
+        return text
+
+    def for_flow_keyframe(self, prompt: str, scene: Scene | None = None) -> str:
+        """A keyframe prompt as actually sent to Flow: the dialogue staging (`keyframe_staging`), then
+        `for_flow`. Not part of the fingerprints, so adding it remakes nothing that is already made."""
+        staging = self.keyframe_staging(scene) if scene is not None else ""
+        if staging and "Staging for the dialogue" not in prompt:
+            base = prompt.rstrip()
+            if base and base[-1] not in ".!?":
+                base += "."
+            prompt = f"{base} {staging}" if base else staging
+        return self.for_flow(prompt)
+
+    def _speech_in_prompt(self, prompt: str) -> bool:
+        """Speech written straight into the prompt ("Minh: …", "Lan says hello", "they talk"): such a scene does
+        have words even with no dialogue lines, so it keeps the language rule. Singing is not talking: s10 of
+        "18 ngày" ("boys softly singing") got the language rule and Veo made up four lines."""
+        if re.search(r"\b(?:say|says|said|saying|ask|asks|asked|whisper|whispers|whispered|shout|shouts|shouted|"
+                     r"reply|replies|replied|speak|speaks|spoke|speaking|talk|talks|talking|"
+                     r"call|calls|calling out|chat|chats|chatting|tell|tells|told)\b", prompt, re.IGNORECASE):
+            return True
+        names = [re.escape(c.name.strip()) for c in self.characters if c.name.strip()]
+        return bool(names) and bool(re.search(rf"\b(?:{'|'.join(names)})\b(?:\s*\([^)]*\))?\s*:", prompt))
+
+    def for_flow_video(self, prompt: str, scene: Scene | None = None) -> str:
+        """A video prompt as actually sent to Flow: who-is-who for the dialogue (`speaker_cues`, when the scene is
+        given), the spoken-language sentence, then `for_flow` (NO_TEXT).
+        None of these are part of the fingerprints, so adding them re-renders nothing."""
+        cues = self.speaker_cues(scene) if scene is not None else ""
+        if cues and "Who is who in the picture" not in prompt and "lips visibly move" not in prompt:
+            if NO_TEXT in prompt:
+                prompt = prompt.replace(NO_TEXT, f"{cues} {NO_TEXT}", 1)
+            else:
+                base = prompt.rstrip()
+                if base and base[-1] not in ".!?":
+                    base += "."
+                prompt = f"{base} {cues}" if base else cues
         rule = self.dialogue_rule()
+        prompt = OLD_DIALOGUE_RULE.sub(lambda _: rule, prompt)
+        if (scene is not None and self.speaks() and rule and not scene.spoken_lines()
+                and rule.rstrip(".") not in prompt
+                and not self._speech_in_prompt(prompt.replace(SILENT_SCENE_RULE, ""))):
+            rule = SILENT_SCENE_RULE
         if not rule or rule.rstrip(".") in prompt:  # already there (pasted by the user, maybe without the dot)
             return self.for_flow(prompt)
         if NO_TEXT in prompt:  # keep the rule before NO_TEXT
@@ -893,7 +1029,7 @@ def merge_subtitles_raw(raw: dict, added: dict[str, dict[str, str]]) -> bool:
     for sc in raw.get("scenes") or []:
         if not isinstance(sc, dict) or str(sc.get("id")) not in added:
             continue
-        subs = sc.get("subtitles") if isinstance(sc.get("subtitles"), dict) else {}
+        subs = subtitle_codes_dict(sc["subtitles"]) if isinstance(sc.get("subtitles"), dict) else {}
         for code, line in added[str(sc["id"])].items():
             if code in SUBTITLE_CODES and line and not subs.get(code):
                 subs[code] = line

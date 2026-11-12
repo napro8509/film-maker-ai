@@ -20,6 +20,13 @@ from filmmaker.web import server  # noqa: E402
 FAKE = Path(__file__).parent / "fake_gflow.py"
 
 
+
+def _said_once(text, rule):
+    """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """Copied from tests/test_web.py (no shared fixture) + a fake planner on the "api" backend."""
@@ -108,7 +115,7 @@ def test_put_language_keeps_done_scenes_done(client, start):
         elif value == "none":
             assert vp.count(NO_DIALOGUE_RULE) == 1
         else:
-            assert vp.count(DIALOGUE_RULE.format(lang=value)) == 1
+            assert _said_once(vp, DIALOGUE_RULE.format(lang=value))
     # no gflow call at all (not even a video) and no job started
     calls = [json.loads(l) for l in client.log.read_text().splitlines()] if client.log.exists() else []
     assert not [c for c in calls if c and c[0] in ("video", "image")]
@@ -121,7 +128,8 @@ def test_put_language_whitespace_is_collapsed_in_prompt(client):
     sb = client.get("/api/projects/film").json()["storyboard"]
     sb["dialogue_language"] = "  Brazilian   Portuguese "
     d = client.put("/api/projects/film", json={"storyboard": sb}).json()
-    assert d["scene_state"]["s03"]["video_prompt"].count(DIALOGUE_RULE.format(lang="Brazilian Portuguese")) == 1
+    assert d["scene_state"]["s01"]["video_prompt"].count(DIALOGUE_RULE.format(lang="Brazilian Portuguese")) == 1
+    assert "Nobody speaks in this scene" in d["scene_state"]["s03"]["video_prompt"]  # "rain": no lines
 
 
 # --- AC15 on the fallback path: keyframe shown as text-only when i2v is unsupported -------------------------
@@ -138,7 +146,7 @@ def test_detail_fallback_text_prompt_has_rule(client):
     (out / "state.json").write_text(json.dumps({"i2v_unsupported": True, "scenes": {}}), encoding="utf-8")
     st = client.get("/api/projects/fb").json()["scene_state"]["k1"]
     assert "Lan at a cafe" in st["video_prompt"]  # the text-only prompt
-    assert st["video_prompt"].count(DIALOGUE_RULE.format(lang="Thai")) == 1
+    assert _said_once(st["video_prompt"], DIALOGUE_RULE.format(lang="Thai"))  # no lines: "nobody speaks"
     assert "spoken dialogue" not in st["image_prompt"].lower()
 
 
@@ -181,6 +189,6 @@ def test_for_flow_video_idempotent(lang, no_text, prompt):
     assert sb.for_flow_video(once) == once
     rule = sb.dialogue_rule()
     if rule:
-        assert once.count(rule) == 1
+        assert _said_once(once, rule)
         if NO_TEXT in once:
             assert once.index(rule) < once.index(NO_TEXT)

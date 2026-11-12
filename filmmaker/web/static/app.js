@@ -305,10 +305,12 @@ function lightbox(url) {
 /* "zones" are small parts of the page that re-render when status changes, without touching form inputs. */
 function zone(id, fn) {
   S.zones.set(id, fn);
-  const el = fn();
+  const el = zoneEl(fn);
   el.id = id;
   return el;
 }
+/* A zone with nothing to show (fn returns null) is an empty hidden div, so it can still be refreshed later. */
+function zoneEl(fn) { return fn() || h("div", { hidden: true }); }
 function refreshZones() {
   for (const [id, fn] of S.zones) {
     const old = document.getElementById(id);
@@ -316,7 +318,7 @@ function refreshZones() {
     // Do not interrupt a clip the user is watching.
     const v = old.querySelector("video");
     if (v && !v.paused) continue;
-    const el = fn();
+    const el = zoneEl(fn);
     el.id = id;
     if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
   }
@@ -324,7 +326,7 @@ function refreshZones() {
 function refreshZone(id) {
   const fn = S.zones.get(id), old = document.getElementById(id);
   if (!fn || !old) return;
-  const el = fn(); el.id = id;
+  const el = zoneEl(fn); el.id = id;
   if (old.outerHTML !== el.outerHTML && !keepsOpenedClip(old, el)) old.replaceWith(el);
 }
 /* A clip opened from lazyVideo() stays open (even paused) while the zone would only show it again as a poster. */
@@ -821,6 +823,7 @@ function renderMain() {
     renderHeader(),
     zone("errors-zone", renderErrors),
     zone("model-zone", renderModelWarning),
+    zone("auto-zone", renderAutoSteps),
     h("div", { class: "tabs", role: "tablist" },
       tabs.map(([k, ic, l, n]) => h("button", { class: S.tab === k ? "on" : "", role: "tab", "aria-selected": String(S.tab === k), onclick: () => switchTab(k) },
         icon(ic), l, n != null ? h("span", { class: "count" }, n) : null))),
@@ -881,6 +884,7 @@ function renderHeader() {
       const busy = jobRunning();
       // Pipeline order, one primary action (render). Dry-run and file actions live in the ⋯ menu.
       return h("div", { class: "actions" },
+        h("button", { class: "btn", disabled: busy, onclick: () => openAutopilot(S.cur), title: "Chạy tự động mọi bước còn thiếu: nhân vật, keyframe, video, AI dựng phim, thumbnail, kèm agent review" }, icon("sparkle"), "Tạo tự động", PAID()),
         h("button", { class: "btn", disabled: busy, onclick: () => runAction("keyframes"), title: "Tạo ảnh mở đầu cho các cảnh kiểu Ảnh → Video (miễn phí)" }, icon("image"), "Tạo keyframe", FREE()),
         h("button", { class: "btn primary", disabled: busy, onclick: () => runAction("video"), title: "Render các cảnh chưa xong (tốn credit, có bước xác nhận)" }, icon("video"), "Render video", PAID()),
         h("button", { class: "btn", disabled: busy, onclick: () => switchTab("final"), title: "Ghép các clip thành phim, thêm nhạc và ảnh bìa" }, icon("stitch"), "Ghép phim"),
@@ -973,7 +977,7 @@ function nextSceneId() {
 function renderScenes() {
   const sb = S.cur.storyboard;
   sb.scenes = sb.scenes || [];
-  const list = h("div", { class: "scenes" }, sb.scenes.map((sc, i) => renderScene(sc, i)));
+  const list = h("div", { class: "scenes" }, zone("qc-summary", renderQCSummary), sb.scenes.map((sc, i) => renderScene(sc, i)));
   list.append(h("button", { class: "add-scene", onclick: () => {
     sb.scenes.push({ id: nextSceneId(), mode: "keyframe", image_prompt: "", prompt: "" });
     changed(); renderMain();
@@ -1366,6 +1370,30 @@ function interruptedReasonText(err) {
   return s.length > 300 ? s.slice(0, 299) + "…" : s;
 }
 
+/* Flow refused the scene on policy grounds: sending the same prompt again fails the same way. */
+const POLICY_RE = /prominent people|harmful content|audio generation failed|violate our polic|Flow xoá video|safety filter|bộ lọc an toàn/i;
+function policyBlocked(st) {
+  return st.status !== "done" && !!st.error && POLICY_RE.test(String(st.error));
+}
+const S_REWRITING = new Set();
+async function rewritePrompt(sc, restage = false) {
+  if (!S.cur || S_REWRITING.has(sc.id)) return;
+  const pid = S.cur.id;
+  S_REWRITING.add(sc.id); refreshZones();
+  try {
+    await flushSave();
+    const d = await api("POST", `/api/projects/${pid}/scenes/${sc.id}/rewrite-prompt`, { restage });
+    if (S.cur && S.cur.id === pid) {
+      Object.assign(S.cur, d); // the server rewrote the storyboard: take its copy
+      renderMain();
+    }
+    const r = d.rewrite || {};
+    toast(r.changed ? `[${sc.id}] ${r.restaged ? "Đã đổi hẳn cách dựng cảnh (khung hình mới, không nối keyframe cảnh trước)" : "Đã viết lại prompt"} — bấm “${S.cur?.scene_state?.[sc.id]?.status === "interrupted" ? "Gửi lại" : "Thử lại"}” để tạo video`
+      : `[${sc.id}] Claude không đổi gì trong prompt`, r.changed ? "ok" : "");
+  } catch (e) { toast(e.message, "error"); }
+  finally { S_REWRITING.delete(sc.id); refreshZones(); }
+}
+
 function renderSceneActions(sc, { keyframe = true, video = true, retry = false, blocked = "" } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const busy = jobRunning();
@@ -1389,6 +1417,19 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
   } else if (st.status === "done" && st.model_status === "retired") {
     kids.push(h("div", { class: "scene-msg warn" }, `Model này đã ngừng từ ${st.model_retires_label}. Clip hiện tại vẫn dùng được; muốn render lại phải đổi model.`));
   }
+  if (policyBlocked(st)) {
+    const busyRw = S_REWRITING.has(sc.id);
+    const n = st.rewrites || 0;
+    kids.push(h("div", { class: "scene-msg warn" },
+      h("div", {}, n
+        ? `Đã viết lại ${n} lần mà Flow vẫn từ chối: sửa chữ thôi chưa đủ, Flow đang chặn cả khung hình / khoảnh khắc. Hãy “Đổi hẳn cảnh quay”: góc máy và bố cục mới, ít người hơn, bỏ chi tiết nổi tiếng của sự kiện thật, không nối keyframe cảnh trước.`
+        : "Flow từ chối vì vi phạm chính sách — gửi lại y nguyên sẽ lỗi tiếp. Nhờ Claude viết lại prompt (giữ nguyên ý cảnh, bỏ chi tiết dễ bị chặn) rồi tạo lại video."),
+      h("div", { class: "row", style: { marginTop: "6px" } },
+        h("button", { class: "btn sm" + (n ? " ghost" : ""), disabled: busy || busyRw, title: "Claude viết lại prompt, ảnh mở đầu và thoại của cảnh này. Không gửi gì lên Flow.",
+          onclick: () => rewritePrompt(sc) }, icon(busyRw ? "refresh" : "sparkle"), busyRw ? "Đang viết lại…" : "Viết lại prompt", FREE()),
+        h("button", { class: "btn sm" + (n ? "" : " ghost"), disabled: busy || busyRw, title: "Dựng lại cảnh: góc máy, bố cục, số người trong khung đều đổi; tắt nối keyframe cảnh trước. Không gửi gì lên Flow.",
+          onclick: () => rewritePrompt(sc, true) }, icon("image"), "Đổi hẳn cảnh quay", FREE()))));
+  }
   const row = h("div", { class: "row" });
   if (keyframe && sc.mode === "keyframe") {
     const hasKf = !!st.keyframe_url && !st.keyframe_stale;
@@ -1404,7 +1445,68 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
   if (st.clip_url && st.keyframe_url) row.append(h("button", { class: "btn sm ghost icon", title: "Xem ảnh keyframe", "aria-label": "Xem ảnh keyframe", onclick: () => lightbox(st.keyframe_url) }, icon("image")));
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
   kids.push(row);
+  if (done && st.clip_url) kids.push(renderQC(sc, st, busy));
   return h("div", { class: "stack tight" }, kids);
+}
+
+/* ---------- AI QC of a rendered clip ---------- */
+
+const QC_LABEL = { PASS: ["ok", "QC đạt"], MINOR: ["warn", "QC: lỗi nhỏ"], FAIL: ["bad", "QC: cần làm lại"] };
+
+async function runQC(only = [], force = false) {
+  if (!S.cur) return;
+  try {
+    await flushSave();
+    startJob(await api("POST", `/api/projects/${S.cur.id}/qc`, { only, force }));
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderQC(sc, st, busy) {
+  const q = st.qc;
+  if (!q) {
+    return h("div", { class: "qc-box none" }, h("span", { class: "small muted" }, "Clip này chưa được AI QC."),
+      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([sc.id]) }, icon("sparkle"), "AI QC", FREE()));
+  }
+  const [cls, label] = QC_LABEL[q.verdict] || ["", q.verdict];
+  const usePrompt = q.prompt && q.prompt.trim() !== (sc.prompt || "").trim()
+    ? h("button", { class: "btn sm", title: "Thay ô “Hành động” bằng prompt AI gợi ý, rồi bấm Render lại (tốn credit)",
+      onclick: () => { sc.prompt = q.prompt; changed(); renderMain(); toast("Đã thay prompt — bấm “Render lại” khi sẵn sàng", "ok"); } }, "Dùng prompt gợi ý")
+    : null;
+  return h("div", { class: "qc-box " + cls },
+    h("div", { class: "row" },
+      h("span", { class: "qc-tag " + cls }, label), h("span", { class: "small muted" }, `${q.score}/10`),
+      q.match != null ? h("span", { class: "small muted", title: "Khung hình đầu clip so với keyframe (1 = trùng khớp)" }, `· khớp keyframe ${q.match.toFixed(2)}`) : null,
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn sm ghost", disabled: busy, title: "Xem và nghe lại clip này (miễn phí)", onclick: () => runQC([sc.id], true) }, icon("refresh"), "QC lại")),
+    q.issues?.length ? h("ul", { class: "rev-list bad" }, q.issues.map((x) => h("li", {}, x))) : null,
+    q.picture ? h("div", { class: "small" }, h("b", {}, "Hình: "), q.picture) : null,
+    q.sound ? h("div", { class: "small" }, h("b", {}, "Âm thanh: "), q.sound) : null,
+    q.transcript != null ? h("details", { class: "small" }, h("summary", {}, `Nghe được${q.language ? ` (${q.language})` : ""}`),
+      h("div", { class: "qc-transcript" }, q.transcript || "(không có lời nói)"))
+      : (q.dialogue_checked === false ? h("div", { class: "small muted" }, "Chưa kiểm tra lời thoại (chưa có model nhận dạng giọng nói — xem Cài đặt → AI QC).") : null),
+    q.prompt && q.verdict !== "PASS" ? h("details", { class: "small" }, h("summary", {}, "Prompt gợi ý để render lại"),
+      h("div", { class: "qc-transcript" }, q.prompt), usePrompt) : null);
+}
+
+function renderQCSummary() {
+  const sb = S.cur.storyboard;
+  const rows = (sb.scenes || []).map((sc) => S.cur.scene_state?.[sc.id]).filter((st) => st && st.status === "done" && st.clip_url);
+  if (!rows.length) return h("div", { hidden: true });
+  const n = { PASS: 0, MINOR: 0, FAIL: 0 }; let none = 0;
+  for (const st of rows) { if (st.qc) n[st.qc.verdict] = (n[st.qc.verdict] || 0) + 1; else none++; }
+  const busy = jobRunning();
+  const fails = (sb.scenes || []).filter((sc) => S.cur.scene_state?.[sc.id]?.qc?.verdict === "FAIL").map((sc) => sc.id);
+  return h("div", { class: "card card-pad qc-summary" },
+    h("div", { class: "row" },
+      h("b", {}, "AI QC clip"),
+      h("span", { class: "qc-tag ok" }, `${n.PASS} đạt`),
+      n.MINOR ? h("span", { class: "qc-tag warn" }, `${n.MINOR} lỗi nhỏ`) : null,
+      n.FAIL ? h("span", { class: "qc-tag bad", title: fails.join(", ") }, `${n.FAIL} cần làm lại: ${fails.join(", ")}`) : null,
+      none ? h("span", { class: "small muted" }, `${none} chưa QC`) : null,
+      h("span", { class: "spacer" }),
+      none ? h("button", { class: "btn sm", disabled: busy, onclick: () => runQC([]) }, icon("sparkle"), `QC ${none} clip mới`, FREE()) : null,
+      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([], true) }, icon("refresh"), "QC lại tất cả")),
+    S.env?.qc && !S.env.qc.model ? h("p", { class: "help" }, "Chưa có model nhận dạng giọng nói nên QC chưa kiểm tra lời thoại — Cài đặt → AI QC → Tải model.") : null);
 }
 
 // What we know about the clip the user may have downloaded by hand into clips/<id>.mp4 (st.manual_clip from the server).
@@ -1881,8 +1983,11 @@ function renderFinal() {
             !SUB_TRACKS.some(([c]) => S.cur.srt_urls?.[c]) && S.cur.srt_url ? h("a", { class: "btn sm", href: S.cur.srt_url.split("?")[0], download: `${S.cur.id}.srt` }, icon("download"), "Phụ đề .srt") : null,
             h("button", { class: "btn sm ghost", onclick: () => api("POST", `/api/projects/${S.cur.id}/reveal`, { path: "output/storyboard/final.mp4" }).catch((e) => toast(e.message, "error")) }, icon("folder"), "Mở trong Finder")));
       }),
+      S.cur.final_url ? renderAsk() : null,
+      S.cur.final_url ? renderSocial() : null,
       zone("playlist-zone", renderPlaylist)),
     h("div", { class: "stack" },
+      zone("auto-review-zone", renderAutoReview),
       h("div", { class: "card card-pad" }, h("div", { class: "card-head" }, h("h3", {}, "Ghép phim")),
         h("div", { class: "stack" },
           h("div", { class: "field" }, h("span", { class: "lbl" }, "Nhạc nền"),
@@ -1930,6 +2035,287 @@ function renderFinal() {
             }))
             : h("p", { class: "help" }, noSubs(sb) ? "Phim này không có phụ đề." : "Chưa có. Thêm phụ đề ở từng cảnh."));
       })));
+}
+
+/* ---------- ask AI about the finished film ---------- */
+
+const ASK_STARTERS = ["Viết caption + hashtag để đăng TikTok/Shorts", "Cảnh nào nên làm lại, prompt mới ra sao?",
+  "Gợi ý ý tưởng cho tập tiếp theo", "Tóm tắt phim và chi phí đã dùng"];
+
+/* Tiny, safe Markdown: text is escaped first, then **bold**, `code`, headings, lists and paragraphs. */
+function mdToHtml(src) {
+  const inline = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, "$1<em>$2</em>");
+  const out = []; let list = null, code = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const line of String(src || "").split("\n")) {
+    if (line.trim().startsWith("```")) {
+      if (code) { out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`); code = null; } else { close(); code = []; }
+      continue;
+    }
+    if (code) { code.push(line); continue; }
+    let m;
+    if ((m = line.match(/^\s*>\s?(.*)$/))) {
+      if (list !== "blockquote") { close(); out.push("<blockquote>"); list = "blockquote"; }
+      if (m[1].trim()) out.push(`<p>${inline(m[1])}</p>`);
+    } else if ((m = line.match(/^\s*[-*•]\s+(.*)$/)) || (m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      const kind = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (list !== kind) { close(); out.push(`<${kind}>`); list = kind; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^#{1,4}\s+(.*)$/))) { close(); out.push(`<h4>${inline(m[1])}</h4>`); }
+    else if (!line.trim()) close();
+    else { close(); out.push(`<p>${inline(line)}</p>`); }
+  }
+  if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+  close();
+  return out.join("");
+}
+
+async function loadAsk(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.ask && S.ask.pid === pid && S.ask.data) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/ask`);
+    if (S.cur?.id !== pid) return;
+    S.ask = { ...(S.ask?.pid === pid ? S.ask : { pid, draft: "" }), data, error: null };
+  } catch (e) { S.ask = { pid, draft: "", data: null, error: e.message }; }
+  refreshZone("ask-zone");
+}
+
+async function sendAsk(question) {
+  const A = S.ask, pid = S.cur?.id;
+  question = (question || "").trim();
+  if (!A || !pid || A.busy || !question) return;
+  A.busy = true; A.pending = question; A.draft = "";
+  const box = document.getElementById("ask-input"); if (box) box.value = "";
+  refreshZone("ask-zone");
+  try {
+    await flushSave();
+    const data = await api("POST", `/api/projects/${pid}/ask`, { question, pictures: localGet("askPictures", true) });
+    if (S.ask?.pid === pid) A.data = data;
+  } catch (e) {
+    toast(e.message, "error");
+    if (S.ask?.pid === pid && !A.draft) { A.draft = question; const b = document.getElementById("ask-input"); if (b) b.value = question; }
+  } finally {
+    A.busy = false; A.pending = null;
+    refreshZone("ask-zone");
+    const list = document.querySelector("#ask-zone .ask-msgs"); if (list) list.scrollTop = list.scrollHeight;
+  }
+}
+
+async function clearAsk() {
+  const pid = S.cur?.id;
+  if (!pid || !S.ask || S.ask.busy) return;
+  if (!confirm("Xoá toàn bộ cuộc trò chuyện về phim này?")) return;
+  try { S.ask.data = await api("DELETE", `/api/projects/${pid}/ask`); } catch (e) { toast(e.message, "error"); }
+  refreshZone("ask-zone");
+}
+
+function renderAsk() {
+  if (!S.ask || S.ask.pid !== S.cur.id || (!S.ask.data && !S.ask.error)) setTimeout(() => loadAsk(), 0);
+  const input = h("textarea", { id: "ask-input", rows: 2, placeholder: "Hỏi bất cứ điều gì về phim này… (Enter để gửi, Shift+Enter xuống dòng)",
+    "aria-label": "Câu hỏi cho AI", value: S.ask?.pid === S.cur.id ? S.ask.draft || "" : "",
+    oninput: (e) => { if (S.ask) S.ask.draft = e.target.value; },
+    onkeydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendAsk(e.target.value); } } });
+  const pics = h("input", { type: "checkbox", checked: localGet("askPictures", true), onchange: (e) => localSet("askPictures", e.target.checked) });
+  return h("div", { class: "card card-pad ask-card" },
+    h("div", { class: "card-head" }, h("h3", {}, icon("sparkle"), " Hỏi AI về phim"), h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, "Không tốn credit Flow")),
+    zone("ask-zone", () => {
+      const A = S.ask?.pid === S.cur?.id ? S.ask : null;
+      if (!A || (!A.data && !A.error)) return h("div", { class: "help" }, "Đang tải…");
+      if (A.error) return h("div", { class: "help" }, A.error);
+      const msgs = A.data.messages || [], ctx = A.data.context || [];
+      const last = msgs[msgs.length - 1];
+      const chips = A.busy ? [] : msgs.length ? (last?.role === "assistant" ? last.follow_ups || [] : []) : ASK_STARTERS;
+      const kb = Math.round(ctx.reduce((n, c) => n + c.chars, 0) / 1000);
+      return h("div", { class: "stack tight" },
+        h("details", { class: "ask-ctx" }, h("summary", { class: "small muted" }, `AI đọc ${ctx.length} mục tư liệu của phim (~${kb}K ký tự)` + (localGet("askPictures", true) ? " + ảnh nhân vật, bìa, contact sheet" : "")),
+          h("ul", { class: "small muted" }, ctx.map((c) => h("li", {}, c.title)))),
+        msgs.length || A.pending ? h("div", { class: "ask-msgs", role: "log", "aria-live": "polite" },
+          msgs.map((m) => m.role === "user" ? h("div", { class: "ask-msg user" }, m.content)
+            : (() => { const d = h("div", { class: "ask-msg ai md" }); d.innerHTML = mdToHtml(m.content); return d; })()),
+          A.pending ? [h("div", { class: "ask-msg user" }, A.pending), h("div", { class: "ask-msg ai typing" }, "AI đang đọc tư liệu và trả lời…")] : null) : null,
+        chips.length ? h("div", { class: "ask-chips" }, chips.map((q) => h("button", { class: "btn sm ghost ask-chip", onclick: () => sendAsk(q) }, q))) : null,
+        msgs.length && !A.busy ? h("div", { class: "row" }, h("span", { class: "spacer" }),
+          h("button", { class: "btn sm ghost", onclick: clearAsk }, icon("trash"), "Xoá cuộc trò chuyện")) : null);
+    }),
+    h("div", { class: "ask-form" }, input,
+      h("div", { class: "row" },
+        h("label", { class: "check small" }, pics, h("span", {}, "Cho AI xem ảnh (chậm hơn một chút)")),
+        h("span", { class: "spacer" }),
+        h("button", { class: "btn primary sm", onclick: () => sendAsk(input.value) }, "Gửi"))));
+}
+
+/* ---------- posts for social networks ---------- */
+
+const SOCIAL_PLATFORMS = [["tiktok", "TikTok"], ["facebook", "Facebook"], ["instagram", "Instagram"]];
+const SOCIAL_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Thái)"]];
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = h("textarea", { style: { position: "fixed", opacity: "0" } }, text);
+    document.body.append(t); t.select(); document.execCommand("copy"); t.remove();
+  }
+  toast("Đã chép", "", 1500);
+}
+
+function postText(p) {
+  return [p.title, p.caption, (p.hashtags || []).map((t) => "#" + t).join(" ")].filter((x) => x && x.trim()).join("\n\n");
+}
+
+async function loadSocial(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.social && S.social.pid === pid && S.social.data) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/social`);
+    if (S.cur?.id !== pid) return;
+    S.social = { ...(S.social?.pid === pid ? S.social : { pid }), data, error: null };
+  } catch (e) { S.social = { pid, data: null, error: e.message }; }
+  refreshZone("social-zone");
+}
+
+async function makeSocial() {
+  const SO = S.social, pid = S.cur?.id;
+  if (!SO || !pid || SO.busy) return;
+  const platforms = localGet("socialPlatforms", ["tiktok", "facebook", "instagram"]);
+  const languages = localGet("socialLangs", ["Vietnamese"]);
+  if (!platforms.length || !languages.length) { toast("Chọn ít nhất một mạng xã hội và một ngôn ngữ.", "error"); return; }
+  SO.busy = true; refreshZone("social-zone");
+  try {
+    await flushSave();
+    const note = document.getElementById("social-note")?.value || "";
+    const data = await api("POST", `/api/projects/${pid}/social`, { platforms, languages, note, pictures: true });
+    if (S.social?.pid === pid) { SO.data = data; SO.lang = null; }
+    if (data.result?.missing?.length) toast("AI chưa viết: " + data.result.missing.join(", "), "", 6000);
+  } catch (e) { toast(e.message, "error"); }
+  finally { SO.busy = false; refreshZone("social-zone"); }
+}
+
+function toggleChoice(key, value, on, fallback) {
+  const cur = new Set(localGet(key, fallback));
+  if (on) cur.add(value); else cur.delete(value);
+  localSet(key, [...cur]);
+}
+
+function renderSocial() {
+  if (!S.social || S.social.pid !== S.cur.id || (!S.social.data && !S.social.error)) setTimeout(() => loadSocial(), 0);
+  const plats = localGet("socialPlatforms", ["tiktok", "facebook", "instagram"]), langs = localGet("socialLangs", ["Vietnamese"]);
+  return h("div", { class: "card card-pad social-card" },
+    h("div", { class: "card-head" }, h("h3", {}, "Nội dung đăng mạng xã hội"), h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, "Không tốn credit Flow")),
+    h("div", { class: "stack tight" },
+      h("div", { class: "social-opts" },
+        h("span", { class: "lbl" }, "Mạng"),
+        SOCIAL_PLATFORMS.map(([k, l]) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: plats.includes(k), onchange: (e) => toggleChoice("socialPlatforms", k, e.target.checked, plats) }), h("span", {}, l)))),
+      h("div", { class: "social-opts" },
+        h("span", { class: "lbl" }, "Ngôn ngữ"),
+        SOCIAL_LANGS.map(([k, l]) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: langs.includes(k), onchange: (e) => toggleChoice("socialLangs", k, e.target.checked, langs) }), h("span", {}, l)))),
+      h("input", { type: "text", id: "social-note", placeholder: "Yêu cầu thêm (tuỳ chọn): giọng hài hước, nhắc tập 2, tên kênh…", "aria-label": "Yêu cầu thêm" })),
+    zone("social-zone", () => {
+      const SO = S.social?.pid === S.cur?.id ? S.social : null;
+      const res = SO?.data?.result;
+      const btn = h("button", { class: "btn primary sm", disabled: !SO || SO.busy, onclick: makeSocial }, icon("sparkle"),
+        SO?.busy ? "AI đang viết…" : res ? "Viết lại" : "Tạo nội dung");
+      if (!SO) return h("div", { class: "row", style: { marginTop: "10px" } }, btn);
+      if (SO.error) return h("div", { class: "help" }, SO.error);
+      const head = h("div", { class: "row", style: { marginTop: "10px" } }, btn,
+        SO.busy ? h("span", { class: "help" }, "Khoảng 1–2 phút.") : res ? h("span", { class: "help" }, "Viết lúc " + new Date(res.at).toLocaleString()) : null);
+      if (!res) return h("div", {}, head);
+      const langsDone = SOCIAL_LANGS.filter(([k]) => res.posts.some((p) => p.language === k));
+      const lang = langsDone.some(([k]) => k === SO.lang) ? SO.lang : langsDone[0]?.[0];
+      return h("div", { class: "stack tight" }, head,
+        langsDone.length > 1 ? h("div", { class: "seg", role: "tablist" }, langsDone.map(([k, l]) =>
+          h("button", { class: "btn sm" + (k === lang ? " primary" : " ghost"), role: "tab", "aria-selected": k === lang ? "true" : "false",
+            onclick: () => { SO.lang = k; refreshZone("social-zone"); } }, l))) : null,
+        res.posts.filter((p) => p.language === lang).map((p) => h("div", { class: "social-post" },
+          h("div", { class: "row" }, h("strong", {}, SOCIAL_PLATFORMS.find(([k]) => k === p.platform)?.[1] || p.platform), h("span", { class: "spacer" }),
+            h("button", { class: "btn sm", onclick: () => copyText(postText(p)) }, icon("copy"), "Chép bài")),
+          p.hook ? h("div", { class: "small" }, h("span", { class: "muted" }, "Chữ trên video 3s đầu: "), h("b", {}, p.hook)) : null,
+          p.title ? h("div", { class: "social-title" }, p.title) : null,
+          h("div", { class: "social-caption" }, p.caption),
+          p.hashtags?.length ? h("div", { class: "social-tags" }, p.hashtags.map((t) => "#" + t).join(" ")) : null,
+          p.first_comment ? h("div", { class: "small" }, h("span", { class: "muted" }, "Bình luận ghim: "), p.first_comment,
+            " ", h("button", { class: "btn sm ghost icon", title: "Chép bình luận", "aria-label": "Chép bình luận", onclick: () => copyText(p.first_comment) }, icon("copy"))) : null)));
+    }));
+}
+
+/* ---------- autopilot ---------- */
+
+const AUTO_STEPS = [["storyboard", "Storyboard"], ["review_storyboard", "Review kịch bản"], ["characters", "Nhân vật"],
+  ["keyframes", "Keyframe"], ["review_keyframes", "Review keyframe"], ["videos", "Video"], ["review_clips", "AI QC clip"],
+  ["edit", "AI dựng phim"], ["thumbnail", "Thumbnail"], ["review_film", "Review cả phim"]];
+
+function autoCostText(scenes, review) {
+  return `Chạy liền: viết storyboard → ${review ? "agent review → " : ""}ảnh nhân vật → keyframe → ${review ? "review keyframe → " : ""}`
+    + `render ${scenes} clip video → ${review ? "AI QC từng clip (chỉ đánh dấu, không tự render lại) → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
+    + `Video TỐN CREDIT (veo-lite khoảng 10 credit/clip ≈ ${scenes * 10} credit). `
+    + "Ảnh và dựng phim miễn phí. Có thể bấm Dừng bất cứ lúc nào; bấm “Tạo tự động” lần nữa để làm tiếp từ chỗ dừng.";
+}
+
+async function openAutopilot(cur) {
+  const review = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
+  const subs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+  const left = (cur.storyboard.scenes || []).filter((s) => cur.scene_state?.[s.id]?.status !== "done").length;
+  modal({
+    title: "Tạo tự động", body: h("div", { class: "stack" },
+      h("p", {}, left ? `Làm mọi bước còn thiếu cho “${cur.storyboard.title}”: ${left} cảnh chưa có clip.` : "Mọi cảnh đã có clip: agent review, dựng lại phim và làm thumbnail nếu cần."),
+      h("p", { class: "help" }, autoCostText(left, review.checked)),
+      h("label", { class: "check" }, review, h("span", {}, "Agent review từng bước")),
+      h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video"))),
+    buttons: [{ label: "Huỷ" }, { label: "Bắt đầu", cls: "primary", onclick: async (c) => {
+      localSet("autoReview", review.checked); localSet("autoSubs", subs.checked);
+      try {
+        await flushSave();
+        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, music: finalPrefs().music }));
+        c();
+      } catch (e) { toast(e.message, "error"); }
+    } }],
+  });
+}
+
+function autoStageMap() {
+  const saved = Object.fromEntries((S.cur?.autopilot?.stages || []).map((s) => [s.key, s]));
+  const j = S.job, live = j && j.kind === "auto" && j.project === S.cur?.id && j.status === "running" ? j.stage : null;
+  return { saved, live };
+}
+
+function renderAutoSteps() {
+  if (!S.cur) return null;
+  const { saved, live } = autoStageMap();
+  if (!live && !S.cur.autopilot) return null;
+  const liveIdx = live ? AUTO_STEPS.findIndex(([k]) => k === live.key) : -1;
+  return h("div", { class: "auto-steps", role: "list", "aria-label": "Các bước tạo tự động" },
+    AUTO_STEPS.map(([k, label], i) => {
+      const st = saved[k] || {};
+      let cls = st.status === "done" ? "done" : st.status === "partial" || st.status === "failed" ? "warn" : st.status === "skipped" ? "skip" : "";
+      if (live && i === liveIdx && live.status === "running") cls = "running";
+      return h("div", { class: "auto-step " + cls, role: "listitem", title: [label, st.note].filter(Boolean).join(" — ") },
+        h("span", { class: "n" }, cls === "done" ? "✓" : i + 1), h("span", { class: "l" }, label));
+    }));
+}
+
+function renderAutoReview() {
+  const a = S.cur?.autopilot;
+  if (!a) return null;
+  const f = a.film_review, sbr = a.storyboard_review;
+  const stage = (k) => (a.stages || []).find((s) => s.key === k) || {};
+  const rows = [["Kịch bản", sbr ? `${sbr.score}/10` : stage("review_storyboard").note],
+    ["Keyframe", stage("review_keyframes").note], ["Clip", stage("review_clips").note]].filter(([, v]) => v);
+  return h("div", { class: "card card-pad" },
+    h("div", { class: "card-head" }, h("h3", {}, "Agent review"), h("span", { class: "spacer" }),
+      f ? h("span", { class: "score " + (f.score >= 8 ? "ok" : f.score >= 6 ? "mid" : "bad") }, `${f.score}/10`) : null),
+    f ? h("div", { class: "stack tight" },
+      h("p", {}, f.summary),
+      f.strengths?.length ? h("ul", { class: "rev-list ok" }, f.strengths.map((x) => h("li", {}, x))) : null,
+      f.issues?.length ? h("ul", { class: "rev-list bad" }, f.issues.map((x) => h("li", {}, x))) : null,
+      f.suggestions?.length ? h("ul", { class: "rev-list next" }, f.suggestions.map((x) => h("li", {}, x))) : null,
+      f.thumbnail ? h("p", { class: "small muted" }, "Ảnh bìa: " + f.thumbnail) : null)
+      : h("p", { class: "help" }, "Agent sẽ chấm cả phim khi tạo tự động xong."),
+    rows.length ? h("table", { class: "list small", style: { marginTop: "8px" } }, rows.map(([k, v]) => h("tr", {}, h("td", {}, k), h("td", {}, v)))) : null);
 }
 
 /* ---------- editor agent (edit plan) ---------- */
@@ -2557,7 +2943,17 @@ async function pollJob() {
     S.job.lines.push(...fresh);
     S.jobSince = d.total;
     const wasRunning = S.job.status === "running";
-    Object.assign(S.job, { status: d.status, result: d.result, finished: d.finished, stop_requested: d.stop_requested });
+    const prevStage = S.job.stage || {};
+    Object.assign(S.job, { status: d.status, result: d.result, finished: d.finished, stop_requested: d.stop_requested,
+      title: d.title, stage: d.stage || {} });
+    if (d.project && S.job.project !== d.project) {
+      S.job.project = d.project;
+      if (S.job.kind === "auto") { await loadProjects(); await openProject(d.project); }
+    }
+    if (S.job.kind === "auto" && (prevStage.key !== S.job.stage.key || prevStage.status !== S.job.stage.status)) {
+      refreshZone("auto-zone");
+      if (S.cur && S.cur.id === S.job.project) refreshCurrent();
+    }
     const prev = S.job.progress || {};
     S.job.progress = d.progress && typeof d.progress === "object" ? d.progress : undefined; // no field (older server) → old way
     appendLog(fresh);
@@ -2597,7 +2993,16 @@ async function onJobDone() {
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
   if (j.kind === "analyze" && j.status === "done" && j.result?.analysis) { await openAnalysis(j.result.analysis); return; }
+  if (j.kind === "auto" && j.result?.project) {
+    if (!S.cur || S.cur.id !== j.result.project) await openProject(j.result.project);
+    else await refreshCurrent();
+    await loadEditPlan(true);
+    if (j.result.final) { S.tab = "final"; }
+    renderMain();
+    return;
+  }
   if (j.kind === "restore" && j.status === "done" && j.result?.id) { await openProject(j.result.id); return; }
+  if (j.kind === "qc_model") { try { S.env = await api("GET", "/api/env"); } catch { /* ignore */ } }
   if (j.kind === "portraits" && S.cur && S.cur.id === j.project && j.result?.images) {
     for (const c of S.cur.storyboard.characters || []) if (j.result.images[c.name]) c.image = j.result.images[c.name];
     if (Object.keys(j.result.images).length) changed(); // server already saved; this keeps a pending edit from dropping it
@@ -2711,6 +3116,7 @@ function updateJobHead() {
   put(head,
     h("span", { class: "dot " + j.status }),
     h("span", { class: "title" }, j.title),
+    j.kind === "auto" && j.stage?.label && j.status === "running" ? h("span", { class: "badge mini running" }, `Bước ${j.stage.index || "?"}/${j.stage.total || 10}: ${j.stage.label}`) : null,
     h("span", { class: "badge mini " + kind }, statusText, " · ", h("span", { id: "elapsed" }, elapsedText())),
     h("span", { class: "last", title: last }, last),
     h("div", { class: "tools" },
@@ -2766,12 +3172,30 @@ function openNewProject() {
         : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
       h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")));
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
-    const n = h("input", { type: "number", min: 1, max: 20, value: 6 });
+    const n = h("input", { type: "number", min: 1, max: 80, value: localGet("autoScenes", 10) });
+    const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
+    const autoSubs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
     const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
     const subSaved = cleanLang(localGet("subtitleLang"));
     const sub = langPicker(SUBTITLE_LANGS, subSaved || "Vietnamese");
     setTimeout(() => idea.focus(), 30);
+    const goAuto = async (e) => {
+      if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
+      const a = speak.read(), b = sub.read();
+      if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); speak.input.focus(); return; }
+      if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); sub.input.focus(); return; }
+      const btn = e.currentTarget, scenes = +n.value || 10;
+      localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); localSet("autoScenes", scenes);
+      localSet("autoReview", autoReview.checked); localSet("autoSubs", autoSubs.checked);
+      if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(scenes, autoReview.checked), "Bắt đầu"))) return;
+      btn.disabled = true;
+      try {
+        const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
+          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked });
+        close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
+      } catch (err) { toast(err.message, "error"); btn.disabled = false; }
+    };
     const go = async (e) => {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
       const a = speak.read(), b = sub.read();
@@ -2792,7 +3216,12 @@ function openNewProject() {
       h("p", { class: "help" }, "Câu “nhân vật nói …” được thêm vào mọi prompt video gửi Flow để cả phim cùng một thứ tiếng."),
       h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
         S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
-      h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, icon("sparkle"), "Viết storyboard")));
+      h("div", { class: "auto-opts" },
+        h("label", { class: "check" }, autoReview, h("span", {}, "Agent review từng bước", h("span", { class: "sub" }, "Review storyboard, keyframe (tự tạo lại ảnh lỗi), clip (render lại clip hỏng, tối đa 3) và cả phim."))),
+        h("label", { class: "check" }, autoSubs, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng.")))),
+      h("div", { class: "row" }, h("span", { class: "spacer" }),
+        h("button", { class: "btn", onclick: go, title: "Chỉ viết storyboard để bạn xem và sửa trước" }, "Chỉ viết storyboard"),
+        h("button", { class: "btn primary", onclick: goAuto, title: "Storyboard → nhân vật → keyframe → video → AI dựng phim → thumbnail, có agent review" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
   };
   const importForm = () => {
     const inp = h("input", { type: "file", accept: ".yaml,.yml" });
@@ -3018,6 +3447,16 @@ async function openSettings() {
     h("option", { value: "api" }, "Anthropic API key — tính phí riêng"));
   const remote = h("input", { type: "text", value: s.backup_remote || "gdrive:FilmMaker", placeholder: "gdrive:FilmMaker" });
   const autoBackup = h("input", { type: "checkbox", checked: !!s.auto_backup });
+  const autoQC = h("input", { type: "checkbox", checked: s.auto_qc !== false });
+  const qcEnv = S.env?.qc || {};
+  const qcModel = qcEnv.model
+    ? h("p", { class: "help" }, "✓ Đã có model nhận dạng giọng nói: QC kiểm tra cả lời thoại (đúng câu, đúng ngôn ngữ, không lặp).")
+    : h("div", { class: "row" }, h("span", { class: "help", style: { flex: "1" } }, qcEnv.whisper
+      ? "Chưa có model nhận dạng giọng nói: QC chỉ xem hình và mức âm thanh, chưa kiểm tra lời thoại."
+      : "Chưa có whisper-cli (chạy “brew install whisper-cpp” trong Terminal) nên QC chưa kiểm tra được lời thoại."),
+      qcEnv.whisper ? h("button", { class: "btn sm", onclick: async (e) => {
+        try { startJob(await api("POST", "/api/qc/model")); e.target.disabled = true; } catch (err) { toast(err.message, "error"); }
+      } }, icon("download"), "Tải model (~550 MB)") : null);
   const backupState = h("div", { class: "row small" }, h("span", { class: "spinner" }), h("span", { class: "muted" }, "Đang kiểm tra rclone…"));
   const checkBackup = () => api("GET", "/api/backup").then((b) => {
     const name = (b.remote.split(":")[0] || "gdrive");
@@ -3072,12 +3511,17 @@ async function openSettings() {
           h("label", { class: "check" }, autoBackup, h("span", {}, "Tự backup sau mỗi clip render xong và khi ghép phim",
             h("span", { class: "sub" }, "Chạy ngầm, không làm chậm việc render. Backup lỗi thì chỉ báo, video vẫn an toàn trên máy."))),
           h("p", { class: "help" }, "Chỉ gửi file mới hoặc đã đổi, không bao giờ xoá gì trên Drive. Clip bị render lại thì bản cũ được giữ trong thư mục .versions. Khôi phục: Phim mới → Từ Drive."))),
+      h("section", { class: "settings-sec" }, h("h3", {}, "AI QC clip"),
+        h("div", { class: "stack" },
+          h("label", { class: "check" }, autoQC, h("span", {}, "Tự QC mỗi clip vừa render",
+            h("span", { class: "sub" }, "AI xem hình (so với keyframe, nhân vật, lỗi hình, chữ trên hình) và nghe âm thanh, lời thoại. Miễn phí, chỉ đánh dấu — không tự render lại."))),
+          qcModel)),
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
         await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
-          backup_remote: remote.value.trim(), auto_backup: autoBackup.checked,
+          backup_remote: remote.value.trim(), auto_backup: autoBackup.checked, auto_qc: autoQC.checked,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
         S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }

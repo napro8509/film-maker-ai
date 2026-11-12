@@ -230,7 +230,45 @@ def _open_project(page, project: str, deadline: Deadline | None = None) -> None:
         raise Fail(EXIT_DRIFT, "Không thấy ô chat của Flow (giao diện có thể đã thay đổi).")
 
 
+ASSET_TITLE = ".asset-title"
+ASSET_ITEM = "button[role=option].asset-item"
+ACTIVE = "asset-item-active"  # Flow's class for a selected upload
+# In the open add menu: is our upload listed, selected (active), still processing, and is anything else selected?
+_SELECTION_JS = """(menu, name) => {
+  const items = Array.from(menu.querySelectorAll('button[role=option].asset-item'));
+  const isMine = e => ((e.querySelector('.asset-title') || {}).innerText || '').trim() === name;
+  const on = e => e.classList.contains('asset-item-active') || e.getAttribute('aria-selected') === 'true';
+  const mine = items.find(isMine);
+  return {mine: !!mine, active: !!mine && on(mine),
+          busy: !!mine && !!mine.querySelector('mat-spinner, mat-progress-spinner, [role=progressbar], .mat-mdc-progress-spinner'),
+          others: items.filter(e => !isMine(e) && on(e)).length};
+}"""
+
+
+def upload_name(image: Path) -> str:
+    """A name no other upload in the project has: Flow lists uploads by file name, not always newest first,
+    and the same name (s08.png) can be there twice. The only safe pick is the item with this exact name."""
+    import uuid
+
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", image.stem)[:40] or "image"
+    return f"fm-{stem}-{uuid.uuid4().hex[:8]}{image.suffix.lower() or '.png'}"
+
+
 def _attach(page, image: Path, deadline: Deadline | None = None) -> None:
+    """Upload `image` and put exactly that picture in the chat box. Never another upload: a wrong picture
+    attached here makes Veo animate the wrong scene (and costs credits)."""
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="fm-up-") as tmp:
+        name = upload_name(image)
+        copy = Path(tmp) / name
+        shutil.copyfile(image, copy)
+        _attach_named(page, copy, image.name, deadline)
+
+
+def _attach_named(page, image: Path, shown: str, deadline: Deadline | None) -> None:
+    name = image.name
     before = page.locator(CHIP).count()
     page.locator(ADD_BTN).click()
     menu = page.locator(ADD_MENU)
@@ -239,40 +277,57 @@ def _attach(page, image: Path, deadline: Deadline | None = None) -> None:
     if uploads_tab.count():
         uploads_tab.first.click()
         time.sleep(0.8)
-    items = menu.locator("button[role=option].asset-item")
-    first_before = items.first.inner_text().strip() if items.count() else None
-    n_before = items.count()
     with page.expect_file_chooser(timeout=15_000) as fc:
         menu.locator("button", has_text="Upload media").first.click()
     fc.value.set_files(str(image))
-    log(f"  đang tải ảnh lên Flow: {image.name}")
+    log(f"  đang tải ảnh lên Flow: {shown}")
+    mine = menu.locator(ASSET_ITEM).filter(has=page.locator(ASSET_TITLE, has_text=name)).first
+    add = menu.locator("button", has_text="Add to prompt").first
+
+    def give_up(msg: str) -> Fail:
+        if menu.is_visible():
+            page.keyboard.press("Escape")
+        if deadline is not None and deadline.expired():
+            return _pre_send_timeout()
+        return Fail(EXIT_DRIFT, msg)
 
     def settled():
         if page.locator(CHIP).count() > before:
-            return "chip"
+            return "chip"  # Flow attached the upload by itself
         if not menu.is_visible():
             return "closed"
-        n = items.count()
-        if n and (n > n_before or items.first.inner_text().strip() != first_before):
+        if mine.count():
             return "listed"
         return None
 
     how = _wait(settled, _cap(deadline, 180), 1.0)
-    if how is None and deadline is not None and deadline.expired():
-        if menu.is_visible():
-            page.keyboard.press("Escape")
-        raise _pre_send_timeout()
+    if how is None:
+        raise give_up(f"Đã tải ảnh lên nhưng không thấy “{shown}” trong danh sách ảnh của Flow.")
     if how == "listed":
-        time.sleep(1.5)  # let the thumbnail finish processing
-        items.first.click()
-        time.sleep(0.8)
-        menu.locator("button", has_text="Add to prompt").first.click()
+        # Seen on Flow 2026-11-11: the upload is listed (not always first) with a spinner while Flow processes
+        # it; the selected upload has the class "asset-item-active" (aria-selected stays "false"); selection is
+        # one-of (a click moves it) and Flow REMEMBERS the last one, even from an earlier session, so "Add to
+        # prompt" is on before we pick anything and would attach that old picture. That is how clips were made
+        # from the wrong scene. So: click only OUR item, and press Add only when ours is the one selected,
+        # processed, and nothing else is selected.
+        state = {"clicked": 0.0}
+
+        def selected() -> bool:
+            info = menu.evaluate(_SELECTION_JS, name) or {}
+            if not info.get("mine"):
+                return False
+            if info.get("active"):
+                return not info.get("busy") and not info.get("others") and add.is_enabled()
+            if time.time() - state["clicked"] >= 4:
+                mine.click()
+                state["clicked"] = time.time()
+            return False
+
+        if not _wait(selected, _cap(deadline, 150), 1.0):
+            raise give_up(f"Flow chưa xử lý xong ảnh “{shown}” vừa tải lên (chưa chọn được để gắn vào chat).")
+        add.click()
     if not _wait(lambda: page.locator(CHIP).count() > before, _cap(deadline, 60), 1.0):
-        if menu.is_visible():
-            page.keyboard.press("Escape")
-        if deadline is not None and deadline.expired():
-            raise _pre_send_timeout()
-        raise Fail(EXIT_DRIFT, "Đã tải ảnh lên nhưng không gắn được vào ô chat của Flow.")
+        raise give_up("Đã tải ảnh lên nhưng không gắn được vào ô chat của Flow.")
     if menu.is_visible():
         page.keyboard.press("Escape")
 
@@ -315,10 +370,24 @@ def _new_tile(page, before: list[str]) -> str | None:
     return None
 
 
+def css_string(text: str) -> str:
+    """`text` as a quoted CSS string. Not json.dumps: its \\u00f4 escapes mean nothing in CSS, so a title with
+    an accented letter ("xôi") never matched and the finished clip was never downloaded."""
+    out = []
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\{ord(ch):x} ")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def _tile(page, title: str):
     """Locator for the video tile with this title. Looked up again on every use, because the
     virtual grid swaps tile nodes while it scrolls and re-renders."""
-    return (page.locator(f"{GRID_TILE}[aria-label={json.dumps(title)}]")
+    return (page.locator(f"{GRID_TILE}[aria-label={css_string(title)}]")
             .filter(has=page.locator(VIDEO_TILE)).first)
 
 
@@ -421,6 +490,24 @@ FAILED_RE = re.compile(r"(generation|video) (has )?failed|couldn['’]t (generat
 # Flow's answer when it accepted the job but has not started it yet ("…has been scheduled and is waiting in the
 # queue due to high demand…"). Kept narrow, so a real error is never taken for "queued".
 QUEUED_RE = re.compile(r"waiting in (the )?queue|has been scheduled", re.I)
+OFFER_RE = re.compile(r"would you like me to (kick off|start|generate)[^?]*\?", re.I)
+BLOCKED_MARK = "Flow xoá video"  # autopilot looks for it to rewrite the prompt
+# Flow made the clip and then removed it (its safety filter): "warning Video has been deleted".
+DELETED_RE = re.compile(r"video has been (deleted|removed)|video was (deleted|removed)", re.I)
+
+
+def after_offer(text: str) -> str:
+    """The part of a bubble after Flow's offer. The agent's turn keeps the offer ("…kick off this 1 video generation,
+    costing 5 credits?"), the Approve/Reject buttons and, folded in, its reasoning ("Show thinking"), which may talk
+    about policies; what Flow says about the result comes after the offer in the SAME bubble."""
+    ends = [m.end() for rx in (CREDIT_RE, OFFER_RE) for m in rx.finditer(text)]
+    if not ends:
+        return text
+    rest = text[max(ends):]
+    m = re.search(r"\bReject\b", rest)
+    return rest[m.end():] if m else rest
+
+
 AUDIO_FAILED_RE = re.compile(r"audio generation failed", re.I)
 APPROVE_MIN_LEFT = 180  # seconds: with less left, Flow's offer is rejected (spent=False) instead of approved
 SEND_MIN_LEFT = 240 + APPROVE_MIN_LEFT + 60  # = 480 s: with less left, nothing is sent (exit 9, spent=False)
@@ -434,11 +521,55 @@ def classify_replies(texts: list[str]) -> tuple[str | None, bool]:
     audio failed). The newest bubble with a signal decides; a queue notice wins over "failed" in the same bubble."""
     audio = any(AUDIO_FAILED_RE.search(t or "") for t in texts)
     for t in reversed(texts):
-        if QUEUED_RE.search(t or ""):
+        t = after_offer(t or "")
+        if DELETED_RE.search(t):
+            return "deleted", audio
+        if QUEUED_RE.search(t):
             return "queued", audio
-        if FAILED_RE.search(t or ""):
+        if FAILED_RE.search(t):
             return "failed", audio
     return None, audio
+
+
+START_MATCH_MIN = 0.75  # first frame vs start picture: right clip ~0.99, another scene's picture <= 0.45
+_THUMB = (64, 36)
+
+
+def _gray_thumb(path: Path, *, video: bool) -> list[int] | None:
+    """A tiny grey picture (64x36) of an image, or of a video's first frame; None when ffmpeg cannot read it."""
+    import subprocess
+
+    w, h = _THUMB
+    cmd = ["ffmpeg", "-loglevel", "error", "-i", str(path), "-frames:v", "1",
+           "-vf", f"scale={w}:{h}:flags=area,format=gray", "-f", "rawvideo", "-"]
+    try:
+        data = subprocess.run(cmd, capture_output=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return list(data) if len(data) == w * h else None
+
+
+def frame_match(image: Path, clip: Path) -> float | None:
+    """How alike the clip's first frame and the start picture are (correlation, -1..1); None if unknown."""
+    a, b = _gray_thumb(image, video=False), _gray_thumb(clip, video=True)
+    if a is None or b is None:
+        return None
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    da, db = [x - ma for x in a], [y - mb for y in b]
+    den = math.sqrt(sum(x * x for x in da) * sum(y * y for y in db))
+    return sum(x * y for x, y in zip(da, db)) / den if den else None
+
+
+def check_start_frame(image: Path, out: Path) -> None:
+    """Veo starts the clip on the attached picture. A clip that does not start on OUR picture was made from
+    another upload: keep it aside as <id>.mismatch.mp4 and fail (credits are spent; never take it as the scene)."""
+    score = frame_match(image, out)
+    if score is None or score >= START_MATCH_MIN:
+        return
+    aside = out.with_name(out.stem + ".mismatch" + out.suffix)
+    out.replace(aside)
+    raise Fail(EXIT_GENERATION_FAILED, f"Clip Flow trả về không bắt đầu từ ảnh mở cảnh (độ khớp {score:.2f}): Flow đã "
+               f"dùng nhầm ảnh khác. Đã để riêng clip đó ở {aside.name}; render lại cảnh này.", spent=True)
 
 
 def run_i2v(args) -> dict:
@@ -460,12 +591,15 @@ def run_i2v(args) -> dict:
         window = "headless" if args.headless else args.window
         ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project, deadline=dl)
         try:
-            return _i2v_on_page(page, args, prompt, [image, *refs], out, dl)
+            result = _i2v_on_page(page, args, prompt, [image, *refs], out, dl)
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
+    if result.get("status") == "ok" and not result.get("dry_run"):
+        check_start_frame(image, out)
+    return result
 
 
 def _i2v_on_page(page, args, prompt: str, files: list[Path], out: Path, dl: Deadline) -> dict:
@@ -593,9 +727,12 @@ def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, 
             replies = []
         kind, audio = classify_replies(replies[1:])
         audio_seen = audio_seen or audio
+        if kind == "deleted":
+            raise Fail(EXIT_GENERATION_FAILED, f"{BLOCKED_MARK}: Flow đã tạo rồi tự xoá video (“Video has been deleted”, "
+                       "thường do bộ lọc an toàn của Flow). Sửa prompt cho nhẹ nhàng hơn rồi gửi lại.", spent=True)
         if kind == "failed":
             # the texts just read, not a second read: a page re-render there would be exit 23
-            texts = [t.strip() for t in replies if t and t.strip()]
+            texts = [after_offer(t).strip() for t in replies if t and after_offer(t).strip()]
             last = texts[-1] if texts else "(không có)"
             raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo video lỗi: " + last[:400]
                        + (" " + AUDIO_HINT if audio_seen else ""), spent=True)
