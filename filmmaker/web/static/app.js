@@ -1985,6 +1985,7 @@ function renderFinal() {
       }),
       S.cur.final_url ? renderAsk() : null,
       S.cur.final_url ? renderSocial() : null,
+      S.cur.final_url ? renderPublish() : null,
       zone("playlist-zone", renderPlaylist)),
     h("div", { class: "stack" },
       zone("auto-review-zone", renderAutoReview),
@@ -2243,6 +2244,80 @@ function renderSocial() {
     }));
 }
 
+/* ---------- auto-publish to Facebook Reels & YouTube ---------- */
+
+const PUBLISH_PLATFORMS = [["facebook_reel", "Facebook Reels"], ["youtube", "YouTube (Shorts / Video)"]];
+
+async function loadPublish(force = false) {
+  if (!S.cur) return;
+  const pid = S.cur.id;
+  if (!force && S.publish && S.publish.pid === pid && S.publish.data) return;
+  try {
+    const data = await api("GET", `/api/projects/${pid}/publish`);
+    if (S.cur?.id !== pid) return;
+    S.publish = { ...(S.publish?.pid === pid ? S.publish : { pid }), data, error: null };
+  } catch (e) { S.publish = { pid, data: null, error: e.message }; }
+  refreshZone("publish-zone");
+}
+
+async function startPublish(force = false) {
+  const pid = S.cur?.id;
+  if (!pid || jobRunning()) return;
+  const platforms = localGet("publishPlatforms", ["facebook_reel", "youtube"]);
+  if (!platforms.length) { toast("Chọn ít nhất một nền tảng (Facebook Reels hoặc YouTube).", "error"); return; }
+  const privacy = document.getElementById("pub-privacy")?.value || "public";
+  const title = document.getElementById("pub-title")?.value || "";
+  const description = document.getElementById("pub-desc")?.value || "";
+  try {
+    await flushSave();
+    const j = await api("POST", `/api/projects/${pid}/publish`, { platforms, privacy, title, description, force });
+    startJob(j);
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function renderPublish() {
+  if (!S.publish || S.publish.pid !== S.cur.id || (!S.publish.data && !S.publish.error)) setTimeout(() => loadPublish(), 0);
+  const plats = localGet("publishPlatforms", ["facebook_reel", "youtube"]);
+  return h("div", { class: "card card-pad publish-card" },
+    h("div", { class: "card-head" }, h("h3", {}, icon("upload"), " Tự động đăng Facebook Reels & YouTube"), h("span", { class: "spacer" }),
+      h("button", { class: "btn sm ghost", onclick: openSettings }, icon("settings"), "Cấu hình kênh")),
+    zone("publish-zone", () => {
+      const PU = S.publish?.pid === S.cur?.id ? S.publish : null;
+      if (!PU || (!PU.data && !PU.error)) return h("div", { class: "help" }, "Đang tải…");
+      if (PU.error) return h("div", { class: "help" }, PU.error);
+      const d = PU.data, cfg = d.configured || {}, st = d.state?.platforms || {}, pv = d.preview?.youtube || d.preview?.facebook_reel || {};
+      const busy = jobRunning();
+      return h("div", { class: "stack tight" },
+        h("div", { class: "social-opts" },
+          h("span", { class: "lbl" }, "Nền tảng"),
+          PUBLISH_PLATFORMS.map(([k, l]) => h("label", { class: "check" },
+            h("input", { type: "checkbox", checked: plats.includes(k), onchange: (e) => toggleChoice("publishPlatforms", k, e.target.checked, plats) }),
+            h("span", {}, l, " ", h("span", { class: "pill " + (cfg[k] ? "ok" : "warn"), style: { fontSize: "11px", padding: "1px 6px" } }, cfg[k] ? "Đã kết nối" : "Chưa cấu hình"))))),
+        h("div", { class: "grid2" },
+          field("Tiêu đề đăng (để trống = tự lấy từ bài AI / tên phim)", h("input", { type: "text", id: "pub-title", placeholder: pv.title || S.cur.storyboard.title || "" })),
+          field("Chế độ hiển thị YouTube", h("select", { id: "pub-privacy", value: d.yt_privacy || "public" },
+            h("option", { value: "public" }, "Công khai (Public)"),
+            h("option", { value: "unlisted" }, "Không công khai (Unlisted)"),
+            h("option", { value: "private" }, "Riêng tư (Private)")))),
+        h("details", {}, h("summary", { class: "small muted" }, "Chỉnh sửa mô tả / caption thủ công (tuỳ chọn)"),
+          h("textarea", { id: "pub-desc", rows: 3, placeholder: pv.description || "Để trống để tự động dùng caption và hashtag từ mục Nội dung mạng xã hội." })),
+        Object.keys(st).length ? h("div", { class: "stack tight", style: { marginTop: "6px" } },
+          PUBLISH_PLATFORMS.map(([k, l]) => {
+            const p = st[k];
+            if (!p) return null;
+            return h("div", { class: "row small" },
+              h("span", { class: "badge " + (p.status === "published" ? "done" : "failed") }, p.status === "published" ? "Đã đăng" : "Lỗi"),
+              h("strong", {}, l),
+              p.url ? h("a", { href: p.url, target: "_blank", rel: "noopener" }, p.url, " ↗") : null,
+              p.error ? h("span", { class: "warn-text" }, p.error) : null);
+          })) : null,
+        h("div", { class: "row", style: { marginTop: "8px" } },
+          h("button", { class: "btn primary sm", disabled: busy, onclick: () => startPublish(false) }, icon("upload"), "Đăng ngay"),
+          Object.values(st).some((x) => x?.status === "published") ? h("button", { class: "btn sm ghost", disabled: busy, onclick: () => startPublish(true) }, icon("refresh"), "Đăng lại (Force)") : null,
+          h("span", { class: "help" }, "Tự động gắn #Shorts cho video dọc 9:16 và đính kèm ảnh bìa thumbnail.")));
+    }));
+}
+
 /* ---------- autopilot ---------- */
 
 const AUTO_STEPS = [["storyboard", "Storyboard"], ["review_storyboard", "Review kịch bản"], ["characters", "Nhân vật"],
@@ -2259,18 +2334,21 @@ function autoCostText(scenes, review) {
 async function openAutopilot(cur) {
   const review = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
   const subs = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+  const autoPub = h("input", { type: "checkbox", checked: localGet("autoPublishAfter", !!S.settings?.auto_publish) });
   const left = (cur.storyboard.scenes || []).filter((s) => cur.scene_state?.[s.id]?.status !== "done").length;
   modal({
     title: "Tạo tự động", body: h("div", { class: "stack" },
       h("p", {}, left ? `Làm mọi bước còn thiếu cho “${cur.storyboard.title}”: ${left} cảnh chưa có clip.` : "Mọi cảnh đã có clip: agent review, dựng lại phim và làm thumbnail nếu cần."),
       h("p", { class: "help" }, autoCostText(left, review.checked)),
       h("label", { class: "check" }, review, h("span", {}, "Agent review từng bước")),
-      h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video"))),
+      h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video")),
+      h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng lên Facebook Reels & YouTube sau khi tạo phim xong"))),
     buttons: [{ label: "Huỷ" }, { label: "Bắt đầu", cls: "primary", onclick: async (c) => {
-      localSet("autoReview", review.checked); localSet("autoSubs", subs.checked);
+      localSet("autoReview", review.checked); localSet("autoSubs", subs.checked); localSet("autoPublishAfter", autoPub.checked);
+      const pubPlats = autoPub.checked ? (S.settings?.auto_publish_platforms?.length ? S.settings.auto_publish_platforms : ["facebook_reel", "youtube"]) : [];
       try {
         await flushSave();
-        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, music: finalPrefs().music }));
+        startJob(await api("POST", `/api/projects/${cur.id}/autopilot`, { review: review.checked, burn_subtitles: subs.checked, music: finalPrefs().music, publish_platforms: pubPlats }));
         c();
       } catch (e) { toast(e.message, "error"); }
     } }],
@@ -3023,6 +3101,7 @@ async function onJobDone() {
   }
   if (S.cur && S.cur.id === j.project) {
     await refreshCurrent();
+    if (j.kind === "publish") await loadPublish(true);
     if ((j.kind === "portraits" || j.kind === "locations") && (S.tab === "story" || S.tab === "board")) renderMain();
     if (j.kind === "edit" || j.kind === "capcut" || j.kind === "make") await loadEditPlan(true);
     if (j.kind === "capcut" && j.result?.capcut_project) toast(`Đã tạo dự án CapCut “${j.result.capcut_project}”. Mở CapCut để xem, chỉnh và xuất phim.`);
@@ -3516,14 +3595,55 @@ async function openSettings() {
           h("label", { class: "check" }, autoQC, h("span", {}, "Tự QC mỗi clip vừa render",
             h("span", { class: "sub" }, "AI xem hình (so với keyframe, nhân vật, lỗi hình, chữ trên hình) và nghe âm thanh, lời thoại. Miễn phí, chỉ đánh dấu — không tự render lại."))),
           qcModel)),
+      (() => {
+        const fbPage = h("input", { type: "text", id: "set-fb-page", value: s.fb_page_id || "", placeholder: "Ví dụ: 1029384756123" });
+        const fbToken = h("input", { type: "password", id: "set-fb-token", placeholder: s.fb_access_token_set ? `Đã lưu (${s.fb_access_token_hint}) · nhập để thay` : "EAAB…", autocomplete: "off" });
+        const ytClient = h("input", { type: "text", id: "set-yt-client", value: s.yt_client_id || "", placeholder: "xxxx.apps.googleusercontent.com" });
+        const ytSecret = h("input", { type: "password", id: "set-yt-secret", placeholder: s.yt_client_secret_set ? `Đã lưu (${s.yt_client_secret_hint}) · nhập để thay` : "GOCSPX-…", autocomplete: "off" });
+        const ytRefresh = h("input", { type: "password", id: "set-yt-refresh", placeholder: s.yt_refresh_token_set ? `Đã lưu (${s.yt_refresh_token_hint}) · nhập để thay` : "1//0g…", autocomplete: "off" });
+        const ytPriv = h("select", { id: "set-yt-priv", value: s.yt_privacy || "public" },
+          h("option", { value: "public" }, "Công khai (Public)"),
+          h("option", { value: "unlisted" }, "Không công khai (Unlisted)"),
+          h("option", { value: "private" }, "Riêng tư (Private)"));
+        const autoPub = h("input", { type: "checkbox", id: "set-auto-pub", checked: !!s.auto_publish });
+        const curPlats = s.auto_publish_platforms || [];
+        const platFb = h("input", { type: "checkbox", id: "set-pub-fb", checked: curPlats.includes("facebook_reel") });
+        const platYt = h("input", { type: "checkbox", id: "set-pub-yt", checked: curPlats.includes("youtube") });
+        return h("section", { class: "settings-sec" }, h("h3", {}, "Đăng tự động Facebook Reels & YouTube"),
+          h("div", { class: "stack" },
+            h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng video sau khi tạo phim xong (Autopilot / Make)")),
+            h("div", { class: "row" },
+              h("label", { class: "check" }, platFb, h("span", {}, "Facebook Reels")),
+              h("label", { class: "check" }, platYt, h("span", {}, "YouTube (Shorts / Video)"))),
+            h("div", { class: "grid2" },
+              field("Facebook Page ID", fbPage),
+              field("Facebook Page Access Token", fbToken)),
+            h("div", { class: "grid3" },
+              field("YouTube OAuth Client ID", ytClient),
+              field("YouTube Client Secret", ytSecret),
+              field("YouTube Refresh Token", ytRefresh)),
+            field("Chế độ hiển thị YouTube mặc định", ytPriv),
+            h("p", { class: "help" }, "Token được lưu bảo mật ở ~/.config/filmmaker/settings.json (chỉ tài khoản máy bạn đọc được).")));
+      })(),
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
-        await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
+        const pubPlats = [];
+        if (document.getElementById("set-pub-fb")?.checked) pubPlats.push("facebook_reel");
+        if (document.getElementById("set-pub-yt")?.checked) pubPlats.push("youtube");
+        S.settings = await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
           backup_remote: remote.value.trim(), auto_backup: autoBackup.checked, auto_qc: autoQC.checked,
+          fb_page_id: document.getElementById("set-fb-page")?.value.trim() || "",
+          fb_access_token: document.getElementById("set-fb-token")?.value.trim() || undefined,
+          yt_client_id: document.getElementById("set-yt-client")?.value.trim() || "",
+          yt_client_secret: document.getElementById("set-yt-secret")?.value.trim() || undefined,
+          yt_refresh_token: document.getElementById("set-yt-refresh")?.value.trim() || undefined,
+          yt_privacy: document.getElementById("set-yt-priv")?.value || "public",
+          auto_publish: !!document.getElementById("set-auto-pub")?.checked,
+          auto_publish_platforms: pubPlats,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
-        S.env = await api("GET", "/api/env"); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
+        S.env = await api("GET", "/api/env"); if (S.cur) loadPublish(true); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }
     } }],
   });

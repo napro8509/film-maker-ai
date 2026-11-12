@@ -612,7 +612,9 @@ def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing,
 @_stitch_options
 @click.option("--edit/--no-edit", "smart_edit", default=False,
               help="Dựng bằng agent dựng phim (chuyển cảnh, cân âm) thay vì nối thẳng.")
-def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, **kw) -> None:
+@click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
+              help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
+def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, publish_to, **kw) -> None:
     """run + stitch: từ storyboard ra thẳng phim.
 
     Chặn cảnh dùng model đã ngừng và cảnh có độ dài model không nhận giống `run`.
@@ -634,6 +636,7 @@ def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_mi
     ab = _auto_backup(storyboard, out_dir, kw.get("auto_backup"))
     if ab:
         ab.finish()  # final.mp4 + thumbnail
+    _maybe_publish_after(storyboard, out_dir, publish_to)
 
 
 @main.command("round-durations")
@@ -789,14 +792,17 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 @click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
 @click.option("--profile", help="gflow profile (tài khoản Google).")
 @click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
+@click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
+              help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
 def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause) -> None:
+         burn_subtitles, music, profile, pause, publish_to) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
     Agent review storyboard, keyframe (tạo lại ảnh lỗi, miễn phí), AI QC từng clip (hình, âm thanh, lời thoại;
     chỉ đánh dấu, không tự render lại) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
     """
+    from . import publisher
     from .autopilot import AutoError, Autopilot, AutoSettings, slug
     from .planner import plan_auto
 
@@ -827,8 +833,10 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         sb_path = d / "storyboard.yaml"
         save_storyboard(sb, sb_path)
         click.echo(f"✔ {sb_path}")
+    pub_cfg = publisher.config_from_settings(s)
+    plats = _resolve_publish_platforms(publish_to, pub_cfg)
     cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
-                       api_key=key, pause=_parse_pause(pause))
+                       api_key=key, pause=_parse_pause(pause), publish_platforms=plats, publish_config=pub_cfg)
     pilot = Autopilot(sb_path, _out_dir(sb_path, None), g, settings=cfg, log=click.echo)
     try:
         result = pilot.run()
@@ -1012,6 +1020,93 @@ def restore(name: str, target: Path | None, remote, overwrite) -> None:
     except BackupError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Xem tiến độ: filmmaker status {target / m['storyboard']}")
+
+
+def _resolve_publish_platforms(publish_to: tuple[str, ...], pub_cfg: Any) -> list[str]:
+    if publish_to:
+        if "all" in publish_to:
+            return ["facebook_reel", "youtube"]
+        return list(dict.fromkeys(publish_to))
+    if pub_cfg.auto_publish and pub_cfg.auto_publish_platforms:
+        return list(pub_cfg.auto_publish_platforms)
+    return []
+
+
+def _maybe_publish_after(storyboard: Path, out_dir: Path, publish_to: tuple[str, ...]) -> None:
+    from . import ai, publisher
+
+    s = user_settings.load()
+    pub_cfg = publisher.config_from_settings(s)
+    plats = _resolve_publish_platforms(publish_to, pub_cfg)
+    if not plats:
+        return
+    key = s.get("anthropic_api_key") or None
+    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    try:
+        publisher.publish_film(storyboard.parent, out_dir, plats, pub_cfg, ai_backend=backend, api_key=key, log=click.echo)
+    except Exception as exc:
+        click.echo(f"⚠ Không đăng được video: {exc}")
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
+@click.option("--platform", "platforms", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
+              help="Nền tảng đăng (mặc định cả facebook_reel và youtube).")
+@click.option("--privacy", type=click.Choice(["public", "unlisted", "private"]), default=None,
+              help="Chế độ hiển thị trên YouTube (mặc định theo Cài đặt hoặc public).")
+@click.option("--title", "custom_title", default="", help="Tiêu đề tùy chỉnh (bỏ trống sẽ dùng tiêu đề AI / storyboard).")
+@click.option("--description", "custom_desc", default="", help="Mô tả / caption tùy chỉnh.")
+@click.option("--force", is_flag=True, help="Đăng lại kể cả khi đã đăng bản phim này trước đó.")
+@click.option("--dry-run", is_flag=True, help="Chỉ xem trước tiêu đề và mô tả sẽ đăng, không gửi lên mạng.")
+def publish(storyboard: Path, out: Path | None, platforms: tuple[str, ...], privacy: str | None,
+            custom_title: str, custom_desc: str, force: bool, dry_run: bool) -> None:
+    """Tự động đăng phim hoàn chỉnh (final.mp4) lên Facebook Reels và kênh YouTube."""
+    from . import ai, publisher
+
+    out_dir = _out_dir(storyboard, out)
+    s = user_settings.load()
+    cfg = publisher.config_from_settings(s)
+    if privacy:
+        cfg.yt_privacy = privacy  # type: ignore[assignment]
+    if not platforms or "all" in platforms:
+        picked = ["facebook_reel", "youtube"]
+    else:
+        picked = list(dict.fromkeys(platforms))
+    key = s.get("anthropic_api_key") or None
+    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    try:
+        res = publisher.publish_film(
+            storyboard.parent, out_dir, picked, cfg,
+            force=force, dry_run=dry_run, custom_title=custom_title, custom_description=custom_desc,
+            ai_backend=backend, api_key=key, log=click.echo,
+        )
+    except (publisher.PublishError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if res["errors"]:
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
+@click.option("--dest", type=click.Path(file_okay=False, path_type=Path), help="Thư mục xuất gói (mặc định <out>/exports).")
+@click.option("--zip/--no-zip", "zip_archive", default=False, show_default=True, help="Nén thành file .zip để chia sẻ.")
+@click.option("--open", "open_dir", is_flag=True, help="Mở thư mục xuất trong Finder sau khi xong.")
+def export(storyboard: Path, out: Path | None, dest: Path | None, zip_archive: bool, open_dir: bool) -> None:
+    """Đóng gói phim hoàn chỉnh để đăng mạng xã hội và lưu trữ (video, phụ đề, ảnh bìa, bài đăng)."""
+    from .export import ExportError, export_package
+
+    sb = load_storyboard(storyboard)
+    out_dir = _out_dir(storyboard, out)
+    try:
+        path = export_package(sb, out_dir, dest=dest, zip_archive=zip_archive, log=click.echo)
+    except ExportError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✔ Đã đóng gói: {path}")
+    if open_dir:
+        import subprocess
+        subprocess.run(["open", str(path if path.is_dir() else path.parent)])
 
 
 @main.command()
