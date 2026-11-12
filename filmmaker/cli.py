@@ -44,6 +44,7 @@ def main() -> None:
                 run  (tạo keyframe + clip trên Flow, chạy lại được)
                 stitch (ghép thành phim bằng ffmpeg)
                 edit (agent dựng phim: chuyển cảnh, cân âm, nhạc -> liền mạch)
+                capcut (agent dựng phim thành dự án CapCut: nhiều chuyển cảnh hơn, sửa tiếp trong CapCut)
                 make (run + stitch một lần)
     """
 
@@ -557,6 +558,56 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, all
 
 @main.command()
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", type=click.Path(path_type=Path))
+@click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
+@click.option("--music-volume", "volume", default=0.25, show_default=True)
+@click.option("--subtitles/--no-subtitles", default=True, show_default=True,
+              help="Đặt phụ đề thành track chữ trong CapCut (sửa / xoá được ở đó).")
+@click.option("--lang", type=click.Choice(["vi", "th", "en"]), default=None,
+              help="Ngôn ngữ phụ đề (mặc định: ngôn ngữ lời dẫn).")
+@click.option("--allow-missing", is_flag=True, help="Vẫn dựng khi còn cảnh chưa có.")
+@_edit_options
+@click.option("--name", help="Tên dự án trong CapCut (mặc định: tên phim).")
+@click.option("--capcut-dir", type=click.Path(file_okay=False, path_type=Path),
+              help="Thư mục dự án của CapCut (mặc định: thư mục chuẩn của CapCut trên máy này).")
+@click.option("--open/--no-open", "open_app", default=True, show_default=True, help="Mở CapCut sau khi tạo dự án.")
+def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing, engine, replan, backend, name,
+           capcut_dir, open_app) -> None:
+    """Agent dựng phim thành dự án CapCut (không tốn credit).
+
+    \b
+    Agent (Claude) làm việc như một editor: xem hình từng cảnh, chọn chỗ cắt và chuyển cảnh, màu phim, hiệu ứng,
+    chuyển động máy trong kho CapCut; tìm nhạc nền (khi chưa có --music) và tiếng động trên mạng; hạ nhạc dưới thoại.
+    Tất cả được xếp sẵn lên timeline CapCut cùng phụ đề và tiêu đề mở đầu. Nguồn âm thanh: <out>/edit_assets/CREDITS.txt.
+    Mở dự án trong CapCut để xem, chỉnh thêm hiệu ứng / âm thanh rồi bấm Export ở đó.
+    Dự án bạn đã sửa trong CapCut không bị ghi đè: lần dựng sau lưu thành dự án mới.
+    """
+    from . import capcut as cc
+
+    sb = load_storyboard(storyboard)
+    if subtitles:
+        _fill_subtitles(sb, storyboard, backend)
+    out_dir = _out_dir(storyboard, out)
+    clips, missing = _clips(sb, out_dir)
+    if missing and not allow_missing:
+        raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
+    try:
+        folder, _ = cc.export_film(
+            sb, clips, out_dir, music=music, music_volume=volume, subtitles=subtitles, subtitle_language=lang,
+            name=name, root=capcut_dir or user_settings.load().get("capcut_drafts_dir") or None, engine=engine,
+            replan=replan, backend=backend, ai_available=_ai_ready(backend),
+            api_key=user_settings.load().get("anthropic_api_key") or None, log=click.echo)
+    except (AssembleError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"🎬 Dự án CapCut: {folder}")
+    if open_app and cc.open_capcut():
+        click.echo(f"Đã mở CapCut: chọn dự án “{folder.name}” ở màn hình chính (chưa thấy thì đóng rồi mở lại CapCut).")
+    else:
+        click.echo(f"Mở CapCut và chọn dự án “{folder.name}” ở màn hình chính.")
+
+
+@main.command()
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @_run_options
 @_stitch_options
 @click.option("--edit/--no-edit", "smart_edit", default=False,
@@ -972,6 +1023,48 @@ def template(output: Path) -> None:
     src = Path(__file__).parent / "templates" / "storyboard.yaml"
     output.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     click.echo(f"✔ {output}")
+
+
+@main.command()
+@click.argument("source")
+@click.option("-o", "--out", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục lưu bản phân tích (mặc định ~/FilmMaker/.analyses/<ngày>-<tên>, cũng hiện trong web UI).")
+@click.option("--no-rea", is_flag=True, help="Không chạy rea-video dù đã cài.")
+@click.option("--film", "film", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Viết luôn storyboard phim mới theo phong cách này vào file .yaml này.")
+@click.option("--idea", default="", help="Ý tưởng cho phim mới (trống: Claude tự nghĩ câu chuyện cùng thể loại).")
+@click.option("--scenes", type=int, default=None, help="Số cảnh phim mới (mặc định: gợi ý theo video mẫu).")
+@click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề phim mới.")
+@click.option("--dialogue-lang", "dialogue_lang", default=None, help="Ngôn ngữ nhân vật nói ('none' = không thoại).")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True)
+def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea: str, scenes: int | None,
+            language: str, dialogue_lang: str | None, backend: str) -> None:
+    """Phân tích một video mẫu (link hoặc file): nhịp dựng, chuyển cảnh, máy quay, màu, âm thanh, chữ, nhân vật,
+    nhịp truyện → report.md + analysis.json; --film viết storyboard phim mới cùng phong cách."""
+    from . import video_analysis as va
+
+    if dialogue_lang is not None:
+        dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
+    language = _cli_lang(language, "--lang", clean_language)
+    folder = out or Path.home() / "FilmMaker" / ".analyses" / va.new_id(Path(source).stem if not va.is_url(source) else
+                                                                          source.split("//", 1)[-1].split("/")[0])
+    try:
+        data = va.analyze(source, folder, use_rea=not no_rea, backend=backend, allow_local=True, log=click.echo)
+    except (va.AnalysisError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✔ {folder / 'report.md'}")
+    if film:
+        if film.exists() and not click.confirm(f"{film} đã tồn tại. Ghi đè?"):
+            return
+        click.echo("Đang viết storyboard theo phong cách video mẫu...")
+        try:
+            sb, _ = va.plan_from_analysis(data, idea, scenes=scenes, language_hint=language,
+                                          dialogue_language=dialogue_lang, backend=backend)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from exc
+        save_storyboard(sb, film)
+        va.copy_reference(folder, film.parent)
+        click.echo(f"✔ {film}: {len(sb.scenes)} cảnh ({sb.aspect}). Xem/sửa rồi chạy: filmmaker run {film} --dry-run")
 
 
 @main.command()

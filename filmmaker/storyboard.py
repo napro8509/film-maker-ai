@@ -23,6 +23,7 @@ NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title 
 # Spoken language forced into every *video* prompt (never into image prompts or the fingerprints).
 LANG_MAX = 40
 NO_DIALOGUE = "none"  # stored value for "Không thoại"
+NO_SUBTITLES = "none"  # subtitle_language for "Không phụ đề": the film has no subtitles at all
 # Says the language of the lines, never that "characters speak": "characters speak only Thai" read as everyone
 # talking, and listeners mouthed or echoed the speaker's line.
 DIALOGUE_RULE = ("Spoken language: {lang}. Each line is said in {lang} only by the character it belongs to; "
@@ -474,8 +475,11 @@ class Storyboard(StoryboardDraft):
     dialogue_language: str | None = Field(default=None, description="Language every character speaks in the videos "
                                           "(English name, e.g. Vietnamese), or 'none' for no spoken dialogue. "
                                           "Empty = Veo guesses.")
-    subtitle_language: str | None = Field(default=None, description="Language of `narration` chosen when planning. "
-                                          "Reference only: never sent to Flow.")
+    subtitle_language: str | None = Field(default=None, description="Language of `narration` chosen when planning, "
+                                          "or 'none' for a film without subtitles. Never sent to Flow.")
+    edit_style: str | None = Field(default=None, description="How to cut this film, learnt from a reference video "
+                                   "(Phân tích video): rhythm, transitions, look, music and sound. The editor agent "
+                                   "follows it. Never sent to Flow.")
 
     @field_validator("dialogue_language", mode="before")
     @classmethod
@@ -485,7 +489,13 @@ class Storyboard(StoryboardDraft):
     @field_validator("subtitle_language", mode="before")
     @classmethod
     def _subtitle_language(cls, v: object) -> str | None:
-        return clean_language(v)
+        v = clean_language(v)
+        return NO_SUBTITLES if v is not None and v.casefold() == NO_SUBTITLES else v
+
+    @property
+    def has_subtitles(self) -> bool:
+        """False when the film was made without subtitles ("Không phụ đề"): no tracks, no .srt, nothing burnt in."""
+        return self.subtitle_language != NO_SUBTITLES
 
     @model_validator(mode="after")
     def _check_scene_characters(self) -> "Storyboard":
@@ -953,7 +963,10 @@ class Storyboard(StoryboardDraft):
 
     def subtitle_line(self, scene: SceneDraft, code: str) -> str | None:
         """The scene's line for track `code`. A missing translation falls back to `narration`,
-        so every track has a line wherever the scene has narration. The primary track is `narration` itself."""
+        so every track has a line wherever the scene has narration. The primary track is `narration` itself.
+        Always None for a film without subtitles."""
+        if not self.has_subtitles:
+            return None
         narration = scene.narration.strip() if scene.narration and scene.narration.strip() else None
         if code == self.primary_subtitle_code() and narration:
             return narration
@@ -963,6 +976,8 @@ class Storyboard(StoryboardDraft):
     def missing_subtitles(self) -> dict[str, list[str]]:
         """{scene id: [track codes without their own line]} for scenes with narration."""
         out: dict[str, list[str]] = {}
+        if not self.has_subtitles:
+            return out
         primary = self.primary_subtitle_code()
         for s in self.scenes:
             if not (s.narration and s.narration.strip()):

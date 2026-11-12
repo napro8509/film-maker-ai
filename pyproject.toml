@@ -35,4 +35,4 @@ testpaths = ["tests"]
 addopts = "-n auto"  # run tests in parallel (pytest-xdist); -n 0 to run in one process
 
 [tool.setuptools.package-data]
-filmmaker = ["templates/*.yaml", "web/static/*", "models.yaml"]
+filmmaker = ["templates/*.yaml", "templates/*.json", "web/static/*", "models.yaml"]

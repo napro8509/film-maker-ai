@@ -523,6 +523,53 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 /* A 9:16 frame is as wide as its picture (a placeholder alone collapses it): keep room for the overlay text. */
 .media.portrait:has(> .prog-ov) { min-width: min(180px, 100%); }
 
+/* ============ Phân tích video ============ */
+.ana-item { padding: var(--sp-2); border: 1px solid var(--border); border-radius: var(--r-2); flex-wrap: nowrap; }
+.ana-item .name { font-weight: var(--fw-bold); font-size: var(--fs-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ana-thumb { width: 64px; height: 40px; flex: none; border-radius: var(--r-1); background: var(--surface-2) center/cover no-repeat; }
+.grow { flex: 1; }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn.block.on { box-shadow: inset 0 0 0 2px var(--accent); }
+.ana { display: flex; flex-direction: column; gap: var(--sp-4); }
+.ana .phead { margin-bottom: 0; }
+.ana-card { padding: var(--sp-4); }
+.ana-card p { line-height: 1.55; }
+.ana-top { display: flex; gap: var(--sp-4); align-items: flex-start; }
+.ana-top > .ana-card { flex: 1; min-width: 0; }
+.ana-video { background: var(--media-bg); border-radius: var(--r-3); width: min(560px, 55%); max-height: 70vh; }
+.ana-video.tall { width: auto; height: min(70vh, 560px); max-width: 45%; }
+.ana-grid { align-items: start; }
+.kv { display: grid; grid-template-columns: 120px 1fr; gap: var(--sp-2); font-size: var(--fs-2); line-height: 1.5; }
+.kv b { color: var(--text-muted); font-weight: var(--fw-medium); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-size: var(--fs-1); background: var(--surface-2); border-radius: var(--r-pill); padding: 2px 10px; color: var(--text-muted); }
+.chip b { color: var(--text); }
+.shot-strip, .beat-strip { display: flex; gap: 2px; width: 100%; }
+.shot-seg { flex-basis: 0; min-width: 3px; height: 34px; border: 0; border-radius: 3px; color: #fff; font-size: 11px; font-weight: var(--fw-bold); cursor: pointer; padding: 0; overflow: hidden; opacity: .88; }
+.shot-seg:hover, .shot-seg:focus-visible { opacity: 1; outline: 2px solid var(--text); outline-offset: 1px; }
+.beat-seg { flex-basis: 0; min-width: 6px; height: 24px; border: 1px solid var(--border-strong); border-radius: 3px; background: var(--surface-2); color: var(--text-muted); font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; padding: 0 4px; }
+.beat-seg:hover { background: var(--accent-soft); color: var(--accent-ink); }
+.loud { width: 100%; height: 70px; display: block; background: var(--surface-2); border-radius: var(--r-2); }
+.loud .fill { fill: color-mix(in srgb, var(--info) 18%, transparent); }
+.loud .line { fill: none; stroke: var(--info); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.loud .mk { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+.ana-list { padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-2); line-height: 1.5; }
+.ana-pre { white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-1); background: var(--surface-2); border-radius: var(--r-2); padding: var(--sp-3); line-height: 1.5; overflow-wrap: anywhere; }
+.table-wrap { overflow-x: auto; }
+.ana-table { border-collapse: collapse; width: 100%; font-size: var(--fs-1); }
+.ana-table th, .ana-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.ana-table th { color: var(--text-muted); font-weight: var(--fw-bold); white-space: nowrap; }
+.ana-table tbody tr { cursor: pointer; }
+.ana-table tbody tr:hover { background: var(--surface-2); }
+.ana-sheets { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
+.ana-sheets img { height: 220px; border-radius: var(--r-2); border: 1px solid var(--border); }
+.ana-film { border-color: var(--accent); }
+@media (max-width: 900px) {
+  .ana-top { flex-direction: column; }
+  .ana-video, .ana-video.tall { width: 100%; max-width: 100%; height: auto; }
+  .ana-grid { grid-template-columns: 1fr; }
+}
+
 /* autopilot */
 .auto-opts { display: grid; gap: 8px; }
 .auto-steps { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0 12px; }

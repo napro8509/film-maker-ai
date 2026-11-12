@@ -60,11 +60,29 @@ FPS = 24
 # --- plan ---------------------------------------------------------------------
 
 
+MAX_SOUNDS = 12  # sound effects in one film (each one is a search + download)
+
+
+class Sound(BaseModel):
+    query: str = Field(description="2-4 plain English words to find the sound in a sound library, "
+                                   "e.g. 'door slam', 'rain on window', 'cinematic whoosh'. No names, no titles.")
+    at: float = Field(default=0.0, description="Seconds from the start of the trimmed clip where the sound begins.")
+    volume: float = Field(default=0.6, description="0-1.5; ambience 0.2-0.4, accents 0.5-0.9.")
+
+
 class ClipEdit(BaseModel):
     id: str = Field(description="Scene id.")
     trim_start: float = Field(default=0.0, description=f"Seconds cut from the start (0-{MAX_TRIM}).")
     trim_end: float = Field(default=0.0, description=f"Seconds cut from the end (0-{MAX_TRIM}).")
     volume: float = Field(default=1.0, description="Gain for this clip's own audio (0-2, 1 = unchanged).")
+    # --- finishing layer (CapCut only; left empty by the basic editor) ---
+    filter: str | None = Field(default=None, description="CapCut colour filter for this clip only, when it must "
+                                                         "look different from the film's `look` (a flashback).")
+    effect: str | None = Field(default=None, description="CapCut picture effect over this clip (exact name).")
+    motion: Literal["none", "push_in", "pull_out"] = Field(default="none", description="Slow camera move added in the edit.")
+    music: float = Field(default=1.0, description="Music level during this clip: 1 = full, ~0.35 under dialogue, 0 = no music.")
+    sounds: list[Sound] = Field(default_factory=list, description="Sound effects laid under this clip (0-2).")
+    note: str = Field(default="", description="Short why for the finishing choices, in Vietnamese.")
 
 
 class Transition(BaseModel):
@@ -72,6 +90,10 @@ class Transition(BaseModel):
     type: TransitionType = "crossfade"
     duration: float = Field(default=0.5, description=f"Seconds (0.2-{MAX_TRANSITION}); ignored for a cut.")
     reason: str = Field(default="", description="Short why, in Vietnamese.")
+    capcut: str | None = Field(default=None, description="CapCut transition id; only when the film is "
+                                                         "finished in CapCut and a list of ids was given.")
+    sound: str | None = Field(default=None, description="Sound played across this cut, as a search phrase "
+                                                        "('soft whoosh', 'deep impact'). Rare.")
 
 
 class EditPlan(BaseModel):
@@ -84,6 +106,17 @@ class EditPlan(BaseModel):
     normalize: bool = Field(default=True, description="Normalize the whole mix to streaming loudness (-14 LUFS).")
     notes: str = Field(default="", description="The editor's short summary of the cut, in Vietnamese.")
     source: Literal["rules", "ai", "manual"] = "rules"
+    # --- finishing layer (CapCut only) ---
+    pro: bool = Field(default=False, description="Set by the program: the plan has the finishing layer.")
+    look: str | None = Field(default=None, description="CapCut colour filter for the whole film (exact name).")
+    look_strength: float = Field(default=0.6, description="0.2-1.0; cinema grades are subtle (0.4-0.7).")
+    music_query: str | None = Field(default=None, description="Search phrase for background music when the user "
+                                    "gave none: mood + instrument + genre in English, e.g. 'sad piano cinematic'.")
+    title: str | None = Field(default=None, description="Opening title shown over the first seconds (the film's "
+                                                        "title, in the film's subtitle language). None = no title.")
+    title_in: str | None = Field(default=None, description="CapCut text entrance animation for the title (exact name).")
+    subtitle_in: str | None = Field(default=None, description="CapCut text entrance animation for every subtitle "
+                                                              "(exact name); keep it very soft.")
 
 
 class ClipInfo(BaseModel):
@@ -219,8 +252,11 @@ def auto_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str]) -> E
 
 def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> EditPlan:
     """Make any plan (AI, hand-edited, or from an older set of clips) safe to render with these clips."""
+    from . import capcut as catalog
+
     by_id = {c.id: c for c in plan.clips}
     clips: list[ClipEdit] = []
+    budget = MAX_SOUNDS
     for sid in order:
         c = by_id.get(sid) or ClipEdit(id=sid, trim_start=_suggested_trims(infos[sid])[0],
                                        trim_end=_suggested_trims(infos[sid])[1])
@@ -232,7 +268,20 @@ def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> Ed
             k = max(0.0, room) / (ts + te) if ts + te else 0
             ts, te = ts * k, te * k
         vol = max(0.0, min(2.0, float(c.volume if c.volume is not None else 1.0)))
-        clips.append(ClipEdit(id=sid, trim_start=round(ts, 3), trim_end=round(te, 3), volume=round(vol, 2)))
+        keep = d - ts - te
+        sounds = []
+        for snd in c.sounds[:2]:
+            q = _query(snd.query)
+            if q and budget > 0:
+                budget -= 1
+                sounds.append(Sound(query=q, at=round(max(0.0, min(float(snd.at or 0), max(0.0, keep - 0.5))), 2),
+                                    volume=round(max(0.05, min(1.5, float(snd.volume or 0.6))), 2)))
+        clips.append(ClipEdit(
+            id=sid, trim_start=round(ts, 3), trim_end=round(te, 3), volume=round(vol, 2),
+            filter=catalog.pick("filters", c.filter), effect=catalog.pick("effects", c.effect),
+            motion=c.motion if c.motion in ("push_in", "pull_out") else "none",
+            music=round(max(0.0, min(1.0, float(c.music if c.music is not None else 1.0))), 2),
+            sounds=sounds, note=(c.note or "")[:200]))
     if plan.even_loudness:
         gains = _loudness_gains([infos[s] for s in order])
         for c in clips:  # only clips the plan left at 1.0 get the automatic gain
@@ -240,6 +289,7 @@ def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> Ed
                 c.volume = gains[c.id]
     length = {c.id: infos[c.id].duration - c.trim_start - c.trim_end for c in clips}
 
+    CAPCUT_TRANSITIONS = catalog.CAPCUT_TRANSITIONS
     tr_by = {t.after: t for t in plan.transitions}
     transitions: list[Transition] = []
     for a, b in zip(order, order[1:]):
@@ -249,13 +299,27 @@ def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> Ed
         dur = min(dur, 0.45 * length[a], 0.45 * length[b])  # never eat more than half of a clip
         if typ != "cut" and dur < 0.1:
             typ, dur = "cut", 0.0
-        transitions.append(Transition(after=a, type=typ, duration=round(dur, 3), reason=t.reason[:200]))
+        capcut = t.capcut if typ != "cut" and t.capcut in CAPCUT_TRANSITIONS else None
+        sound = _query(t.sound) if budget > 0 else None
+        budget -= 1 if sound else 0
+        transitions.append(Transition(after=a, type=typ, duration=round(dur, 3), reason=t.reason[:200],
+                                      capcut=capcut, sound=sound))
 
     total = sum(length.values()) - sum(t.duration for t in transitions)
     fi = max(0.0, min(3.0, float(plan.fade_in), total / 4))
     fo = max(0.0, min(4.0, float(plan.fade_out), total / 3))
-    return plan.model_copy(update={"clips": clips, "transitions": transitions,
-                                   "fade_in": round(fi, 3), "fade_out": round(fo, 3), "notes": plan.notes[:1500]})
+    return plan.model_copy(update={
+        "clips": clips, "transitions": transitions, "fade_in": round(fi, 3), "fade_out": round(fo, 3),
+        "notes": plan.notes[:1500], "look": catalog.pick("filters", plan.look),
+        "look_strength": round(max(0.1, min(1.0, float(plan.look_strength or 0.6))), 2),
+        "music_query": _query(plan.music_query), "title": " ".join((plan.title or "").split())[:80] or None,
+        "title_in": catalog.pick("text_in", plan.title_in), "subtitle_in": catalog.pick("text_in", plan.subtitle_in)})
+
+
+def _query(text: str | None) -> str | None:
+    """A search phrase as sent to the sound library: a few plain words, nothing else."""
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", text or "")[:6]
+    return " ".join(words).lower()[:60] or None
 
 
 # --- timeline -----------------------------------------------------------------
@@ -436,7 +500,11 @@ in Vietnamese.
 Also: fade_in (0.3-1.0 s from black), fade_out (0.8-2.5 s ending), duck_music (true when there is music and the
 clips have dialogue or important sound), even_loudness (normally true), normalize (normally true).
 `notes`: 2-4 sentences in Vietnamese explaining the rhythm and the choices, for the user.
-Return exactly one clips entry per scene and one transitions entry per neighbouring pair, using the given ids."""
+Return exactly one clips entry per scene and one transitions entry per neighbouring pair, using the given ids.
+If the brief has an "Edit style to imitate" section, the user wants this film cut like a reference video they
+analysed: follow it for the rhythm (how long shots stay, where to cut harder), the kinds of transitions, the
+fades, the music level and where it rises or drops, and (when finishing) the colour look and sound effects.
+The rules above still win where the guide would break them (never cut into speech or the key action)."""
 
 
 def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_music: bool) -> str:
@@ -445,6 +513,8 @@ def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_mus
     if sb.style:
         lines.append(f"Style: {sb.style}")
     lines.append(f"Background music: {'yes' if has_music else 'no'}")
+    if (sb.edit_style or "").strip():
+        lines.append("Edit style to imitate (learnt from a reference video):\n" + sb.edit_style.strip()[:4000])
     lines.append("Scenes in film order:")
     for sid in order:
         s, i = scenes[sid], infos[sid]
@@ -460,11 +530,62 @@ def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_mus
     return "\n".join(lines)
 
 
+SHEET_ROWS = 4  # scenes on one contact sheet
+SHEET_CELL = 256
+
+
+def frame_sheets(clips: list[tuple[str, Path]], infos: dict[str, ClipInfo], folder: Path,
+                 log: Log = print) -> list[tuple[Path, list[str]]]:
+    """Contact sheets so the agent can see the footage: [(sheet.jpg, [scene ids, top row first])].
+    Each row is one scene: a frame near its start, its middle and its end."""
+    ffmpeg = _need("ffmpeg")
+    folder.mkdir(parents=True, exist_ok=True)
+    cell = (f"scale={SHEET_CELL}:{SHEET_CELL}:force_original_aspect_ratio=decrease,"
+            f"pad={SHEET_CELL}:{SHEET_CELL}:(ow-iw)/2:(oh-ih)/2")
+    sheets = []
+    for n in range(0, len(clips), SHEET_ROWS):
+        group = clips[n:n + SHEET_ROWS]
+        with tempfile.TemporaryDirectory() as tmp:
+            k = 0
+            for sid, path in group:
+                d = infos[sid].duration
+                for frac in (0.1, 0.5, 0.9):
+                    k += 1
+                    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{d * frac:.2f}", "-i", str(path),
+                                    "-frames:v", "1", "-vf", cell, "-q:v", "4", str(Path(tmp) / f"{k:03}.jpg")],
+                                   capture_output=True, timeout=60)
+            sheet = folder / f"sheet{n // SHEET_ROWS + 1:02}.jpg"
+            proc = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(Path(tmp) / "%03d.jpg"),
+                                   "-frames:v", "1", "-vf", f"tile=3x{len(group)}", "-q:v", "4", str(sheet)],
+                                  capture_output=True, timeout=60)
+        if proc.returncode == 0 and sheet.is_file():
+            sheets.append((sheet, [sid for sid, _ in group]))
+    return sheets
+
+
 def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has_music: bool,
-            backend: str = "auto", api_key: str | None = None, timeout: int = 600, log: Log = print) -> EditPlan:
+            backend: str = "auto", api_key: str | None = None, timeout: int = 900, capcut: bool = False,
+            pro: bool = False, sheets: list[tuple[Path, list[str]]] | None = None, log: Log = print) -> EditPlan:
+    """capcut: the film is finished in CapCut, so the agent also picks a CapCut transition for every cut.
+    pro: the agent also does the finishing layer (colour, effects, camera moves, sound design, title) and,
+    given `sheets` (frame_sheets), looks at the footage first."""
     from .planner import MODEL, _subscription_env, claude_code_binary
 
+    system = SYSTEM
+    sheets = sheets or []
+    if capcut:
+        from .capcut import agent_guide, finishing_guide
+
+        system += agent_guide()
+        if pro:
+            system += finishing_guide(has_music, bool(sheets))
+    looks = "".join(f"\n- {p.name}: rows top to bottom = {', '.join(ids)} (columns: start, middle, end of the clip)"
+                    for p, ids in sheets)
+
     user = _brief(sb, infos, order, has_music) + "\n\nWrite the edit plan."
+    if sheets:
+        user += "\n\nContact sheets of the footage" + (
+            " (image files in the current folder; open each one with the Read tool first):" + looks)
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     log(f"Agent dựng phim (Claude, {'gói Claude Code' if backend == 'claude_code' else 'API'}) đang xem kịch bản và các clip…")
@@ -473,9 +594,12 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
         if not binary:
             raise RuntimeError("không thấy lệnh `claude` (Claude Code)")
         schema = json.dumps(EditPlan.model_json_schema())
-        cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
-               "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
-        with tempfile.TemporaryDirectory() as cwd:
+        cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", system,
+               "--tools", "Read" if sheets else "", "--strict-mcp-config", "--no-session-persistence"]
+        if sheets:
+            cmd += ["--allowedTools", "Read"]
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = str(sheets[0][0].parent) if sheets else tmp  # the agent only sees the sheets' folder
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
                                       env=_subscription_env())
@@ -498,8 +622,17 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
             import anthropic
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
+        content: list | str = user
+        if sheets:
+            import base64
+
+            content = [{"type": "text", "text": user}]
+            for path, _ in sheets:
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg",
+                    "data": base64.standard_b64encode(path.read_bytes()).decode()}})
         response = anthropic.Anthropic().messages.parse(
-            model=MODEL, max_tokens=8000, system=SYSTEM, messages=[{"role": "user", "content": user}],
+            model=MODEL, max_tokens=16000, system=system, messages=[{"role": "user", "content": content}],
             output_format=EditPlan, output_config={"effort": "medium"},
             extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
         )
@@ -507,6 +640,7 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
             raise RuntimeError("Claude không lập được kế hoạch dựng cho phim này.")
         plan = response.parsed_output
     plan.source = "ai"
+    plan.pro = bool(capcut and pro)
     return sanitize(plan, infos, order)
 
 
@@ -536,14 +670,22 @@ def save_plan(plan: EditPlan, out_dir: Path) -> Path:
 
 def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, engine: str = "auto",
               replan: bool = False, has_music: bool = False, backend: str = "auto", api_key: str | None = None,
-              ai_available: bool = True, log: Log = print) -> tuple[EditPlan, dict[str, ClipInfo]]:
-    """engine: auto (Claude if available, else rules) | ai | rules. A saved plan is reused unless replan."""
+              ai_available: bool = True, capcut: bool = False, pro: bool = False,
+              log: Log = print) -> tuple[EditPlan, dict[str, ClipInfo]]:
+    """engine: auto (Claude if available, else rules) | ai | rules. A saved plan is reused unless replan.
+    capcut: the plan is for a CapCut project (the agent may use CapCut's transitions).
+    pro: with capcut, the agent looks at the footage and adds the finishing layer; a saved plan the agent or
+    the rules made without that layer is replaced (a plan the user edited by hand is kept)."""
     if not clips:
         raise AssembleError("không có clip nào để dựng")
     order = [sid for sid, _ in clips]
     log(f"Phân tích {len(clips)} clip…")
     infos = analyze(clips, cache=out_dir / "edit_analysis.json", log=log)
     saved = None if replan else load_plan(out_dir)
+    can_ai = engine == "ai" or (engine == "auto" and ai_available)
+    if saved and capcut and pro and can_ai and not saved.pro and saved.source != "manual":
+        log("Bản dựng đã lưu chưa có lớp hoàn thiện (màu phim, âm thanh, chuyển động): agent dựng lại bản đầy đủ.")
+        saved = None
     if saved:
         log(f"Dùng bản dựng đã lưu ({plan_path(out_dir).name}, nguồn: {saved.source}). Bấm “Dựng lại từ đầu” để agent làm bản mới.")
         plan = sanitize(saved, infos, order)
@@ -553,7 +695,15 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
         plan = auto_plan(sb, infos, order)
     else:
         try:
-            plan = ai_plan(sb, infos, order, has_music=has_music, backend=backend, api_key=api_key, log=log)
+            sheets = []
+            if capcut and pro:
+                try:
+                    sheets = frame_sheets(clips, infos, out_dir / "edit_frames", log=log)
+                    log(f"Agent xem hình {len(clips)} cảnh ({len(sheets)} bảng ảnh)…")
+                except (AssembleError, OSError, subprocess.SubprocessError) as exc:
+                    log(f"⚠ Không trích được ảnh cảnh ({exc}); agent dựng theo kịch bản.")
+            plan = ai_plan(sb, infos, order, has_music=has_music, backend=backend, api_key=api_key,
+                           capcut=capcut, pro=pro, sheets=sheets, log=log)
         except RuntimeError as exc:
             if engine == "ai":
                 raise
@@ -562,8 +712,26 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
     save_plan(plan, out_dir)
     if plan.notes:
         log(f"Ghi chú dựng: {plan.notes}")
+    if plan.pro:
+        if plan.look:
+            log(f"  Màu phim: {plan.look} ({round(plan.look_strength * 100)}%)")
+        if plan.music_query and not has_music:
+            log(f"  Nhạc nền agent tìm: “{plan.music_query}”")
+        for c in plan.clips:
+            bits = [f"hiệu ứng {c.effect}" if c.effect else "", f"màu riêng {c.filter}" if c.filter else "",
+                    {"push_in": "đẩy máy vào", "pull_out": "kéo máy ra"}.get(c.motion, ""),
+                    f"nhạc {round(c.music * 100)}%" if c.music < 0.99 else "",
+                    *(f"tiếng “{x.query}”" for x in c.sounds)]
+            bits = [b for b in bits if b]
+            if bits:
+                log(f"  {c.id}: {', '.join(bits)}{f' — {c.note}' if c.note else ''}")
     for t in plan.transitions:
         label = TRANSITIONS[t.type][1]
+        if capcut:
+            from .capcut import CAPCUT_TRANSITIONS, transition_for
+
+            key = transition_for(t)
+            label = CAPCUT_TRANSITIONS[key].label if key else label
         log(f"  {t.after} → {label}{'' if t.type == 'cut' else f' {t.duration:.1f}s'}"
             f"{f' — {t.reason}' if t.reason else ''}")
     return plan, infos
