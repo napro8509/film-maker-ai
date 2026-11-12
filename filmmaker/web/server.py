@@ -223,6 +223,10 @@ class QCBody(BaseModel):
     force: bool = False
 
 
+class RewriteBody(BaseModel):
+    restage: bool = False  # re-stage the shot (new framing, no chaining), not just reword it
+
+
 class AskBody(BaseModel):
     question: str
     pictures: bool = True  # send portraits, cover and a contact sheet of the film along
@@ -492,6 +496,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                           "models_used": retirement.models_used(pipe, meta)}
             talk = sb.dialogue_warnings()
             qc_all = qc.load(out_dir(pid))
+            rewrites = ui_prefs.read(pdir(pid)).get("rewrites") or {}
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
                 kf = pipe.keyframe_path(s)
@@ -515,6 +520,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
                     "video_prompt": sb.for_flow_video(sb.text_only_prompt(s) if (i2v_off and sb.fallback_t2v and s.mode == "keyframe") else sb.video_prompt(s), s),
                     "rendered_as": st.get("rendered_as"),
+                    "rewrites": len(rewrites.get(s.id) or []) if isinstance(rewrites, dict) else 0,
                     "image_prompt": sb.for_flow(sb.image_prompt(s)) if s.mode == "keyframe" else None,
                     "model": s.model or sb.model,
                     "model_status": meta.status(eff),
@@ -1494,6 +1500,79 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if reason:
             raise HTTPException(409, detail={"message": f"[{sid}] {msg}", "reason": reason})
         return detail(pid)  # outside jobs.lock: ffprobe/retirement for the whole project need no lock
+
+    def _when(stamp: Any) -> float:
+        try:
+            return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _scene_snapshot(scene: dict) -> dict[str, Any]:
+        return {k: scene.get(k) for k in ("prompt", "image_prompt", "dialogue", "camera")}
+
+    @app.post("/api/projects/{pid}/scenes/{sid}/rewrite-prompt")
+    def rewrite_prompt(pid: str, sid: str, body: RewriteBody | None = None) -> dict[str, Any]:
+        """“Viết lại prompt”: Flow refused the scene (prominent people, harmful content, audio failed, clip
+        deleted…). Claude rewrites the scene from the error so the same beat gets through. Not a job: nothing
+        is sent to Flow; the user renders again when ready.
+
+        Every rewrite is kept in ui.json (`rewrites`). Those Flow refused afterwards are sent back to Claude, who
+        then re-stages the shot (new framing, no chaining from the previous keyframe) instead of rewording it:
+        rewording alone does not get past a refusal Flow makes on the picture or the moment as a whole."""
+        from .. import reviewer
+
+        restage = bool(body and body.restage)
+        pdir(pid)
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        if not any(x.id == sid for x in sb.scenes):
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        st = State(out_dir(pid) / "state.json").scene(sid)
+        error = str(st.get("error") or "").strip()
+        if not error:
+            raise HTTPException(400, f"[{sid}] Cảnh này không có lỗi từ Flow để viết lại.")
+        raw = read_raw(pid)
+        scene = next((x for x in raw.get("scenes") or [] if isinstance(x, dict) and x.get("id") == sid), None)
+        if scene is None:
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        hist = [e for e in (ui_prefs.read(pdir(pid)).get("rewrites") or {}).get(sid) or [] if isinstance(e, dict)]
+        sent = _when(st.get("submitted_at") or st.get("updated_at"))
+        earlier = [e for e in hist if _when(e.get("at")) < sent]  # rewrites that were rendered and refused
+        if restage and not earlier:
+            earlier = [_scene_snapshot(scene)]  # the version that just failed
+        try:
+            fix = reviewer.soften_scene(sb, sid, error, earlier=earlier or None, backend=backend,
+                                        api_key=load_settings().get("anthropic_api_key") or None)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(502, f"Claude không viết lại được: {exc}")
+        fix.id = sid
+        changed = reviewer.apply_scene_fixes(raw, [fix])
+        restaged = bool(changed and earlier)
+        if restaged and scene.get("continue_previous") is not False:
+            scene["continue_previous"] = False  # a new framing: do not start from the previous scene's picture
+        if restaged and fix.camera is None and isinstance(scene.get("camera"), dict):
+            # the old shot size / lens / composition describe the refused framing: keep only the move and speed
+            kept = {k: v for k, v in scene["camera"].items() if k in ("movement", "speed")}
+            if kept:
+                scene["camera"] = kept
+            else:
+                scene.pop("camera", None)
+        if changed:
+            write_raw(pid, raw)
+            entry = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **_scene_snapshot(scene)}
+            ui_prefs.update(pdir(pid), lambda p: p.setdefault("rewrites", {}).__setitem__(
+                sid, ((p.get("rewrites") or {}).get(sid) or [])[-9:] + [entry]))
+        out = detail(pid)
+        out["rewrite"] = {"scene": sid, "changed": bool(changed), "restaged": restaged, "attempt": len(hist) + 1,
+                          "issues": fix.issues, "prompt": fix.prompt, "image_prompt": fix.image_prompt,
+                          "dialogue": [d.model_dump(exclude_none=True) for d in fix.dialogue] if fix.dialogue is not None else None}
+        return out
 
     # ---- editor agent: edit plan (edit.json) ----
 

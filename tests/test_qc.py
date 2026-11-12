@@ -312,11 +312,25 @@ def test_dialogue_scene_gets_frames_taken_while_the_line_is_heard(film, fake_cla
                                                       "segments": [{"start": 0.2, "end": 1.4, "text": "เราไม่เป็นไร"}]})
     qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
     label = fake_claude[0]["images"][-1]
-    assert "while the line is heard" in label and "0.35s" in label and (out / "qcw" / "s01_speaking.jpg").is_file()
-    assert "sai người nói" in qc.SYSTEM
+    assert "while the line is heard" in label and "0.3s" in label and "1.3s" in label
+    assert "6 frames" in label and (out / "qcw" / "s01_speaking.jpg").is_file()
+    assert "sai người nói" in qc.SYSTEM and "Check EVERY frame" in qc.SYSTEM
     fake_claude.clear()
     qc.check_scene(sb, sb.scenes[1], clip, kf, out / "qcw")  # no dialogue written: no who-speaks frames
     assert not any("while the line" in x for x in fake_claude[0]["images"])
+
+
+@needs_ffmpeg
+def test_speaking_frames_span_a_line_whisper_cut_in_pieces(tmp_path):
+    # s05 of "18 ngày": the coach mouthed the first words of the boy's line. Frames must cover the whole line.
+    d = tmp_path
+    clip = d / "c.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=10:duration=6",
+                    str(clip)], check=True)
+    segs = [{"start": 0.2, "end": 1.0, "text": "a"}, {"start": 1.1, "end": 2.0, "text": "b"},
+            {"start": 4.5, "end": 5.0, "text": "c"}]
+    _, times = qc.speaking_frames(clip, segs, d / "f.jpg")
+    assert len(times) == 6 and times[0] < 0.5 and 1.5 < times[-1] < 2.0  # both pieces, not the far one
 
 
 @needs_ffmpeg
@@ -337,3 +351,24 @@ def test_whispered_line_gets_a_more_sensitive_second_listen(film, fake_claude, n
     calls.clear()
     qc.check_scene(sb, sb.scenes[1], clip, kf, out / "qcw")  # no line expected: one listen is enough
     assert calls == [None]
+
+
+@needs_ffmpeg
+def test_a_line_cried_over_rain_gets_a_listen_without_the_detector(film, fake_claude, no_whisper, monkeypatch):
+    # s15 of "18 ngày": the mother's line was sobbed over heavy rain; the speech detector heard nothing at any
+    # threshold, but whisper on the whole clip found "con ơi, con của mẹ".
+    d, out = film
+    kf, clip = _media(out, "s01")
+    sb = load_storyboard(d / "storyboard.yaml")
+    calls = []
+
+    def fake(c, vad_threshold=None, *, use_vad=True):
+        calls.append((vad_threshold, use_vad))
+        segs = [] if use_vad else [{"start": 0.0, "end": 7.9, "text": "con ơi"}]
+        return {"language": "vi", "text": " ".join(x["text"] for x in segs), "segments": segs, "vad": use_vad,
+                "dropped": False}
+
+    monkeypatch.setattr(qc, "transcribe", fake)
+    res = qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
+    assert calls == [(None, True), (qc.FAINT_VAD, True), (None, False)]
+    assert "FAINT" in fake_claude[0]["user"] and "con ơi" in fake_claude[0]["user"] and res["transcript"] == "con ơi"

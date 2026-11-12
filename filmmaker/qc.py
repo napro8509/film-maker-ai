@@ -84,6 +84,10 @@ Check:
   the expected dialogue: if another character visibly speaks it (their mouth moves while the speaker's stays shut,
   or the speaker has their back to the camera and someone else talks), that is FAIL ("sai người nói"), and give a
   `prompt` that puts the speaker facing the camera and saying the line, with the others listening silently.
+  Check EVERY frame, not just some: Veo often splits one line between two people (the listener mouths the first
+  words, then the speaker the rest). If in any frame a character who has no line talks (mouth open mid-word,
+  gesturing as if speaking) while the line is heard, it is also FAIL ("sai người nói"), even when the right
+  speaker talks in the other frames. Name the frames and who talks in each in `sound`.
   Exact lip-sync timing you cannot verify from stills: do not guess about it.
 FAIL only for what a viewer would clearly notice; MINOR for small flaws; PASS when it is good.
 Give `prompt` only when a FAIL would likely be fixed by a different action prompt."""
@@ -194,10 +198,12 @@ def _looped(segs: list[dict[str, Any]]) -> bool:
 FAINT_VAD = 0.3  # second, more sensitive listen when a line was expected and nothing was heard (whispers)
 
 
-def transcribe(clip: Path, vad_threshold: float | None = None) -> dict[str, Any] | None:
+def transcribe(clip: Path, vad_threshold: float | None = None, *, use_vad: bool = True) -> dict[str, Any] | None:
     """{"language", "text", "segments": [{"start", "end", "text"}], "vad", "dropped"} via whisper.cpp;
-    None when it is not set up. With the speech detector, only stretches where someone speaks are transcribed."""
-    binary, model, vad = whisper_binary(), whisper_model(), vad_model()
+    None when it is not set up. With the speech detector, only stretches where someone speaks are transcribed.
+    `use_vad=False` listens to the whole clip (a line cried out over rain, which the detector skips)."""
+    binary, model = whisper_binary(), whisper_model()
+    vad = vad_model() if use_vad else None
     if not binary or not model:
         return None
     with tempfile.TemporaryDirectory(prefix="fm-qc-") as tmp:
@@ -231,15 +237,20 @@ def transcribe(clip: Path, vad_threshold: float | None = None) -> dict[str, Any]
 # --- one scene -------------------------------------------------------------------
 
 
-SPEAK_FRAMES = 4
+SPEAK_FRAMES = 6  # spread over the whole line: a line split between two mouths must show
 
 
 def speaking_frames(clip: Path, segments: list[dict[str, Any]], dest: Path) -> tuple[Path, list[float]] | None:
-    """A strip of frames taken while speech is heard (first line), to see whose mouth moves."""
+    """A strip of frames taken while speech is heard (the first line, or the first two seconds-or-more of speech
+    when whisper split it into short pieces), to see whose mouth moves."""
     segs = [s for s in segments if s["end"] > s["start"]]
     if not segs:
         return None
     a, b = segs[0]["start"], segs[0]["end"]
+    for s in segs[1:]:  # "Không được, đoạn này dài quá" | "Nắm tay nhau…": one line, two pieces
+        if b - a >= 2.5 or s["start"] - b > 0.6:
+            break
+        b = s["end"]
     times = [round(a + (b - a) * (i + 0.5) / SPEAK_FRAMES, 2) for i in range(SPEAK_FRAMES)]
     sel = "+".join(f"lt(prev_pts*TB\\,{x})*gte(pts*TB\\,{x})" for x in times)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -285,6 +296,10 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         soft = transcribe(clip, vad_threshold=FAINT_VAD)  # a whispered line the detector skipped
         if soft and soft["segments"]:
             speech = {**soft, "faint": True}
+        else:  # sobbing or shouting over rain / music: the detector hears no voice at any threshold
+            whole = transcribe(clip, use_vad=False)
+            if whole and whole["segments"]:
+                speech = {**whole, "faint": True}
     strip = reviewer._sheet(clip, work / f"{s.id}_frames.jpg", cols=FRAMES, rows=1, height=300)
     images: list[tuple[str, Path]] = []
     if keyframe and keyframe.is_file():
@@ -303,7 +318,7 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         facts.append("Transcript: not available (speech-to-text is not set up): judge the sound from the audio "
                      "levels only and say the dialogue could not be checked.")
     else:
-        how = ("FAINT: nothing was heard at first, a more sensitive listen found a very soft voice (a whisper?): the "
+        how = ("FAINT: nothing was heard at first, a more sensitive listen found a voice that is very soft or buried in other sound (a whisper, a sob over rain?): the "
                "words may be wrong; do not FAIL for a missing line" if speech.get("faint") else
                "speech detector on: only stretches with a voice were transcribed" if speech.get("vad") else
                "no speech detector: on music or ambient sound the transcript may be made up")

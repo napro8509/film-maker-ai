@@ -220,7 +220,7 @@ def test_detail_video_prompt_no_dialogue(client):
     make_project(client, pid="mute", dialogue_language="none")
     st = client.get("/api/projects/mute").json()["scene_state"]
     assert st["s01"]["video_prompt"].count(NO_DIALOGUE_RULE) == 1
-    assert "All spoken dialogue is in" not in st["s01"]["video_prompt"]
+    assert "Spoken language:" not in st["s01"]["video_prompt"]
 
 
 def test_detail_without_language_unchanged(client):

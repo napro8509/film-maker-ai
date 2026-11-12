@@ -192,6 +192,25 @@ def test_apply_scene_fixes_only_touches_given_fields():
                                 "dialogue": [{"character": "Lan", "line": "Chào"}]}
 
 
+def test_review_can_add_the_real_speaker_as_a_new_character():
+    # s27 of "18 ngày": the farmer's line was given to WIT (an officer, not in the rice field). The reviewer saw
+    # it but could not name a speaker outside the list, so the fix was dropped and nothing said so.
+    raw = {"characters": [{"name": "WIT", "description": "naval officer"}],
+           "scenes": [{"id": "s27", "prompt": "The old farmer nods.", "characters": ["WIT"],
+                       "dialogue": [{"character": "WIT", "line": "Cứ để ngập ruộng tôi."}]}]}
+    rev = reviewer.StoryboardReview(verdict="REVISE", score=7, summary="", scenes=[
+        reviewer.SceneFix(id="s27", issues=["thoại của ông nông dân"],
+                          dialogue=[reviewer.DialogueFix(character="FARMER", line="Cứ để ngập ruộng tôi.")])],
+        characters=[reviewer.NewCharacter(name="FARMER", description="70-year-old Thai farmer, straw hat"),
+                    reviewer.NewCharacter(name="wit", description="duplicate, ignored")])
+    assert reviewer.add_characters(raw, rev.characters) == ["FARMER"]
+    assert reviewer.apply_scene_fixes(raw, rev.scenes) == ["s27"]
+    s27 = raw["scenes"][0]
+    assert s27["dialogue"] == [{"character": "FARMER", "line": "Cứ để ngập ruộng tôi."}]
+    assert s27["characters"] == ["WIT", "FARMER"]
+    assert "ADD that person" in reviewer.STORYBOARD_SYSTEM
+
+
 def test_frame_strip_and_contact_sheet(tmp_path):
     import subprocess
     v = tmp_path / "v.mp4"
@@ -338,6 +357,66 @@ def test_audio_failure_is_rewritten_with_gentler_dialogue_then_sent_once(env, mo
     assert any("không tạo được âm thanh" in l for l in lines) and any("thoại mới" in l for l in lines)
     assert len([c for c in calls() if c[0] == "video"]) == n + 1  # one rewritten resend, not the old scene again
     assert p.data["resent"] == ["s02"]
+
+
+def test_prominent_people_refusal_is_rewritten_then_sent_once(env, monkeypatch):
+    # "18 ngày" (a true story): Flow refused s29/s37/s38 with "might violate our policies about generating
+    # prominent people", and the scene was sent again unchanged. Now Claude rewrites it first.
+    from filmmaker.pipeline import State
+    sb_path, calls, _ = env
+    _pilot(sb_path, review=False)[0].run()
+    out = sb_path.parent / "output" / "storyboard"
+    State(out / "state.json").update(
+        "s02", status="submitting", submitted_at="2026-11-11T00:00:00+00:00",
+        error="Flow (giao diện chat): Flow báo tạo video lỗi: warning\nFailed\nThis prompt might violate our "
+              "policies about generating prominent people. Please try a different prompt or send feedback.")
+    (out / "clips" / "s02.mp4").unlink()
+    got = []
+    monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw:
+                        got.append((system, user)) or schema(id="s02", prompt="A diver nods and steps forward",
+                                                            content_direction="Quiet courage"))
+    n = len([c for c in calls() if c[0] == "video"])
+    p, lines = _pilot(sb_path, review=False)
+    p._stage_videos({})
+    assert yaml.safe_load(sb_path.read_text())["scenes"][1]["prompt"] == "A diver nods and steps forward"
+    assert any("người nổi tiếng" in l for l in lines)
+    assert "prominent people" in got[0][1] and "true story" in got[0][0]
+    assert len([c for c in calls() if c[0] == "video"]) == n + 1 and p.data["resent"] == ["s02"]
+    assert "prominent people" in reviewer.STORYBOARD_SYSTEM
+
+
+def test_harmful_content_refusal_is_rewritten_too(monkeypatch):
+    # s45/s47: a sedated boy carried on a stretcher was refused as "harmful content".
+    from filmmaker.storyboard import Storyboard
+    sb = Storyboard.model_validate({"title": "x", "model": "veo-lite", "scenes": [
+        {"id": "s45", "mode": "t2v", "prompt": "a diver carries a sleeping boy", "duration": 8}]})
+    got = []
+    monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw: got.append((system, user)) or schema(id="s45"))
+    reviewer.soften_scene(sb, "s45", "Failed\nThis prompt might violate our policies about generating harmful content.")
+    assert "harmful content" in got[0][1] and "unconscious" in got[0][0]
+
+
+def test_scenes_flow_never_accepted_get_a_last_try_with_a_new_keyframe(env, monkeypatch):
+    # 18 ngày: s10/s14/s26/s42 got "Something went wrong" on every try with the same picture. After the usual
+    # retry, such scenes get a fresh (free) keyframe and one last send.
+    sb_path, _, _ = env
+    p, lines = _pilot(sb_path, review=False)
+    runs: list[dict] = []
+    left = iter([["s01", "s02", "s03"], ["s01", "s03"], ["s01", "s03"]])
+    monkeypatch.setattr(p, "_video_run", lambda **kw: runs.append(kw))
+    monkeypatch.setattr(p, "_unsent_failures", lambda: next(left))
+    monkeypatch.setattr(p, "_soften_blocked", lambda: None)
+    monkeypatch.setattr(p, "pipe", lambda *a: type("P", (), {"sb": p.sb(), "is_done": lambda self, s: True,
+                                                              "state": None})())
+    try:
+        p._stage_videos({})
+    except Exception:  # what follows the retries is not under test here
+        pass
+    assert runs[1] == {"only": {"s01", "s02", "s03"}, "confirm": set()}
+    modes = {s.id: s.mode for s in p.sb().scenes}
+    assert runs[2]["only"] == {"s01", "s03"}
+    assert runs[2]["force_keyframes"] == {sid for sid in ("s01", "s03") if modes[sid] == "keyframe"}
+    assert any("thử lần cuối" in l for l in lines)
 
 
 def test_soften_prompt_mentions_audio_only_for_audio_failures(monkeypatch):

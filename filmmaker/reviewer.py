@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from . import ai
-from .storyboard import NO_DIALOGUE, Storyboard
+from .storyboard import NO_DIALOGUE, Camera, Storyboard
 
 Verdict = Literal["PASS", "REVISE"]
 
@@ -29,6 +29,11 @@ class DialogueFix(BaseModel):
     delivery: str | None = None
 
 
+class NewCharacter(BaseModel):
+    name: str = Field(description="Short unique name in capitals, e.g. FARMER.")
+    description: str = Field(description="Fixed look in English, like the other characters: age, face, hair, outfit.")
+
+
 class SceneFix(BaseModel):
     id: str
     issues: list[str] = Field(default_factory=list, description="Problems found, short, in Vietnamese.")
@@ -37,6 +42,8 @@ class SceneFix(BaseModel):
     content_direction: str | None = Field(default=None, description="Corrected content direction (English), only when it must change.")
     narration: str | None = Field(default=None, description="Corrected subtitle line, only when it must change.")
     dialogue: list[DialogueFix] | None = Field(default=None, description="Full corrected dialogue of the scene, only when it must change.")
+    camera: Camera | None = Field(default=None, description="Full new camera direction (replaces the old one), only "
+                                  "when the shot itself changes (a new framing or composition).")
 
 
 class StoryboardReview(BaseModel):
@@ -44,6 +51,8 @@ class StoryboardReview(BaseModel):
     score: int = Field(description="1-10, overall quality of the storyboard as a short film for social video.")
     summary: str = Field(description="2-4 sentences in Vietnamese.")
     scenes: list[SceneFix] = Field(default_factory=list, description="Only the scenes that need a change.")
+    characters: list[NewCharacter] = Field(default_factory=list, description="Characters to ADD, only when a scene's "
+                                           "line belongs to someone not in the character list.")
 
 
 class KeyframeVerdict(BaseModel):
@@ -101,12 +110,19 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
 - Dialogue fits the clip (about 2-3 short lines in 8 seconds), nobody repeats a line, lines move the story.
   Lip-sync works best with ONE speaker per scene whose face is visible: fix scenes where two characters both
   speak by keeping one speaker (move the reply to the next scene's dialogue if it matters).
+- Every line is given to the person who says it in the picture. When it belongs to someone who is not in the
+  character list (a farmer, a nurse, a passer-by), ADD that person in `characters` (short NAME, look in English
+  like the others) and return the scene's full corrected `dialogue` with that name. A line given to a character
+  who is not in the scene is never left as it is: Veo is told to show that person speaking.
 - No visible text, captions or written words asked for anywhere.
 - Content Google Flow refuses or fails on (credits are lost: "Audio generation failed", or the clip is deleted):
   insults or slurs (above all about disability), threats, shouting, fights, bullying up close, injuries, pain,
   blood, weapons, and above all children in distress (hurt, crying hard, mocked, fighting). Rewrite such scenes
   mildly, keeping the story beat: dialogue without insults, calm/soft `delivery` instead of fierce or raised,
   action and image_prompt without pain or violence (feelings through faces and small gestures).
+- Real, identifiable people (Flow refuses "prominent people"): in a film based on a true event, prompts and
+  content directions must not point to the real persons — no real names, ranks, units or famous roles ("the
+  retired Navy SEAL", "the Australian doctor"), no "true story". Describe characters by look and action only.
 Fix only what clearly needs fixing; keep everything else exactly. For a scene you change, return only the
 fields that change (full new text for each), plus the issues. verdict PASS when it can be produced as is
 (small fixes still allowed), REVISE when the story or several scenes have real problems."""
@@ -160,6 +176,8 @@ verdict PASS when it is ready to publish, REVISE when something should be fixed 
 
 
 AUDIO_FAILED = "audio generation failed"  # Flow's words when it could not make a clip's sound
+PROMINENT = "prominent people"  # Flow's words when a prompt looks like real, well-known people
+HARMFUL = "harmful content"  # Flow's words when a scene looks like harm (often a child unconscious or in danger)
 
 SOFTEN_SYSTEM = COMMON + """
 Google Flow generated the clip of this scene and then deleted it (its safety filter), or refused it.
@@ -178,7 +196,30 @@ in distress. Then change all of these that apply:
 - Delivery: calm, quiet, sincere or soft, never fierce, sneering, screaming, crying hard or "raised voice".
 - Action and ambience: no fight, confrontation, bullying up close, pain, injury, limping, gritted teeth,
   sweat and tears together, or crowds jeering; keep the emotion (sad, worried, brave, kind) with faces, looks
-  and small gestures. With children, keep it especially mild and warm."""
+  and small gestures. With children, keep it especially mild and warm.
+
+When the error says the prompt "might violate our policies about generating prominent people", Flow thinks the
+scene shows real, identifiable people (a film based on a true event). Keep the story beat and the characters'
+names, but remove what points to the real persons: real names, ranks, units and famous roles ("retired Navy
+SEAL", "the Australian doctor"), nationality + job combinations, exact dates, places and true-event details
+that identify them, and words like "true story". Describe them as ordinary fictional people by look and action
+only. Give a new `prompt` and a new `content_direction`, and a new `image_prompt` too if the opening frame
+carries those details.
+
+When the error says "harmful content", the scene reads as harm, most often a child who looks unconscious, limp,
+sedated, trapped or in danger. Keep the story beat but show it safely: the child awake and calm or resting
+peacefully, carried gently with the face visible and relaxed, no masks over a still face, no limp bodies, no
+drowning or struggle in water; show danger through the setting and the adults' focus, not the child's body.
+
+When earlier rewrites of the scene are listed and Flow refused them the same way, rewording was not enough:
+Flow judges the opening picture and the whole moment, not single words. Change what is SHOWN, not just the
+wording. Re-stage the shot so it no longer recreates a well-known real photo, news footage or famous moment:
+another camera angle and framing (a close-up of one character's face or hands, the scene seen from behind or
+from far away, a detail such as lamp light on water), fewer people in frame, and different poses. Drop the
+famous details of the real event from the picture, the action and the dialogue (exact counts, dates, places,
+well-known quotes): keep the feeling, say it another way. Always give a new `image_prompt` then, a new
+`prompt` and `content_direction` that match it, and a new `camera` (the old shot size, lens and composition
+belong to the refused framing and would contradict the new picture)."""
 
 
 # --- storyboard text -------------------------------------------------------------
@@ -295,9 +336,28 @@ def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extr
     return ai.ask(FILM_SYSTEM, user, FilmReview, images=images, **kw)
 
 
-def soften_scene(sb: Storyboard, sid: str, error: str, **kw) -> SceneFix:
+def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SceneFix:
+    """`earlier`: previous rewrites of this scene that Flow refused too ({prompt, image_prompt, dialogue}),
+    oldest first. With them Claude re-stages the shot instead of rewording it again."""
     user = (storyboard_brief(sb) + f"\n\nScene {sid} was blocked by Flow: {error[:500]}\n"
             f"Rewrite scene {sid} so it can be generated.")
+    if earlier:
+        user += (f"\nThe scene was already rewritten {len(earlier)} time(s) and Flow still refused it. "
+                 "Those versions (all refused):")
+        for i, e in enumerate(earlier[-4:], 1):
+            user += f"\n  attempt {i}: opening frame: {str(e.get('image_prompt') or '-')[:600]}"
+            user += f"\n             action: {str(e.get('prompt') or '-')[:600]}"
+            if e.get("dialogue"):
+                user += "\n             dialogue: " + " / ".join(
+                    f"{d.get('character')}: {d.get('line')}" for d in e["dialogue"] if isinstance(d, dict))
+        user += ("\nRewording again will fail the same way: re-stage the shot as the instructions say (new "
+                 "framing and composition, fewer people, no famous details of the real event).")
+    if PROMINENT in error.lower():
+        user += ("\nFlow refused it as “prominent people”: rewrite the prompt and content direction so nothing "
+                 "points to real, identifiable persons, as the instructions say.")
+    if HARMFUL in error.lower():
+        user += ("\nFlow refused it as “harmful content”: show the beat safely, as the instructions say (no child "
+                 "who looks unconscious, limp or in danger).")
     if AUDIO_FAILED in error.lower():
         user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
                  "the instructions say, keeping the story point.")
@@ -309,8 +369,23 @@ def soften_scene(sb: Storyboard, sid: str, error: str, **kw) -> SceneFix:
 SCENE_FIELDS = ("prompt", "image_prompt", "content_direction", "narration")
 
 
+def add_characters(raw: dict, new: list[NewCharacter]) -> list[str]:
+    """Add the reviewer's new characters (a speaker missing from the list). Returns the names added."""
+    chars = raw.setdefault("characters", [])
+    have = {str(c.get("name", "")).strip().casefold() for c in chars if isinstance(c, dict)}
+    added: list[str] = []
+    for c in new:
+        name, desc = c.name.strip(), c.description.strip()
+        if name and desc and name.casefold() not in have:
+            chars.append({"name": name, "description": desc})
+            have.add(name.casefold())
+            added.append(name)
+    return added
+
+
 def apply_scene_fixes(raw: dict, fixes: list[SceneFix]) -> list[str]:
-    """Write the corrected fields into the raw storyboard dict. Returns the ids of the scenes changed."""
+    """Write the corrected fields into the raw storyboard dict. Returns the ids of the scenes changed.
+    A dialogue line by someone not in the character list is dropped (add them first with `add_characters`)."""
     by_id = {s.get("id"): s for s in raw.get("scenes") or [] if isinstance(s, dict)}
     names = {str(c.get("name", "")).strip().casefold() for c in raw.get("characters") or [] if isinstance(c, dict)}
     changed: list[str] = []
@@ -324,6 +399,14 @@ def apply_scene_fixes(raw: dict, fixes: list[SceneFix]) -> list[str]:
             if isinstance(val, str) and val.strip() and val.strip() != str(scene.get(f) or "").strip():
                 scene[f] = val.strip()
                 touched = True
+        if fix.camera is not None:
+            cam = fix.camera.model_dump(exclude_none=True)
+            if cam != (scene.get("camera") or {}):
+                if cam:
+                    scene["camera"] = cam
+                else:
+                    scene.pop("camera", None)
+                touched = True
         if fix.dialogue is not None:
             rows = [d.model_dump(exclude_none=True) for d in fix.dialogue
                     if d.line.strip() and d.character.strip().casefold() in names]
@@ -332,6 +415,11 @@ def apply_scene_fixes(raw: dict, fixes: list[SceneFix]) -> list[str]:
                 if not rows:
                     scene.pop("dialogue", None)
                 touched = True
+            cast = scene.get("characters")
+            if isinstance(cast, list):  # an explicit cast must include whoever now speaks
+                for r in rows:
+                    if r["character"].strip().casefold() not in {str(n).strip().casefold() for n in cast}:
+                        cast.append(r["character"].strip())
         if touched:
             changed.append(fix.id)
     return changed

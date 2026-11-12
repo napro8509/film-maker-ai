@@ -144,7 +144,7 @@ def test_flow_ui_no_dialogue(env, monkeypatch, lang):
         p = _prompt(c)
         assert p.count(NO_DIALOGUE_RULE) == 1, p
         if "Minh waits" not in p:  # s03 keeps the user's own pasted sentence
-            assert "All spoken dialogue is in" not in p, p
+            assert "Spoken language:" not in p, p
 
 
 # --- AC11: `filmmaker run --dry-run` ---------------------------------------------------------------------

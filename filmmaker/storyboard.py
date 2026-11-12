@@ -23,12 +23,18 @@ NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title 
 # Spoken language forced into every *video* prompt (never into image prompts or the fingerprints).
 LANG_MAX = 40
 NO_DIALOGUE = "none"  # stored value for "Không thoại"
-DIALOGUE_RULE = "All spoken dialogue is in {lang}; characters speak only {lang}."
+# Says the language of the lines, never that "characters speak": "characters speak only Thai" read as everyone
+# talking, and listeners mouthed or echoed the speaker's line.
+DIALOGUE_RULE = ("Spoken language: {lang}. Each line is said in {lang} only by the character it belongs to; "
+                 "nobody else repeats it, mouths it or talks along.")
+# The sentence used before; prompts that still carry it get the new one instead.
+OLD_DIALOGUE_RULE = re.compile(r"All spoken dialogue is in [^;.]+; characters speak only [^.]+\.?")
 NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
 # A scene without lines in a film with dialogue. Sending the language rule there ("characters speak only Thai")
 # made Veo invent lines in half of such scenes (a mother saying "it's ok, I'm here" in a scene meant to be silent).
 SILENT_SCENE_RULE = ("Nobody speaks in this scene: no dialogue, no words, no voice-over; the characters stay silent "
-                     "(breathing, sighs and crying are fine); background voices, if any, are an indistinct murmur; "
+                     "(breathing, sighs, crying, laughing and wordless humming are fine); background voices, if any, "
+                     "are an indistinct murmur; "
                      "only ambient sound and sound effects.")
 
 
@@ -692,9 +698,10 @@ class Storyboard(StoryboardDraft):
 
     def _speech_in_prompt(self, prompt: str) -> bool:
         """Speech written straight into the prompt ("Minh: …", "Lan says hello", "they talk"): such a scene does
-        have words even with no dialogue lines, so it is not told that nobody speaks."""
+        have words even with no dialogue lines, so it keeps the language rule. Singing is not talking: s10 of
+        "18 ngày" ("boys softly singing") got the language rule and Veo made up four lines."""
         if re.search(r"\b(?:say|says|said|saying|ask|asks|asked|whisper|whispers|whispered|shout|shouts|shouted|"
-                     r"reply|replies|replied|speak|speaks|spoke|speaking|talk|talks|talking|sing|sings|singing|"
+                     r"reply|replies|replied|speak|speaks|spoke|speaking|talk|talks|talking|"
                      r"call|calls|calling out|chat|chats|chatting|tell|tells|told)\b", prompt, re.IGNORECASE):
             return True
         names = [re.escape(c.name.strip()) for c in self.characters if c.name.strip()]
@@ -714,6 +721,7 @@ class Storyboard(StoryboardDraft):
                     base += "."
                 prompt = f"{base} {cues}" if base else cues
         rule = self.dialogue_rule()
+        prompt = OLD_DIALOGUE_RULE.sub(lambda _: rule, prompt)
         if (scene is not None and self.speaks() and rule and not scene.spoken_lines()
                 and rule.rstrip(".") not in prompt
                 and not self._speech_in_prompt(prompt.replace(SILENT_SCENE_RULE, ""))):

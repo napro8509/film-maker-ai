@@ -232,13 +232,25 @@ class Autopilot:
             if f.issues:
                 self.log(f"  [{f.id}] " + "; ".join(f.issues))
         changed: list[str] = []
-        self.edit_raw(lambda raw: bool(changed.extend(reviewer.apply_scene_fixes(raw, rev.scenes))) or bool(changed))
+        added: list[str] = []
+
+        def fix(raw: dict) -> bool:
+            added.extend(reviewer.add_characters(raw, rev.characters))
+            changed.extend(reviewer.apply_scene_fixes(raw, rev.scenes))
+            return bool(added or changed)
+
+        self.edit_raw(fix)
         try:
             self.sb()
         except Exception as exc:  # a fix broke the storyboard: never keep that
             raise AutoError(f"bản sửa của agent review làm storyboard lỗi: {exc}") from exc
+        if added:
+            self.log(f"Thêm nhân vật theo review: {', '.join(added)}")
         if changed:
             self.log(f"Đã sửa theo review: {', '.join(changed)}")
+        left = [f.id for f in rev.scenes if f.issues and f.id not in changed]
+        if left:
+            self.log(f"⚠ Review có góp ý nhưng không kèm bản sửa: {', '.join(left)} — xem lại các cảnh này nếu cần.")
         self.mark("review_storyboard", "done", f"{rev.score}/10, sửa {len(changed)} cảnh", score=rev.score,
                   verdict=rev.verdict, changed=changed)
 
@@ -414,13 +426,23 @@ class Autopilot:
         return report
 
     def _stage_videos(self, result: dict) -> None:
-        report = self._video_run(confirm=set())
-        pipe = self.pipe()
-        failed = [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and
-                  pipe.state.scene(s.id).get("status") != SUBMITTING]
+        self._video_run(confirm=set())
+        failed = self._unsent_failures()
         if failed:
             self.log(f"Thử lại cảnh lỗi (chưa trừ credit): {', '.join(failed)}")
             self._video_run(only=set(failed), confirm=set())
+        still = self._unsent_failures()
+        if still:
+            # Flow's agent kept answering "Something went wrong" for the same scenes (18 ngày: s10, s14, s26, s42
+            # failed every time while the others went through): it is the scene's picture, not chance. A new
+            # opening frame is free, so make one and send each such scene one last time.
+            modes = {sc.id: sc.mode for sc in self.sb().scenes}
+            kf = {sid for sid in still if modes.get(sid) == "keyframe"}
+            self.log(f"Vẫn lỗi trước khi Flow nhận (chưa trừ credit): {', '.join(still)}. "
+                     + ("Tạo lại keyframe (miễn phí) rồi " if kf else "")
+                     + f"thử lần cuối sau {RETRY_WAIT}s.")
+            self.sleep(RETRY_WAIT)
+            self._video_run(only=set(still), confirm=set(), force_keyframes=kf)
         self._soften_blocked()
         pipe = self.pipe()
         interrupted = [s.id for s in pipe.sb.scenes
@@ -442,9 +464,16 @@ class Autopilot:
         result["missing"] = missing
         self.mark("videos", "done" if not missing else "partial", f"{done}/{len(pipe.sb.scenes)} clip", missing=missing)
 
+    def _unsent_failures(self) -> list[str]:
+        """Scenes with no clip that Flow never accepted (no credit spent)."""
+        pipe = self.pipe()
+        return [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and
+                pipe.state.scene(s.id).get("status") != SUBMITTING]
+
     def _soften_blocked(self) -> None:
         """Scenes Flow blocked after it started (credits spent): it made the clip and then deleted it (safety
-        filter), or it could not make the clip's sound ("Audio generation failed"). Sending the same scene again
+        filter), it refused the scene as showing "prominent people" (real persons of a true story), or it could not
+        make the clip's sound ("Audio generation failed"). Sending the same scene again
         fails the same way, so Claude rewrites it gently, then it is sent once more (counts as its one resend)."""
         pipe = self.pipe()
         blocked = []
@@ -454,6 +483,10 @@ class Autopilot:
                 continue
             if BLOCKED_MARK in err:
                 blocked.append((s, "Flow đã xoá video (bộ lọc an toàn)"))
+            elif reviewer.PROMINENT in err.lower():
+                blocked.append((s, "Flow chặn vì cảnh giống người nổi tiếng / người thật"))
+            elif reviewer.HARMFUL in err.lower():
+                blocked.append((s, "Flow chặn vì cảnh trông như có hại (thường là trẻ em bất tỉnh / gặp nguy)"))
             elif reviewer.AUDIO_FAILED in err.lower():
                 blocked.append((s, "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"))
         if not blocked:

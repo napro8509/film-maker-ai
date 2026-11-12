@@ -1361,6 +1361,30 @@ function interruptedReasonText(err) {
   return s.length > 300 ? s.slice(0, 299) + "…" : s;
 }
 
+/* Flow refused the scene on policy grounds: sending the same prompt again fails the same way. */
+const POLICY_RE = /prominent people|harmful content|audio generation failed|violate our polic|Flow xoá video|safety filter|bộ lọc an toàn/i;
+function policyBlocked(st) {
+  return st.status !== "done" && !!st.error && POLICY_RE.test(String(st.error));
+}
+const S_REWRITING = new Set();
+async function rewritePrompt(sc, restage = false) {
+  if (!S.cur || S_REWRITING.has(sc.id)) return;
+  const pid = S.cur.id;
+  S_REWRITING.add(sc.id); refreshZones();
+  try {
+    await flushSave();
+    const d = await api("POST", `/api/projects/${pid}/scenes/${sc.id}/rewrite-prompt`, { restage });
+    if (S.cur && S.cur.id === pid) {
+      Object.assign(S.cur, d); // the server rewrote the storyboard: take its copy
+      renderMain();
+    }
+    const r = d.rewrite || {};
+    toast(r.changed ? `[${sc.id}] ${r.restaged ? "Đã đổi hẳn cách dựng cảnh (khung hình mới, không nối keyframe cảnh trước)" : "Đã viết lại prompt"} — bấm “${S.cur?.scene_state?.[sc.id]?.status === "interrupted" ? "Gửi lại" : "Thử lại"}” để tạo video`
+      : `[${sc.id}] Claude không đổi gì trong prompt`, r.changed ? "ok" : "");
+  } catch (e) { toast(e.message, "error"); }
+  finally { S_REWRITING.delete(sc.id); refreshZones(); }
+}
+
 function renderSceneActions(sc, { keyframe = true, video = true, retry = false, blocked = "" } = {}) {
   const st = S.cur.scene_state?.[sc.id] || {};
   const busy = jobRunning();
@@ -1383,6 +1407,19 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
     kids.push(h("div", { class: "scene-msg warn" }, `Model này ngừng ngày ${st.model_retires_label}. Clip hiện tại vẫn dùng được, nhưng Render lại sau ngày đó sẽ lỗi; nên đổi model trước khi render lại (sẽ tốn credit).`));
   } else if (st.status === "done" && st.model_status === "retired") {
     kids.push(h("div", { class: "scene-msg warn" }, `Model này đã ngừng từ ${st.model_retires_label}. Clip hiện tại vẫn dùng được; muốn render lại phải đổi model.`));
+  }
+  if (policyBlocked(st)) {
+    const busyRw = S_REWRITING.has(sc.id);
+    const n = st.rewrites || 0;
+    kids.push(h("div", { class: "scene-msg warn" },
+      h("div", {}, n
+        ? `Đã viết lại ${n} lần mà Flow vẫn từ chối: sửa chữ thôi chưa đủ, Flow đang chặn cả khung hình / khoảnh khắc. Hãy “Đổi hẳn cảnh quay”: góc máy và bố cục mới, ít người hơn, bỏ chi tiết nổi tiếng của sự kiện thật, không nối keyframe cảnh trước.`
+        : "Flow từ chối vì vi phạm chính sách — gửi lại y nguyên sẽ lỗi tiếp. Nhờ Claude viết lại prompt (giữ nguyên ý cảnh, bỏ chi tiết dễ bị chặn) rồi tạo lại video."),
+      h("div", { class: "row", style: { marginTop: "6px" } },
+        h("button", { class: "btn sm" + (n ? " ghost" : ""), disabled: busy || busyRw, title: "Claude viết lại prompt, ảnh mở đầu và thoại của cảnh này. Không gửi gì lên Flow.",
+          onclick: () => rewritePrompt(sc) }, icon(busyRw ? "refresh" : "sparkle"), busyRw ? "Đang viết lại…" : "Viết lại prompt", FREE()),
+        h("button", { class: "btn sm" + (n ? "" : " ghost"), disabled: busy || busyRw, title: "Dựng lại cảnh: góc máy, bố cục, số người trong khung đều đổi; tắt nối keyframe cảnh trước. Không gửi gì lên Flow.",
+          onclick: () => rewritePrompt(sc, true) }, icon("image"), "Đổi hẳn cảnh quay", FREE()))));
   }
   const row = h("div", { class: "row" });
   if (keyframe && sc.mode === "keyframe") {

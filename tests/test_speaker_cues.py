@@ -28,7 +28,7 @@ def test_cues_say_who_speaks_and_who_stays_silent():
     assert "Only TonTeen speaks" in cues and "TonTeen turns the face toward the camera" in cues
     assert "Malee keeps the mouth closed" in cues
     sent = sb.for_flow_video(sb.video_prompt(s), s)
-    assert cues in sent and sent.index(cues) < sent.index("All spoken dialogue is in Thai") < sent.index(NO_TEXT)
+    assert cues in sent and sent.index(cues) < sent.index("Spoken language: Thai") < sent.index(NO_TEXT)
     assert sb.for_flow_video(sent, s) == sent  # sending the sent prompt again adds nothing
 
 
@@ -73,7 +73,7 @@ def test_a_scene_without_lines_is_told_nobody_speaks():
     sb = _sb()
     quiet, talking = sb.scenes[1], sb.scenes[0]
     sent = sb.for_flow_video(sb.video_prompt(quiet), quiet)
-    assert SILENT_SCENE_RULE in sent and "speak only Thai" not in sent
+    assert SILENT_SCENE_RULE in sent and "Spoken language: Thai" not in sent
     assert sb.for_flow_video(sent, quiet) == sent
     assert DIALOGUE_RULE.format(lang="Thai") in sb.for_flow_video(sb.video_prompt(talking), talking)
     before = sb.scene_fingerprint(quiet)
@@ -116,3 +116,38 @@ def test_keyframe_is_staged_with_the_speaker_as_the_main_face(tmp_path, monkeypa
     pipe = Pipeline(sb, tmp_path / "out", g)
     pipe._make_keyframe(s, "proj", RunOptions())
     assert got and staging in got[0]
+
+
+def test_a_scene_without_lines_never_gets_the_language_rule():
+    # s10 of "18 ngày": "boys softly singing" counted as speech, the scene got "characters speak only Vietnamese"
+    # and Veo made up four lines.
+    from filmmaker.storyboard import SILENT_SCENE_RULE
+
+    sb = _sb()
+    quiet = sb.scenes[1]
+
+    def sent(prompt):
+        quiet.prompt = prompt
+        return sb.for_flow_video(sb.video_prompt(quiet), quiet)
+
+    singing = sent("The boys softly sing and laugh around the flashlight.")
+    assert SILENT_SCENE_RULE in singing and "Spoken language: Thai" not in singing
+    talking = sent("Malee says hello.")  # someone does talk: the language rule stays
+    assert "Spoken language: Thai" in talking and SILENT_SCENE_RULE not in talking
+    typed = sent("Malee: con ăn đi.")  # a line typed into the prompt is dialogue
+    assert "Spoken language: Thai" in typed
+    assert not sb._speech_in_prompt("The boys are singing.")
+
+
+def test_language_rule_names_the_language_not_who_talks():
+    # "characters speak only Vietnamese" read as everyone talking: listeners echoed the speaker's line.
+    from filmmaker.storyboard import DIALOGUE_RULE
+
+    sb = _sb()
+    s = sb.scenes[0]
+    sent = sb.for_flow_video(sb.video_prompt(s), s)
+    assert DIALOGUE_RULE.format(lang="Thai") in sent and "characters speak" not in sent
+    assert "only by the character it belongs to" in sent
+    s.prompt = "TonTeen steps away. All spoken dialogue is in Thai; characters speak only Thai. He sighs."
+    old = sb.for_flow_video(sb.video_prompt(s), s)  # the old sentence in a stored prompt is swapped, not doubled
+    assert "characters speak" not in old and old.count("Spoken language: Thai") == 1

@@ -121,7 +121,7 @@ def test_pasted_rule_is_not_repeated(pasted):
 def test_no_dialogue_rule(lang):
     sb = _sb(dialogue_language=lang)
     out = sb.for_flow_video("Lan walks")
-    assert out.count(NO_DIALOGUE_RULE) == 1 and "All spoken dialogue is in" not in out
+    assert out.count(NO_DIALOGUE_RULE) == 1 and "Spoken language:" not in out
     out = sb.for_flow_video(f"Lan walks. {NO_DIALOGUE_RULE} Rain falls.")
     assert out.count(NO_DIALOGUE_RULE) == 1
 
@@ -239,7 +239,7 @@ def test_pipeline_no_dialogue_rule(env):
     _check(calls, NO_DIALOGUE_RULE, {"i2v", "r2v", "t2v"})
     for c in calls():  # s03 (Minh) has the Vietnamese sentence pasted by hand: the user's own text stays
         if c[0] == "video" and "Minh" not in " ".join(c):
-            assert "All spoken dialogue is in" not in " ".join(c), c
+            assert "Spoken language:" not in " ".join(c), c
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
