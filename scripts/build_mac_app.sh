@@ -14,6 +14,7 @@ VENV_PY="$ROOT/.venv/bin/python"
 echo "→ Cài thư viện..."
 if ! PIPLOG="$("$VENV_PY" -m pip install -q -e '.[ai,ui,app]' 2>&1)"; then echo "$PIPLOG"; exit 1; fi
 echo "→ Tạo app..."
+VERSION="$("$VENV_PY" -c 'import filmmaker; print(filmmaker.__version__)')"
 
 PYCFG="$("$VENV_PY" -c 'import sys,os; print(os.path.join(sys.base_prefix,"bin",f"python{sys.version_info[0]}.{sys.version_info[1]}-config"))')"
 [ -x "$PYCFG" ] || { echo "Không tìm thấy $PYCFG"; exit 1; }
@@ -83,7 +84,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleExecutable</key><string>FilmMaker</string>
   <key>CFBundleIconFile</key><string>FilmMaker</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSDesktopFolderUsageDescription</key><string>Film Maker cần đọc mã nguồn và dự án phim nằm trong thư mục Desktop (kể cả khi điều khiển Flow để tạo video).</string>

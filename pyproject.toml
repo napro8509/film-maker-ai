@@ -1,6 +1,6 @@
 [project]
 name = "film-maker-ai"
-version = "0.1.0"
+version = "1.0.0"
 description = "Automate making videos on Google Flow (Veo) through gflow-cli: idea -> storyboard -> clips -> final film."
 readme = "README.md"
 requires-python = ">=3.10"
