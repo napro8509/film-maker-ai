@@ -2858,7 +2858,7 @@ function renderAnalysis() {
         h("div", { class: "muted small" }, "Phân tích video"),
         h("h1", {}, ai.title_vi || src.title || d.id),
         h("div", { class: "stats" },
-          h("span", {}, fmtDur(dur)), h("span", {}, m.aspect === "9:16" ? "Dọc 9:16" : "Ngang 16:9"),
+          h("span", {}, fmtDur(dur)), h("span", {}, (m.aspect === "9:16" ? "Dọc " : "Ngang ") + (m.ratio || m.aspect || "16:9")),
           h("span", {}, `${st.shots || 0} shot · TB ${st.average || 0}s/shot · ${st.cuts_per_minute || 0} cắt/phút`),
           src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener noreferrer" }, "Video gốc ", icon("external")) : null,
           d.rea?.used ? h("span", { class: "badge done mini" }, "rea-video") : null)),

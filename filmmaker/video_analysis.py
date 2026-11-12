@@ -409,7 +409,19 @@ def probe(path: Path) -> dict[str, Any]:
     if duration <= 0:
         raise AnalysisError("không đọc được độ dài video")
     return {"duration": round(duration, 3), "width": w, "height": h, "fps": fps,
-            "aspect": "9:16" if h > w else "16:9", "has_audio": any(s.get("codec_type") == "audio" for s in streams)}
+            "aspect": "9:16" if h > w else "16:9", "ratio": ratio_label(w, h), "has_audio": any(s.get("codec_type") == "audio" for s in streams)}
+
+
+def ratio_label(w: int, h: int) -> str:
+    """The frame shape as people name it: 16:9, 9:16, 4:3, 1:1, 2.39:1 ..."""
+    if not w or not h:
+        return "?"
+    r = w / h
+    for name, val in (("16:9", 16 / 9), ("9:16", 9 / 16), ("4:3", 4 / 3), ("3:4", 3 / 4), ("1:1", 1.0),
+                      ("4:5", 4 / 5), ("1.85:1", 1.85), ("2.39:1", 2.39)):
+        if abs(r - val) / val < 0.02:
+            return name
+    return f"{r:.2f}:1"
 
 
 def parse_showinfo(stderr: str) -> list[float]:
@@ -570,7 +582,7 @@ def _front_matter(text: str) -> tuple[dict, str]:
 
 def parse_timeline(text: str) -> list[dict[str, Any]]:
     """rea-video's reel/timeline.md: one line per shot inside a ```reel-timeline block."""
-    m = re.search(r"```reel-timeline\n(.*?)```", text, re.S)
+    m = re.search(r"```reel-timeline\n(.*?)(?:```|\Z)", text, re.S)
     rows = []
     for line in (m.group(1) if m else "").splitlines():
         mm = re.match(r"#(\d+)\s+([\d.]+)-([\d.]+)\s*(.*)$", line.strip())
@@ -594,12 +606,14 @@ def read_reel(out: Path) -> dict[str, Any] | None:
     if not (out / "REEL.md").is_file():
         return None
     card, _ = _front_matter((out / "REEL.md").read_text(encoding="utf-8", errors="replace"))
-    texts = {}
+    texts, full = {}, {}
     for name in REEL_FILES:
         p = out / name
         if p.is_file():
-            texts[name] = p.read_text(encoding="utf-8", errors="replace")[:REA_TEXT_MAX]
-    timeline = parse_timeline(texts.get("reel/timeline.md", ""))
+            full[name] = p.read_text(encoding="utf-8", errors="replace")
+            texts[name] = full[name][:REA_TEXT_MAX]
+    # Parse the whole timeline: a long video's timeline is far longer than what is sent to Claude.
+    timeline = parse_timeline(full.get("reel/timeline.md", ""))
     return {"card": card, "texts": texts, "timeline": timeline}
 
 
@@ -694,7 +708,7 @@ def _brief(src: dict, m: dict, reel: dict | None) -> str:
     st = rhythm_stats(m["shots"])
     lines = [f"Reference video: {src.get('title') or '(no title)'}"
              + (f" by {src['uploader']}" if src.get("uploader") else ""),
-             f"Length {m['duration']:.1f} s, {m['width']}x{m['height']} ({m['aspect']}), {m['fps']} fps, "
+             f"Length {m['duration']:.1f} s, {m['width']}x{m['height']} ({m.get('ratio') or m['aspect']}; the new film will be {m['aspect']}), {m['fps']} fps, "
              f"audio: {'yes' if m['has_audio'] else 'no'}"]
     if src.get("description"):
         lines.append("Description: " + " ".join(src["description"].split())[:800])
@@ -845,7 +859,7 @@ def analyze(source: str, folder: Path, *, use_rea: bool = True, backend: str = "
     src = fetch(source, folder, allow_local=allow_local, log=log, should_stop=should_stop)
     video = folder / src["file"]
     m = measure(video, log=log, should_stop=should_stop)
-    log(f"Video {fmt_time(m['duration'])}, {m['width']}x{m['height']} ({m['aspect']}), {len(m['shots'])} shot.")
+    log(f"Video {fmt_time(m['duration'])}, {m['width']}x{m['height']} ({m.get('ratio') or m['aspect']}), {len(m['shots'])} shot.")
     reel = None
     if use_rea:
         reel = run_rea(video, folder / "rea", log=log, should_stop=should_stop)
@@ -912,7 +926,7 @@ def report_markdown(data: dict) -> str:
     out = [f"# {ai.get('title_vi') or src.get('title') or 'Phân tích video'}", ""]
     if src.get("url"):
         out.append(f"Nguồn: {src['url']}")
-    out += [f"Độ dài {fmt_time(m.get('duration', 0))} · {m.get('width')}x{m.get('height')} ({m.get('aspect')}) · "
+    out += [f"Độ dài {fmt_time(m.get('duration', 0))} · {m.get('width')}x{m.get('height')} ({m.get('ratio') or m.get('aspect')}) · "
             f"{st.get('shots', 0)} shot · trung bình {st.get('average', 0)}s/shot · {st.get('cuts_per_minute', 0)} cắt/phút",
             "", "## Tóm tắt", ai.get("summary_vi", ""), "", f"**Thể loại:** {ai.get('genre_vi', '')}",
             f"**Mở đầu (hook):** {ai.get('hook_vi', '')}", f"**Vì sao hiệu quả:** {ai.get('why_it_works_vi', '')}",

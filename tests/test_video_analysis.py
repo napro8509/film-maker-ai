@@ -150,6 +150,24 @@ def test_parse_timeline_and_read_reel(tmp_path):
     assert va.read_reel(tmp_path / "nothing") is None
 
 
+def test_read_reel_long_timeline_is_parsed_whole(tmp_path):
+    # A 4-minute film gives a timeline far longer than the text sent to Claude: every shot must still be read.
+    (tmp_path / "reel").mkdir()
+    (tmp_path / "REEL.md").write_text("---\nreel: 1\nshots: 300\n---\n")
+    rows = "".join(f"#{n:02d} {n - 1}.0-{n}.0 | cam static | {'x' * 60}\n" for n in range(1, 301))
+    (tmp_path / "reel" / "timeline.md").write_text("```reel-timeline\n" + rows + "```\n")
+    reel = va.read_reel(tmp_path)
+    assert len(reel["timeline"]) == 300 and reel["timeline"][-1]["end"] == 300.0
+    assert len(reel["texts"]["reel/timeline.md"]) <= va.REA_TEXT_MAX
+    assert len(va.parse_timeline("```reel-timeline\n#01 0.0-1.0 | cam static\n")) == 1  # no closing fence
+
+
+def test_ratio_label():
+    assert va.ratio_label(1920, 1080) == "16:9" and va.ratio_label(1080, 1920) == "9:16"
+    assert va.ratio_label(1280, 536) == "2.39:1" and va.ratio_label(1000, 1000) == "1:1"
+    assert va.ratio_label(1000, 500) == "2.00:1" and va.ratio_label(0, 0) == "?"
+
+
 # --- fetch --------------------------------------------------------------------
 
 
