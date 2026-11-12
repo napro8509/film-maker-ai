@@ -137,7 +137,10 @@ function localSet(k, v) { try { localStorage.setItem("fm." + k, JSON.stringify(v
 const LANG_OTHER = "__other__";
 const DIALOGUE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"],
                         ["none", "Không thoại (chỉ nhạc/âm thanh)"]];
-const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"]];
+const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], ["Thai", "ไทย (Tiếng Thái)"],
+                        ["none", "Không phụ đề"]];
+/* "Không phụ đề": the film is made without subtitles (no tracks, no .srt, nothing burnt in). */
+const noSubs = (sb) => normLine(sb?.subtitle_language).toLowerCase() === "none";
 
 /* Every film always has three subtitle tracks. `narration` is the line in the primary track's language. */
 const SUB_TRACKS = [["vi", "Tiếng Việt", "Vietnamese"], ["th", "ไทย", "Thai"], ["en", "English", "English"]];
@@ -168,6 +171,8 @@ function setSubLine(sb, sc, code, value) {
 }
 /* Three inputs (vi / th / en) for one scene. */
 function subtitleFields(sb, sc, onChange) {
+  if (noSubs(sb)) return h("p", { class: "help" }, "Phim này không có phụ đề. ",
+    h("a", { href: "#", onclick: (e) => { e.preventDefault(); delete sb.subtitle_language; onChange(); renderMain(); } }, "Bật phụ đề"));
   const primary = primarySubCode(sb);
   return h("div", { class: "grid3" }, SUB_TRACKS.map(([code, label]) => field(
     `Phụ đề ${label}${code === primary ? " · gốc" : ""}`,
@@ -184,7 +189,7 @@ function cleanLang(v) {
   return s && s.length <= 40 ? s : null;
 }
 /* <select> of presets + "Khác…" (free text input shown only then); unset adds "Chưa đặt (Veo tự đoán)" = null. */
-function langPicker(presets, value, { unset, noNone } = {}) {
+function langPicker(presets, value, { unset } = {}) {
   const fold = (s) => String(s).toLowerCase();
   const hit = typeof value === "string" && value.trim() ? presets.find(([v]) => fold(v) === fold(value.trim())) : null;
   const empty = value == null || (typeof value === "string" && !value.trim());
@@ -201,7 +206,6 @@ function langPicker(presets, value, { unset, noNone } = {}) {
     if (select.value !== LANG_OTHER) return { ok: true, value: select.value };
     const v = cleanLang(input.value);
     if (!v) return { ok: false, msg: "hãy nhập tên ngôn ngữ (tối đa 40 ký tự, không có ký tự đặc biệt ẩn)" };
-    if (noNone && v.toLowerCase() === "none") return { ok: false, msg: "phụ đề cần một ngôn ngữ cụ thể, không dùng “none”" };
     return { ok: true, value: v };
   };
   return { el: h("div", { class: "stack tight" }, select, input), select, input, read };
@@ -1825,9 +1829,9 @@ function renderFinal() {
             h("input", { type: "range", min: 0, max: 1, step: 0.05, value: p.volume,
               oninput: (e) => { document.getElementById("volv").textContent = Math.round(e.target.value * 100) + "%"; },
               onchange: (e) => saveFinalPrefs({ ...finalPrefs(), volume: +e.target.value }) })) : null,
-          h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
+          noSubs(S.cur.storyboard) ? null : h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.burn_subtitles, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_subtitles: e.target.checked }) }),
             h("span", {}, "In phụ đề lên hình", h("span", { class: "sub" }, "Phim luôn có 3 track phụ đề Việt / Thái / Anh (bật/tắt trong trình phát) và 3 file .srt. Bản dịch còn thiếu được Claude tự dịch khi ghép. Khi dựng bằng CapCut, bật mục này để phụ đề thành track chữ sửa được trong CapCut."))),
-          p.burn_subtitles ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Track in lên hình"),
+          p.burn_subtitles && !noSubs(S.cur.storyboard) ? h("label", { class: "field" }, h("span", { class: "lbl" }, "Track in lên hình"),
             h("select", { value: p.burn_language || primarySubCode(S.cur.storyboard), onchange: (e) => saveFinalPrefs({ ...finalPrefs(), burn_language: e.target.value }) },
               SUB_TRACKS.map(([code, label]) => h("option", { value: code }, label)))) : null,
           h("label", { class: "check" }, h("input", { type: "checkbox", checked: p.allow_missing, onchange: (e) => saveFinalPrefs({ ...finalPrefs(), allow_missing: e.target.checked }) }),
@@ -1858,7 +1862,7 @@ function renderFinal() {
               return h("li", { lang: code }, h("span", { class: "mono muted" }, sc.id + " "), subLine(sb, sc, code),
                 own ? null : h("span", { class: "small muted" }, " (chưa dịch — tự dịch khi ghép)"));
             }))
-            : h("p", { class: "help" }, "Chưa có. Thêm phụ đề ở từng cảnh."));
+            : h("p", { class: "help" }, noSubs(sb) ? "Phim này không có phụ đề." : "Chưa có. Thêm phụ đề ở từng cảnh."));
       })));
 }
 
@@ -2700,7 +2704,7 @@ function openNewProject() {
     const aspect = h("select", {}, h("option", { value: "16:9" }, "Ngang 16:9"), h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"));
     const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
     const subSaved = cleanLang(localGet("subtitleLang"));
-    const sub = langPicker(SUBTITLE_LANGS, subSaved && subSaved.toLowerCase() !== "none" ? subSaved : "Vietnamese", { noNone: true });
+    const sub = langPicker(SUBTITLE_LANGS, subSaved || "Vietnamese");
     setTimeout(() => idea.focus(), 30);
     const go = async (e) => {
       if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return; }
@@ -2903,7 +2907,7 @@ function renderAnalysisFilmForm(d) {
   const n = h("input", { type: "number", min: 1, max: 20, value: d.suggested_scenes || 6 });
   const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
   const subSaved = cleanLang(localGet("subtitleLang"));
-  const sub = langPicker(SUBTITLE_LANGS, subSaved && subSaved.toLowerCase() !== "none" ? subSaved : "Vietnamese", { noNone: true });
+  const sub = langPicker(SUBTITLE_LANGS, subSaved || "Vietnamese");
   const go = async (e) => {
     const a = speak.read(), b = sub.read();
     if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); return; }

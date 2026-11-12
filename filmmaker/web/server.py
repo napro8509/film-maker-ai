@@ -39,7 +39,7 @@ from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, 
 from ..settings import DEFAULT_BACKUP_REMOTE, settings_path
 from ..gflow import Gflow, GflowError, _extract_json, _split
 from ..pipeline import DONE, Pipeline, RunOptions, State
-from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, Scene, Storyboard, clean_dialogue_language, clean_language,
+from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, NO_SUBTITLES, Scene, Storyboard, clean_dialogue_language, clean_language,
                           load_storyboard, merge_subtitles_raw, save_storyboard)
 from ..thumbnail import ThumbnailError
 from .. import video_analysis as va
@@ -851,7 +851,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log(f"Ý tưởng: {body.idea[:300]}")
             dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
                         else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
-            job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: {language}")
+            job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: "
+                    f"{'không phụ đề' if language.casefold() == NO_SUBTITLES else language}")
             sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=max(1, min(20, body.scenes)),
                               aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
             pid, d = new_project_dir(sb.title)
