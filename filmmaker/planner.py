@@ -11,7 +11,7 @@ import tempfile
 
 from . import durations as durations_mod
 from . import model_meta
-from .storyboard import (NO_DIALOGUE, Storyboard, StoryboardDraft, _line_key, clean_dialogue_language,
+from .storyboard import (NO_DIALOGUE, NO_SUBTITLES, Storyboard, StoryboardDraft, _line_key, clean_dialogue_language,
                          clean_language)
 
 MODEL = "claude-opus-5-5"
@@ -35,7 +35,7 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Continuity: each scene starts from the end state of the previous scene: the same positions of people, objects that were moved stay moved, the same light and time of day unless the story deliberately jumps.
 - After a time jump set `continue_previous: false`; when the place changes, change `location`.
 - Put the shared visual look in `style` once instead of repeating it.
-- `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
+- `narration` is an optional short subtitle line. Write it in the subtitle language given in the message (a "Subtitle (narration) language" or "Narration language" line); if there is no such line, in the SAME language as the user's idea. If the message says "Subtitles: none", the film has no subtitles: leave `narration` and `subtitles` empty in every scene. Subtitles are added from it later, so never ask for visible text in a prompt: no captions, subtitles, signs with words, title cards or written dialogue in `prompt` / `image_prompt`.
 - The film always has three subtitle tracks: whenever a scene has `narration`, also fill `subtitles` with that same line in Vietnamese (`vi`), Thai (`th`) and English (`en`); the one in the narration's own language is exactly the `narration` text, the other two are natural translations (not transliterations).
 - Direct the content of every scene in `content_direction` (English, 1-2 sentences): what the audience must understand and feel in this clip, the emotional beat, and how each character in it acts and reacts (expression, body language). Make each scene move the story forward.
 - Spoken lines go ONLY in `dialogue`, never in `prompt` / `image_prompt`: one row per line in the order spoken, `character` = exact character name, `line` = the exact words, `delivery` = how it is said in English (emotion, tone, volume, pace, e.g. "whispering, holding back tears"). Keep it short enough for the clip (about 2-3 short lines in 8 seconds). Characters take turns: one speaker per row, nobody talks at the same time.
@@ -104,16 +104,19 @@ def _user_message(idea: str, scenes: int, aspect: str, language_hint: str | None
     user = f"Idea: {idea}\nNumber of scenes: {scenes}\nAspect ratio: {aspect}"
     if durations:  # right after the aspect line, so the message still ends with the language line
         user += "\nAllowed clip durations (seconds): " + durations_mod.allowed_text(list(durations))
-    if dialogue_language is None:  # old clients / CLI without --dialogue-lang: unchanged message
+    no_subs = bool(language_hint) and language_hint.strip().casefold() == NO_SUBTITLES
+    if dialogue_language is None and not no_subs:  # old clients / CLI without --dialogue-lang: unchanged message
         if language_hint:
             user += f"\nNarration language: {language_hint}"
         return user
-    if dialogue_language.strip().casefold() == NO_DIALOGUE:
+    if dialogue_language is not None and dialogue_language.strip().casefold() == NO_DIALOGUE:
         user += "\nSpoken dialogue: none (no character speaks; only ambient sound, sound effects and music)"
-    else:
+    elif dialogue_language is not None:
         user += (f"\nSpoken dialogue language: {dialogue_language} "
                  f"(every character who speaks speaks only {dialogue_language})")
-    if language_hint:
+    if no_subs:
+        user += "\nSubtitles: none (the film has no subtitles: leave `narration` and `subtitles` empty in every scene)"
+    elif language_hint:
         user += f"\nSubtitle (narration) language: {language_hint}"
     return user
 
@@ -205,6 +208,10 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
         sb, used = plan(idea, **kw), "api"
     sb.dialogue_language = dialogue_language
     sb.subtitle_language = clean_language(kw.get("language_hint")) if sb.dialogue_language else None
+    if (kw.get("language_hint") or "").strip().casefold() == NO_SUBTITLES:
+        sb.subtitle_language = NO_SUBTITLES
+        for sc in sb.scenes:  # "Không phụ đề": nothing to show even if Claude wrote a line anyway
+            sc.narration, sc.subtitles = None, None
     # New projects never start on a model Flow is retiring (default: veo-lite).
     meta = model_meta.load()
     sb = model_meta.normalize_new_storyboard(sb, meta)
@@ -349,7 +356,9 @@ Vary the angle: the secret, the twist, the conflict, the emotion. Return only th
 def _story_summary(sb: Storyboard) -> str:
     lines = [f"Film title: {sb.title}"]
     if sb.dialogue_language == NO_DIALOGUE:
-        lines.append(f"Spoken language: none; write titles in {sb.subtitle_language}" if sb.subtitle_language
+        lines.append(f"Spoken language: none; write titles in {sb.subtitle_language}"
+                     if sb.subtitle_language and sb.has_subtitles
+                     else "Spoken language: none; write titles in the language of the film title" if sb.subtitle_language
                      else "Spoken language: none; write titles in the language of the narration lines")
     elif sb.dialogue_language:
         lines.append(f"Spoken language: {sb.dialogue_language}")

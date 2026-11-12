@@ -44,8 +44,8 @@ def test_language_constants():
     assert 'const LANG_OTHER = "__other__";' in SRC
     assert re.search(r'const DIALOGUE_LANGS = \[\["Vietnamese", "Tiếng Việt"\], \["English", "English"\], '
                      r'\["Thai", "ไทย \(Tiếng Thái\)"\],\s*\["none", "Không thoại \(chỉ nhạc/âm thanh\)"\]\];', SRC)
-    assert ('const SUBTITLE_LANGS = [["Vietnamese", "Tiếng Việt"], ["English", "English"], '
-            '["Thai", "ไทย (Tiếng Thái)"]];') in SRC
+    assert re.search(r'const SUBTITLE_LANGS = \[\["Vietnamese", "Tiếng Việt"\], \["English", "English"\], '
+                     r'\["Thai", "ไทย \(Tiếng Thái\)"\],\s*\["none", "Không phụ đề"\]\];', SRC)
     picker = _func("langPicker")
     assert '"Khác…"' in picker and '"Chưa đặt (Veo tự đoán)"' in picker
     assert "maxlength: 80" in picker  # not 40, so "> 40 chars" still reaches the toast (AC2)
@@ -56,7 +56,7 @@ def test_new_film_popup_fields_and_storage():  # AC1, AC3
     assert 'field("Nhân vật nói", speak.el)' in f and 'field("Ngôn ngữ phụ đề", sub.el)' in f
     assert 'langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese")' in f
     assert 'cleanLang(localGet("subtitleLang"))' in f and "langPicker(SUBTITLE_LANGS" in f
-    assert '!== "none"' in f  # "none" left in subtitleLang falls back to Vietnamese
+    assert 'langPicker(SUBTITLE_LANGS, subSaved || "Vietnamese")' in f  # "none" = Không phụ đề is remembered too
     assert "localStorage" not in f  # only through localGet/localSet ("fm." prefix)
 
 
@@ -176,7 +176,7 @@ def js(tmp_path_factory):
 
 
 DIALOGUE_LABELS = ["Tiếng Việt", "English", "ไทย (Tiếng Thái)", "Không thoại (chỉ nhạc/âm thanh)", "Khác…"]
-SUBTITLE_LABELS = ["Tiếng Việt", "English", "ไทย (Tiếng Thái)", "Khác…"]
+SUBTITLE_LABELS = ["Tiếng Việt", "English", "ไทย (Tiếng Thái)", "Không phụ đề", "Khác…"]
 
 
 def test_clean_lang(js):
