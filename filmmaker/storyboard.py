@@ -12,6 +12,10 @@ from typing import Literal, NamedTuple
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from . import formats
+from . import i2v_prompt
+from .i2v_prompt import VideoShot
+
 Aspect = Literal["16:9", "9:16"]
 Mode = Literal["t2v", "i2v", "keyframe"]
 
@@ -417,6 +421,18 @@ class SceneDraft(BaseModel):
 class Scene(SceneDraft):
     characters: list[str] | None = Field(
         default=None, description="Names of characters in this scene (overrides name detection).")
+    # Basic formats only (not in the drama planner's schema): the parts of the image-to-video prompt, joined by
+    # i2v_prompt.assemble with the house I2V templates. `prompt` keeps the action as a plain summary.
+    video_shot: VideoShot | None = Field(default=None, description="Structured image-to-video prompt (basic formats).")
+    screen_time: float | None = Field(default=None, ge=0.5, le=60, description="Seconds this scene stays on screen "
+                                      "in the final cut (films made from a reference video): the clip is rendered "
+                                      "at its usual length and the editor trims it to this. Omit to let the "
+                                      "editor decide.")
+
+    @field_validator("video_shot", mode="after")
+    @classmethod
+    def _empty_shot(cls, v: VideoShot | None) -> VideoShot | None:
+        return None if v is None or v.is_empty() else v
 
     @field_validator("characters")
     @classmethod
@@ -480,6 +496,47 @@ class Storyboard(StoryboardDraft):
     edit_style: str | None = Field(default=None, description="How to cut this film, learnt from a reference video "
                                    "(Phân tích video): rhythm, transitions, look, music and sound. The editor agent "
                                    "follows it. Never sent to Flow.")
+    # Chosen in "Phim mới". Empty `format` = short_drama (every project made before formats existed).
+    format: str | None = Field(default=None, description="Film format: short_drama (full drama flow: content "
+                               "direction, camera, dialogue, locations) or feature / series / short_film / clip "
+                               "(basic flow: picture -> video). Never sent to Flow.")
+    audio: str | None = Field(default=None, description="Basic formats: dialogue, silent, voiceover, onscreen_text "
+                              "or music. Sets the sound sentence added to every video prompt.")
+    visual_style: str | None = Field(default=None, description="Visual style picked when planning (realistic, 2d, "
+                                     "3d, anime, other); its sentence is already in `style`.")
+    genres: list[str] | None = Field(default=None, description="Genres picked when planning (family, romance...).")
+
+    @field_validator("format", "audio", "visual_style", mode="before")
+    @classmethod
+    def _choice(cls, v: object, info) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        allowed = {"format": formats.FORMATS, "audio": formats.AUDIO, "visual_style": formats.VISUALS}[info.field_name]
+        if not isinstance(v, str) or v.strip() not in allowed:
+            raise ValueError(f"must be one of: {', '.join(allowed)}")
+        return v.strip()
+
+    @field_validator("genres", mode="before")
+    @classmethod
+    def _genres(cls, v: object) -> list[str] | None:
+        return formats.clean_genres(v) or None
+
+    @property
+    def basic(self) -> bool:
+        """Basic text -> image -> video flow (I2V prompt guide): camera, content direction and dialogue rows are not used;
+        locations are (described once, their look added to the picture, the previous keyframe reused)."""
+        return formats.is_basic(self.format)
+
+    def spoken_language(self) -> str | None:
+        """Language of the words spoken in a basic film (None when nobody speaks / not set)."""
+        return self.dialogue_language if self.dialogue_language and self.speaks() else None
+
+    def audio_rule(self) -> str:
+        """Basic formats: the sound sentence for every video prompt ("" for the drama)."""
+        if not self.basic:
+            return ""
+        lang = self.dialogue_language if self.dialogue_language and self.speaks() else None
+        return formats.audio_rule(self.audio, lang)
 
     @field_validator("dialogue_language", mode="before")
     @classmethod
@@ -603,8 +660,9 @@ class Storyboard(StoryboardDraft):
             parts.append(setting)
         if chars is None:
             chars = self._characters_in(text)
-        if chars:
-            parts.append(" ".join(f"{c.name}: {c.description.strip()}." for c in chars))
+        if chars:  # basic formats: no "look.." double stop (the drama keeps its text: fingerprints)
+            parts.append(" ".join(f"{c.name}: {c.description.strip().rstrip('.') if self.basic else c.description.strip()}."
+                                  for c in chars))
         if self.style.strip():
             parts.append(f"Style: {self.style.strip().rstrip('.')}.")
         return " ".join(parts)
@@ -614,6 +672,13 @@ class Storyboard(StoryboardDraft):
         off does not mark finished scenes for re-rendering."""
         if not self.no_text or NO_TEXT in prompt:
             return prompt
+        if self.basic:  # I2V guide rule 6: one short closing sentence, not a long list of negatives
+            if i2v_prompt.NO_TEXT_IMAGE in prompt:
+                return prompt
+            base = prompt.rstrip()
+            if base and base[-1] not in ".!?":
+                base += "."
+            return f"{base} {i2v_prompt.NO_TEXT_IMAGE}" if base else i2v_prompt.NO_TEXT_IMAGE
         base = prompt.rstrip()
         if base and base[-1] not in ".!?":
             base += "."
@@ -698,7 +763,7 @@ class Storyboard(StoryboardDraft):
     def for_flow_keyframe(self, prompt: str, scene: Scene | None = None) -> str:
         """A keyframe prompt as actually sent to Flow: the dialogue staging (`keyframe_staging`), then
         `for_flow`. Not part of the fingerprints, so adding it remakes nothing that is already made."""
-        staging = self.keyframe_staging(scene) if scene is not None else ""
+        staging = self.keyframe_staging(scene) if scene is not None and not self.basic else ""
         if staging and "Staging for the dialogue" not in prompt:
             base = prompt.rstrip()
             if base and base[-1] not in ".!?":
@@ -721,6 +786,16 @@ class Storyboard(StoryboardDraft):
         """A video prompt as actually sent to Flow: who-is-who for the dialogue (`speaker_cues`, when the scene is
         given), the spoken-language sentence, then `for_flow` (NO_TEXT).
         None of these are part of the fingerprints, so adding them re-renders nothing."""
+        if self.basic and i2v_prompt.CLOSING in prompt:  # a structured I2V prompt is complete as it is
+            return prompt
+        if self.basic:  # one sound sentence, nothing from the drama flow
+            rule = self.audio_rule()
+            if not rule or rule.rstrip(".") in prompt:
+                return self.for_flow(prompt)
+            base = prompt.rstrip()
+            if base and base[-1] not in ".!?":
+                base += "."
+            return self.for_flow(f"{base} {rule}" if base else rule)
         cues = self.speaker_cues(scene) if scene is not None else ""
         if cues and "Who is who in the picture" not in prompt and "lips visibly move" not in prompt:
             if NO_TEXT in prompt:
@@ -746,6 +821,24 @@ class Storyboard(StoryboardDraft):
         return self.for_flow(f"{base} {rule}" if base else rule)
 
     def portrait_prompt(self, c: Character) -> str:
+        if self.basic and not (c.image_prompt and c.image_prompt.strip()):
+            # A natural everyday setting, not "full body on a plain studio background": that framing of a child
+            # is blocked by Google's child-safety filter (and no exact ages: child_safe).
+            # A film still of an everyday moment, the person DOING something (tested on Flow with a child: the
+            # studio "reference image" wording and a posed "smiling in a home" were both blocked; helping to set
+            # the table passed).
+            desc = i2v_prompt.child_safe(c.description.strip().rstrip("."))
+            if not re.match(r"(?i)(?:a|an|the)\b", desc):
+                desc = f"A cheerful {desc}"
+            who = ("she" if re.search(r"(?i)\b(?:girl|schoolgirl|woman|lady|mother|grandmother|grandma|sister|she|her)\b", desc)
+                   else "he" if re.search(r"(?i)\b(?:boy|schoolboy|man|father|grandfather|grandpa|brother|he|his)\b", desc)
+                   else "they")
+            base = (f"{desc}, smiling as {who} {'help' if who == 'they' else 'helps'} set the kitchen table in a "
+                    "bright, everyday home. Medium shot, face clearly visible, softly blurred background, soft "
+                    "natural light, photorealistic film still.")
+            if self.style.strip():
+                base += f" Style: {self.style.strip().rstrip('.')}."
+            return i2v_prompt.child_safe(i2v_prompt.soften_identical(base))
         if c.image_prompt and c.image_prompt.strip():
             base = c.image_prompt.strip().rstrip(".") + "."
         else:
@@ -754,7 +847,7 @@ class Storyboard(StoryboardDraft):
                     "plain light grey studio background, soft even lighting, sharp detail.")
         if self.style.strip():
             base += f" Style: {self.style.strip().rstrip('.')}."
-        return base
+        return i2v_prompt.child_safe(i2v_prompt.soften_identical(base)) if self.basic else base
 
     def thumbnail_prompt(self) -> str:
         """Cover picture prompt (the title is printed later, not drawn by the model)."""
@@ -834,6 +927,19 @@ class Storyboard(StoryboardDraft):
         """Problems with the dialogue, per scene id (Vietnamese, for the editor and `filmmaker check`):
         a line said twice (in the scene or in an earlier scene), unknown speaker, speaker not in the scene."""
         out: dict[str, list[str]] = {}
+        if self.basic:  # the I2V prompt guide instead (word count, names, missing camera / action...)
+            names = [c.name for c in self.characters]
+            for sc in self.scenes:
+                if sc.video_shot is not None:
+                    w = i2v_prompt.warnings(sc.video_shot, audio_mode=self.audio, narration=sc.narration, names=names)
+                    if w:
+                        out[sc.id] = w
+            if self.audio == "dialogue":
+                for sid in i2v_prompt.axis_breaks([(sc.id, sc.video_shot) for sc in self.scenes
+                                                   if sc.video_shot is not None]):
+                    out.setdefault(sid, []).append("Sai trục 180°: người đáp ở cảnh này phải đứng phía khung hình đối "
+                                                   "diện và nhìn ngược hướng với người nói ở cảnh trước.")
+            return out
         known = {c.name.strip().casefold() for c in self.characters if c.name.strip()}
         said: dict[str, str] = {}  # line key -> "scene id / speaker" that said it first
         for s in self.scenes:
@@ -916,6 +1022,13 @@ class Storyboard(StoryboardDraft):
         return " ".join(p for p in parts if p)
 
     def video_prompt(self, scene: Scene) -> str:
+        if self.basic:  # the motion only (the look is in the picture); t2v also gets characters and style
+            if scene.video_shot is not None:
+                return i2v_prompt.assemble(scene.video_shot, audio_mode=self.audio, language=self.spoken_language(),
+                                           narration=scene.narration)
+            if scene.mode == "t2v":
+                return self._compose(scene.prompt, "", self._prompt_characters(scene))
+            return scene.prompt.strip()
         perf = self.performance(scene)
         if scene.mode == "t2v":
             return self._compose(scene.prompt, self._join(self.direction(scene), perf), self._prompt_characters(scene),
@@ -930,16 +1043,23 @@ class Storyboard(StoryboardDraft):
     def text_only_prompt(self, scene: Scene) -> str:
         """Text-to-video prompt for a keyframe scene when image-to-video is unavailable:
         the opening-frame description plus the motion, with characters and style."""
-        direction = self._join(self.direction(scene), self.performance(scene))
+        direction = "" if self.basic else self._join(self.direction(scene), self.performance(scene))
+        setting = self._setting(scene)
         if scene.image_prompt and scene.image_prompt.strip():
             return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
-                                 direction, self._prompt_characters(scene), setting=self._setting(scene))
-        return self._compose(scene.prompt, direction, self._prompt_characters(scene),
-                             setting=self._setting(scene))
+                                 direction, self._prompt_characters(scene), setting=setting)
+        return self._compose(scene.prompt, direction, self._prompt_characters(scene), setting=setting)
 
     def image_prompt(self, scene: Scene) -> str:
         # A still has no motion: only the framing, lens, focus, composition and lighting apply.
         # The content direction sets the faces and body language of the opening frame; dialogue is audio only.
+        if self.basic:  # text -> picture: the scene's still, its characters and the style (no aspect / seconds)
+            text = scene.image_prompt or scene.prompt
+            staging = (i2v_prompt.first_frame_staging(scene.video_shot)
+                       if self.audio == "dialogue" and scene.video_shot is not None else "")
+            return i2v_prompt.child_safe(i2v_prompt.soften_identical(
+                self._compose(i2v_prompt.strip_technical(text), staging, self._prompt_characters(scene),
+                              setting=self._setting(scene))))
         content = f"Content direction: {scene.content_direction.rstrip('.')}." if scene.content_direction else ""
         return self._compose(scene.image_prompt or scene.prompt,
                              self._join(self.direction(scene, FRAME_FIELDS), content),

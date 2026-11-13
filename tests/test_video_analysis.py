@@ -377,7 +377,7 @@ def test_plan_from_analysis(monkeypatch):
     sb, used = va.plan_from_analysis(analysis_data(), "", language_hint="Vietnamese", dialogue_language="Thai")
     assert used == "api" and sb.style == "warm cinematic drama, teal-orange grade"
     assert "Measured on the reference (40s): 3 shots" in sb.edit_style and "Cut every 1-2 s" in sb.edit_style
-    assert got["kw"]["aspect"] == "9:16" and got["kw"]["scenes"] == 6  # 40 s / 7 ≈ 6 scenes
+    assert got["kw"]["aspect"] == "9:16" and got["kw"]["scenes"] == 7  # 2.5 + 1.5 s, then 36 s in 5 clip-sized scenes
     assert got["kw"]["dialogue_language"] == "Thai" and got["kw"]["language_hint"] == "Vietnamese"
     assert "Một người cha giấu bí mật" in got["idea"]  # no idea given: the suggested one
     assert "REFERENCE STYLE" in got["idea"] and "do NOT copy" in got["idea"] and "twist" in got["idea"]
@@ -385,12 +385,99 @@ def test_plan_from_analysis(monkeypatch):
     assert got["idea"].startswith("Chuyện cô giáo") and got["kw"]["scenes"] == 4 and got["kw"]["aspect"] == "16:9"
 
 
+def test_plan_from_analysis_remake_keeps_the_film_and_recasts_people(monkeypatch):
+    got = {}
+
+    def fake_plan_auto(idea, **kw):
+        got["idea"], got["kw"] = idea, kw
+        return Storyboard.model_validate({"title": "Làm lại", "model": "veo-lite", "scenes": [
+            {"id": f"s{i:02d}", "prompt": "a"} for i in range(1, kw["scenes"] + 1)]}), "api"
+
+    monkeypatch.setattr(planner, "plan_auto", fake_plan_auto)
+    data = analysis_data()
+    data["measured"]["duration"] = 8.0  # 0-2.5 (shots 1+2), 2.5-4 (shot 3), 4-8
+    data["subtitles"] = "00:01 Anh về rồi!"
+    sb, _ = va.plan_from_analysis(data, "nhân vật là người Việt", mode="same")
+    idea = got["idea"]
+    assert idea.startswith("REMAKE THE REFERENCE VIDEO") and "Change ONLY the people" in idea
+    assert "REFERENCE STYLE" not in idea and "Extra wishes from the user: nhân vật là người Việt" in idea
+    assert "s01, 2.5s" in idea and "shot #1, #2" in idea and "close-up, eye-level, push in: shot 1" in idea
+    assert "Anh về rồi" in idea and "the wife (vợ)" in idea
+    assert [s.screen_time for s in sb.scenes] == [2.5, 1.5, 4.0]
+    assert sum(s.screen_time for s in sb.scenes) == 8.0
+    assert all(s.duration is None or s.duration >= s.screen_time for s in sb.scenes)
+    assert sb.edit_style.startswith("- Target length: about 8s")
+    with pytest.raises(ValueError):
+        va.plan_from_analysis(data, mode="copy")
+
+
+def test_clip_too_short_for_its_screen_time_falls_back_to_flow_default():
+    from filmmaker import model_meta
+    sb = Storyboard.model_validate({"title": "x", "model": "veo-3-fast", "scenes": [
+        {"id": "s01", "prompt": "a", "duration": 4, "screen_time": 4.2},
+        {"id": "s02", "prompt": "b", "duration": 4, "screen_time": 2.0}]})
+    meta = model_meta.load()
+    if meta.durations("veo-3-fast"):
+        pytest.skip("veo-3-fast lists its lengths here")
+    va._clip_durations(sb, meta)
+    assert [s.duration for s in sb.scenes] == [None, 4]
+
+
+def test_style_mode_also_times_each_scene(monkeypatch):
+    monkeypatch.setattr(planner, "plan_auto", lambda idea, **kw: (Storyboard.model_validate(
+        {"title": "x", "scenes": [{"id": f"s{i:02d}", "prompt": "a"} for i in range(1, kw["scenes"] + 1)]}), "api"))
+    data = analysis_data()
+    data["measured"]["duration"] = 15.0
+    sb, _ = va.plan_from_analysis(data, "Chuyện mới", scenes=7)
+    assert len(sb.scenes) == 7 and abs(sum(s.screen_time for s in sb.scenes) - 15) < 0.05
+
+
 def test_suggested_scenes_bounds():
     d = analysis_data()
     d["measured"]["duration"] = 8
-    assert va.suggested_scenes(d) == 3  # at least 3, and at least one per beat
+    assert va.suggested_scenes(d) == 3  # 0-2.5 (1 s shot merged), 2.5-4, 4-8
     d["measured"]["duration"] = 600
     assert va.suggested_scenes(d) == 20
+
+
+def _m(duration, shots):
+    return {"duration": duration, "shots": [{"n": i, "start": a, "end": b} for i, (a, b) in enumerate(shots, 1)]}
+
+
+def test_scene_budget_fits_a_short_reference():
+    # a 15 s reel with 7 shots must not become 7 scenes of 4-8 s: the budget adds up to 15 s
+    shots = [(0, 3.5), (3.5, 5.2), (5.2, 6.4), (6.4, 8.3), (8.3, 10.0), (10.0, 11.2), (11.2, 15.0)]
+    b = va.scene_budget(_m(15, shots))
+    assert abs(sum(x["length"] for x in b) - 15) < 0.05
+    assert all(x["length"] >= va.MIN_SCENE_CUT for x in b)
+    assert [k for x in b for k in x["shots"]] == list(range(1, 8))  # every shot used once, in order
+    assert va.suggested_scenes({"measured": _m(15, shots)}) == len(b) <= 7
+    forced = va.scene_budget(_m(15, shots), 7)
+    assert [x["shots"] for x in forced] == [[k] for k in range(1, 8)]  # a chosen 7 = the reference's own 7 shots
+    assert abs(sum(x["length"] for x in forced) - 15) < 0.05
+    assert len(va.scene_budget(_m(15, shots), 9)) == 9
+    text = va.recipe_timing_vi({"measured": _m(15, shots)})
+    assert text.startswith(f"Khớp video gốc 15s: {len(b)} cảnh") and "Tổng ≈ 15.0s" in text
+
+
+def test_scene_budget_splits_long_takes_and_fills_the_tail():
+    b = va.scene_budget(_m(20, [(0, 20)]))  # one 20 s take = three Veo clips
+    assert len(b) == 3 and all(x["length"] <= va.MAX_SCENE_CUT for x in b)
+    b = va.scene_budget(_m(10, [(0, 2), (2, 4)]))  # cut detection stopped at 4 s
+    assert b[-1]["end"] == 10 and b[-1]["shots"] == []
+    assert va.scene_budget({"duration": 0, "shots": []}) == []
+
+
+def test_brief_and_film_brief_carry_the_budget():
+    m = {**_m(15, [(0, 5), (5, 10), (10, 15)]), "width": 720, "height": 1280, "aspect": "9:16", "fps": 30,
+         "has_audio": True}
+    m["shots"] = [(0, 5), (5, 10), (10, 15)]
+    brief = va._brief({"title": "x"}, m, None)
+    assert "SCENE BUDGET" in brief and "exactly 3 scenes" in brief and "scene 2: 5.0s" in brief
+    data = analysis_data()
+    data["measured"]["duration"] = 15.0
+    fb = va.film_brief(data, 4)
+    assert "about 15s in total" in fb and "4 scenes" in fb
 
 
 def test_edit_style_round_trip_and_editor_brief(tmp_path):
@@ -489,7 +576,8 @@ def test_web_analysis_flow(client, monkeypatch):
     items = c.get("/api/analyses").json()
     assert [a["id"] for a in items] == [aid] and items[0]["thumb"].endswith("frames/sheet01.jpg")
     d = c.get(f"/api/analyses/{aid}").json()
-    assert d["ai"]["title_vi"] == "Video mẫu" and d["suggested_scenes"] == 6
+    assert d["ai"]["title_vi"] == "Video mẫu" and d["suggested_scenes"] == 7
+    assert d["recipe_timing_vi"].startswith("Khớp video gốc 40s: 7 cảnh")
     assert d["video_url"] == f"/api/analyses/{aid}/file/source.mp4"
     assert c.get(d["sheets"][0]["url"]).content == b"jpg"
     assert c.get(f"/api/analyses/{aid}/file/../../settings.json").status_code == 404
@@ -514,8 +602,15 @@ def test_web_analysis_flow(client, monkeypatch):
     assert "Cut every 1-2 s" in sb.edit_style and sb.style.startswith("warm cinematic")
     assert got["kw"]["scenes"] == 5 and got["kw"]["aspect"] == "9:16"
     assert (c.ws / pid / "reference" / "analysis.json").is_file()
-    assert c.get(f"/api/projects/{pid}").json()["storyboard"]["edit_style"].startswith("- Measured")
+    assert c.get(f"/api/projects/{pid}").json()["storyboard"]["edit_style"].startswith("- Target length") and "- Measured" in c.get(f"/api/projects/{pid}").json()["storyboard"]["edit_style"]
     assert c.post(f"/api/analyses/{aid}/film", json={"dialogue_language": "a\nb"}).status_code == 400
+    assert c.post(f"/api/analyses/{aid}/film", json={"mode": "copy"}).status_code == 422
+    j = _wait(c, c.post(f"/api/analyses/{aid}/film", json={"idea": "", "scenes": 3, "mode": "same"}).json())
+    assert j["status"] == "done", j["lines"] and got["idea"].startswith("REMAKE THE REFERENCE VIDEO")
+    assert got["idea"].startswith("REMAKE THE REFERENCE VIDEO") and got["kw"]["scenes"] == 3
+    b = c.get(f"/api/analyses/{aid}/budget?n=4").json()
+    assert b["scenes"] == 4 and abs(sum(b["lengths"]) - 40) < 0.1 and b["text"].startswith("Khớp video gốc 40s: 4 cảnh")
+    assert c.get(f"/api/analyses/{aid}/budget").json()["scenes"] == 7
 
     assert c.delete(f"/api/analyses/{aid}").json() == {"ok": True}
     assert not (c.ws / ".analyses" / aid).exists()

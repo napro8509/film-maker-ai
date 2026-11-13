@@ -18,7 +18,7 @@ import statistics
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Collection, Literal
 
 from pydantic import BaseModel, Field
 
@@ -132,6 +132,9 @@ class ClipInfo(BaseModel):
     tail_freeze: float = 0.0
     tail_silence: float = 0.0
     mostly_silent: bool = False
+    # where someone speaks (whisper.cpp, from the first heard word to the end of the last), measured only for timed
+    # scenes with lines (scene.screen_time + dialogue); None = not measured
+    speech: list[float] | None = None
 
 
 # --- analysis -----------------------------------------------------------------
@@ -187,8 +190,23 @@ def analyze_clip(sid: str, path: Path) -> ClipInfo:
     return ClipInfo(id=sid, path=str(path), duration=round(duration, 3), has_audio=audio, **info)
 
 
-def analyze(clips: list[tuple[str, Path]], *, cache: Path | None = None, log: Log = print) -> dict[str, ClipInfo]:
-    """Analysis of every clip, cached by file size + mtime so re-editing is quick."""
+def speech_span(path: Path) -> list[float]:
+    """[start, end] of the speech in a clip (whisper.cpp with its speech detector), or [] when none is heard or
+    speech-to-text is not set up. The end (the last word) is the reliable part; the start can be early."""
+    from . import qc
+
+    try:
+        r = qc.transcribe(path)
+    except Exception:  # noqa: BLE001 - optional help for the cut, never a reason to fail the edit
+        return []
+    segs = (r or {}).get("segments") or []
+    return [segs[0]["start"], segs[-1]["end"]] if segs else []
+
+
+def analyze(clips: list[tuple[str, Path]], *, cache: Path | None = None, log: Log = print,
+            speech_for: Collection[str] = ()) -> dict[str, ClipInfo]:
+    """Analysis of every clip, cached by file size + mtime so re-editing is quick.
+    speech_for: scene ids whose speech is located too (timed scenes with lines: the kept part must hold it)."""
     stored: dict = {}
     if cache and cache.is_file():
         try:
@@ -196,17 +214,24 @@ def analyze(clips: list[tuple[str, Path]], *, cache: Path | None = None, log: Lo
         except ValueError:
             stored = {}
     out: dict[str, ClipInfo] = {}
+    changed = False
     for sid, path in clips:
         st = path.stat()
         key = f"{path}|{st.st_size}|{int(st.st_mtime)}"
         hit = stored.get(sid)
         if hit and hit.get("key") == key:
             out[sid] = ClipInfo.model_validate(hit["info"])
-            continue
-        log(f"  phân tích {sid} ({path.name})…")
-        out[sid] = analyze_clip(sid, path)
-        stored[sid] = {"key": key, "info": out[sid].model_dump()}
-    if cache:
+        else:
+            log(f"  phân tích {sid} ({path.name})…")
+            out[sid] = analyze_clip(sid, path)
+            changed = True
+        if sid in speech_for and out[sid].speech is None and out[sid].has_audio:
+            log(f"  tìm lời thoại trong {sid}…")
+            out[sid].speech = speech_span(path)
+            changed = True
+        if changed:
+            stored[sid] = {"key": key, "info": out[sid].model_dump()}
+    if cache and changed:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(stored, indent=1, ensure_ascii=False), encoding="utf-8")
     return out
@@ -247,11 +272,40 @@ def auto_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str]) -> E
     plan = EditPlan(clips=clips, transitions=transitions, source="rules",
                     notes="Bản dựng tự động: cắt khung đen/đứng hình ở đầu-cuối clip, hoà tan 0,5s giữa các cảnh, "
                           "mở/kết bằng mờ đen, cân bằng âm lượng giữa các clip.")
-    return sanitize(plan, infos, order)
+    return sanitize(plan, infos, order, screen_times(sb))
 
 
-def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> EditPlan:
-    """Make any plan (AI, hand-edited, or from an older set of clips) safe to render with these clips."""
+SPEECH_PAD = 0.3  # seconds kept after the last word (and before the first, when it fits)
+
+
+def keep_speech(ts: float, want: float, d: float, speech: list[float] | None) -> float:
+    """Start of the `want`-second window kept from a `d`-second clip: the plan's start when it holds the speech,
+    else moved so the whole line is kept, or (a line longer than the window) so the line ends on screen."""
+    hi = max(0.0, d - want)
+    ts = max(0.0, min(ts, hi))
+    if not speech:
+        return ts
+    a, b = speech
+    if b - a + SPEECH_PAD <= want:  # the whole line fits: just make sure it is inside
+        lo_ts, hi_ts = b + SPEECH_PAD - want, a - min(SPEECH_PAD, max(0.0, want - (b - a) - SPEECH_PAD))
+        ts = min(max(ts, lo_ts), hi_ts)
+    else:  # longer than the window: its end (the reliable part, and the punchline) stays on screen
+        ts = b + SPEECH_PAD - want
+    return round(max(0.0, min(ts, hi)), 3)
+
+
+def screen_times(sb: Storyboard | None) -> dict[str, float]:
+    """Scene id -> seconds it must stay on screen (scene.screen_time), for scenes that set one."""
+    return {s.id: float(s.screen_time) for s in (sb.scenes if sb else []) if s.screen_time}
+
+
+def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str],
+             targets: dict[str, float] | None = None) -> EditPlan:
+    """Make any plan (AI, hand-edited, or from an older set of clips) safe to render with these clips.
+    targets: scene id -> on-screen seconds (scene.screen_time); those clips are trimmed to exactly that length,
+    keeping the plan's start trim when it fits and cutting the rest from the end (a hand-edited plan keeps its
+    own trims for them, just without the usual MAX_TRIM cap)."""
+    targets = targets or {}
     from . import capcut as catalog
 
     by_id = {c.id: c for c in plan.clips}
@@ -264,7 +318,18 @@ def sanitize(plan: EditPlan, infos: dict[str, ClipInfo], order: list[str]) -> Ed
         ts = max(0.0, min(MAX_TRIM, float(c.trim_start or 0)))
         te = max(0.0, min(MAX_TRIM, float(c.trim_end or 0)))
         room = d - MIN_KEEP
-        if ts + te > room:  # too much trimmed: scale both down
+        want = targets.get(sid)
+        if want and plan.source == "manual":  # hand-tuned: the user's trims win, without the usual cap
+            ts = max(0.0, min(float(c.trim_start or 0), room))
+            te = max(0.0, min(float(c.trim_end or 0), room))
+            if ts + te > room:
+                k = max(0.0, room) / (ts + te)
+                ts, te = ts * k, te * k
+        elif want and want < d - 0.05:  # a short scene: keep exactly `want` seconds
+            want = max(MIN_KEEP, want)
+            ts = keep_speech(float(c.trim_start or 0), want, d, infos[sid].speech)
+            te = d - ts - want
+        elif ts + te > room:  # too much trimmed: scale both down
             k = max(0.0, room) / (ts + te) if ts + te else 0
             ts, te = ts * k, te * k
         vol = max(0.0, min(2.0, float(c.volume if c.volume is not None else 1.0)))
@@ -504,7 +569,9 @@ Return exactly one clips entry per scene and one transitions entry per neighbour
 If the brief has an "Edit style to imitate" section, the user wants this film cut like a reference video they
 analysed: follow it for the rhythm (how long shots stay, where to cut harder), the kinds of transitions, the
 fades, the music level and where it rises or drops, and (when finishing) the colour look and sound effects.
-The rules above still win where the guide would break them (never cut into speech or the key action)."""
+The rules above still win where the guide would break them (never cut into speech or the key action).
+A scene marked KEEP ON SCREEN must last exactly that long: choose trim_start so the kept part holds its key
+action (trims for these scenes may go beyond the usual limit; the rest is cut from the end)."""
 
 
 def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_music: bool) -> str:
@@ -525,7 +592,9 @@ def _brief(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], has_mus
         lines.append(
             f"- {sid}: {i.duration:.2f}s | black start/end {i.lead_black:.2f}/{i.tail_black:.2f}s | "
             f"frozen start/end {i.lead_freeze:.2f}/{i.tail_freeze:.2f}s | {sound} | suggested trims {ts}/{te}\n"
-            f"  opening frame: {(s.image_prompt or '-')[:400]}\n  action: {s.prompt[:500]}"
+            + (f" | KEEP ON SCREEN {s.screen_time:.1f}s (trim the clip to this)" if s.screen_time else "")
+            + (f" | speech heard {i.speech[0]:.1f}-{i.speech[1]:.1f}s (keep the line)" if i.speech else "")
+            + f"\n  opening frame: {(s.image_prompt or '-')[:400]}\n  action: {s.prompt[:500]}"
             + (f"\n  narration: {s.narration}" if s.narration else ""))
     return "\n".join(lines)
 
@@ -641,7 +710,7 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
         plan = response.parsed_output
     plan.source = "ai"
     plan.pro = bool(capcut and pro)
-    return sanitize(plan, infos, order)
+    return sanitize(plan, infos, order, screen_times(sb))
 
 
 # --- whole job ----------------------------------------------------------------
@@ -680,7 +749,10 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
         raise AssembleError("không có clip nào để dựng")
     order = [sid for sid, _ in clips]
     log(f"Phân tích {len(clips)} clip…")
-    infos = analyze(clips, cache=out_dir / "edit_analysis.json", log=log)
+    from .qc import scene_lines
+
+    talk = {s.id for s in sb.scenes if s.screen_time and scene_lines(sb, s)}
+    infos = analyze(clips, cache=out_dir / "edit_analysis.json", log=log, speech_for=talk)
     saved = None if replan else load_plan(out_dir)
     can_ai = engine == "ai" or (engine == "auto" and ai_available)
     if saved and capcut and pro and can_ai and not saved.pro and saved.source != "manual":
@@ -688,7 +760,7 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
         saved = None
     if saved:
         log(f"Dùng bản dựng đã lưu ({plan_path(out_dir).name}, nguồn: {saved.source}). Bấm “Dựng lại từ đầu” để agent làm bản mới.")
-        plan = sanitize(saved, infos, order)
+        plan = sanitize(saved, infos, order, screen_times(sb))
     elif engine == "rules" or (engine == "auto" and not ai_available):
         if engine == "auto":
             log("Chưa dùng được Claude nên dựng theo luật mặc định (vẫn có chuyển cảnh, cân âm, mở/kết mờ).")

@@ -89,6 +89,63 @@ def test_sanitize_clamps_bad_plans_and_fills_gaps():
     assert p.fade_in <= 3 and p.fade_out <= 4
 
 
+def test_screen_time_trims_a_clip_to_its_scene_length():
+    infos = {"s01": info("s01", 8.0), "s02": info("s02", 8.0)}
+    plan = editor.EditPlan(clips=[editor.ClipEdit(id="s01", trim_start=0.5), editor.ClipEdit(id="s02", trim_start=7)],
+                           transitions=[editor.Transition(after="s01", type="cut")])
+    p = editor.sanitize(plan, infos, ["s01", "s02"], {"s01": 2.0, "s02": 3.0})
+    a, b = p.clips
+    assert (a.trim_start, round(8 - a.trim_start - a.trim_end, 3)) == (0.5, 2.0)  # 5.5 s cut, past MAX_TRIM
+    assert round(8 - b.trim_start - b.trim_end, 3) == 3.0 and b.trim_start == 5.0  # start trim shortened to fit
+    # without a target the usual cap applies
+    assert editor.sanitize(plan, infos, ["s01", "s02"]).clips[1].trim_start == editor.MAX_TRIM
+    # a hand-edited plan keeps its own trims for timed scenes, without the cap
+    manual = plan.model_copy(update={"source": "manual", "clips": [editor.ClipEdit(id="s01", trim_end=5.0),
+                                                                    editor.ClipEdit(id="s02")]})
+    m = editor.sanitize(manual, infos, ["s01", "s02"], {"s01": 2.0, "s02": 3.0})
+    assert m.clips[0].trim_end == 5.0 and m.clips[1].trim_end == 0
+    sb = Storyboard.model_validate({"title": "x", "scenes": [{"id": "s01", "prompt": "a", "screen_time": 2},
+                                                             {"id": "s02", "prompt": "b"}]})
+    assert editor.screen_times(sb) == {"s01": 2.0}
+    assert "KEEP ON SCREEN 2.0s" in editor._brief(sb, infos, ["s01", "s02"], False)
+    rows, total = editor.timeline(editor.auto_plan(sb, infos, ["s01", "s02"]), infos)
+    assert round(rows[0][2] - rows[0][1], 2) == 2.0
+
+
+def test_keep_speech_moves_the_window_onto_the_line():
+    k = editor.keep_speech
+    assert k(0, 4.24, 7.93, [1.03, 6.88]) == 2.94  # line longer than the window: it ends on screen
+    assert k(0, 2.0, 4.0, [1.0, 2.5]) == 0.8  # whole line kept
+    assert k(0, 3.0, 8.0, [0.5, 1.5]) == 0.0  # already inside: the plan's start stays
+    assert k(3, 3.0, 8.0, [0.5, 1.5]) == 0.2  # window after the line: moved back
+    assert k(1, 2.0, 4.0, None) == 1 and k(1, 2.0, 4.0, []) == 1  # nothing heard / not measured
+    assert k(0, 2.0, 4.0, [3.5, 3.9]) == 2.0  # never past the end of the clip
+
+
+def test_sanitize_keeps_the_line_of_a_timed_scene():
+    infos = {"s01": info("s01", 7.93, speech=[5.5, 6.75])}
+    plan = editor.EditPlan(clips=[editor.ClipEdit(id="s01")])
+    c = editor.sanitize(plan, infos, ["s01"], {"s01": 4.24}).clips[0]
+    kept = (c.trim_start, 7.93 - c.trim_end)
+    assert kept[0] <= 5.5 and kept[1] >= 6.75 and round(kept[1] - kept[0], 2) == 4.24
+
+
+def test_analyze_locates_speech_only_where_asked_and_caches_it(media, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(editor, "speech_span", lambda p: calls.append(p.name) or [1.0, 2.0])
+    cache = tmp_path / "a.json"
+    infos = editor.analyze(clips_of(media), cache=cache, log=lambda *_: None, speech_for={"s01", "s03"})
+    assert infos["s01"].speech == [1.0, 2.0] and infos["s02"].speech is None
+    assert infos["s03"].speech is None  # no audio track: nothing to listen to
+    assert calls == ["a.mp4"]
+    again = editor.analyze(clips_of(media), cache=cache, log=lambda *_: None, speech_for={"s01", "s02"})
+    assert again["s01"].speech == [1.0, 2.0] and again["s02"].speech == [1.0, 2.0]
+    assert calls == ["a.mp4", "b.mp4"]  # s01 from the cache, s02 measured once now
+    assert "speech heard 1.0-2.0s" in editor._brief(
+        Storyboard.model_validate({"title": "x", "scenes": [{"id": s, "prompt": "a"} for s in ("s01", "s02", "s03")]}),
+        again, ["s01", "s02", "s03"], False)
+
+
 def test_timeline_and_subtitles_follow_overlaps():
     infos = {s: info(s) for s in ("s01", "s02")}
     plan = editor.EditPlan(clips=[editor.ClipEdit(id="s01", trim_end=1), editor.ClipEdit(id="s02")],

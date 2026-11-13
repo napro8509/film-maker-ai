@@ -169,11 +169,13 @@ def test_field_order_unchanged():
     new_scene = ["location", "continue_previous"]
     # dialogue_language / subtitle_language exist only on Storyboard, after every old field (dialogue-language)
     # edit_style (video-analysis) also only on Storyboard, appended last
-    assert list(Storyboard.model_fields) == new_sb + ["dialogue_language", "subtitle_language", "edit_style"]
+    assert list(Storyboard.model_fields) == new_sb + ["dialogue_language", "subtitle_language", "edit_style",
+                                                     "format", "audio", "visual_style", "genres"]  # film formats
     assert list(StoryboardDraft.model_fields) == new_sb
     new_scene += ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
-    assert list(Scene.model_fields)[:-1] == old_scene + new_scene == list(SceneDraft.model_fields)
-    assert list(Scene.model_fields)[-1] == "characters"
+    assert list(Scene.model_fields)[:-3] == old_scene + new_scene == list(SceneDraft.model_fields)
+    # video_shot: basic formats only; screen_time: films made from a reference video (set by the app, not Claude)
+    assert list(Scene.model_fields)[-3:] == ["characters", "video_shot", "screen_time"]
 
 
 def test_draft_schema_has_no_scene_characters():

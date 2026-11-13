@@ -286,6 +286,11 @@ class Gflow:
             stderr = "\n".join(l for l in err_lines if not prog.is_quiet_log(l))
             detail = err.get("detail") or err.get("title") or (stderr or stdout).strip()[-800:]
             hint = err.get("remediation_hint")
+            if re.search(r"(?i)violate (?:our|the) polic", str(detail)):
+                # Flow's agent puts the reason after the first line ("Last reply: error\n\nThis generation might
+                # violate our policies"), and logs show only the first line: say it plainly, up front.
+                detail = ("Flow chặn prompt này vì chính sách nội dung (thường do mô tả trẻ em: tuổi cụ thể, ảnh toàn "
+                          "thân trên nền studio). Hãy đổi cách mô tả. | " + " ".join(str(detail).split())[:300])
             msg = f"gflow exited {returncode}: {detail}" + (f" (hint: {hint})" if hint else "")
             raise GflowError(
                 msg,

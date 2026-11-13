@@ -17,6 +17,7 @@ Everything is saved in one folder per analysis (analysis.json, report.md, source
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -46,6 +47,9 @@ VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
 REA_HOME = Path("~/FilmMaker/.tools/rea-video").expanduser()
 REA_TEXT_MAX = 9000  # characters of each rea-video Reel file sent to Claude
 SUBS_MAX = 6000
+MIN_SCENE_CUT = 1.5  # a new-film scene shorter than this on screen is merged with its neighbour
+MAX_SCENE_CUT = 8.0  # one Veo clip is at most 8 s, so a longer stretch of the reference needs several scenes
+MAX_SCENES = 20
 
 
 class AnalysisError(RuntimeError):
@@ -152,8 +156,11 @@ class VideoAnalysis(BaseModel):
                             "transitions (which, how long, where), fades in/out, music (mood, level, where it rises "
                             "or drops, ducking under speech), sound effects (which, where), colour look, subtitle style "
                             "and the opening hook. Concrete numbers, no names from the video.")
-    film_recipe_vi: str = Field(description="How to make a new film like this with an AI video tool whose clips are "
-                                            "4-8 s each: number of scenes, shot types, what to prompt, in Vietnamese.")
+    film_recipe_vi: str = Field(description="How to make a new film like this, in Vietnamese. Follow the SCENE BUDGET "
+                                            "in the brief exactly: same number of scenes, and for each scene its "
+                                            "on-screen length after trimming (the lengths add up to the reference "
+                                            "length), its shot type and what to prompt. Veo renders 4-8 s per clip; "
+                                            "the editor keeps only that many seconds of each.")
     idea_suggestion_vi: str = Field(description="A NEW original story idea in the same format and genre "
                                                 "(not a copy), 2-3 sentences in Vietnamese.")
 
@@ -171,6 +178,9 @@ characters and places.
 
 Then turn it into tools for the new film: `look.style_prompt` (English, appended to every Veo prompt),
 `edit_style` (English guide for the editor agent, with concrete numbers), `film_recipe_vi` and a new idea.
+The new film must be as long as the reference, not longer: `film_recipe_vi` uses the SCENE BUDGET from the brief
+(number of scenes and each scene's on-screen seconds, which add up to the reference length). Never pad a short
+reference with extra scenes, and never present 4-8 s as the length a scene stays on screen.
 Describe people by look and role only; never name or identify real people, never copy brand names or the
 exact dialogue. Fields ending in _vi are for the user and are written in Vietnamese; the others in English.
 Return one `shots` entry per labelled shot, in order."""
@@ -704,6 +714,112 @@ def contact_sheets(video: Path, shots: list[tuple[float, float]], folder: Path, 
     return sheets
 
 
+def _segments(m: dict) -> list[dict[str, Any]]:
+    d = float(m.get("duration") or 0)
+    end_all = min(d, MAX_SECONDS) if d > 0 else 0
+    out: list[dict[str, Any]] = []
+    for n, s in enumerate(m.get("shots") or [], 1):
+        a, b = (s["start"], s["end"]) if isinstance(s, dict) else s
+        num = s.get("n", n) if isinstance(s, dict) else n
+        if end_all and a >= end_all:
+            break
+        b = min(b, end_all) if end_all else b
+        if b > a:
+            out.append({"shots": [num], "start": float(a), "end": float(b)})
+    if out and end_all - out[-1]["end"] > 0.3:  # cut detection stopped early: the tail is one more stretch
+        out.append({"shots": [], "start": out[-1]["end"], "end": end_all})
+    elif out:
+        out[-1]["end"] = max(out[-1]["end"], end_all)
+    if not out and end_all > 0:
+        out.append({"shots": [], "start": 0.0, "end": end_all})
+    return out
+
+
+def _join(segs: list[dict], i: int) -> None:
+    a, b = segs[i], segs.pop(i + 1)
+    a["shots"], a["end"] = a["shots"] + b["shots"], b["end"]
+
+
+def scene_budget(m: dict, n: int | None = None) -> list[dict[str, Any]]:
+    """How the reference's length splits into new-film scenes: [{shots, start, end, length}], in order.
+
+    Every scene is one Veo clip (4-8 s) trimmed to `length`; the lengths add up to the reference duration,
+    so a 15 s reference gives a ~15 s film. Neighbouring shots shorter than MIN_SCENE_CUT are merged, a stretch
+    longer than one clip is split, and the count is capped at MAX_SCENES (or forced to `n`).
+    """
+    segs = _segments(m)
+    if not segs:
+        return []
+    # stretches longer than one clip -> several scenes
+    split: list[dict] = []
+    for g in segs:
+        length = g["end"] - g["start"]
+        parts = max(1, math.ceil(length / MAX_SCENE_CUT - 1e-9))
+        for k in range(parts):
+            split.append({"shots": list(g["shots"]), "start": g["start"] + length * k / parts,
+                          "end": g["start"] + length * (k + 1) / parts})
+    segs = split
+    if n:  # a chosen count: keep the reference's own shot boundaries as far as possible
+        target = max(1, min(MAX_SCENES, n))
+    else:  # the natural count: every scene at least MIN_SCENE_CUT on screen
+        while len(segs) > 1:  # too-short scenes join their shorter neighbour
+            lens = [g["end"] - g["start"] for g in segs]
+            i = min(range(len(segs)), key=lambda k: lens[k])
+            if lens[i] >= MIN_SCENE_CUT:
+                break
+            if i == 0:
+                _join(segs, 0)
+            elif i == len(segs) - 1:
+                _join(segs, i - 1)
+            else:
+                _join(segs, i - 1 if lens[i - 1] <= lens[i + 1] else i)
+        target = min(MAX_SCENES, len(segs))
+
+    def pair_key(k: int) -> tuple[bool, float]:  # merge a pair with a too-short scene first, then the shortest
+        a, b = segs[k]["end"] - segs[k]["start"], segs[k + 1]["end"] - segs[k + 1]["start"]
+        return (min(a, b) >= MIN_SCENE_CUT, a + b)
+
+    while len(segs) > target:
+        _join(segs, min(range(len(segs) - 1), key=pair_key))
+    while len(segs) < target:  # split the longest scene in two
+        i = max(range(len(segs)), key=lambda k: segs[k]["end"] - segs[k]["start"])
+        g = segs[i]
+        mid = (g["start"] + g["end"]) / 2
+        segs[i:i + 1] = [{"shots": list(g["shots"]), "start": g["start"], "end": mid},
+                         {"shots": list(g["shots"]), "start": mid, "end": g["end"]}]
+    for g in segs:
+        g["shots"] = sorted(set(g["shots"]))
+        g["start"], g["end"] = round(g["start"], 2), round(g["end"], 2)
+        g["length"] = round(g["end"] - g["start"], 2)
+    return segs
+
+
+def budget_text(budget: list[dict]) -> str:
+    """English lines for the planner / editor: the on-screen length of each new scene."""
+    if not budget:
+        return ""
+    total = sum(b["length"] for b in budget)
+    return (f"- Target length: about {total:.0f}s in total, like the reference (do not make it longer). "
+            f"{len(budget)} scene{'' if len(budget) == 1 else 's'}; keep each on screen for: "
+            + ", ".join(f"s{i:02d} {b['length']:.1f}s" for i, b in enumerate(budget, 1))
+            + ". Each scene is ONE simple action that reads in that time; its 4-8 s clip is trimmed to it.")
+
+
+def recipe_timing_vi(data: dict, n: int | None = None) -> str:
+    """Vietnamese summary of the scene budget, shown above Claude's recipe (exact, from the measurements)."""
+    m = data.get("measured") or {}
+    budget = scene_budget(m, n)
+    if not budget:
+        return ""
+    total = sum(b["length"] for b in budget)
+    parts = []
+    for i, b in enumerate(budget, 1):
+        src = (" (shot " + ", ".join(f"#{k}" for k in b["shots"]) + ")") if b["shots"] else ""
+        parts.append(f"{i}) {b['length']:.1f}s{src}")
+    return (f"Khớp video gốc {total:.0f}s: {len(budget)} cảnh, thời lượng giữ lại của từng cảnh sau khi dựng: "
+            + "; ".join(parts) + f". Tổng ≈ {total:.1f}s. Veo tạo mỗi clip 4–8s, khi dựng chỉ giữ đúng đoạn trên.")
+
+
 def _brief(src: dict, m: dict, reel: dict | None) -> str:
     st = rhythm_stats(m["shots"])
     lines = [f"Reference video: {src.get('title') or '(no title)'}"
@@ -724,6 +840,14 @@ def _brief(src: dict, m: dict, reel: dict | None) -> str:
         lines.append("Sound moments: " + "; ".join(
             f"{x['at']:.0f}s {x['kind']}" + (f" ({x['change']:+.0f} LU)" if "change" in x else "")
             for x in m["moments"][:40]))
+    budget = scene_budget(m)
+    if budget:
+        lines.append(f"\nSCENE BUDGET for the new film (must total {m['duration']:.1f} s like the reference; use "
+                     f"exactly {len(budget)} scenes in film_recipe_vi, each kept on screen this long after trimming "
+                     "its 4-8 s Veo clip):")
+        lines += [f"scene {i}: {b['length']:.1f}s, from reference shot(s) "
+                  + ", ".join(f"#{n}" for n in b["shots"]) if b["shots"] else f"scene {i}: {b['length']:.1f}s"
+                  for i, b in enumerate(budget, 1)]
     if src.get("subtitles"):
         lines.append("\nSubtitles / dialogue from the site (timed):\n" + src["subtitles"])
     if reel:
@@ -956,7 +1080,7 @@ def report_markdown(data: dict) -> str:
                  n.get("movement", ""), n.get("transition_in", ""), n.get("subject", ""), n.get("text_on_screen", "")]
         out.append("| " + " | ".join(c.replace("|", "/").replace("\n", " ") for c in cells) + " |")
     out += ["", "## Hướng dẫn dựng (cho agent dựng phim)", "", "```", data.get("edit_style", ""), "```", "",
-            "## Cách làm phim tương tự", ai.get("film_recipe_vi", ""), "", "## Gợi ý ý tưởng mới",
+            "## Cách làm phim tương tự", recipe_timing_vi(data), "", ai.get("film_recipe_vi", ""), "", "## Gợi ý ý tưởng mới",
             ai.get("idea_suggestion_vi", ""), ""]
     if (data.get("rea") or {}).get("used"):
         out += ["## rea-video", f"{(data['rea'].get('card') or {}).get('description', '')} — chi tiết: rea/report.html", ""]
@@ -967,21 +1091,26 @@ def report_markdown(data: dict) -> str:
 
 
 def suggested_scenes(data: dict) -> int:
+    """As many scenes as fit the reference's length (see scene_budget), so the new film is as long as it."""
+    budget = scene_budget(data.get("measured") or {})
+    if budget:
+        return len(budget)
     d = (data.get("measured") or {}).get("duration") or 30
-    beats = len((data.get("ai") or {}).get("beats") or [])
-    return max(3, min(20, max(round(d / 7), beats)))
+    return max(1, min(MAX_SCENES, round(d / 6)))
 
 
-def film_brief(data: dict) -> str:
+def film_brief(data: dict, scenes: int | None = None) -> str:
     """The reference style, in English, for the planner (added to the idea)."""
     ai, m = data.get("ai") or {}, data.get("measured") or {}
     st = m.get("stats") or {}
+    budget = scene_budget(m, scenes)
     look, snd, txt = ai.get("look") or {}, ai.get("sound") or {}, ai.get("text") or {}
     lines = ["", "REFERENCE STYLE (make the new film feel like this reference video; do NOT copy its story, "
              "people, names or dialogue):",
              f"- Format: {ai.get('genre_vi', '')}; reference length {m.get('duration', 0):.0f}s, {st.get('shots', 0)} "
              f"shots, average shot {st.get('average', 0)}s (the new film's clips are longer; the editor trims them).",
              f"- Hook (first seconds): {ai.get('hook_vi', '')}",
+             *([budget_text(budget)] if budget else []),
              "- Story structure to follow (beats): " + " -> ".join(
                  f"{b['label']} ({b['what_vi'][:120]})" for b in ai.get("beats") or []),
              f"- Visual look (use it in `style`): {look.get('style_prompt', '')}",
@@ -1000,20 +1129,98 @@ def film_brief(data: dict) -> str:
     return "\n".join(lines)
 
 
+FILM_MODES = ("style", "same")  # style: new story in the same style; same: remake the reference, new people only
+
+
+def remake_brief(data: dict, scenes: int | None = None) -> str:
+    """Planner brief for a shot-for-shot remake of the reference where only the people are new (English)."""
+    ai, m = data.get("ai") or {}, data.get("measured") or {}
+    notes = {s["n"]: s for s in ai.get("shots") or []}
+    budget = scene_budget(m, scenes)
+    look, snd, txt = ai.get("look") or {}, ai.get("sound") or {}, ai.get("text") or {}
+    lines = ["REMAKE THE REFERENCE VIDEO. Keep everything the same: the story and its beats, every action and "
+             "reaction in the same order, shot sizes, angles, camera moves, places, props, light and colour, the "
+             "timing, the sound moments, the on-screen text style and the meaning of what is said. Change ONLY the "
+             "people: invent NEW characters (new names, faces, hair, outfits; similar age and the same roles). "
+             "Never describe or resemble the real people of the reference.",
+             f"Summary of the reference: {ai.get('summary_vi', '')}",
+             f"Reference length {m.get('duration', 0):.1f}s. Write exactly {len(budget) or scenes} scenes, in this "
+             "order; the seconds are how long each stays on screen, so give each ONE action that reads in that time "
+             "(a short scene can be 2 s: one look, one gesture, one reaction):"]
+    for i, b in enumerate(budget, 1):
+        shot_txt = " / ".join(
+            ", ".join(x for x in (notes[k].get("size"), notes[k].get("angle"), notes[k].get("movement")) if x)
+            + f": {notes[k].get('subject', '')}"
+            + (f" (purpose: {notes[k]['purpose']})" if notes[k].get("purpose") else "")
+            + (f" [text on screen: {notes[k]['text_on_screen']}]" if notes[k].get("text_on_screen") else "")
+            for k in b["shots"] if k in notes)
+        lines.append(f"- s{i:02d}, {b['length']:.1f}s, reference {b['start']:.1f}-{b['end']:.1f}s"
+                     + (f" (shot {', '.join(f'#{k}' for k in b['shots'])}): {shot_txt}" if shot_txt else ""))
+    if ai.get("beats"):
+        lines.append("Beats: " + " -> ".join(f"{b['start']:.0f}-{b['end']:.0f}s {b['label']}: {b['what_vi']}"
+                                             for b in ai["beats"]))
+    if ai.get("characters"):
+        lines.append("Roles to recast with new people (keep the role, not the look): "
+                     + "; ".join(f"{p['name']} ({p.get('role_vi', '')})" for p in ai["characters"]))
+    if ai.get("settings"):
+        lines.append("Places (keep them): " + "; ".join(f"{p['name']}: {p['look'][:200]}" for p in ai["settings"]))
+    lines += [f"Visual look (use it in `style`): {look.get('style_prompt', '')}",
+              f"Camera: {ai.get('camera_vi', '')}",
+              f"Sound: {snd.get('music_vi', '')} {snd.get('sfx_vi', '')} Voices: {snd.get('voice_vi', '')}",
+              f"On-screen text: {txt.get('subtitles_vi', '')} {txt.get('titles_vi', '')}"]
+    if (data.get("subtitles") or "").strip():
+        lines.append("What is said in the reference (timed; keep the meaning and where it falls, say it in the "
+                     "film's dialogue language with the new characters' names):\n" + data["subtitles"].strip()[:2500])
+    lines.append("Notes in Vietnamese above are for meaning only; write the storyboard as usual.")
+    return "\n".join(lines)
+
+
+def _clip_durations(sb, meta) -> None:
+    """Render each timed scene at the shortest clip the model allows that still covers its screen_time."""
+    from . import durations as durations_mod
+
+    for s in sb.scenes:
+        if not s.screen_time:
+            continue
+        allowed = sorted(durations_mod.allowed_for(sb, s, meta) or [])
+        if allowed:
+            s.duration = next((x for x in allowed if x >= s.screen_time), allowed[-1])
+        elif s.duration and s.duration < s.screen_time + 0.5:  # unknown lengths: a clip too short for the scene
+            s.duration = None  # Flow's default (8 s) leaves room for the action and the line
+
+
 def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None, language_hint: str | None = None,
-                       dialogue_language: str | None = None, backend: str = "auto", api_key: str | None = None):
-    """A new Storyboard in the style of the analysed video (planner.plan_auto). Returns (storyboard, backend)."""
+                       dialogue_language: str | None = None, backend: str = "auto", api_key: str | None = None,
+                       mode: str = "style"):
+    """A new Storyboard from the analysed video (planner.plan_auto). Returns (storyboard, backend).
+
+    mode "style": a NEW story in the same format and style; "same": a remake of the reference where only the
+    characters are new. Either way each scene gets `screen_time` from the scene budget, so the cut film is as
+    long as the reference (a scene can be 2 s on screen; its clip is rendered short and trimmed)."""
+    from . import model_meta
     from .planner import plan_auto
 
+    if mode not in FILM_MODES:
+        raise ValueError(f"mode must be one of {FILM_MODES}")
     ai = data.get("ai") or {}
-    idea = (idea or "").strip() or (
-        "Invent a NEW original story in the same format and genre as the reference. Starting point: "
-        + (ai.get("idea_suggestion_vi") or ai.get("genre_vi") or "a short emotional drama"))
     aspect = (data.get("measured") or {}).get("aspect") or "16:9"
-    sb, used = plan_auto(idea + "\n" + film_brief(data), backend=backend, api_key=api_key,
-                         scenes=max(1, min(20, scenes or suggested_scenes(data))), aspect=aspect,
-                         language_hint=language_hint, dialogue_language=dialogue_language)
-    sb.edit_style = data.get("edit_style") or edit_style_text(data) or None
+    n = max(1, min(MAX_SCENES, scenes or suggested_scenes(data)))
+    if mode == "same":
+        extra = (idea or "").strip()
+        prompt = remake_brief(data, n) + (f"\nExtra wishes from the user: {extra}" if extra else "")
+    else:
+        idea = (idea or "").strip() or (
+            "Invent a NEW original story in the same format and genre as the reference. Starting point: "
+            + (ai.get("idea_suggestion_vi") or ai.get("genre_vi") or "a short emotional drama"))
+        prompt = idea + "\n" + film_brief(data, n)
+    sb, used = plan_auto(prompt, backend=backend, api_key=api_key,
+                         scenes=n, aspect=aspect, language_hint=language_hint, dialogue_language=dialogue_language)
+    budget = scene_budget(data.get("measured") or {}, len(sb.scenes) or n)
+    for s, b in zip(sb.scenes, budget):
+        s.screen_time = b["length"]
+    _clip_durations(sb, model_meta.load())
+    style = data.get("edit_style") or edit_style_text(data) or ""
+    sb.edit_style = "\n".join(x for x in (budget_text(budget), style) if x) or None
     style_prompt = ((ai.get("look") or {}).get("style_prompt") or "").strip()
     if style_prompt and not (sb.style or "").strip():
         sb.style = style_prompt
@@ -1034,4 +1241,6 @@ def copy_reference(analysis_dir: Path, project_dir: Path) -> Path:
 
 __all__ = ["VideoAnalysis", "AnalysisError", "AnalysisStopped", "analyze", "fetch", "measure", "run_rea",
            "contact_sheets", "ask_claude", "plan_from_analysis", "film_brief", "edit_style_text", "list_analyses",
-           "report_markdown", "load", "new_id", "rea_binary", "ytdlp_command", "copy_reference", "suggested_scenes"]
+           "report_markdown", "load", "new_id", "rea_binary", "ytdlp_command", "copy_reference", "suggested_scenes",
+           "scene_budget", "recipe_timing_vi", "budget_text",
+           "remake_brief", "FILM_MODES"]

@@ -229,7 +229,9 @@ class Autopilot:
 
     def _stage_storyboard(self, result: dict) -> None:
         sb = self.sb()  # the storyboard exists by now (the caller planned it)
-        n_dlg = sum(len(s.spoken_lines()) for s in sb.scenes)
+        from .qc import scene_lines  # drama rows or the I2V speaker line
+
+        n_dlg = sum(len(scene_lines(sb, s)) for s in sb.scenes)
         self.log(f"“{sb.title}”: {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật, {n_dlg} câu thoại.")
         # Durations the model does not accept would block the render later: round them up now (free).
         pipe = self.pipe(sb)
@@ -343,7 +345,52 @@ class Autopilot:
     def _keyframe_scenes(self, sb: Storyboard) -> list:
         return [s for s in sb.scenes if s.mode == "keyframe"]
 
+    def _location_images(self) -> None:
+        """Basic formats: a reference picture of every place (free), so the first keyframe at a place starts from
+        it and the room looks the same across scenes. Never for a place already in a finished clip (its new
+        reference would mark the paid clip as changed)."""
+        sb = self.sb()
+        if not sb.basic or not sb.locations:
+            return
+        pipe = self.pipe(sb)
+        in_clips = {loc.name for s in sb.scenes if pipe.state.scene(s.id).get("status") == DONE
+                    and Path(pipe.state.scene(s.id).get("video") or "").is_file()
+                    for loc in [sb.scene_location(s)] if loc is not None}
+        picked, used = [], set()
+        for i, loc in enumerate(sb.locations):
+            if not loc.name.strip() or not loc.description.strip() or loc.name in in_clips:
+                continue
+            if sb.location_image(loc) is not None:
+                continue
+            stem = slug(loc.name) or f"boi-canh-{i + 1}"
+            while stem in used:
+                stem += f"-{i + 1}"
+            used.add(stem)
+            picked.append((i, loc, self.sb_path.parent / "assets" / "locations" / f"{stem}.png"))
+        if not picked:
+            return
+        index = {loc.name: i for i, loc, _ in picked}
+
+        def save_one(_idx: int, loc: Any, dest: Path) -> None:
+            i = index[loc.name]
+            rel = dest.relative_to(self.sb_path.parent).as_posix()
+
+            def fn(raw: dict) -> bool:
+                locs = raw.get("locations") or []
+                if i < len(locs) and isinstance(locs[i], dict) and locs[i].get("name") == loc.name:
+                    locs[i]["image"] = rel
+                    return True
+                return False
+            self.edit_raw(fn)
+
+        self.log(f"Tạo ảnh bối cảnh cho {len(picked)} nơi (miễn phí) để giữ không gian giống nhau giữa các cảnh…")
+        report = pipe.generate_location_images([(loc, dest) for _, loc, dest in picked], self.opts(), on_done=save_one)
+        self.check_stop()
+        if report.failed:
+            self.log(f"⚠ Chưa có ảnh bối cảnh: {', '.join(report.failed)} (cảnh ở đó chỉ dùng mô tả chữ)")
+
     def _stage_keyframes(self, result: dict) -> None:
+        self._location_images()
         for attempt in (1, 2):
             pipe = self.pipe()
             report = pipe.run(self.opts(keyframes_only=True))

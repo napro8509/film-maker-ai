@@ -382,7 +382,7 @@ async function init() {
   S.auth = localGet("auth");
   renderTopbar();
   await loadProjects();
-  const want = decodeURIComponent(location.hash.slice(1)) || localGet("lastProject");
+  const want = decodeURIComponent(location.hash.slice(1)) || localGet("lastProject") || "";
   if (want.startsWith("analysis/")) { await openAnalysis(want.slice(9)); loadModels(null); }
   const pick = S.projects.some((p) => p.id === want) ? want : S.projects[0]?.id;
   if (S.ana) { /* an analysis is open (#analysis/<id>) */ } else if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
@@ -1193,9 +1193,9 @@ function renderScene(sc, i) {
       h("div", { class: "scene-fields" },
         sc.mode === "keyframe" ? text("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, ai đứng đâu, bối cảnh…", 3, "nên viết tiếng Anh") : null,
         sc.mode === "i2v" ? h("div", { class: "grid2" }, imagePicker(sc, "image", "Ảnh bắt đầu"), imagePicker(sc, "end_image", "Ảnh kết thúc (tuỳ chọn)", true)) : null,
-        text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles… (góc máy chọn ở mục Chỉ đạo hình ảnh)", 3, "nên viết tiếng Anh"),
-        renderCamera(sc),
-        renderDirection(sc, i),
+        isBasic(sb) ? renderShot(sb, sc, i) : text("prompt", sc.mode === "t2v" ? "Nội dung video" : "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles… (góc máy chọn ở mục Chỉ đạo hình ảnh)", 3, "nên viết tiếng Anh"),
+        isBasic(sb) ? null : renderCamera(sc),
+        isBasic(sb) ? null : renderDirection(sc, i),
         renderSceneLocation(sb, sc, i),
         zone(`chars-${i}`, () => {
           const speakers = (Array.isArray(sc.dialogue) ? sc.dialogue : []).filter((d) => d.line && d.character).map((d) => d.character).join(" ");
@@ -1621,7 +1621,7 @@ function renderStory() {
         sb.edit_style != null ? field("Phong cách dựng (từ video mẫu)",
           h("textarea", { rows: 5, class: "mono", value: sb.edit_style || "", placeholder: "Trống: agent dựng phim tự chọn nhịp, chuyển cảnh, âm thanh",
             oninput: (e) => set("edit_style", e.target.value) }), "agent dựng phim làm theo; không gửi Flow") : null,
-        renderDialogueLang(sb, set),
+        isBasic(sb) ? formatSummary(sb) : renderDialogueLang(sb, set),
         h("div", { class: "stack tight" },
           h("label", { class: "check" },
             h("input", { type: "checkbox", checked: sb.no_text !== false,
@@ -1637,6 +1637,88 @@ function renderStory() {
               oninput: (e) => set("project_id", e.target.value || undefined) }))))),
     renderCharacters(sb),
     renderLocations(sb));
+}
+
+/* Basic formats: the image-to-video prompt in parts (scene.video_shot), joined on the server with the house I2V
+   templates: motion only, people by position + look (never names), one line of at most 12 words for one speaker,
+   the others silent, no long negatives. Empty parts are dropped; an empty shot falls back to scene.prompt. */
+const SHOT_MAX_WORDS = 12;
+const wordCount = (t) => (String(t || "").match(/[\p{L}\p{N}'-]+/gu) || []).length;
+function renderShot(sb, sc, i) {
+  const shot = () => (sc.video_shot = sc.video_shot && typeof sc.video_shot === "object" ? sc.video_shot : {});
+  const tidy = () => {
+    const v = sc.video_shot;
+    if (!v) return;
+    if (v.speaker && !String(v.speaker.line || "").trim() && !String(v.speaker.visual_tag || "").trim()) delete v.speaker;
+    if (Array.isArray(v.listeners) && !v.listeners.length) delete v.listeners;
+    if (!["camera", "action", "environment", "audio"].some((k) => String(v[k] || "").trim()) && !v.speaker && !v.listeners) delete sc.video_shot;
+  };
+  const edit = () => { tidy(); changed(); refreshZone(`shotwarn-${i}`); refreshZone(`chars-${i}`); };
+  const shotObj = (make) => (make ? shot() : sc.video_shot);
+  const input = (obj, key, ph, rows = 1) => h(rows > 1 ? "textarea" : "input", { type: "text", rows, placeholder: ph, value: obj()?.[key] || "",
+    oninput: (e) => { const o = obj(true); o[key] = e.target.value; if (key === "action" && obj === shotObj) sc.prompt = e.target.value || sc.prompt; edit(); } });
+  const sp = (make) => { const v = make ? shot() : sc.video_shot; if (!v) return undefined; if (make && !v.speaker) v.speaker = {}; return v.speaker; };
+  const talk = sb.audio === "dialogue";
+  const lineCount = h("span", { class: "hint" });
+  const showCount = () => { const n = wordCount(sc.video_shot?.speaker?.line); lineCount.textContent = ` · ${n}/${SHOT_MAX_WORDS} từ`; lineCount.classList.toggle("warn-text", n > SHOT_MAX_WORDS); };
+  const lineInput = h("input", { type: "text", placeholder: "Một câu ngắn, không ngoặc kép, không viết tắt kiểu don't", value: sc.video_shot?.speaker?.line || "",
+    oninput: (e) => {
+      const s = sp(true), old = s.line || "";
+      s.line = e.target.value;
+      // the subtitle follows the line while it is still the same words
+      if (!sc.narration || sc.narration.trim() === old.trim()) { sc.narration = e.target.value || undefined; }
+      showCount(); edit();
+    } });
+  showCount();
+  const listeners = () => { const v = shot(); v.listeners = Array.isArray(v.listeners) ? v.listeners : []; return v.listeners; };
+  return h("div", { class: "shot-box stack tight" },
+    h("div", { class: "lbl" }, "Prompt video (chuẩn I2V)", h("span", { class: "hint" }, " · chỉ tả chuyển động; gọi người bằng vị trí + ngoại hình, không dùng tên; viết tiếng Anh")),
+    h("div", { class: "grid2" },
+      field("Máy quay", input(shotObj, "camera", "Static locked-off medium shot, shallow depth of field")),
+      field("Âm thanh", input(shotObj, "audio", "quiet room tone, soft footsteps (không nhạc)"))),
+    field("Hành động", input(shotObj, "action", "In the center, the little girl in the yellow dress widens her eyes and steps back", 2),
+      talk && String(sc.video_shot?.speaker?.line || "").trim() ? "cảnh có người nói: video dùng Cử chỉ khi nói + Người nghe, ô này chỉ dự phòng" : "1–2 nhịp, thì hiện tại"),
+    field("Chuyển động phụ & ánh sáng", input(shotObj, "environment", "the curtains sway softly under warm daylight matching the starting frame")),
+    talk ? h("details", { class: "shot-talk", open: !!sc.video_shot?.speaker || null },
+      h("summary", {}, "Người nói (tuỳ chọn) — một người, một câu ≤ 12 từ"),
+      h("div", { class: "stack tight" },
+        h("div", { class: "grid2" },
+          field("Vị trí trên khung", input(sp, "position", "frame left / frame right")),
+          field("Đặc điểm nhận dạng", input(sp, "visual_tag", "the little girl in the pink dress"))),
+        h("label", { class: "field" }, h("span", { class: "lbl" }, "Câu thoại", lineCount), lineInput),
+        h("div", { class: "grid2" },
+          field("Giọng", input(sp, "voice_style", "excited, clear")),
+          field("Cử chỉ khi nói", input(sp, "action", "leans forward slightly"))),
+        h("div", { class: "grid2" },
+          field("Góc đầu", input(sp, "head_angle", "three-quarter profile / side profile")),
+          field("Hướng nhìn", input(sp, "gaze", "frame right / off-screen left / tên người nghe"), "trống: tự nhìn về phía người nghe")),
+        h("p", { class: "help" }, "Chống lỗi nhìn thẳng ống kính khi nói: máy khoá cứng, hướng nhìn theo tọa độ khung hình, tự khép miệng sau câu thoại. Không dùng camera / lens / viewer / his left."),
+        h("div", { class: "lbl" }, "Người nghe", h("span", { class: "hint" }, " · tự thêm hướng mặt về người nói và “remaining completely silent with lips closed”")),
+        (sc.video_shot?.listeners || []).map((l, j) => h("div", { class: "row shot-listener" },
+          h("input", { type: "text", placeholder: "frame left", value: l.position || "", "aria-label": "Vị trí người nghe", oninput: (e) => { l.position = e.target.value; edit(); } }),
+          h("input", { type: "text", placeholder: "the woman in the beige sweater", value: l.visual_tag || "", "aria-label": "Đặc điểm người nghe", oninput: (e) => { l.visual_tag = e.target.value; edit(); } }),
+          h("input", { type: "text", placeholder: "listening with a gentle closed-mouth smile", value: l.silent_action || "", "aria-label": "Biểu cảm người nghe", oninput: (e) => { l.silent_action = e.target.value; edit(); } }),
+          h("button", { class: "btn ghost icon sm danger", title: "Xoá người nghe", "aria-label": "Xoá người nghe", onclick: () => { listeners().splice(j, 1); tidy(); changed(); renderMain(); } }, icon("trash")))),
+        h("div", {}, h("button", { class: "btn sm ghost", onclick: () => { listeners().push({ position: "", visual_tag: "" }); renderMain(); } }, icon("plus"), "Thêm người nghe")))) : null,
+    zone(`shotwarn-${i}`, () => {
+      const w = S.cur.scene_state?.[sc.id]?.dialogue_warnings || [];
+      return w.length ? h("ul", { class: "small warn-text talk-warnings" }, w.map((m) => h("li", {}, m))) : h("div");
+    }));
+}
+
+/* Film formats (Phim mới). Every format but the short drama uses the basic text -> image -> video flow:
+   no content direction, camera or dialogue rows in the editor (locations are kept). */
+function isBasic(sb) {
+  const F = S.env?.formats;
+  return !!(sb && sb.format && F && sb.format !== F.drama && F.formats.some((f) => f.key === sb.format));
+}
+function formatSummary(sb) {
+  const F = S.env.formats, lab = (list, k) => (list.find((x) => x.key === k) || {}).label;
+  const parts = [["Định dạng", lab(F.formats, sb.format)], ["Âm thanh / lời", lab(F.audio, sb.audio)], ["Hình ảnh", lab(F.visuals, sb.visual_style)],
+    ["Thể loại", (sb.genres || []).map((g) => lab(F.genres, g)).filter(Boolean).join(", ")],
+    ["Ngôn ngữ", normLine(sb.dialogue_language).toLowerCase() !== "none" && sb.dialogue_language ? sb.dialogue_language : noSubs(sb) ? "" : sb.subtitle_language]];
+  return h("div", { class: "fmt-summary" }, parts.filter(([, v]) => v).map(([k, v]) => h("span", { class: "chip on static" }, h("span", { class: "muted" }, k + ": "), v)),
+    h("p", { class: "help" }, "Luồng I2V: chữ → ảnh → video, bối cảnh giữ nguyên giữa các cảnh. Âm thanh / lời theo chuẩn prompt I2V."));
 }
 
 /* Key order as backend _dump_dict: language keys right after `aspect` (write_raw dumps in object order).
@@ -3298,6 +3380,96 @@ function openNewProject() {
       S.env.claude_code?.available ? "Claude Code chưa đăng nhập. Mở Terminal, chạy “claude” rồi gõ /login bằng tài khoản Claude của bạn. "
         : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
       h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")));
+    const F = S.env.formats;
+    if (!F) return dramaForm(null);
+    const box = h("div", { class: "stack" });
+    let fmt = F.formats.some((f) => f.key === localGet("filmFormat")) ? localGet("filmFormat") : F.drama;
+    const draw = () => {
+      const info = F.formats.find((f) => f.key === fmt);
+      put(box, h("div", { class: "field" }, h("span", { class: "lbl" }, "Định dạng", h("span", { class: "hint" }, " · quyết định số cảnh, nhịp kể và cách chia tập")),
+        h("div", { class: "choice fmt-choice", role: "radiogroup", "aria-label": "Định dạng phim" }, F.formats.map((f) => h("button", {
+          class: fmt === f.key ? "on" : "", role: "radio", "aria-checked": String(fmt === f.key),
+          onclick: () => { fmt = f.key; localSet("filmFormat", fmt); draw(); } }, h("b", {}, f.label), h("span", {}, f.desc))))),
+        info.basic ? basicForm(info) : dramaForm(fmt));
+    };
+    draw();
+    return box;
+  };
+  /* Formats other than the drama: text -> image -> video, without the drama's direction, camera or dialogue rows. */
+  const basicForm = (info) => {
+    const F = S.env.formats;
+    const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một chú mèo lạc đường trong thành phố tìm cách về nhà trước khi trời mưa…", value: localGet("draftIdea", ""), oninput: (e) => localSet("draftIdea", e.target.value) });
+    const n = h("input", { type: "number", min: 1, max: 80, value: info.scenes });
+    const minutes = h("span", { class: "help" });
+    const showMin = () => { const k = +n.value || 0, sec = k * 8; minutes.textContent = `≈ ${sec < 120 ? sec + " giây" : Math.round(sec / 60) + " phút"} phim (mỗi cảnh ~8 giây).` + (info.key === "feature" || info.key === "series" ? " Tối đa 80 cảnh mỗi lần; phim dài hơn hãy làm thành nhiều phần / nhiều tập." : ""); };
+    n.oninput = showMin; showMin();
+    let audio = F.audio.some((a) => a.key === localGet("filmAudio")) ? localGet("filmAudio") : "silent";
+    let visual = F.visuals.some((v) => v.key === localGet("filmVisual")) ? localGet("filmVisual") : "realistic";
+    const genres = new Set((localGet("filmGenres", []) || []).filter((g) => F.genres.some((x) => x.key === g)));
+    const custom = h("input", { type: "text", maxlength: 300, placeholder: F.other_style_hint, value: localGet("filmCustomStyle", ""), oninput: (e) => localSet("filmCustomStyle", e.target.value) });
+    const aspect = h("select", {}, F.aspects.map((a) => h("option", { value: a.value, disabled: !a.enabled }, a.label)));
+    aspect.value = ["9:16", "16:9"].includes(localGet("filmAspect")) ? localGet("filmAspect") : "9:16";
+    aspect.onchange = () => localSet("filmAspect", aspect.value);
+    const lang = langPicker(SUBTITLE_LANGS.filter(([v]) => v !== "none"), cleanLang(localGet("filmLang")) || "Vietnamese");
+    const burn = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+    const audioBox = h("div"), styleBox = h("div"), langBox = h("div");
+    const drawAudio = () => {
+      const a = F.audio.find((x) => x.key === audio);
+      put(audioBox, h("div", { class: "choice audio-choice", role: "radiogroup", "aria-label": "Âm thanh / lời" }, F.audio.map((x) => h("button", {
+        class: audio === x.key ? "on" : "", role: "radio", "aria-checked": String(audio === x.key),
+        onclick: () => { audio = x.key; localSet("filmAudio", audio); drawAudio(); } }, h("b", {}, x.label), h("span", {}, x.desc)))));
+      put(langBox, field(a.spoken ? "Ngôn ngữ lời nói" : a.text ? "Ngôn ngữ chữ trên màn hình" : "Ngôn ngữ tên phim", lang.el),
+        a.text ? h("label", { class: "check" }, burn, h("span", {}, "In chữ lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng."))) : null);
+    };
+    const drawStyle = () => put(styleBox,
+      h("select", { "aria-label": "Phong cách hình ảnh", onchange: (e) => { visual = e.target.value; localSet("filmVisual", visual); drawStyle(); } },
+        F.visuals.map((v) => h("option", { value: v.key, selected: v.key === visual }, v.label))),
+      visual === "other" ? custom : null);
+    const genreChips = h("div", { class: "chips", role: "group", "aria-label": "Thể loại" }, F.genres.map((g) => h("button", {
+      class: "chip" + (genres.has(g.key) ? " on" : ""), "aria-pressed": String(genres.has(g.key)),
+      onclick: (e) => { genres.has(g.key) ? genres.delete(g.key) : genres.add(g.key); localSet("filmGenres", [...genres]);
+        e.currentTarget.classList.toggle("on", genres.has(g.key)); e.currentTarget.setAttribute("aria-pressed", String(genres.has(g.key))); } }, g.label)));
+    drawAudio(); drawStyle();
+    setTimeout(() => idea.focus(), 30);
+    const payload = () => {
+      if (!idea.value.trim()) { toast("Hãy nhập ý tưởng", "error"); return null; }
+      if (visual === "other" && !custom.value.trim()) { toast("Hãy mô tả phong cách hình ảnh", "error"); custom.focus(); return null; }
+      const l = lang.read();
+      if (!l.ok) { toast("Ngôn ngữ: " + l.msg, "error"); lang.input.focus(); return null; }
+      localSet("filmLang", l.value);
+      return { idea: idea.value, scenes: Math.max(1, Math.min(80, +n.value || info.scenes)), aspect: aspect.value, language: l.value,
+        format: info.key, audio, visual_style: visual, custom_style: visual === "other" ? custom.value : "", genres: [...genres] };
+    };
+    const planOnly = async (e) => {
+      const body = payload(); if (!body) return;
+      const btn = e.currentTarget; btn.disabled = true;
+      try { const j = await api("POST", "/api/projects/plan", body); close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết kịch bản, thường mất 1–3 phút…", "", 6000); }
+      catch (err) { toast(err.message, "error"); btn.disabled = false; }
+    };
+    const planAll = async (e) => {
+      const body = payload(); if (!body) return;
+      const btn = e.currentTarget;
+      localSet("autoSubs", burn.checked);
+      if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(body.scenes, false), "Bắt đầu"))) return;
+      btn.disabled = true;
+      try {
+        const j = await api("POST", "/api/projects/autopilot", { ...body, review: false, burn_subtitles: burn.checked });
+        close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động. Bạn có thể làm việc khác.", "", 8000);
+      } catch (err) { toast(err.message, "error"); btn.disabled = false; }
+    };
+    return h("div", { class: "stack" },
+      field("Ý tưởng phim", idea),
+      h("div", { class: "field" }, h("span", { class: "lbl" }, "Âm thanh / lời", h("span", { class: "hint" }, " · quyết định kịch bản có viết lời hay không")), audioBox),
+      h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Phong cách hình ảnh"), styleBox), field("Khung hình", aspect)),
+      h("div", { class: "field" }, h("span", { class: "lbl" }, "Thể loại", h("span", { class: "hint" }, " · chọn nhiều")), genreChips),
+      h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh"), n, minutes), h("div", { class: "stack tight" }, langBox)),
+      h("p", { class: "help" }, "Luồng I2V: mỗi cảnh Claude viết một ảnh mở đầu và một chuyển động theo chuẩn prompt I2V → tạo ảnh → ảnh thành video. Bối cảnh được mô tả một lần và giữ nguyên giữa các cảnh. Không có chỉ đạo nội dung, camera hay thoại từng dòng như Short drama."),
+      h("div", { class: "row" }, h("span", { class: "spacer" }),
+        h("button", { class: "btn", onclick: planOnly, title: "Chỉ viết kịch bản để bạn xem và sửa trước" }, "Chỉ viết kịch bản"),
+        h("button", { class: "btn primary", onclick: planAll, title: "Kịch bản → ảnh nhân vật → ảnh cảnh → video → dựng phim → thumbnail" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
+  };
+  /* Short drama: the original form, unchanged (`fmt` is sent so the project records its format). */
+  const dramaForm = (fmt) => {
     const idea = h("textarea", { rows: 4, placeholder: "Ví dụ: Một cô gái mở quán cà phê nhỏ ở Hà Nội, buổi sáng đầu tiên đón vị khách đầu tiên là ông cụ hàng xóm…", value: localGet("draftIdea", "") , oninput: (e) => localSet("draftIdea", e.target.value) });
     const n = h("input", { type: "number", min: 1, max: 80, value: localGet("autoScenes", 10) });
     const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
@@ -3319,7 +3491,7 @@ function openNewProject() {
       btn.disabled = true;
       try {
         const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
-          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked });
+          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, ...(fmt ? { format: fmt } : {}) });
         close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -3332,7 +3504,7 @@ function openNewProject() {
       localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); // remembered even if the plan job fails
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value });
+        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value, ...(fmt ? { format: fmt } : {}) });
         close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–3 phút…", "", 6000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -3489,7 +3661,7 @@ function renderAnalysis() {
           src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener noreferrer" }, "Video gốc ", icon("external")) : null,
           d.rea?.used ? h("span", { class: "badge done mini" }, "rea-video") : null)),
       h("div", { class: "actions" },
-        h("button", { class: "btn primary", onclick: () => film.scrollIntoView({ behavior: "smooth", block: "start" }) }, icon("sparkle"), "Tạo phim theo phong cách này"),
+        h("button", { class: "btn primary", onclick: () => film.scrollIntoView({ behavior: "smooth", block: "start" }) }, icon("sparkle"), "Tạo phim từ video này"),
         d.rea_report ? h("a", { class: "btn", href: d.rea_report, target: "_blank", rel: "noopener" }, "Báo cáo rea-video") : null,
         h("button", { class: "btn icon", title: "Đóng", "aria-label": "Đóng bản phân tích", onclick: closeAnalysis }, icon("x")))),
     h("div", { class: "ana-top" },
@@ -3519,35 +3691,71 @@ function renderAnalysis() {
       (d.sheets || []).length ? h("details", {}, h("summary", {}, `Ảnh các shot (${d.sheets.length} bảng)`), h("div", { class: "ana-sheets" }, d.sheets.map((sh) => h("a", { href: sh.url, target: "_blank" }, h("img", { src: sh.url, alt: "Shot " + sh.shots.join(", "), loading: "lazy" }))))) : null),
     card("Hướng dẫn dựng cho agent dựng phim", h("p", { class: "help" }, "Được lưu vào storyboard phim mới (edit_style). Agent dựng phim (Dựng phim / CapCut) làm theo nhịp, chuyển cảnh, màu và âm thanh này."),
       h("pre", { class: "ana-pre" }, d.edit_style || ai.edit_style || "")),
-    card("Cách làm phim tương tự", p(ai.film_recipe_vi)),
+    card("Cách làm phim tương tự", d.recipe_timing_vi ? h("p", { class: "help" }, h("b", {}, "Thời lượng: "), d.recipe_timing_vi) : null, p(ai.film_recipe_vi)),
     film);
 }
 
 function renderAnalysisFilmForm(d) {
   const ai = d.ai || {};
-  const idea = h("textarea", { rows: 4, placeholder: "Để trống: Claude tự nghĩ câu chuyện mới cùng thể loại. Gợi ý: " + (ai.idea_suggestion_vi || "") });
+  const MODES = [["same", "copy", "Làm giống video gốc", "Giữ nguyên truyện, cảnh, góc máy, nhịp; chỉ tạo nhân vật mới"],
+    ["style", "sparkle", "Phong cách tương tự", "Câu chuyện và nhân vật mới, cùng thể loại và nhịp dựng"]];
+  let mode = localGet("anaFilmMode") === "same" ? "same" : "style";
+  const PH = { style: "Để trống: Claude tự nghĩ câu chuyện mới cùng thể loại. Gợi ý: " + (ai.idea_suggestion_vi || ""),
+    same: "Tuỳ chọn, ví dụ: nhân vật là gia đình người Việt, chồng khoảng 35 tuổi, vợ tóc ngắn…" };
+  const idea = h("textarea", { rows: 4 });
+  const ideaField = field("Ý tưởng phim mới", idea, "tuỳ chọn");
+  const ideaLabel = ideaField.querySelector(".lbl");
+  const hint = ai.idea_suggestion_vi ? h("p", { class: "help" }, "Gợi ý: ", ai.idea_suggestion_vi, " ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); idea.value = ai.idea_suggestion_vi; idea.focus(); } }, "Dùng gợi ý")) : null;
   const n = h("input", { type: "number", min: 1, max: 20, value: d.suggested_scenes || 6 });
+  const timing = h("p", { class: "help ana-timing" }, d.recipe_timing_vi || "");
+  let tmr = 0, seq = 0;
+  const refreshTiming = () => {
+    clearTimeout(tmr);
+    tmr = setTimeout(async () => {
+      const k = Math.max(1, Math.min(20, +n.value || 0)), my = ++seq;
+      if (!k) return;
+      try { const b = await api("GET", `/api/analyses/${d.id}/budget?n=${k}`); if (my === seq) timing.textContent = b.text; } catch { /* keep the last preview */ }
+    }, 250);
+  };
+  n.addEventListener("input", refreshTiming);
+  const reset = h("a", { href: "#", onclick: (e) => { e.preventDefault(); n.value = d.suggested_scenes || 6; refreshTiming(); } }, `Gợi ý: ${d.suggested_scenes || 6} cảnh`);
   const speak = langPicker(DIALOGUE_LANGS, cleanLang(localGet("dialogueLang")) || "Vietnamese");
   const subSaved = cleanLang(localGet("subtitleLang"));
   const sub = langPicker(SUBTITLE_LANGS, subSaved || "Vietnamese");
+  const about = h("p", { class: "help" });
+  const goLabel = h("span", {});
+  const picker = h("div", { class: "choice", role: "radiogroup", "aria-label": "Cách làm phim từ video mẫu" });
+  const paint = () => {
+    picker.replaceChildren(...MODES.map(([k, ic, t, desc]) => h("button", { type: "button", class: mode === k ? "on" : "", role: "radio", "aria-checked": String(mode === k),
+      onclick: () => { mode = k; localSet("anaFilmMode", k); paint(); } }, icon(ic), h("b", {}, t), h("span", {}, desc))));
+    idea.placeholder = PH[mode];
+    if (ideaLabel && ideaLabel.firstChild && ideaLabel.firstChild.nodeType === 3) ideaLabel.firstChild.textContent = mode === "same" ? "Ghi chú về nhân vật mới " : "Ý tưởng phim mới ";
+    if (hint) hint.hidden = mode === "same";
+    about.textContent = mode === "same"
+      ? "Storyboard làm lại đúng từng cảnh của video mẫu (truyện, hành động, góc máy, bối cảnh, màu, nhịp) nhưng nhân vật là người mới do app tạo. Mỗi cảnh có thời lượng riêng (có thể chỉ 2s); clip render ngắn nhất model cho phép rồi agent dựng cắt đúng độ dài, tổng bằng video gốc."
+      : "Storyboard mới lấy nhịp truyện, góc máy, màu (style) của video mẫu nhưng câu chuyện, nhân vật là mới. Mỗi cảnh có thời lượng riêng để tổng bằng video gốc; agent dựng phim cắt theo cùng nhịp.";
+    goLabel.textContent = mode === "same" ? "Tạo phim giống video mẫu" : "Tạo phim theo phong cách này";
+  };
   const go = async (e) => {
     const a = speak.read(), b = sub.read();
     if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); return; }
     if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); return; }
     const btn = e.currentTarget; btn.disabled = true;
     localSet("dialogueLang", a.value); localSet("subtitleLang", b.value);
-    try { startJob(await api("POST", `/api/analyses/${d.id}/film`, { idea: idea.value, scenes: +n.value || null, language: b.value, dialogue_language: a.value })); toast("Claude đang viết storyboard theo phong cách video mẫu…", "", 6000); }
+    try { startJob(await api("POST", `/api/analyses/${d.id}/film`, { idea: idea.value, scenes: +n.value || null, language: b.value, dialogue_language: a.value, mode })); toast(mode === "same" ? "Claude đang viết storyboard giống video mẫu, nhân vật mới…" : "Claude đang viết storyboard theo phong cách video mẫu…", "", 6000); }
     catch (err) { toast(err.message, "error"); }
     btn.disabled = false;
   };
-  return h("section", { class: "card ana-card ana-film" }, h("div", { class: "card-head" }, h("h3", {}, "Tạo phim theo phong cách này")),
+  paint();
+  return h("section", { class: "card ana-card ana-film" }, h("div", { class: "card-head" }, h("h3", {}, "Tạo phim từ video mẫu")),
     h("div", { class: "card-body stack" },
-      field("Ý tưởng phim mới", idea, "tuỳ chọn"),
-      ai.idea_suggestion_vi ? h("p", { class: "help" }, "Gợi ý: ", ai.idea_suggestion_vi, " ", h("a", { href: "#", onclick: (e) => { e.preventDefault(); idea.value = ai.idea_suggestion_vi; idea.focus(); } }, "Dùng gợi ý")) : null,
-      h("div", { class: "grid2" }, field("Số cảnh", n, "mỗi cảnh 4–8s"), field("Khung hình", h("input", { type: "text", value: (d.measured?.aspect === "9:16" ? "Dọc 9:16" : "Ngang 16:9") + " (như video mẫu)", disabled: true }))),
+      picker,
+      ideaField, hint,
+      h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh ", h("span", { class: "hint" }, "· ", reset)), n), field("Khung hình", h("input", { type: "text", value: (d.measured?.aspect === "9:16" ? "Dọc 9:16" : "Ngang 16:9") + " (như video mẫu)", disabled: true }))),
+      timing,
       h("div", { class: "grid2" }, field("Nhân vật nói", speak.el), field("Ngôn ngữ phụ đề", sub.el)),
-      h("p", { class: "help" }, "Storyboard mới lấy nhịp truyện, góc máy, màu (style) của video mẫu nhưng câu chuyện, nhân vật là mới. Hướng dẫn dựng được lưu kèm để agent dựng phim cắt theo cùng nhịp. Bạn xem, sửa trước khi tạo bất cứ thứ gì."),
-      h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", disabled: jobRunning(), onclick: go }, icon("sparkle"), "Tạo phim theo phong cách này"))));
+      about,
+      h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", disabled: jobRunning(), onclick: go }, icon("sparkle"), goLabel))));
 }
 
 /* ---------- settings & credits ---------- */

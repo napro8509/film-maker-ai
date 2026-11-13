@@ -5,9 +5,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+
+from pydantic import BaseModel
 
 from . import durations as durations_mod
 from . import model_meta
@@ -251,13 +254,13 @@ def claude_code_status() -> dict:
     return {"available": True, "logged_in": bool(data.get("loggedIn")), "method": data.get("authMethod")}
 
 
-def _draft_claude_code(user: str, timeout: int = 900) -> dict:
-    """One planner call through the local `claude` CLI -> the raw draft dict."""
+def _draft_claude_code(user: str, timeout: int = 900, *, system: str | None = None, schema_model=None) -> dict:
+    """One planner call through the local `claude` CLI -> the raw draft dict (drama SYSTEM / schema by default)."""
     binary = claude_code_binary()
     if not binary:
         raise RuntimeError("không thấy lệnh `claude` (Claude Code). Cài tại https://claude.com/claude-code")
-    schema = json.dumps(StoryboardDraft.model_json_schema())
-    cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", SYSTEM,
+    schema = json.dumps((schema_model or StoryboardDraft).model_json_schema())
+    cmd = [binary, "-p", user, "--output-format", "json", "--json-schema", schema, "--system-prompt", system or SYSTEM,
            "--tools", "", "--strict-mcp-config", "--no-session-persistence"]
     with tempfile.TemporaryDirectory() as cwd:  # keep any project CLAUDE.md out of the prompt
         try:
@@ -312,6 +315,7 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
         sb.subtitle_language = NO_SUBTITLES
         for sc in sb.scenes:  # "Không phụ đề": nothing to show even if Claude wrote a line anyway
             sc.narration, sc.subtitles = None, None
+    sb = fix_vietnamese_diacritics(sb, backend=used, api_key=api_key, log=kw.get("log"))
     # New projects never start on a model Flow is retiring (default: veo-lite).
     meta = model_meta.load()
     sb = model_meta.normalize_new_storyboard(sb, meta)
@@ -319,8 +323,116 @@ def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, d
     return durations_mod.round_new_storyboard(sb, meta), used
 
 
-def _draft_api(user: str) -> dict:
-    """One planner call through the Anthropic API -> the raw draft dict."""
+# --- Vietnamese without diacritics -------------------------------------------------------------------
+# Claude now and then writes Vietnamese lines without their tone marks ("Ca nha lam gi tren do vay?"): Veo then
+# speaks the wrong tones and the subtitles are wrong. Spotted here and sent back once to get the marks added.
+
+class _VnItem(BaseModel):
+    key: str
+    text: str
+
+
+class _VnFix(BaseModel):
+    items: list[_VnItem]
+
+
+VN_FIX_SYSTEM = """You restore Vietnamese diacritics (dấu). Each item is Vietnamese written without its tone marks.
+Return every item with the same `key` and the same words, punctuation and meaning, written with full, correct
+Vietnamese diacritics. Do not translate, shorten or rephrase."""
+
+
+def _is_vietnamese(lang: str | None) -> bool:
+    return (lang or "").strip().casefold() in ("vietnamese", "tiếng việt", "vi")
+
+
+def _plain_vietnamese(text: str | None) -> bool:
+    """Words but no letter outside ASCII (dashes and quotes do not count): Vietnamese of three words or more is
+    never like that."""
+    t = (text or "").strip()
+    return len(re.findall(r"[A-Za-z]+", t)) >= 3 and not any(ch.isalpha() and ord(ch) > 127 for ch in t)
+
+
+def vietnamese_without_marks(sb: Storyboard) -> dict[str, str]:
+    """{key: text} of the Vietnamese lines / subtitles written without diacritics (empty when there are few)."""
+    out: dict[str, str] = {}
+    total = 0
+    viet_lines = _is_vietnamese(sb.dialogue_language)
+    viet_subs = _is_vietnamese(sb.subtitle_language) or sb.primary_subtitle_code() == "vi"
+    for sc in sb.scenes:
+        if viet_lines:
+            for i, d in enumerate(sc.dialogue or []):
+                if d.line and d.line.strip():
+                    total += 1
+                    if _plain_vietnamese(d.line):
+                        out[f"{sc.id}.line.{i}"] = d.line
+        sp = sc.video_shot.speaker if sc.video_shot is not None else None
+        if viet_lines and sp and sp.line.strip():
+            total += 1
+            if _plain_vietnamese(sp.line):
+                out[f"{sc.id}.speaker"] = sp.line
+        if viet_subs and sc.narration and sc.narration.strip():
+            total += 1
+            if _plain_vietnamese(sc.narration):
+                out[f"{sc.id}.narration"] = sc.narration
+        if sc.subtitles and sc.subtitles.vi and _plain_vietnamese(sc.subtitles.vi):
+            out[f"{sc.id}.vi"] = sc.subtitles.vi
+    if (viet_lines or viet_subs) and sb.thumbnail.text and _plain_vietnamese(sb.thumbnail.text):
+        out["thumbnail"] = sb.thumbnail.text
+    # one slip ("OK la") is not worth a call; most lines without marks is the failure
+    return out if len(out) >= 2 and len(out) * 2 >= max(1, total) else {}
+
+
+def fix_vietnamese_diacritics(sb: Storyboard, *, backend: str, api_key: str | None = None, log=None) -> Storyboard:
+    bad = vietnamese_without_marks(sb)
+    if not bad:
+        return sb
+    if log:
+        log(f"⚠ {len(bad)} câu tiếng Việt bị thiếu dấu: nhờ Claude thêm dấu lại…")
+    user = "Items:\n" + json.dumps([{"key": k, "text": v} for k, v in bad.items()], ensure_ascii=False)
+    try:
+        if backend == "claude_code":
+            out = _draft_claude_code(user, 300, system=VN_FIX_SYSTEM, schema_model=_VnFix)
+        else:
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+            out = _draft_api(user, system=VN_FIX_SYSTEM, schema_model=_VnFix)
+    except RuntimeError as exc:
+        if log:
+            log(f"⚠ Không thêm được dấu: {exc}")
+        return sb
+    fixed = {str(it.get("key")): str(it.get("text") or "").strip() for it in out.get("items") or [] if isinstance(it, dict)}
+    by_id = {sc.id: sc for sc in sb.scenes}
+    n = 0
+    for key, text in fixed.items():
+        if key not in bad or not text or _plain_vietnamese(text):
+            continue
+        if key == "thumbnail":
+            sb.thumbnail.text = text
+        else:
+            sid, _, part = key.partition(".")
+            sc = by_id.get(sid)
+            if sc is None:
+                continue
+            if part == "narration":
+                sc.narration = text
+            elif part == "speaker" and sc.video_shot is not None and sc.video_shot.speaker:
+                sc.video_shot.speaker.line = text
+            elif part == "vi" and sc.subtitles:
+                sc.subtitles.vi = text
+            elif part.startswith("line.") and sc.dialogue:
+                i = int(part.split(".")[1])
+                if i < len(sc.dialogue):
+                    sc.dialogue[i].line = text
+            else:
+                continue
+        n += 1
+    if log:
+        log(f"Đã thêm dấu cho {n}/{len(bad)} câu.")
+    return sb
+
+
+def _draft_api(user: str, *, system: str | None = None, schema_model=None) -> dict:
+    """One planner call through the Anthropic API -> the raw draft dict (drama SYSTEM / schema by default)."""
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover
@@ -330,9 +442,9 @@ def _draft_api(user: str) -> dict:
     response = client.messages.parse(
         model=MODEL,
         max_tokens=16000,
-        system=SYSTEM,
+        system=system or SYSTEM,
         messages=[{"role": "user", "content": user}],
-        output_format=StoryboardDraft,
+        output_format=schema_model or StoryboardDraft,
         output_config={"effort": "medium"},
         # If a safety classifier declines, let the API retry on a fallback model.
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},

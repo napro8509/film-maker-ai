@@ -23,7 +23,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -32,7 +32,7 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import durations as dur
-from .. import autopilot, film_chat, flow_caps, qc, social, manual_clip, model_change, model_meta, retirement
+from .. import autopilot, film_chat, flow_caps, formats, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
 from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -305,6 +305,7 @@ class StyleFilmBody(BaseModel):
     scenes: int | None = None  # None: suggested from the reference
     language: str = "Vietnamese"  # subtitle (narration) language
     dialogue_language: str | None = None
+    mode: Literal["style", "same"] = "style"  # same: remake the reference, only the characters are new
 
 
 class PlanBody(BaseModel):
@@ -313,6 +314,13 @@ class PlanBody(BaseModel):
     aspect: str = "16:9"
     language: str = "Vietnamese"  # subtitle (narration) language
     dialogue_language: str | None = None  # language every character speaks; "none" = no dialogue
+    # Film format chosen in "Phim mới" (filmmaker/formats.py). None / short_drama = the drama flow above;
+    # any other format = basic text -> image -> video, with `language` as the language of the words.
+    format: str | None = None
+    audio: str = "silent"
+    visual_style: str = "realistic"
+    custom_style: str = ""
+    genres: list[str] = []
 
 
 def _credits(out: Path) -> str | None:
@@ -748,6 +756,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "workspace": str(workspace),
             "profile": s.get("profile") or None,
             "platform": sys.platform,
+            "formats": formats.public(),
             "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
             "video_analysis": {"ytdlp": bool(va.ytdlp_command()), "rea_video": bool(va.rea_binary())},
             "qc": qc.status(),
@@ -979,10 +988,44 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 except ValueError as exc:
                     raise HTTPException(400, f"{label}: {exc}.")
 
+    def check_format(body: PlanBody) -> bool:
+        """400 for a bad format / sound / style / aspect; True when the basic flow is used."""
+        if body.format is not None and body.format not in formats.FORMATS:
+            raise HTTPException(400, f"Định dạng không hợp lệ: {body.format}.")
+        if not formats.is_basic(body.format):
+            return False
+        if body.audio not in formats.AUDIO:
+            raise HTTPException(400, f"Âm thanh / lời không hợp lệ: {body.audio}.")
+        if body.visual_style not in formats.VISUALS:
+            raise HTTPException(400, f"Phong cách hình ảnh không hợp lệ: {body.visual_style}.")
+        if body.visual_style == "other" and not body.custom_style.strip():
+            raise HTTPException(400, "Hãy mô tả phong cách hình ảnh.")
+        if body.aspect not in ("16:9", "9:16"):
+            raise HTTPException(400, "Flow chỉ tạo được video ngang 16:9 hoặc dọc 9:16.")
+        return True
+
+    def plan_basic_job(job: Job, body: PlanBody, scenes: int, backend: str, key: str | None, language: str) -> Any:
+        from ..basic_planner import plan_basic
+
+        via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+        f = formats.FORMATS[body.format]
+        job.log(f"Claude đang viết kịch bản {scenes} cảnh qua {via}…")
+        job.log(f"Định dạng: {f['label']} · Âm thanh: {formats.AUDIO[body.audio]['label']} · "
+                f"Hình ảnh: {formats.VISUALS[body.visual_style]['label']} · Khung: {body.aspect}")
+        genres = formats.clean_genres(body.genres)
+        if genres:
+            job.log("Thể loại: " + ", ".join(formats.GENRES[g][0] for g in genres))
+        job.log(f"Ý tưởng: {body.idea[:300]}")
+        sb, _ = plan_basic(body.idea, fmt=body.format, audio=body.audio, visual=body.visual_style,
+                           custom_style=body.custom_style, genres=genres, scenes=scenes, aspect=body.aspect,
+                           language=language, backend=backend, api_key=key, log=job.log)
+        return sb
+
     @app.post("/api/projects/plan")
     def plan_project(body: PlanBody) -> dict[str, Any]:
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        basic = check_format(body)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
@@ -992,22 +1035,25 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         key = load_settings().get("anthropic_api_key") or None
 
         def work(job: Job) -> dict[str, Any]:
-            from ..planner import plan_auto
-
-            via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
-            job.log(f"Claude đang viết storyboard {body.scenes} cảnh qua {via}…")
-            job.log(f"Ý tưởng: {body.idea[:300]}")
-            dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
-                        else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
-            job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: "
-                    f"{'không phụ đề' if language.casefold() == NO_SUBTITLES else language}")
-            from ..planner import MAX_SCENES
+            from ..planner import MAX_SCENES, plan_auto
 
             n = max(1, min(MAX_SCENES, body.scenes))
             if n != body.scenes:
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
-            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
-                              aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+            if basic:
+                sb = plan_basic_job(job, body, n, backend, key, language)
+            else:
+                via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+                job.log(f"Claude đang viết storyboard {n} cảnh qua {via}…")
+                job.log(f"Ý tưởng: {body.idea[:300]}")
+                dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
+                            else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
+                job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: "
+                        f"{'không phụ đề' if language.casefold() == NO_SUBTITLES else language}")
+                sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
+                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+                if body.format:
+                    sb.format = body.format
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
@@ -1835,7 +1881,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.put("/api/projects/{pid}/edit-plan")
     def put_edit_plan(pid: str, body: dict[str, Any]) -> dict[str, Any]:
         """Save a hand-tuned edit plan; the next “AI dựng phim” renders it as is (free)."""
-        from ..editor import ClipInfo, EditPlan, sanitize, save_plan
+        from ..editor import ClipInfo, EditPlan, sanitize, save_plan, screen_times
 
         try:
             plan = EditPlan.model_validate({**body, "source": "manual"})
@@ -1849,7 +1895,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             infos = {}
         order = [c.id for c in plan.clips]
         if order and all(i in infos for i in order):
-            plan = sanitize(plan, infos, order)
+            try:
+                targets = screen_times(load_storyboard(pdir(pid) / "storyboard.yaml"))
+            except Exception:  # noqa: BLE001 - a broken storyboard must not block saving the plan
+                targets = {}
+            plan = sanitize(plan, infos, order, targets)
         save_plan(plan, od)
         return edit_view(pid)
 
@@ -2220,6 +2270,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        basic = check_format(body)
+        if basic:
+            body.review = False  # the review agents check drama direction (camera, dialogue, locations)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
@@ -2239,8 +2292,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             n = max(1, min(MAX_SCENES, body.scenes))
             if n != body.scenes:
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
-            sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
-                              aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+            if basic:
+                sb = plan_basic_job(job, body, n, backend, key, language)
+            else:
+                sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
+                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+                if body.format:
+                    sb.format = body.format
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
@@ -2263,6 +2321,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if wp.retired:
             raise HTTPException(409, detail={"message": f"Không thể render: {len(wp.retired)} cảnh dùng model đã ngừng",
                                              "reason": "model_retired", "retired": wp.retired})
+        if sb.basic:
+            body.review = False  # the review agents check drama direction (camera, dialogue, locations)
         return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body)).public()
 
     # ---- backup (Google Drive via rclone) ----
@@ -2401,10 +2461,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         for s in data.get("sheets") or []:
             s["url"] = analysis_url(aid, s["file"])
         data["suggested_scenes"] = va.suggested_scenes(data)
+        data["recipe_timing_vi"] = va.recipe_timing_vi(data)
         data["folder"] = str(d)
         rea_report = d / "rea" / "report.html"
         data["rea_report"] = analysis_url(aid, "rea/report.html") if rea_report.is_file() else None
         return data
+
+    @app.get("/api/analyses/{aid}/budget")
+    def analysis_budget(aid: str, n: int | None = None) -> dict[str, Any]:
+        """How the reference's length splits into n scenes (n omitted: the suggested count)."""
+        data = va.load(adir(aid))
+        n = max(1, min(va.MAX_SCENES, n)) if n else None
+        b = va.scene_budget(data.get("measured") or {}, n)
+        return {"scenes": len(b), "lengths": [x["length"] for x in b], "text": va.recipe_timing_vi(data, n)}
 
     @app.get("/api/analyses/{aid}/file/{rel:path}")
     def analysis_file(aid: str, rel: str):
@@ -2437,13 +2506,18 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         def work(job: Job) -> dict[str, Any]:
             n = body.scenes or va.suggested_scenes(data)
-            job.log(f"Claude đang viết storyboard {n} cảnh theo phong cách “{data['ai'].get('title_vi', aid)}”…")
-            if body.idea.strip():
-                job.log(f"Ý tưởng: {body.idea.strip()[:300]}")
+            title = data['ai'].get('title_vi', aid)
+            if body.mode == "same":
+                job.log(f"Claude đang viết storyboard {n} cảnh làm lại giống “{title}”, chỉ đổi nhân vật…")
             else:
+                job.log(f"Claude đang viết storyboard {n} cảnh theo phong cách “{title}”…")
+            if body.idea.strip():
+                job.log(("Ghi chú: " if body.mode == "same" else "Ý tưởng: ") + body.idea.strip()[:300])
+            elif body.mode == "style":
                 job.log("Chưa có ý tưởng: Claude tự nghĩ một câu chuyện mới cùng thể loại.")
+            job.log(va.recipe_timing_vi(data, n))
             sb, _ = va.plan_from_analysis(data, body.idea, scenes=n, language_hint=language,
-                                          dialogue_language=dialogue, backend=backend, api_key=key)
+                                          dialogue_language=dialogue, backend=backend, api_key=key, mode=body.mode)
             pid, pd = new_project_dir(sb.title)
             save_storyboard(sb, pd / "storyboard.yaml")
             va.copy_reference(d, pd)

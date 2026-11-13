@@ -272,14 +272,30 @@ def clip_sig(p: Path) -> str:
         return ""
 
 
+def scene_lines(sb: Storyboard, s: Scene) -> list[tuple[str, str, str]]:
+    """(who, words, delivery) the clip should say. Drama: the scene's `dialogue` rows. I2V formats: the line of
+    `video_shot.speaker` (who = the speaker's visual tag), or with a voice-over the narrator's `narration`."""
+    if sb.dialogue_language == NO_DIALOGUE:
+        return []
+    if sb.basic:
+        sp = s.video_shot.speaker if s.video_shot is not None else None
+        if sb.audio == "dialogue" and sp and sp.line.strip():
+            return [(sp.visual_tag or "the speaker", sp.line.strip(), sp.voice_style or "")]
+        if sb.audio == "voiceover" and s.narration and s.narration.strip():
+            return [("a narrator voice-over (not a character on screen; nobody on screen moves the lips)",
+                     s.narration.strip(), "")]
+        return []
+    return [(d.character, d.line, d.delivery or "") for d in (s.dialogue or []) if d.line.strip()]
+
+
 def expected_dialogue(sb: Storyboard, s: Scene) -> str:
     if sb.dialogue_language == NO_DIALOGUE:
         return "No dialogue: nobody should speak (ambient sound and music only)."
-    lines = [d for d in (s.dialogue or []) if d.line.strip()]
+    lines = scene_lines(sb, s)
     lang = sb.dialogue_language or "the characters' natural language"
     if not lines:
         return f"No dialogue in this scene (nobody should say words). Film language: {lang}."
-    rows = "\n".join(f"- {d.character}: {d.line}" + (f" ({d.delivery})" if d.delivery else "") for d in lines)
+    rows = "\n".join(f"- {who}: {words}" + (f" ({how})" if how else "") for who, words, how in lines)
     return f"Expected dialogue, in {lang}, in this order, each line once:\n{rows}"
 
 
@@ -291,7 +307,7 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     match = round(raw_match, 3) if raw_match is not None and raw_match == raw_match else None  # None or NaN: unknown
     sound = audio_stats(clip)
     speech = transcribe(clip)
-    has_lines = sb.dialogue_language != NO_DIALOGUE and any(d.line.strip() for d in (s.dialogue or []))
+    has_lines = bool(scene_lines(sb, s))
     if has_lines and speech and speech.get("vad") and not speech["segments"]:
         soft = transcribe(clip, vad_threshold=FAINT_VAD)  # a whispered line the detector skipped
         if soft and soft["segments"]:
@@ -327,7 +343,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     user = "\n".join([
         reviewer.storyboard_brief(sb), "",
         f"QC scene {s.id} ({s.duration}s).",
-        f"Action prompt: {s.prompt}",
+        # I2V formats: the prompt actually sent (speaker, gaze, listeners); `prompt` there is only a summary
+        f"Action prompt: {sb.video_prompt(s) if sb.basic else s.prompt}",
         f"Opening frame: {s.image_prompt or '-'}",
         f"Content direction: {s.content_direction or '-'}",
         expected_dialogue(sb, s), "", *facts])
