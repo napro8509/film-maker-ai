@@ -171,6 +171,44 @@ def _check_durations(storyboard: Path, out: Path | None) -> bool:
     return False
 
 
+def _format_options(f):
+    from . import formats as fm
+
+    f = click.option("--genre", "genres", multiple=True, type=click.Choice(list(fm.GENRES)),
+                     help="Thể loại (lặp lại được; luồng mới).")(f)
+    f = click.option("--visual", default="realistic", show_default=True, type=click.Choice([k for k in fm.VISUALS if k != "other"]),
+                     help="Phong cách hình ảnh (luồng mới).")(f)
+    f = click.option("--audio", default="dialogue", show_default=True, type=click.Choice(list(fm.AUDIO)),
+                     help="Âm thanh / lời (luồng mới): dialogue = nhân vật nói, silent, voiceover, onscreen_text.")(f)
+    f = click.option("--format", "fmt", default=fm.DEFAULT_FORMAT, show_default=True, type=click.Choice(list(fm.FORMATS)),
+                     help=f"Định dạng phim. {fm.DRAMA} là luồng drama cũ, đã ngừng dùng (deprecated).")(f)
+    return f
+
+
+def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: int, aspect: str,
+              language: str | None, dialogue_lang: str | None, backend: str = "auto", api_key: str | None = None):
+    """Storyboard for a new film: the basic flow, or the deprecated drama planner for `--format short_drama`."""
+    from . import formats as fm
+
+    if fm.is_deprecated(fmt):
+        click.echo(f"⚠ {fm.DEPRECATED_NOTE}")
+        from .planner import plan_auto
+
+        sb, _ = plan_auto(idea, backend=backend, api_key=api_key, scenes=scenes, aspect=aspect,
+                          language_hint=language, dialogue_language=dialogue_lang, log=click.echo)
+        sb.format = fm.DRAMA
+        return sb
+    from .basic_planner import plan_basic
+
+    # the language of the words: what characters say when they speak, else the subtitle / title language
+    words = dialogue_lang if fm.uses_language(audio) and dialogue_lang and dialogue_lang != "none" else language
+    click.echo(f"Định dạng: {fm.FORMATS[fmt]['label']} · Âm thanh: {fm.AUDIO[audio]['label']} · "
+               f"Hình ảnh: {fm.VISUALS[visual]['label']} · Khung: {aspect}")
+    sb, _ = plan_basic(idea, fmt=fmt, audio=audio, visual=visual, genres=list(genres), scenes=scenes, aspect=aspect,
+                       language=words, backend=backend, api_key=api_key, log=click.echo)
+    return sb
+
+
 @main.command()
 @click.argument("idea")
 @click.option("-o", "--output", type=click.Path(path_type=Path), default=Path("storyboard.yaml"), show_default=True)
@@ -184,10 +222,13 @@ def _check_durations(storyboard: Path, out: Path | None) -> bool:
                    "Được ép vào mọi prompt video. --lang vẫn là ngôn ngữ phụ đề (narration).")
 @click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
               help="claude_code = dùng gói Claude (Pro/Max) qua lệnh `claude`; api = dùng ANTHROPIC_API_KEY.")
+@_format_options
 def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
-         backend: str) -> None:
-    """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key)."""
-    from .planner import plan_auto
+         backend: str, fmt: str, audio: str, visual: str, genres) -> None:
+    """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key).
+
+    Mặc định dùng luồng mới (--format clip: chữ -> ảnh -> video). --format short_drama là luồng cũ, đã ngừng dùng.
+    """
 
     if dialogue_lang is not None:  # checked before overwriting or calling Claude
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
@@ -197,9 +238,9 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
         return
     click.echo("Đang viết storyboard...")
     try:
-        sb, _ = plan_auto(idea, backend=backend, scenes=scenes, aspect=aspect, language_hint=language,
-                          dialogue_language=dialogue_lang, log=click.echo)
-    except RuntimeError as exc:
+        sb = _plan_new(idea, fmt=fmt, audio=audio, visual=visual, genres=genres, scenes=scenes, aspect=aspect,
+                       language=language, dialogue_lang=dialogue_lang, backend=backend)
+    except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     save_storyboard(sb, output)
     click.echo(f"✔ {output}: {len(sb.scenes)} cảnh. Xem/sửa lại rồi chạy: filmmaker run {output} --dry-run")
@@ -794,17 +835,19 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 @click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
 @click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
               help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
+@_format_options
 def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause, publish_to) -> None:
+         burn_subtitles, music, profile, pause, publish_to, fmt, audio, visual, genres) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
     Agent review storyboard, keyframe (tạo lại ảnh lỗi, miễn phí), AI QC từng clip (hình, âm thanh, lời thoại;
     chỉ đánh dấu, không tự render lại) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
+    Phim mới mặc định dùng luồng mới (--format clip); --format short_drama là luồng cũ, đã ngừng dùng.
     """
+    from . import formats as fm
     from . import publisher
     from .autopilot import AutoError, Autopilot, AutoSettings, slug
-    from .planner import plan_auto
 
     if not idea and not existing:
         raise click.UsageError("cần IDEA hoặc --storyboard")
@@ -820,9 +863,9 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         language = _cli_lang(language, "--lang", clean_language)
         click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
         try:
-            sb, _ = plan_auto(idea, api_key=key, scenes=scenes, aspect=aspect, language_hint=language,
-                              dialogue_language=dialogue_lang, log=click.echo)
-        except RuntimeError as exc:
+            sb = _plan_new(idea, fmt=fmt, audio=audio, visual=visual, genres=genres, scenes=scenes, aspect=aspect,
+                           language=language, dialogue_lang=dialogue_lang, api_key=key)
+        except (RuntimeError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
         ws = workspace or Path.home() / "FilmMaker"
         base = slug(sb.title) or "phim"
@@ -833,6 +876,8 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         sb_path = d / "storyboard.yaml"
         save_storyboard(sb, sb_path)
         click.echo(f"✔ {sb_path}")
+    if review and not fm.is_deprecated(load_storyboard(sb_path).format):
+        review = False  # the review agents check drama direction (camera, dialogue rows, locations); like the app
     pub_cfg = publisher.config_from_settings(s)
     plats = _resolve_publish_platforms(publish_to, pub_cfg)
     cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,

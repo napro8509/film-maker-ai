@@ -527,7 +527,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s = load_settings()
         return Gflow(profile=s.get("profile") or None, dry_run=dry_run, log=log,
                      ui_enabled=bool(s.get("flow_ui", True)), ui_max_credits=int(s.get("flow_ui_max_credits") or 0),
-                     ui_window=s.get("flow_ui_window") or "hidden")
+                     ui_window=s.get("flow_ui_window") or "hidden",
+                     flow_characters=bool(s.get("flow_characters", True)))
 
     # ---- project summary / detail ----
 
@@ -1044,6 +1045,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 sb = plan_basic_job(job, body, n, backend, key, language)
             else:
                 via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+                job.log(f"⚠ {formats.DEPRECATED_NOTE}")
                 job.log(f"Claude đang viết storyboard {n} cảnh qua {via}…")
                 job.log(f"Ý tưởng: {body.idea[:300]}")
                 dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None

@@ -591,8 +591,9 @@ def _front_matter(text: str) -> tuple[dict, str]:
 
 
 def parse_timeline(text: str) -> list[dict[str, Any]]:
-    """rea-video's reel/timeline.md: one line per shot inside a ```reel-timeline block."""
-    m = re.search(r"```reel-timeline\n(.*?)(?:```|\Z)", text, re.S)
+    """rea-video's timeline: one line per shot inside a ```videomd-timeline block (video/timeline.md), or
+    ```reel-timeline (reel/timeline.md) in rea-video versions before the VIDEO.md format."""
+    m = re.search(r"```(?:videomd|reel)-timeline\n(.*?)(?:```|\Z)", text, re.S)
     rows = []
     for line in (m.group(1) if m else "").splitlines():
         mm = re.match(r"#(\d+)\s+([\d.]+)-([\d.]+)\s*(.*)$", line.strip())
@@ -608,22 +609,26 @@ def parse_timeline(text: str) -> list[dict[str, Any]]:
     return rows
 
 
-REEL_FILES = ("REEL.md", "reel/timeline.md", "reel/content.md", "reel/cast.md", "reel/sound.md", "reel/look.md",
-              "reel/packaging.md")
+# rea-video output: the card file at the top and one Markdown file per part in a folder. The current format is
+# VIDEO.md + video/ (https://github.com/videomd/videomd); older versions wrote REEL.md + reel/.
+REA_LAYOUTS = (("VIDEO.md", "video"), ("REEL.md", "reel"))
+REA_PARTS = ("timeline", "content", "cast", "sound", "look", "packaging")
 
 
 def read_reel(out: Path) -> dict[str, Any] | None:
-    if not (out / "REEL.md").is_file():
+    layout = next(((card, part) for card, part in REA_LAYOUTS if (out / card).is_file()), None)
+    if not layout:
         return None
-    card, _ = _front_matter((out / "REEL.md").read_text(encoding="utf-8", errors="replace"))
+    card_name, part_dir = layout
+    card, _ = _front_matter((out / card_name).read_text(encoding="utf-8", errors="replace"))
     texts, full = {}, {}
-    for name in REEL_FILES:
+    for name in (card_name, *(f"{part_dir}/{part}.md" for part in REA_PARTS)):
         p = out / name
         if p.is_file():
             full[name] = p.read_text(encoding="utf-8", errors="replace")
             texts[name] = full[name][:REA_TEXT_MAX]
     # Parse the whole timeline: a long video's timeline is far longer than what is sent to Claude.
-    timeline = parse_timeline(full.get("reel/timeline.md", ""))
+    timeline = parse_timeline(full.get(f"{part_dir}/timeline.md", ""))
     return {"card": card, "texts": texts, "timeline": timeline}
 
 
@@ -653,6 +658,9 @@ def run_rea(video: Path, out: Path, *, log: Log = print, should_stop: StopCheck 
     if reel:
         card = reel["card"]
         log(f"  rea-video: {card.get('shots', len(reel['timeline']))} shot — {card.get('description', '')}")
+    elif proc.returncode == 0:
+        log(f"⚠ rea-video chạy xong nhưng không thấy {' / '.join(c for c, _ in REA_LAYOUTS)} trong {out} "
+            "(định dạng đầu ra mới?) — tiếp tục không có nó.")
     return reel
 
 
@@ -1191,14 +1199,16 @@ def _clip_durations(sb, meta) -> None:
 
 def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None, language_hint: str | None = None,
                        dialogue_language: str | None = None, backend: str = "auto", api_key: str | None = None,
-                       mode: str = "style"):
-    """A new Storyboard from the analysed video (planner.plan_auto). Returns (storyboard, backend).
+                       mode: str = "style", fmt: str | None = None):
+    """A new Storyboard from the analysed video. Returns (storyboard, backend).
+
+    `fmt`: the film format. None picks the new (basic) flow: `clip` for a reference up to 90 s, else `short_film`;
+    `short_drama` keeps the deprecated drama planner (planner.plan_auto).
 
     mode "style": a NEW story in the same format and style; "same": a remake of the reference where only the
     characters are new. Either way each scene gets `screen_time` from the scene budget, so the cut film is as
     long as the reference (a scene can be 2 s on screen; its clip is rendered short and trimmed)."""
-    from . import model_meta
-    from .planner import plan_auto
+    from . import formats, model_meta
 
     if mode not in FILM_MODES:
         raise ValueError(f"mode must be one of {FILM_MODES}")
@@ -1213,15 +1223,32 @@ def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None,
             "Invent a NEW original story in the same format and genre as the reference. Starting point: "
             + (ai.get("idea_suggestion_vi") or ai.get("genre_vi") or "a short emotional drama"))
         prompt = idea + "\n" + film_brief(data, n)
-    sb, used = plan_auto(prompt, backend=backend, api_key=api_key,
-                         scenes=n, aspect=aspect, language_hint=language_hint, dialogue_language=dialogue_language)
+    style_prompt = ((ai.get("look") or {}).get("style_prompt") or "").strip()
+    if fmt is None:
+        fmt = "clip" if float((data.get("measured") or {}).get("duration") or 0) <= 90 else "short_film"
+    if fmt not in formats.FORMATS:
+        raise ValueError(f"định dạng {fmt!r} không hợp lệ")
+    if formats.is_deprecated(fmt):
+        from .planner import plan_auto
+
+        sb, used = plan_auto(prompt, backend=backend, api_key=api_key, scenes=n, aspect=aspect,
+                             language_hint=language_hint, dialogue_language=dialogue_language)
+        sb.format = formats.DRAMA
+    else:
+        from .basic_planner import plan_basic
+
+        speaks = bool(dialogue_language) and dialogue_language.casefold() != "none"
+        sb, used = plan_basic(prompt, fmt=fmt, audio="dialogue" if speaks else "silent",
+                              visual="other" if style_prompt else "realistic", custom_style=style_prompt,
+                              scenes=n, aspect=aspect if aspect in ("16:9", "9:16") else "9:16",
+                              language=dialogue_language if speaks else language_hint,
+                              backend=backend, api_key=api_key)
     budget = scene_budget(data.get("measured") or {}, len(sb.scenes) or n)
     for s, b in zip(sb.scenes, budget):
         s.screen_time = b["length"]
     _clip_durations(sb, model_meta.load())
     style = data.get("edit_style") or edit_style_text(data) or ""
     sb.edit_style = "\n".join(x for x in (budget_text(budget), style) if x) or None
-    style_prompt = ((ai.get("look") or {}).get("style_prompt") or "").strip()
     if style_prompt and not (sb.style or "").strip():
         sb.style = style_prompt
     return sb, used

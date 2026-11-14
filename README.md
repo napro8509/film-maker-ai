@@ -59,6 +59,16 @@ filmmaker auto "Bà Tư bán xôi ở góc phố Hà Nội..." -n 10 --aspect 9:
 filmmaker auto --storyboard ~/FilmMaker/goi-xoi-cua-ba-tu/storyboard.yaml   # làm tiếp chỗ dừng
 ```
 
+Phim mới mặc định dùng **luồng mới** (chữ → ảnh → video): `--format clip` (Clip ngắn), đổi bằng `--format short_film`,
+`series`, `feature`; kèm `--audio dialogue|silent|voiceover|onscreen_text|music`, `--visual realistic|2d|3d|anime` và
+`--genre family` (lặp lại được). `filmmaker plan` nhận cùng các cờ này.
+
+> **Luồng Short drama cũ đã ngừng dùng (deprecated).** Chỉ chạy khi ghi rõ `--format short_drama`, có cảnh báo trong
+> log; trong popup "Phim mới" nó nằm cuối danh sách, mờ đi và không bao giờ được chọn sẵn. Dự án cũ (storyboard không
+> có `format`) vẫn mở và làm tiếp bình thường, autopilot chỉ in một dòng cảnh báo. "Làm phim theo video mẫu" (Phân tích
+> video) cũng dùng luồng mới: `clip` khi video mẫu dài tới 90 giây, dài hơn thì `short_film`; phong cách hình lấy từ video mẫu. Skill `/make-film` (đội agent viết
+> storyboard tay) vẫn dùng luồng cũ.
+
 | # | Bước | Ai làm | Tốn credit |
 |---|---|---|---|
 | 1 | Viết storyboard (+ làm tròn độ dài model không nhận) | Claude | không |
@@ -102,7 +112,7 @@ Giao diện có:
 - **Sửa từng cảnh**: đổi kiểu cảnh, prompt, độ dài, model, phụ đề; thêm/xoá/nhân bản/đổi thứ tự; tải ảnh lên cho kiểu Ảnh → Video; xem prompt thực tế gửi lên Flow. Tự động lưu.
 - **Chỉ đạo nội dung & thoại** (mỗi cảnh): ghi mục đích cảnh và cách nhân vật diễn; thêm từng câu thoại (ai nói, nói gì, nói thế nào). Lời thoại được đưa vào prompt video theo dạng `Lan (whispering) says: ...`, nói lần lượt từng người, kèm quy tắc không ai nói lặp câu của người khác. Câu trùng trong cùng cảnh không được gửi lên Flow; câu trùng với cảnh trước được cảnh báo (cả trong app và `filmmaker check`). "Từ ý tưởng" cũng tự viết phần này cho mỗi cảnh.
 - **Nhân vật & phong cách**: mô tả nhân vật một lần, tự thêm vào mọi cảnh có tên nhân vật đó.
-- **Ảnh nhân vật (tham chiếu)**: tạo ảnh nhân vật trên Flow (miễn phí) hoặc tải ảnh lên. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
+- **Ảnh nhân vật (tham chiếu)**: tạo nhân vật bằng tính năng **Characters** của Flow (panel trái → New character, miễn phí): app gõ mô tả, đặt đúng tên nhân vật trên Flow và tải ảnh về. Khi tạo keyframe qua giao diện chat của Flow, nhân vật được gắn theo tên (“+” → Characters → Add to prompt) thay vì tải ảnh lên lại, nên Flow tự giữ khuôn mặt. Tạo lại nhân vật thì bản cũ trên Flow được đổi tên thành “<tên> (cũ …)”. Đổi ảnh nhân vật bằng tay thì app gửi ảnh mới như trước. Nếu trang Characters lỗi, app tự quay về tạo ảnh bằng prompt; tắt hẳn bằng `"flow_characters": false` trong settings.json. Có thể tải ảnh lên thay vì tạo. Ảnh được gửi kèm (`--ref`) khi tạo keyframe (`gflow image i2i`) và video Chữ → Video (`gflow video r2v`) của mọi cảnh có tên nhân vật, tối đa 3 nhân vật mỗi cảnh, để giữ khuôn mặt đồng nhất. Nếu tài khoản Flow chưa hỗ trợ thì tự quay về cách cũ (không tốn credit). Đổi ảnh nhân vật sẽ đánh dấu các cảnh liên quan cần tạo lại.
 - **Bối cảnh (thẻ "Bối cảnh" ở tab Câu chuyện, ngay dưới "Nhân vật")**: khai báo mỗi nơi lặp lại một lần (mô tả + ảnh tham chiếu), thêm/sửa/xoá, tải ảnh lên hoặc bấm "Tạo ảnh bối cảnh" (miễn phí). Trình sửa cảnh có ô "Bối cảnh" và ô "Nối tiếp keyframe cảnh trước"; thẻ có ô chung "Nối keyframe cảnh liền trước cùng bối cảnh". Cảnh Ảnh → Video bỏ qua bối cảnh. Xem mục "Bối cảnh và cảnh liền mạch".
 - **Tab "Bảng"**: xem cả phim như một bảng card: nhân vật → keyframe → video của từng cảnh. Kéo nối mũi tên để chọn nhân vật xuất hiện trong cảnh; tạo ảnh nhân vật và keyframe ngay trên card (miễn phí); render video có hộp xác nhận credit. Xem mục "Nhân vật trong từng cảnh".
 - **Tạo keyframe trước (miễn phí)**: xem ảnh mở đầu từng cảnh, sửa đến khi ưng rồi mới render video. Render lại video vẫn giữ ảnh đã duyệt.

@@ -668,6 +668,7 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 
 /* Phim mới: format / sound pickers and genre chips (basic formats) */
 .fmt-choice, .audio-choice { margin-bottom: 0; }
+.fmt-choice button.deprecated:not(.on) { opacity: .55; }
 button.chip { border: 1px solid var(--border); cursor: pointer; padding: 4px 12px; font: inherit; font-size: var(--fs-1); }
 button.chip:hover { border-color: var(--border-strong); }
 .chip.on { background: var(--accent-soft); color: var(--accent-ink); border-color: var(--accent); }

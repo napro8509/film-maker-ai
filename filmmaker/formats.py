@@ -8,6 +8,11 @@ small helpers: no I/O, imported by the storyboard, the planner and the web serve
 from __future__ import annotations
 
 DRAMA = "short_drama"
+# The drama flow is deprecated: kept so old projects (empty `format`) still open and finish, but new films use
+# the basic flow. DEFAULT_FORMAT is what a new film gets when no format is chosen.
+DEFAULT_FORMAT = "clip"
+DEPRECATED_NOTE = ("Luồng Short drama cũ đã ngừng dùng (deprecated): phim mới hãy chọn định dạng khác "
+                   "(Clip ngắn, Phim ngắn, ...). Dự án cũ vẫn chạy tiếp được.")
 
 # key -> label, help, default scene count, pacing guide for the planner (English)
 FORMATS: dict[str, dict] = {
@@ -28,7 +33,7 @@ FORMATS: dict[str, dict] = {
                   "character arc and a satisfying ending."),
     },
     DRAMA: {
-        "label": "Short drama", "desc": "Nhiều tập 1–3 phút, mỗi tập kết bằng một tình tiết gây tò mò", "scenes": 10,
+        "label": "Short drama (cũ)", "desc": "Luồng cũ, đã ngừng dùng: chỉ để làm tiếp dự án cũ", "scenes": 10,
         "guide": "",  # the original drama planner, unchanged
     },
     "clip": {
@@ -43,8 +48,9 @@ AUDIO: dict[str, dict] = {
     "dialogue": {
         "label": "Có thoại", "desc": "Kịch bản có lời nhân vật, cần lồng tiếng hoặc khớp môi",
         "guide": ("Characters speak. A scene with words has ONE `speaker` (face visible, one line of at most 12 "
-                  "words) and every other visible person in `listeners`; `narration` = that line (the subtitle). "
-                  "Scenes without words leave `speaker` empty."),
+                  "words) and every other visible person in `listeners`; `narration` = exactly that line (the subtitle). "
+                  "Scenes without words leave both `speaker` and `narration` empty: never a `narration` without "
+                  "a `speaker`."),
         "rule": "Spoken language: {lang}. Only one person speaks; everyone else keeps lips closed.",
     },
     "silent": {
@@ -107,6 +113,11 @@ def is_basic(fmt: str | None) -> bool:
     return bool(fmt) and fmt in FORMATS and fmt != DRAMA
 
 
+def is_deprecated(fmt: str | None) -> bool:
+    """True for the old drama flow: `short_drama`, or no format at all (projects made before formats existed)."""
+    return not fmt or fmt == DRAMA
+
+
 def clean_genres(values: object) -> list[str]:
     """Known genre keys, in the given order, without duplicates."""
     out: list[str] = []
@@ -146,8 +157,11 @@ def public() -> dict:
     """The choices for the web UI."""
     return {
         "drama": DRAMA,
-        "formats": [{"key": k, "label": v["label"], "desc": v["desc"], "scenes": v["scenes"], "basic": k != DRAMA}
-                    for k, v in FORMATS.items()],
+        "default": DEFAULT_FORMAT,
+        "deprecated_note": DEPRECATED_NOTE,
+        "formats": [{"key": k, "label": v["label"], "desc": v["desc"], "scenes": v["scenes"], "basic": k != DRAMA,
+                     "deprecated": k == DRAMA}
+                    for k, v in sorted(FORMATS.items(), key=lambda kv: kv[0] == DRAMA)],
         "audio": [{"key": k, "label": v["label"], "desc": v["desc"], "spoken": uses_language(k), "text": has_text(k)}
                   for k, v in AUDIO.items()],
         "visuals": [{"key": k, "label": v["label"]} for k, v in VISUALS.items()],

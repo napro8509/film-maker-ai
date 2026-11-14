@@ -169,7 +169,7 @@ def test_cli_bad_lang_with_dialogue_lang_exits(dump, tmp_path):
 
 def _cli_plan(tmp_path, *args):
     out = tmp_path / "sb.yaml"
-    r = CliRunner().invoke(main, ["plan", "ý", "-n", "1", "-o", str(out), "--backend", "claude_code", *args])
+    r = CliRunner().invoke(main, ["plan", "ý", "-n", "1", "-o", str(out), "--backend", "claude_code", "--format", "short_drama", *args])
     assert r.exit_code == 0, r.output
     return yaml.safe_load(out.read_text())
 

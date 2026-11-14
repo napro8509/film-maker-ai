@@ -21,6 +21,7 @@ from . import durations as dur
 from . import flow_caps, manual_clip, model_meta
 from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
+from .flow_ui import character_ref
 from .storyboard import MAX_REFS, Character, Location, RefItem, Scene, Storyboard, file_sha  # noqa: F401
 from .thumbnail import render_cover
 
@@ -117,6 +118,7 @@ class Pipeline:
         self._flow_media: dict[str, dict[str, str]] = {}  # project -> {sha256 of file: media id}
         self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
         self._dry_kf: set[str] = set()  # dry-run: keyframes this run "made" already (so the next scene can chain)
+        self._no_flow_chars = False  # the Flow Characters page failed this run: portraits go back to plain t2i
 
     def _sha(self, path: Path) -> str | None:
         try:
@@ -167,7 +169,7 @@ class Pipeline:
             for i, (n, _) in enumerate(refs)) + ". " + prompt)
         # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
         if self.state.data.get("i2i_ui") and self.g.ui_available():
-            return self._image_via_ui(what, ui_prompt, files, kw)
+            return self._image_via_ui(what, ui_prompt, self.ui_refs(refs, project), kw)
         ref_args = files if project in self._no_media_refs else self.flow_refs(refs, project)
         while True:
             try:
@@ -187,11 +189,35 @@ class Pipeline:
                     self.state.data["i2i_ui"] = True
                     self.state.save()
                     self._remember(i2i_ui=True)
-                    return self._image_via_ui(what, ui_prompt, files, kw)
+                    return self._image_via_ui(what, ui_prompt, self.ui_refs(refs, project), kw)
                 self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
                 return None
 
-    def _image_via_ui(self, what: str, prompt: str, files: list[Path], kw: dict) -> Path | None:
+    def flow_character(self, name: str, project: str, image: Path | None = None) -> dict[str, Any] | None:
+        """The Flow character made for `name` in `project` (state.json "flow_characters"), or None. With `image`,
+        only while that file is still the picture the character was made with (a replaced picture means the
+        storyboard no longer matches the Flow character)."""
+        fc = (self.state.data.get("flow_characters") or {}).get(name.strip())
+        if not fc or fc.get("project") != project or not fc.get("flow_name"):
+            return None
+        if image is not None and (not fc.get("sha") or fc["sha"] != self._sha(image)):
+            return None
+        return fc
+
+    def ui_refs(self, refs: list[tuple[str, Path]], project: str) -> list[Path | str]:
+        """References for the Flow chat page: a character made on Flow's Characters page is attached by its
+        name (Flow keeps its face itself); anything else is uploaded as a picture."""
+        out: list[Path | str] = []
+        for name, p in refs:
+            fc = self.flow_character(name, project, p)
+            if fc:
+                self.log(f"  {name}: dùng nhân vật Flow “{fc['flow_name']}” (không tải ảnh lên lại)")
+                out.append(character_ref(fc["flow_name"]))
+            else:
+                out.append(p)
+        return out
+
+    def _image_via_ui(self, what: str, prompt: str, files: list[Path | str], kw: dict) -> Path | None:
         self.log(f"  → {what} qua giao diện chat của Flow")
         try:
             return self.g.ui_image_to_image(self.sb.for_flow(prompt), files, **kw)
@@ -626,11 +652,15 @@ class Pipeline:
             self.rep.submitting(key)
             try:
                 with self.rep.active(key):
-                    img = self._with_retries(
-                        f"tạo {label}",
-                        lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
-                                                     model=self.sb.image_model, project=project),
-                        opts.max_retries)
+                    img = None
+                    if key_prefix == "char" and self.use_flow_characters():
+                        img = self._flow_character_image(c, prompt, dest, project)
+                    if img is None:
+                        img = self._with_retries(
+                            f"tạo {label}",
+                            lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
+                                                         model=self.sb.image_model, project=project),
+                            opts.max_retries)
             except GflowError as exc:
                 self.rep.failed(key)
                 report.failed[c.name] = str(exc)
@@ -651,6 +681,39 @@ class Pipeline:
             self.log(f"[{c.name}] OK -> {dest}")
             self.rep.done(key)
         return report
+
+    def use_flow_characters(self) -> bool:
+        """Character pictures are made on Flow's Characters page (a reusable Flow character) rather than as a
+        plain text-to-image picture: needs the Flow page driver (gflow's own `character create` uses a labs route
+        that accounts moved to flow.google.com no longer have)."""
+        return bool(self.g.flow_characters and not self._no_flow_chars and self.g.ui_available())
+
+    def _flow_character_image(self, c: Character, prompt: str, dest: Path, project: str) -> Path | None:
+        """Make `c` as a Flow character and save its picture to `dest`; None when that did not work (the caller
+        then makes a plain picture from the prompt, as before)."""
+        name = c.name.strip()
+        old = self.flow_character(name, project)
+        retire = None
+        if old and old.get("entity_id"):
+            retire = (old["entity_id"], f"{name} (cũ {datetime.now().strftime('%d-%m %H%M')})")
+        self.log(f"[{c.name}] tạo nhân vật trên Flow (Characters → New character)")
+        try:
+            res = self.g.ui_create_character(name, self.sb.for_flow(prompt), out=dest, project=project, retire=retire)
+        except GflowError as exc:
+            if exc.exit_code in (23, 2):  # page changed / no driver: stop trying for the rest of this run
+                self._no_flow_chars = True
+            self.log(f"[{c.name}] ! Không tạo được nhân vật trên Flow ({exc}); tạo ảnh bằng prompt như cũ.")
+            return None
+        img = Path(res.get("local_path") or dest)
+        if self.g.dry_run:
+            return img
+        if img != dest and img.is_file():
+            dest.write_bytes(img.read_bytes())
+        chars = self.state.data.setdefault("flow_characters", {})
+        chars[name] = {"project": project, "entity_id": res.get("entity_id"), "flow_name": res.get("name") or name,
+                       "media_id": res.get("media_id"), "sha": self._sha(dest), "made_at": _now()}
+        self.state.save()
+        return dest
 
     def _run_keyframes(self, scenes: list[Scene], opts: RunOptions, report: RunReport) -> RunReport:
         """Make only the keyframe stills (free on Flow) so they can be reviewed before paying for video."""

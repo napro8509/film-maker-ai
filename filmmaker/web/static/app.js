@@ -181,6 +181,19 @@ function subtitleFields(sb, sc, onChange) {
       placeholder: code === primary ? "Không bắt buộc" : "Để trống: tự dịch khi ghép phim",
       oninput: (e) => { setSubLine(sb, sc, code, e.target.value); onChange(); } }))));
 }
+/* Basic films with dialogue: the subtitle is the speaker's line (never typed apart, so what is read on screen is
+   what the video model is asked to say); only the other tracks' translations are editable. */
+function dialogueSubFields(sb, sc, onChange) {
+  const sp = sc.video_shot?.speaker, line = normLine(sp?.line);
+  if (!line) return h("p", { class: "help" }, h("b", {}, "Không thoại"), " · cảnh này không có ai nói nên không có phụ đề. Muốn có thoại, mở “Người nói” ở trên và nhập câu thoại.");
+  const who = normLine(sp.visual_tag) || normLine(sp.position) || "người nói";
+  const primary = primarySubCode(sb);
+  return h("div", { class: "stack tight" },
+    h("p", { class: "help" }, h("b", {}, "Thoại"), ` · ${who}: “${line}”`, h("span", { class: "sub" }, " — cũng là phụ đề; sửa ở ô Câu thoại.")),
+    noSubs(sb) ? null : h("div", { class: "grid2" }, SUB_TRACKS.filter(([code]) => code !== primary).map(([code, label]) => field(`Phụ đề ${label}`,
+      h("input", { type: "text", lang: code, value: sc.subtitles?.[code] || "", placeholder: "Để trống: tự dịch khi ghép phim",
+        oninput: (e) => { setSubLine(sb, sc, code, e.target.value); onChange(); } })))));
+}
 function subTrack() { const c = localGet("subTrack", "vi"); return SUB_TRACKS.some(([k]) => k === c) ? c : "vi"; }
 /* A valid language name with whitespace collapsed, or null (not a string, empty, has a line break, > 40 chars). */
 function cleanLang(v) {
@@ -1224,7 +1237,7 @@ function renderScene(sc, i) {
             h("select", { value: sc.model || "", onchange: (e) => { sc.model = e.target.value || undefined; changed(); renderMain(); } },
               h("option", { value: "" }, `Theo phim (${sb.model ? modelLabel(sb.model) : "mặc định"})`),
               videoModelOptions(sc.model).map((m) => h("option", { value: m.alias }, m.label))))),
-        subtitleFields(sb, sc, changed),
+        isBasic(sb) && sb.audio === "dialogue" ? zone(`subs-${i}`, () => dialogueSubFields(sb, sc, changed)) : subtitleFields(sb, sc, changed),
         zone(`preview-${i}`, () => {
           const st = S.cur.scene_state?.[sc.id];
           if (!st) return h("div");
@@ -1667,9 +1680,9 @@ function renderShot(sb, sc, i) {
     oninput: (e) => {
       const s = sp(true), old = s.line || "";
       s.line = e.target.value;
-      // the subtitle follows the line while it is still the same words
-      if (!sc.narration || sc.narration.trim() === old.trim()) { sc.narration = e.target.value || undefined; }
-      showCount(); edit();
+      // a dialogue film's subtitle IS the spoken line (the server enforces it); old translations no longer match
+      if (normLine(e.target.value) !== normLine(old)) { sc.narration = normLine(e.target.value) || undefined; delete sc.subtitles; }
+      showCount(); edit(); refreshZone(`subs-${i}`);
     } });
   showCount();
   const listeners = () => { const v = shot(); v.listeners = Array.isArray(v.listeners) ? v.listeners : []; return v.listeners; };
@@ -3433,13 +3446,16 @@ function openNewProject() {
     const F = S.env.formats;
     if (!F) return dramaForm(null);
     const box = h("div", { class: "stack" });
-    let fmt = F.formats.some((f) => f.key === localGet("filmFormat")) ? localGet("filmFormat") : F.drama;
+    // The old short drama flow is deprecated: a new film never starts on it (not even when it was the last pick).
+    const saved = F.formats.find((f) => f.key === localGet("filmFormat") && !f.deprecated);
+    let fmt = saved ? saved.key : (F.default || F.formats.find((f) => !f.deprecated).key);
     const draw = () => {
       const info = F.formats.find((f) => f.key === fmt);
       put(box, h("div", { class: "field" }, h("span", { class: "lbl" }, "Định dạng", h("span", { class: "hint" }, " · quyết định số cảnh, nhịp kể và cách chia tập")),
         h("div", { class: "choice fmt-choice", role: "radiogroup", "aria-label": "Định dạng phim" }, F.formats.map((f) => h("button", {
-          class: fmt === f.key ? "on" : "", role: "radio", "aria-checked": String(fmt === f.key),
+          class: (fmt === f.key ? "on" : "") + (f.deprecated ? " deprecated" : ""), role: "radio", "aria-checked": String(fmt === f.key),
           onclick: () => { fmt = f.key; localSet("filmFormat", fmt); draw(); } }, h("b", {}, f.label), h("span", {}, f.desc))))),
+        info.deprecated ? h("div", { class: "banner warn flush", role: "note" }, icon("alert"), h("div", { class: "b-body" }, F.deprecated_note)) : null,
         info.basic ? basicForm(info) : dramaForm(fmt));
     };
     draw();

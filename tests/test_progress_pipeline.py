@@ -155,7 +155,7 @@ def test_keyframes_job_callback_order(env):
 
 def test_portraits_callback_order(env):
     rec = Rec()
-    pipe = make(env, KF, rec)
+    pipe = make(env, KF, rec, g=Gflow(log=lambda *_: None, flow_characters=False))  # gflow t2i path
     chars = [(c, env / "assets" / f"c{i}.png") for i, c in enumerate(pipe.sb.characters)]
     report = pipe.generate_portraits(chars, opts())
     assert report.done == ["Lan", "Bà Mai"]
@@ -187,7 +187,7 @@ def test_portraits_on_done_gets_index(env):
 
 def test_portraits_stop_and_fatal_drop_rest(env, monkeypatch):
     rec = Rec()
-    pipe = make(env, KF, rec)
+    pipe = make(env, KF, rec, g=Gflow(log=lambda *_: None, flow_characters=False))  # gflow t2i path
     chars = [(c, env / "assets" / f"c{i}.png") for i, c in enumerate(pipe.sb.characters)]
     monkeypatch.setenv("FAKE_GFLOW_FAIL", "c0.png:37:false")
     report = pipe.generate_portraits(chars, opts())
