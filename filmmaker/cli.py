@@ -1051,7 +1051,7 @@ def _maybe_publish_after(storyboard: Path, out_dir: Path, publish_to: tuple[str,
 @main.command()
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path), help="Thư mục kết quả (mặc định output/<tên storyboard>).")
-@click.option("--platform", "platforms", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
+@click.option("--platform", "platforms", multiple=True, type=click.Choice(["facebook_reel", "facebook_story", "youtube", "all"]),
               help="Nền tảng đăng (mặc định cả facebook_reel và youtube).")
 @click.option("--privacy", type=click.Choice(["public", "unlisted", "private"]), default=None,
               help="Chế độ hiển thị trên YouTube (mặc định theo Cài đặt hoặc public).")

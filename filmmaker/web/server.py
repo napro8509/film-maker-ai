@@ -877,7 +877,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s["auto_qc"] = bool(s.get("auto_qc", True))
         s["auto_publish"] = bool(s.get("auto_publish"))
         if isinstance(s.get("auto_publish_platforms"), list):
-            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "youtube")]
+            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "facebook_story", "youtube")]
         else:
             s["auto_publish_platforms"] = []
         if s.get("yt_privacy") not in ("public", "unlisted", "private"):

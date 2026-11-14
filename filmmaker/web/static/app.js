@@ -2374,7 +2374,7 @@ function renderSocial() {
 
 /* ---------- auto-publish to Facebook Reels & YouTube ---------- */
 
-const PUBLISH_PLATFORMS = [["facebook_reel", "Facebook Reels"], ["youtube", "YouTube (Shorts / Video)"]];
+const PUBLISH_PLATFORMS = [["facebook_reel", "Facebook Reels"], ["facebook_story", "Facebook Story"], ["youtube", "YouTube (Shorts / Video)"]];
 
 async function loadPublish(force = false) {
   if (!S.cur) return;
@@ -2407,7 +2407,7 @@ function renderPublish() {
   if (!S.publish || S.publish.pid !== S.cur.id || (!S.publish.data && !S.publish.error)) setTimeout(() => loadPublish(), 0);
   const plats = localGet("publishPlatforms", ["facebook_reel", "youtube"]);
   return h("div", { class: "card card-pad publish-card" },
-    h("div", { class: "card-head" }, h("h3", {}, icon("upload"), " Tự động đăng Facebook Reels & YouTube"), h("span", { class: "spacer" }),
+    h("div", { class: "card-head" }, h("h3", {}, icon("upload"), " Tự động đăng Facebook Reels, Story & YouTube"), h("span", { class: "spacer" }),
       h("button", { class: "btn sm ghost", onclick: openSettings }, icon("settings"), "Cấu hình kênh")),
     zone("publish-zone", () => {
       const PU = S.publish?.pid === S.cur?.id ? S.publish : null;
@@ -2470,7 +2470,7 @@ async function openAutopilot(cur) {
       h("p", { class: "help" }, autoCostText(left, review.checked)),
       h("label", { class: "check" }, review, h("span", {}, "Agent review từng bước")),
       h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video")),
-      h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng lên Facebook Reels & YouTube sau khi tạo phim xong"))),
+      h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng lên Facebook Reels, Story & YouTube sau khi tạo phim xong"))),
     buttons: [{ label: "Huỷ" }, { label: "Bắt đầu", cls: "primary", onclick: async (c) => {
       localSet("autoReview", review.checked); localSet("autoSubs", subs.checked); localSet("autoPublishAfter", autoPub.checked);
       const pubPlats = autoPub.checked ? (S.settings?.auto_publish_platforms?.length ? S.settings.auto_publish_platforms : ["facebook_reel", "youtube"]) : [];
@@ -3864,12 +3864,14 @@ async function openSettings() {
         const autoPub = h("input", { type: "checkbox", id: "set-auto-pub", checked: !!s.auto_publish });
         const curPlats = s.auto_publish_platforms || [];
         const platFb = h("input", { type: "checkbox", id: "set-pub-fb", checked: curPlats.includes("facebook_reel") });
+        const platFbStory = h("input", { type: "checkbox", id: "set-pub-fb-story", checked: curPlats.includes("facebook_story") });
         const platYt = h("input", { type: "checkbox", id: "set-pub-yt", checked: curPlats.includes("youtube") });
-        return h("section", { class: "settings-sec" }, h("h3", {}, "Đăng tự động Facebook Reels & YouTube"),
+        return h("section", { class: "settings-sec" }, h("h3", {}, "Đăng tự động Facebook Reels, Story & YouTube"),
           h("div", { class: "stack" },
             h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng video sau khi tạo phim xong (Autopilot / Make)")),
             h("div", { class: "row" },
               h("label", { class: "check" }, platFb, h("span", {}, "Facebook Reels")),
+              h("label", { class: "check" }, platFbStory, h("span", {}, "Facebook Story")),
               h("label", { class: "check" }, platYt, h("span", {}, "YouTube (Shorts / Video)"))),
             h("div", { class: "grid2" },
               field("Facebook Page ID", fbPage),
@@ -3886,6 +3888,7 @@ async function openSettings() {
       try {
         const pubPlats = [];
         if (document.getElementById("set-pub-fb")?.checked) pubPlats.push("facebook_reel");
+        if (document.getElementById("set-pub-fb-story")?.checked) pubPlats.push("facebook_story");
         if (document.getElementById("set-pub-yt")?.checked) pubPlats.push("youtube");
         S.settings = await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
