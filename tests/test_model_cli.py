@@ -376,7 +376,7 @@ def test_planner_output_normalized_cli(env, monkeypatch, model):
     monkeypatch.setattr(planner, "plan",
                         lambda idea, **kw: _planned(model, ["veo-quality", "omni-1.2-flash", None]))
     out = env.root / "planned.yaml"
-    res = cli("plan", "ý tưởng", "-o", out, "--backend", "api")
+    res = cli("plan", "ý tưởng", "-o", out, "--backend", "api", "--format", "short_drama")
     assert res.exit_code == 0, res.output
     raw = yaml.safe_load(out.read_text())
     assert raw["model"] == "veo-lite"

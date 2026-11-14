@@ -555,6 +555,23 @@ class Storyboard(StoryboardDraft):
         return self.subtitle_language != NO_SUBTITLES
 
     @model_validator(mode="after")
+    def _dialogue_subtitles(self) -> "Storyboard":
+        """Basic films with spoken dialogue: the subtitle IS the speaker's line, nothing else. A scene without a
+        `speaker` has no subtitle: a free `narration` there read like dialogue but never reached the video prompt.
+        Translations are kept while the line is unchanged and dropped (re-translated when editing) otherwise."""
+        if not (self.basic and self.audio == "dialogue"):
+            return self
+        for s in self.scenes:
+            sp = s.video_shot.speaker if s.video_shot else None
+            line = " ".join(str(sp.line or "").split()) if sp else ""
+            if line == " ".join(str(s.narration or "").split()):
+                if not line:
+                    s.narration, s.subtitles = None, None
+                continue
+            s.narration, s.subtitles = (line or None), None
+        return self
+
+    @model_validator(mode="after")
     def _check_scene_characters(self) -> "Storyboard":
         if all(s.characters is None for s in self.scenes):
             return self  # old storyboards: duplicate / empty names stay allowed
@@ -669,7 +686,9 @@ class Storyboard(StoryboardDraft):
 
     def for_flow(self, prompt: str) -> str:
         """The prompt as actually sent to Flow. Not part of the fingerprints, so turning this on or
-        off does not mark finished scenes for re-rendering."""
+        off does not mark finished scenes for re-rendering. Children are always described in the wording Google's
+        child-safety filter lets through (`i2v_prompt.child_safe`: no exact ages or body details)."""
+        prompt = i2v_prompt.child_safe(prompt)
         if not self.no_text or NO_TEXT in prompt:
             return prompt
         if self.basic:  # I2V guide rule 6: one short closing sentence, not a long list of negatives
@@ -821,6 +840,11 @@ class Storyboard(StoryboardDraft):
         return self.for_flow(f"{base} {rule}" if base else rule)
 
     def portrait_prompt(self, c: Character) -> str:
+        if not self.basic and i2v_prompt.is_minor(c.description):
+            # A child's reference picture: never the studio "full body, facing the camera" pose (Google's
+            # child-safety filter blocks it), even when the planner wrote one; the look comes from the description.
+            # Not part of any fingerprint: an existing portrait is not remade.
+            return i2v_prompt.child_portrait(c.description, self.style)
         if self.basic and not (c.image_prompt and c.image_prompt.strip()):
             # A natural everyday setting, not "full body on a plain studio background": that framing of a child
             # is blocked by Google's child-safety filter (and no exact ages: child_safe).

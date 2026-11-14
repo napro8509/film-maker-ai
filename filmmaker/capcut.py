@@ -751,7 +751,7 @@ def export_draft(sb: Storyboard, clips: list[tuple[str, Path]], plan: EditPlan, 
     log(f"Dự án CapCut “{folder.name}”: {len(plan.clips)} cảnh ({doc['duration'] / US:.1f}s), "
         f"{sum(1 for k in cuts if k)} chuyển cảnh{' (' + ', '.join(kinds) + ')' if kinds else ''}, "
         f"{sum(1 for k in cuts if not k)} cắt thẳng{', có nhạc nền' if music else ''}"
-        f"{', có phụ đề' if any(t['type'] == 'text' for t in doc['tracks']) else ''}.")
+        f"{', có phụ đề' if any(t['type'] == 'text' and t['name'] == 'Phụ đề' for t in doc['tracks']) else ''}.")
     extras = []
     if plan.look:
         extras.append(f"màu phim “{plan.look}”")

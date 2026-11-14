@@ -79,7 +79,8 @@ templates, so write each field as a plain phrase. Rules:
   center), `visual_tag` and a small `silent_action` ("listening attentively with a gentle closed-mouth smile");
   the tool adds that they face the speaker and stay silent with lips closed.
 - `narration`: only when the sound guide asks for it, in the message's language, at most 12 words. With spoken
-  dialogue, `narration` is the speaker's `line` (it becomes the subtitle).
+  dialogue, `narration` is exactly the speaker's `line` (it becomes the subtitle): every scene whose words should
+  be heard has a `speaker`; a scene without a `speaker` is silent and leaves `narration` empty.
 - Never ask for visible text: no captions, signs with words or title cards anywhere.
 - For 9:16 keep faces and the key action in the upper-middle of the frame (say so in `image_prompt` only as
   "upper-middle of the frame", without the ratio).
@@ -175,8 +176,8 @@ def _to_storyboard(draft: dict, *, fmt: str, audio: str, visual: str, style: str
     for i, sc in enumerate([s for s in draft.get("scenes") or [] if isinstance(s, dict)], 1):
         shot = _shot(sc, audio)
         narration = " ".join(str(sc.get("narration") or "").split()) if text else ""
-        if not narration and audio == "dialogue" and shot.speaker:
-            narration = i2v_prompt.clean_line(shot.speaker.line)
+        if audio == "dialogue":  # the subtitle is the spoken line, nothing else (Storyboard enforces it too)
+            narration = " ".join(str(shot.speaker.line or "").split()) if shot.speaker else ""
         summary = i2v_prompt.clean_text(shot.action or (shot.speaker.action if shot.speaker else "")) or "."
         data["scenes"].append({"id": f"s{i:02d}", "mode": "keyframe",
                                **({"location": sc["location"]} if isinstance(sc.get("location"), str) else {}),
@@ -251,6 +252,10 @@ def problems(draft: dict, audio: str) -> dict[str, list[str]]:
                 bad.append("every `position` in a dialogue scene must be frame left / frame right / frame center")
         if not shot.camera.strip() or not (shot.action.strip() or (shot.speaker and shot.speaker.action.strip())):
             bad.append("`camera` or `action` is missing")
+        if audio == "dialogue" and narration and not talking:
+            bad.append("`narration` has words but the scene has no `speaker`: in a dialogue film the subtitle is "
+                       "the spoken line, so either add a `speaker` (visible person, frame position, the line) and "
+                       "`listeners`, or leave `narration` empty for a silent scene")
         if bad:
             out[str(sc.get("id"))] = bad
     if audio == "dialogue":

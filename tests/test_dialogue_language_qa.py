@@ -187,6 +187,7 @@ def test_dry_run_without_language_has_no_rule(env):
 def test_portrait_and_cover_images_have_no_rule(env, lang):
     tmp_path, calls, _ = env
     pipe = _pipe(tmp_path, _story(lang))
+    pipe.g.flow_characters = False  # the portrait as a gflow t2i call (same prompt as a Flow character would get)
     minh = pipe.sb.characters[1]
     rep = pipe.generate_portraits([(minh, tmp_path / "assets" / "minh.png")], RunOptions(pause=(0, 0)))
     assert rep.done == ["Minh"]

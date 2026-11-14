@@ -530,3 +530,87 @@ def test_poll_timeout_after_submit_is_not_resent(env, monkeypatch):
     res = CliRunner().invoke(main, ["run", str(sb_path), "--pause", "0"])
     assert "bị ngắt" in res.output
     assert sum(c[0] == "video" and "s02.mp4" in " ".join(c) for c in calls()) == sent
+
+
+# --- Flow characters (left panel Characters -> New character) ---------------------------------------------------
+
+def _flow_char_portrait(sb_path, tmp_path, out):
+    """Lan's picture made as a Flow character, saved over the storyboard's lan.png."""
+    pipe = make_pipe(sb_path, out)
+    report = pipe.generate_portraits([(pipe.sb.characters[0], tmp_path / "lan.png")], RunOptions(pause=(0, 0)))
+    assert report.done == ["Lan"]
+    return pipe
+
+
+def test_portrait_is_made_as_a_flow_character(env, ui, tmp_path):
+    sb_path, calls = _ref_env(env, tmp_path)
+    out = tmp_path / "out"
+    pipe = _flow_char_portrait(sb_path, tmp_path, out)
+    assert ["image", "t2i"] not in [c[:2] for c in calls()]  # no plain prompt picture
+    (char,) = ui()
+    assert char[0] == "char" and char[char.index("--name") + 1] == "Lan"
+    assert char[char.index("--project") + 1] == "proj-123" and "red scarf" in char[char.index("--prompt") + 1]
+    assert "--retire-id" not in char
+    fc = make_pipe(sb_path, out).state.data["flow_characters"]["Lan"]
+    assert fc["entity_id"] == "ent-lan" and fc["flow_name"] == "Lan" and fc["project"] == "proj-123"
+    assert fc["sha"] == pipe._sha(tmp_path / "lan.png") and (tmp_path / "lan.png").stat().st_size > 100
+
+
+def test_keyframe_attaches_the_flow_character_by_name(env, ui, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    out = tmp_path / "out"
+    _flow_char_portrait(sb_path, tmp_path, out)
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "image i2i:36:false")  # agent-only composer: keyframes via the chat page
+    report = make_pipe(sb_path, out).run(RunOptions(pause=(0, 0), keyframes_only=True))
+    assert report.done == ["s01"]
+    i2i = ui()[-1]
+    assert i2i[0] == "i2i" and i2i[i2i.index("--ref") + 1] == "character:Lan"  # not an upload of lan.png
+
+
+def test_changed_picture_is_uploaded_not_the_old_flow_character(env, ui, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    out = tmp_path / "out"
+    _flow_char_portrait(sb_path, tmp_path, out)
+    (tmp_path / "lan.png").write_bytes(b"a picture the user put there by hand")
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "image i2i:36:false")
+    make_pipe(sb_path, out).run(RunOptions(pause=(0, 0), keyframes_only=True))
+    i2i = ui()[-1]
+    assert i2i[i2i.index("--ref") + 1] == str(tmp_path / "lan.png")
+
+
+def test_remade_flow_character_renames_the_old_one(env, ui, tmp_path):
+    sb_path, calls = _ref_env(env, tmp_path)
+    out = tmp_path / "out"
+    _flow_char_portrait(sb_path, tmp_path, out)
+    _flow_char_portrait(sb_path, tmp_path, out)
+    second = ui()[-1]
+    assert second[second.index("--retire-id") + 1] == "ent-lan"
+    assert second[second.index("--retire-name") + 1].startswith("Lan (cũ ")
+    assert second[second.index("--name") + 1] == "Lan"
+
+
+def test_flow_character_failure_falls_back_to_a_prompt_picture(env, ui, tmp_path, monkeypatch):
+    sb_path, calls = _ref_env(env, tmp_path)
+    monkeypatch.setenv("FAKE_FLOW_UI_FAIL", "23:false")  # the Characters page changed
+    pipe = make_pipe(sb_path, tmp_path / "out")
+    chars = [(c, tmp_path / f"c{i}.png") for i, c in enumerate(pipe.sb.characters)]
+    report = pipe.generate_portraits(chars, RunOptions(pause=(0, 0)))
+    assert report.done == [c.name for c in pipe.sb.characters]
+    assert [c[:2] for c in calls()].count(["image", "t2i"]) == len(chars)
+    assert len(ui()) == 1  # tried once, then the rest of the run went straight to t2i
+    assert "flow_characters" not in pipe.state.data
+
+
+def test_flow_characters_can_be_turned_off(env, ui, tmp_path):
+    sb_path, calls = _ref_env(env, tmp_path)
+    pipe = Pipeline(load_storyboard(sb_path), tmp_path / "out", Gflow(log=lambda *_: None, flow_characters=False),
+                    log=lambda *_: None, sleep=lambda *_: None)
+    pipe.generate_portraits([(pipe.sb.characters[0], tmp_path / "x.png")], RunOptions(pause=(0, 0)))
+    assert ui() == [] and ["image", "t2i"] in [c[:2] for c in calls()]
+
+
+def test_flow_ui_split_refs():
+    from filmmaker.flow_ui import character_ref, split_refs
+
+    assert split_refs([Path("/a/b.png"), character_ref("Bà Mai"), "c.png"]) == [
+        ("file", "/a/b.png"), ("character", "Bà Mai"), ("file", "c.png")]

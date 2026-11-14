@@ -332,6 +332,257 @@ def _attach_named(page, image: Path, shown: str, deadline: Deadline | None) -> N
         page.keyboard.press("Escape")
 
 
+# --- Flow Characters (left panel "Characters" -> New character), checked on 2026-11-14 ----------------------
+CHAR_BOX = "flow-character-prompt-box"
+CHAR_EDITOR = f"{CHAR_BOX} .ProseMirror"
+CHAR_SEND = f'{CHAR_BOX} button[aria-label="Start generation"]'
+CHAR_NAME = 'flow-character-form input[aria-label="Character name"]'
+CHAR_INFO = 'flow-character-form textarea[aria-label="Character personality"]'
+CHAR_IMG = "flow-character-image-preview img.preview-image"
+CHAR_PANEL = "flow-character-preview-panel"
+CHAR_ID_RE = re.compile(r"/character/([0-9a-fA-F-]{36})")
+CHARACTER_REF = "character:"  # --ref character:<name> = a Flow character of the project, attached by its name
+CHAR_FAILED_RE = re.compile(r"couldn['’]t|could not|unable to|policy|violat|try a different|something went wrong|"
+                            r"failed", re.I)
+# Click the one add-menu item whose title is exactly `name` (a substring match would pick "Minh (cũ)" for "Minh").
+_CLICK_EXACT_JS = """(menu, name) => {
+  const it = Array.from(menu.querySelectorAll('button[role=option].asset-item'))
+    .find(e => ((e.querySelector('.asset-title') || {}).innerText || '').trim() === name);
+  if (it) it.click();
+  return !!it;
+}"""
+
+
+def character_ref(name: str) -> str:
+    return CHARACTER_REF + name
+
+
+def split_refs(refs: list) -> list[tuple[str, str]]:
+    """("character", name) or ("file", path) for each --ref (a str or Path), in order."""
+    out = []
+    for r in map(str, refs):
+        out.append(("character", r[len(CHARACTER_REF):].strip()) if r.startswith(CHARACTER_REF) else ("file", r))
+    return out
+
+
+def _attach_character(page, name: str, deadline: Deadline | None = None) -> None:
+    """Put the project's Flow character `name` in the chat box ("+" -> Characters -> pick -> Add to prompt).
+    Only the item titled exactly `name`: Flow remembers the last selected asset, so "Add to prompt" may be on
+    before anything is picked (see _attach_named)."""
+    before = page.locator(CHIP).count()
+    page.locator(ADD_BTN).click()
+    menu = page.locator(ADD_MENU)
+    menu.wait_for(state="visible", timeout=15_000)
+    tab = menu.locator("[role=tab]", has_text="Characters")
+    if tab.count():
+        tab.first.click()
+        time.sleep(0.8)
+    search = menu.locator('input[aria-label="Search assets"]')
+    if search.count():
+        search.first.fill(name)
+        time.sleep(1.0)
+    add = menu.locator("button", has_text="Add to prompt").first
+
+    def give_up(msg: str) -> Fail:
+        if menu.is_visible():
+            page.keyboard.press("Escape")
+        if deadline is not None and deadline.expired():
+            return _pre_send_timeout()
+        return Fail(EXIT_DRIFT, msg)
+
+    if not _wait(lambda: (menu.evaluate(_SELECTION_JS, name) or {}).get("mine"), _cap(deadline, 30), 1.0):
+        raise give_up(f"Không thấy nhân vật “{name}” trong mục Characters của project Flow.")
+    state = {"clicked": 0.0}
+
+    def selected() -> bool:
+        info = menu.evaluate(_SELECTION_JS, name) or {}
+        if info.get("active"):
+            return not info.get("busy") and not info.get("others") and add.is_enabled()
+        if time.time() - state["clicked"] >= 3:
+            menu.evaluate(_CLICK_EXACT_JS, name)
+            state["clicked"] = time.time()
+        return False
+
+    if not _wait(selected, _cap(deadline, 60), 1.0):
+        raise give_up(f"Không chọn được nhân vật “{name}” để gắn vào chat của Flow.")
+    add.click()
+    if not _wait(lambda: page.locator(CHIP).count() > before, _cap(deadline, 60), 1.0):
+        raise give_up(f"Không gắn được nhân vật “{name}” vào ô chat của Flow.")
+    if menu.is_visible():
+        page.keyboard.press("Escape")
+    log(f"  đã gắn nhân vật Flow: {name}")
+
+
+def _attach_refs(page, refs: list[str], deadline: Deadline | None = None) -> None:
+    for kind, value in split_refs(refs):
+        if kind == "character":
+            _attach_character(page, value, deadline)
+        else:
+            _attach(page, Path(value).expanduser(), deadline)
+
+
+RENAME_RPC = "rzMKMb"  # batchexecute call that saves entity_info.display_name (seen 2026-11-14)
+
+
+def _set_character_name(page, name: str) -> None:
+    """Type the name like a person: Flow only saves it (rzMKMb) on real key events, `fill()` changes the field
+    without saving (measured 2026-11-14)."""
+    inp = page.locator(CHAR_NAME)
+    inp.wait_for(state="visible", timeout=30_000)
+    edit = page.locator('flow-character-form button[aria-label="Edit name"]')
+    if edit.count():
+        edit.first.click()
+        time.sleep(0.5)
+    inp.click()
+    page.keyboard.press("ControlOrMeta+A")
+    page.keyboard.press("Backspace")
+    try:
+        with page.expect_request(lambda r: RENAME_RPC in r.url or RENAME_RPC in (r.post_data or ""),
+                                 timeout=15_000):
+            page.keyboard.type(name, delay=20)
+            page.keyboard.press("Enter")
+    except Exception as exc:
+        if type(exc).__name__ != "TimeoutError":
+            raise
+        log(f"  (chưa thấy Flow lưu tên “{name}”, vẫn tiếp tục)")
+    if not _wait(lambda: inp.input_value().strip() == name, 10):
+        raise Fail(EXIT_DRIFT, f"Không đặt được tên nhân vật “{name}” trên Flow.")
+    time.sleep(1.5)
+
+
+def _character_done(page) -> None:
+    """Press Done on the character page (Flow saves the edits) and wait for it to leave the page."""
+    done = page.locator("flow-character-edit-header button", has_text="Done")
+    if not done.count():
+        return
+    url = page.url
+    try:
+        done.first.click()
+        _wait(lambda: page.url != url, 10)
+    except Exception:
+        pass
+    time.sleep(1.5)
+
+
+def _character_image(page) -> str | None:
+    """URL of the generated character picture, once Flow shows it."""
+    return page.evaluate("""(sel) => {
+      const i = document.querySelector(sel);
+      // Seen both as flow-content.google/image/<id>?… and flow.google.com/asb/… (2026-11-14). Not `complete` /
+      // `naturalWidth`: the driver's minimized window never decodes it. The download checks the bytes instead.
+      return i && /flow-content\\.google\\/image\\/|\\/asb\\//.test(i.src || '') ? i.src : null;
+    }""", CHAR_IMG)
+
+
+def _download_url(ctx, url: str, out: Path) -> bool:
+    try:
+        r = ctx.request.get(url, timeout=120_000)
+        body = r.body() if r.ok else b""
+    except Exception as exc:
+        log(f"  (chưa tải được ảnh: {str(exc).splitlines()[0]})")
+        return False
+    if len(body) < 10_000 or not (body[:3] == b"\xff\xd8\xff" or body[:8] == b"\x89PNG\r\n\x1a\n"
+                                  or (body[:4] == b"RIFF" and body[8:12] == b"WEBP")):
+        return False
+    out.write_bytes(body)
+    return True
+
+
+def run_char(args) -> dict:
+    """Make a Flow character (Characters -> New character): generate its picture from the description, give it
+    the film's name for the character, download the picture. Images cost no credits.
+    --retire-id/--retire-name first renames an older character of the same name, so the name stays unique
+    (the chat picker attaches characters by their exact name)."""
+    out = Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise Fail(EXIT_USAGE, f"Python này chưa có Playwright ({sys.executable}). Hãy dùng Python của gflow-cli.") from exc
+
+    with sync_playwright() as pw:
+        window = "headless" if args.headless else args.window
+        ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project)
+        try:
+            base = f"{FLOW}/project/{args.project}/character"
+            if args.retire_id:
+                try:
+                    page.goto(f"{base}/{args.retire_id}", wait_until="domcontentloaded", timeout=90_000)
+                    if _wait(lambda: page.locator(CHAR_NAME).count() > 0, 30):
+                        _set_character_name(page, args.retire_name)
+                        _character_done(page)  # leaving right away loses the new name
+                        log(f"  đổi tên nhân vật cũ trên Flow thành “{args.retire_name}”")
+                except Exception as exc:  # never blocks making the new one
+                    log(f"  (không đổi tên được nhân vật cũ: {getattr(exc, 'detail', None) or str(exc).splitlines()[0]})")
+            page.goto(base, wait_until="domcontentloaded", timeout=90_000)
+            if not _wait(lambda: page.locator(CHAR_EDITOR).count() > 0, 60):
+                raise Fail(EXIT_DRIFT, "Không thấy trang tạo nhân vật (Characters → New character) của Flow.")
+            page.locator(CHAR_EDITOR).click()
+            page.keyboard.insert_text(args.prompt)
+            time.sleep(0.5)
+            if args.dry_run:
+                log("  (dry-run) đã gõ mô tả nhân vật, không bấm tạo.")
+                return {"status": "ok", "dry_run": True}
+            send = page.locator(CHAR_SEND)
+            if not _wait(lambda: send.is_enabled(), 15):
+                raise Fail(EXIT_DRIFT, "Nút tạo nhân vật của Flow không bật lên.")
+            send.click()
+            log("  đã gửi mô tả nhân vật, chờ Flow tạo ảnh…")
+            started, src, entity = time.time(), None, None
+            while time.time() - started < args.timeout:
+                m = CHAR_ID_RE.search(page.url)
+                entity = m.group(1) if m else entity
+                try:
+                    # The minimized window draws no frames, and the character page only shows the new picture
+                    # on the next frame (seen 2026-11-14): a tiny capture makes Chrome draw one.
+                    page.screenshot(type="jpeg", quality=10, clip={"x": 0, "y": 0, "width": 8, "height": 8},
+                                    timeout=10_000)
+                except Exception:
+                    pass
+                try:
+                    src = _character_image(page) if entity else None
+                except Exception as exc:
+                    if not _transient(exc):
+                        raise
+                if src:
+                    break
+                panel = page.locator(CHAR_PANEL)
+                text = panel.first.inner_text() if entity and panel.count() else ""
+                if text and CHAR_FAILED_RE.search(text):
+                    raise Fail(EXIT_GENERATION_FAILED, "Flow báo không tạo được ảnh nhân vật: " + text.strip()[:400])
+                time.sleep(2)
+            if not src:
+                shot = out.with_name(out.stem + ".flow-error.png")
+                try:
+                    page.screenshot(path=str(shot))
+                    seen = page.evaluate("s => Array.from(document.querySelectorAll(s)).map(i => (i.src || '').slice(0, 90))",
+                                         CHAR_IMG)
+                    log(f"  (ảnh màn hình Flow lúc lỗi: {shot}; trang: {page.url}; ảnh: {seen})")
+                except Exception:
+                    pass
+                raise Fail(EXIT_TIMEOUT, f"Quá {args.timeout}s mà Flow chưa tạo xong ảnh nhân vật.")
+            _set_character_name(page, args.name)
+            if args.info:
+                info = page.locator(CHAR_INFO)
+                if info.count():
+                    info.first.fill(args.info)
+                    info.first.evaluate("e => e.blur()")
+                    time.sleep(1.0)
+            time.sleep(2)  # let Flow publish the full-size file behind the preview
+            if not (_download_url(ctx, src, out) or ("/asb/" in src and _download_url(ctx, src + "=d", out))):
+                raise Fail(EXIT_DRIFT, "Flow đã tạo nhân vật nhưng không tải được ảnh về.")
+            _character_done(page)
+            media = re.search(r"/image/([0-9a-fA-F-]{36})", src)
+            log(f"  đã tạo nhân vật Flow “{args.name}” ({entity[:8]}…), ảnh: {out} ({out.stat().st_size // 1024} KB)")
+            return {"status": "ok", "local_path": str(out), "entity_id": entity, "name": args.name,
+                    "media_id": media.group(1) if media else None}
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def _video_titles(page) -> list[str]:
     """Titles of the video tiles at the top of the grid (newest first)."""
     return page.locator(GRID_TILE).evaluate_all(
@@ -575,8 +826,8 @@ def check_start_frame(image: Path, out: Path) -> None:
 def run_i2v(args) -> dict:
     dl = Deadline(args.timeout)  # first: the budget counts from the moment the driver starts
     image = Path(args.image).expanduser()
-    refs = [Path(r).expanduser() for r in args.ref or []]
-    for p in [image, *refs]:
+    refs = list(args.ref or [])
+    for p in [image, *(Path(v).expanduser() for k, v in split_refs(refs) if k == "file")]:
         if not p.is_file():
             raise Fail(EXIT_USAGE, f"không thấy ảnh {p}")
     out = Path(args.out).expanduser()
@@ -591,7 +842,7 @@ def run_i2v(args) -> dict:
         window = "headless" if args.headless else args.window
         ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project, deadline=dl)
         try:
-            result = _i2v_on_page(page, args, prompt, [image, *refs], out, dl)
+            result = _i2v_on_page(page, args, prompt, [str(image), *refs], out, dl)
         finally:
             try:
                 ctx.close()
@@ -602,7 +853,7 @@ def run_i2v(args) -> dict:
     return result
 
 
-def _i2v_on_page(page, args, prompt: str, files: list[Path], out: Path, dl: Deadline) -> dict:
+def _i2v_on_page(page, args, prompt: str, files: list[str], out: Path, dl: Deadline) -> dict:
     if page.locator(NEW_SESSION_BTN).count():
         page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
         time.sleep(1.5)
@@ -610,8 +861,7 @@ def _i2v_on_page(page, args, prompt: str, files: list[Path], out: Path, dl: Dead
         page.locator(CLEAR_BTN).first.click()
         time.sleep(0.5)
 
-    for p in files:
-        _attach(page, p, dl)
+    _attach_refs(page, files, dl)
 
     editor = page.locator(EDITOR)
     editor.click()
@@ -836,12 +1086,12 @@ def _download_image(ctx, src: str, out: Path) -> bool:
 
 
 def run_i2i(args) -> dict:
-    refs = [Path(r).expanduser() for r in args.ref or []]
+    refs = list(args.ref or [])
     if not refs:
         raise Fail(EXIT_USAGE, "cần ít nhất một ảnh tham chiếu (--ref)")
-    for p in refs:
-        if not p.is_file():
-            raise Fail(EXIT_USAGE, f"không thấy ảnh {p}")
+    for kind, value in split_refs(refs):
+        if kind == "file" and not Path(value).expanduser().is_file():
+            raise Fail(EXIT_USAGE, f"không thấy ảnh {value}")
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_image_prompt(args.prompt, refs=len(refs), aspect=args.aspect, model=args.model)
@@ -860,8 +1110,7 @@ def run_i2i(args) -> dict:
             if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
                 page.locator(CLEAR_BTN).first.click()
                 time.sleep(0.5)
-            for p in refs:
-                _attach(page, p)
+            _attach_refs(page, refs)
             editor = page.locator(EDITOR)
             editor.click()
             page.keyboard.insert_text(prompt)
@@ -955,9 +1204,15 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("i2i", help="one image from a prompt + character reference images (free)")
     common(b, 300)
     b.add_argument("--ref", action="append", required=True)
+    c = sub.add_parser("char", help="a Flow character (Characters -> New character) from a description (free)")
+    common(c, 300)
+    c.add_argument("--name", required=True)
+    c.add_argument("--info", help="Character info (personality) shown to the Flow agent")
+    c.add_argument("--retire-id", help="rename this older character of the project first")
+    c.add_argument("--retire-name", default="")
     args = ap.parse_args(argv)
     try:
-        result = run_i2i(args) if args.cmd == "i2i" else run_i2v(args)
+        result = {"i2i": run_i2i, "char": run_char}.get(args.cmd, run_i2v)(args)
         code = 0
     except Fail as f:
         result = {"status": "fail", "error": {"exit_code": f.code, "detail": f.detail, "retryable": False, "spent": f.spent}}

@@ -25,11 +25,16 @@ if fail:
                                                   "retryable": False, "spent": spent == "true"}}))
     sys.exit(int(code))
 out = Path(argv[argv.index("-o") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
-if argv[0] == "i2i":  # one image
+if argv[0] in ("i2i", "char"):  # one image
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=64x36",
                     "-frames:v", "1", str(out)], check=True)
 else:
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=s=320x180:d=1:r=24",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)], check=True)
 media = os.environ.get("FAKE_FLOW_UI_MEDIA") or "m-" + out.stem
+if argv[0] == "char":  # a Flow character: its entity id and the name it was given
+    name = argv[argv.index("--name") + 1]
+    print(json.dumps({"status": "ok", "local_path": str(out), "entity_id": "ent-" + out.stem, "name": name,
+                      "media_id": media}))
+    sys.exit(0)
 print(json.dumps({"status": "ok", "local_path": str(out), "credits": 30, "succeeded": True, "media_id": media}))

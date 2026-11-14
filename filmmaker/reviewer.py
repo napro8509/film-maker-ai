@@ -120,6 +120,13 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
   blood, weapons, and above all children in distress (hurt, crying hard, mocked, fighting). Rewrite such scenes
   mildly, keeping the story beat: dialogue without insults, calm/soft `delivery` instead of fierce or raised,
   action and image_prompt without pain or violence (feelings through faces and small gestures).
+- Children in `characters`, `prompt` and `image_prompt` (Google's child-safety filter blocks many pictures of minors and the credits are lost): never an
+  exact age ("4 years old", "age 8", "10 months old") nor body details (chubby, round or rosy cheeks, plump): write
+  "a toddler girl", "a schoolgirl", "a baby boy" and describe them by hair, clothes and what they do. Keep children
+  fully and casually dressed in everyday activities, usually in medium or wide shots together with an adult; never
+  a child in a bath, swimwear, undressing, in bed up close, asleep or limp, alone and frightened, crying hard, or an
+  adult kissing, feeding or holding a child's face up close. Fear or shock in a child is played as surprise or
+  playful worry. Give close-ups and the main spoken lines to adults or teens when the story allows.
 - Real, identifiable people (Flow refuses "prominent people"): in a film based on a true event, prompts and
   content directions must not point to the real persons — no real names, ranks, units or famous roles ("the
   retired Navy SEAL", "the Australian doctor"), no "true story". Describe characters by look and action only.
@@ -210,6 +217,11 @@ When the error says "harmful content", the scene reads as harm, most often a chi
 sedated, trapped or in danger. Keep the story beat but show it safely: the child awake and calm or resting
 peacefully, carried gently with the face visible and relaxed, no masks over a still face, no limp bodies, no
 drowning or struggle in water; show danger through the setting and the adults' focus, not the child's body.
+
+When the error is a plain "might violate our policies" and a child is in the scene, it is most often the
+child-safety filter: keep the beat but frame it so the child is a natural part of an everyday moment with an
+adult (medium or wide shot, fully dressed, awake and calm or playful), drop exact ages and body details, and
+move close-ups or the line to the adult.
 
 When earlier rewrites of the scene are listed and Flow refused them the same way, rewording was not enough:
 Flow judges the opening picture and the whole moment, not single words. Change what is SHOWN, not just the
