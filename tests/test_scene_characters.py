@@ -3,7 +3,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from filmmaker.storyboard import (MAX_REFS, Scene, SceneDraft, Storyboard, StoryboardDraft, load_storyboard,
+from filmmaker.storyboard import (Scene, SceneDraft, Storyboard, StoryboardDraft, load_storyboard,
                                   save_storyboard)
 
 
@@ -67,15 +67,15 @@ def test_thumbnail_unaffected_by_scene_characters(tmp_path):
     assert names(after.thumbnail_refs()) == ["CharA", "CharC"]
 
 
-def test_four_names_three_images_in_storyboard_order(tmp_path):
+def test_all_images_sent_in_storyboard_order(tmp_path):
     sb = make(tmp_path, [{"id": "k", "prompt": "a crowd", "characters": ["CharD", "CharE", "CharC", "CharB", "CharA"]}])
     k = sb.scenes[0]
     p = sb.image_prompt(k)
     for n in "ABCDE":
         assert f"Char{n}: look of {n}." in p
     assert p.index("CharA:") < p.index("CharB:") < p.index("CharE:")  # storyboard order, not list order
-    assert names(sb.scene_refs(k)) == ["CharA", "CharB", "CharC"]
-    assert len(sb.scene_refs(k)) == MAX_REFS
+    # Every character with a picture is sent — no 3-image cap — and CharE (no picture) only gets its description.
+    assert names(sb.scene_refs(k)) == ["CharA", "CharB", "CharC", "CharD"]
 
 
 def test_i2v_and_refs_off(tmp_path):

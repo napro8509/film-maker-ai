@@ -118,17 +118,17 @@ def test_keyframes_only_order_and_chain(env):
     kf_only(env.pipe(three()))
     calls = env.calls()
     assert [Path(c[c.index("-o") + 1]).name for c in calls if c[0] == "image"] == ["s01.png", "s02.png", "s03.png"]
-    assert refs(image_call(calls, "s01.png")) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png"]
-    assert refs(image_call(calls, "s02.png")) == ["<tmp>/out/keyframes/s01.png", "<tmp>/minh.png", "<tmp>/lan.png"]
-    assert refs(image_call(calls, "s03.png")) == ["<tmp>/out/keyframes/s02.png", "<tmp>/minh.png", "<tmp>/lan.png"]
+    assert refs(image_call(calls, "s01.png")) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
+    assert refs(image_call(calls, "s02.png")) == ["<tmp>/out/keyframes/s01.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
+    assert refs(image_call(calls, "s03.png")) == ["<tmp>/out/keyframes/s02.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert "Setting: long dark teak table, brass ceiling lamp." in image_call(calls, "s02.png")[2]
     assert not any(c[0] == "video" for c in calls)
     log = "\n".join(env.lines)
     assert "  không nối keyframe cảnh trước: cảnh đầu; dùng ảnh bối cảnh" in env.lines
-    assert "  ảnh tham chiếu: bối cảnh Phòng khách, Minh, Lan" in env.lines
+    assert "  ảnh tham chiếu: bối cảnh Phòng khách, Minh, Lan, Tuan" in env.lines
     assert "  nối keyframe s01 (giữ ánh sáng, vị trí người)" in env.lines
-    assert "  ảnh tham chiếu: keyframe s01, Minh, Lan" in env.lines
-    assert env.lines.count("  bỏ ảnh Tuan: hết chỗ (tối đa 3)") == 3
+    assert "  ảnh tham chiếu: keyframe s01, Minh, Lan, Tuan" in env.lines
+    assert not any("bỏ ảnh" in l for l in env.lines)  # no character picture is ever dropped now
     assert "ảnh tham chiếu nhân vật" not in log
     kfs = env.tmp / "out" / "keyframes"
     assert env.state("s01")["keyframe_from"] is None and env.state("s01")["keyframe_from_sha"] is None
@@ -150,7 +150,7 @@ def test_chain_media_id_on_new_pipeline(env):
     flow_copy.write_bytes((env.tmp / "out" / "keyframes" / "s01.png").read_bytes())
     env.catalog([("media-kf-s01-0001", flow_copy)])
     kf_only(env.pipe(), only={"s02"}, force_keyframes={"s02"})
-    assert refs(image_call(env.calls(), "s02.png")) == ["media-kf-s01-0001", "<tmp>/minh.png", "<tmp>/lan.png"]
+    assert refs(image_call(env.calls(), "s02.png")) == ["media-kf-s01-0001", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert env.state("s02")["keyframe_from"] == "s01"
 
 
@@ -159,7 +159,7 @@ def test_dry_run_logs_will_chain(env):
     kf_only(env.pipe(three(), dry=True))
     assert "  sẽ nối keyframe s01 (nếu tạo xong)" in env.lines
     assert "  sẽ nối keyframe s02 (nếu tạo xong)" in env.lines
-    assert "  ảnh tham chiếu: keyframe s01, Minh, Lan" in env.lines
+    assert "  ảnh tham chiếu: keyframe s01, Minh, Lan, Tuan" in env.lines
     i2i = [l for l in env.lines if " image i2i " in l]
     assert len(i2i) == 3 and str(env.tmp / "out" / "keyframes" / "s01.png") in i2i[1]
     assert not (env.tmp / "out" / "state.json").exists()
@@ -193,7 +193,7 @@ def _rerun_s02(env, scenes, why: str, **top):
     env.calls()
     kf_only(env.pipe(scenes, **top), only={"s02"}, force_keyframes={"s02"})
     assert f"  không nối keyframe cảnh trước: {why}; dùng ảnh bối cảnh" in env.lines
-    assert refs(image_call(env.calls(), "s02.png")) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png"]
+    assert refs(image_call(env.calls(), "s02.png")) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert env.state("s02")["keyframe_from"] is None and env.state("s02")["keyframe_from_sha"] is None
 
 
@@ -233,7 +233,7 @@ def test_no_location_image_says_so(env):
     sc = [scene("s01", location="Bếp")]
     kf_only(env.pipe(sc, dry=True))
     assert "  không nối keyframe cảnh trước: cảnh đầu; bối cảnh chưa có ảnh" in env.lines
-    assert "  ảnh tham chiếu: Minh, Lan" in env.lines
+    assert "  ảnh tham chiếu: Minh, Lan, Tuan" in env.lines
 
 
 @needs_ffmpeg
@@ -284,7 +284,8 @@ def test_chain_through_flow_chat_ui(env, ui_ok):
     pipe.g.ui_image_to_image = ui_i2i
     kf_only(pipe, only={"s02"})
     kfs = env.tmp / "out" / "keyframes"
-    assert sent == [[kfs / "s01.png", (env.tmp / "minh.png").resolve(), (env.tmp / "lan.png").resolve()]]
+    assert sent == [[kfs / "s01.png", (env.tmp / "minh.png").resolve(), (env.tmp / "lan.png").resolve(),
+                     (env.tmp / "tuan.png").resolve()]]
     st = env.state("s02")
     if ui_ok:
         assert st["keyframe_from"] == "s01" and st["keyframe_from_sha"] == sha(kfs / "s01.png")
@@ -316,15 +317,15 @@ def test_regen_prev_keeps_status(env):
 
 @needs_ffmpeg
 def test_t2v_r2v_refs(env):
-    """AC20: a t2v scene with a location sends [location, <=2 characters], never the previous keyframe."""
+    """AC20: a t2v scene with a location sends [location, all its characters], never the previous keyframe."""
     report = env.pipe([scene("s01"), scene("s02", mode="t2v", image_prompt=None, prompt="Minh, Lan and Tuan stand")]
                       ).run(RunOptions(pause=(0, 0)))
     assert report.ok, report
     r2v = [c for c in env.calls() if c[:2] == ["video", "r2v"]]
     assert len(r2v) == 1
-    assert refs(r2v[0]) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png"]
+    assert refs(r2v[0]) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert "Setting: long dark teak table, brass ceiling lamp." in r2v[0][2]
-    assert env.lines.count("  ảnh tham chiếu: bối cảnh Phòng khách, Minh, Lan") == 2
+    assert env.lines.count("  ảnh tham chiếu: bối cảnh Phòng khách, Minh, Lan, Tuan") == 2
 
 
 def test_old_log_line_kept(env):

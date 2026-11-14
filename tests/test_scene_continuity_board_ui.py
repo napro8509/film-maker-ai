@@ -1,6 +1,7 @@
-"""Board side of scene-continuity (AC36): linkKind / bSceneCharMsgs read the per-scene character picture limit
-(charRefLimit from app.js: 2 when the scene has a location, else 3). Real code cut out of board.js / app.js and
-run under node with tiny stubs; skipped without node."""
+"""Board side of scene-continuity: linkKind / bSceneCharMsgs report which characters have their picture sent.
+Characters are no longer capped (they go through Flow characters), so every character with a picture is sent and
+only characters without one fall back to description. Real code cut out of board.js / app.js and run under node
+with tiny stubs; skipped without node."""
 import json
 import re
 import shutil
@@ -50,29 +51,30 @@ const mk = (extra, state) => {
   return sb;
 };
 const out = {};
-// scene with a location, 3 characters with pictures, server sent 2
-{
-  const sc = { id: "s1", mode: "keyframe", location: "phòng khách", characters: ["Minh", "Lan", "Hoa"] };
-  mk({ scenes: [sc] }, { s1: { refs: ["Minh", "Lan"], char_ref_limit: 2 } });
-  out.loc = { hoa: B.linkKind("Hoa", "s1"), minh: B.linkKind("Minh", "s1"), msgs: B.bSceneCharMsgs(sc).map((k) => k.text) };
-  // no char_ref_limit in scene_state (older payload): fallback from the scene's location
-  mk({ scenes: [sc] }, { s1: { refs: ["Minh", "Lan"] } });
-  out.locFallback = B.linkKind("Hoa", "s1");
-  mk({ scenes: [sc], use_character_refs: false }, { s1: { refs: [], char_ref_limit: 2 } });
-  out.off = B.linkKind("Hoa", "s1");
-}
-// no location / i2v: limit 3
+// scene with a location and 4 characters that all have pictures: every one is sent, no cap
 {
   const chars4 = [...chars, { name: "Tú", image: "t.png" }];
-  const sc = { id: "s2", mode: "keyframe", characters: ["Minh", "Lan", "Hoa", "Tú"] };
-  mk({ scenes: [sc], characters: chars4 }, { s2: { refs: ["Minh", "Lan", "Hoa"], char_ref_limit: 3 } });
-  out.noLoc = { tu: B.linkKind("Tú", "s2"), msgs: B.bSceneCharMsgs(sc).map((k) => k.text) };
-  mk({ scenes: [sc], characters: chars4 }, { s2: { refs: ["Minh", "Lan", "Hoa"] } });
-  out.noLocFallback = B.linkKind("Tú", "s2");
+  const sc = { id: "s1", mode: "keyframe", location: "phòng khách", characters: ["Minh", "Lan", "Hoa", "Tú"] };
+  mk({ scenes: [sc], characters: chars4 }, { s1: { refs: ["Minh", "Lan", "Hoa", "Tú"] } });
+  out.loc = { tu: B.linkKind("Tú", "s1"), minh: B.linkKind("Minh", "s1"), msgs: B.bSceneCharMsgs(sc).map((k) => k.text) };
+  // use_character_refs: false wins over everything
+  mk({ scenes: [sc], characters: chars4, use_character_refs: false }, { s1: { refs: [] } });
+  out.off = B.linkKind("Tú", "s1");
+}
+// a character without a picture: only its description is sent, and the board says so
+{
+  const chars2 = [{ name: "Minh", image: "m.png" }, { name: "Nam" }];
+  const sc = { id: "s2", mode: "keyframe", characters: ["Minh", "Nam"] };
+  mk({ scenes: [sc], characters: chars2 }, { s2: { refs: ["Minh"] } });
+  out.noImg = { nam: B.linkKind("Nam", "s2"), minh: B.linkKind("Minh", "s2"), msgs: B.bSceneCharMsgs(sc).map((k) => k.text) };
+}
+// i2v sends no character pictures; an unknown scene id behaves the same as "picture not sent"
+{
+  const chars4 = [...chars, { name: "Tú", image: "t.png" }];
   const iv = { id: "s3", mode: "i2v", image: "x.png", location: "Phòng khách", characters: ["Minh", "Lan", "Hoa", "Tú"] };
-  mk({ scenes: [iv], characters: chars4 }, { s3: { refs: ["Minh", "Lan", "Hoa"] } });
+  mk({ scenes: [iv], characters: chars4 }, { s3: { refs: [] } });
   out.i2v = B.linkKind("Tú", "s3");
-  mk({ scenes: [], characters: chars4 }, { s9: { refs: ["Minh", "Lan", "Hoa"] } });
+  mk({ scenes: [], characters: chars4 }, { s9: { refs: [] } });
   out.unknownScene = B.linkKind("Tú", "s9");
 }
 process.stdout.write(JSON.stringify(out));
@@ -91,22 +93,23 @@ def js(tmp_path_factory):
     return json.loads(res.stdout)
 
 
-def test_location_scene_limit_is_two(js):  # AC36
-    assert js["loc"]["hoa"] == {"desc": True, "reason": "đã đủ 2 ảnh nhân vật: Minh, Lan"}
+def test_location_scene_sends_every_character(js):
+    # A scene with a location and four characters with pictures: all of them are sent, nothing is dropped.
+    assert js["loc"]["tu"] == {"desc": False, "reason": ""}
     assert js["loc"]["minh"] == {"desc": False, "reason": ""}
-    assert js["loc"]["msgs"] == ["Chỉ gửi ảnh của 2 nhân vật: Minh, Lan"]
-    assert js["locFallback"]["reason"] == "đã đủ 2 ảnh nhân vật: Minh, Lan"
-    assert "bối cảnh" not in js["loc"]["hoa"]["reason"] and "keyframe" not in js["loc"]["hoa"]["reason"]
+    assert js["loc"]["msgs"] == []
 
 
-def test_refs_off_wins(js):  # AC36
+def test_refs_off_wins(js):
     assert js["off"] == {"desc": True, "reason": "đang tắt gửi ảnh nhân vật"}
 
 
-def test_no_location_or_i2v_limit_is_three(js):  # AC36
-    three = "đã đủ 3 ảnh nhân vật: Minh, Lan, Hoa"
-    assert js["noLoc"]["tu"]["reason"] == three
-    assert js["noLoc"]["msgs"] == ["Chỉ gửi ảnh của 3 nhân vật: Minh, Lan, Hoa"]
-    assert js["noLocFallback"]["reason"] == three
-    assert js["i2v"]["reason"] == three
-    assert js["unknownScene"]["reason"] == three
+def test_character_without_picture_uses_description(js):
+    assert js["noImg"]["nam"] == {"desc": True, "reason": "chưa có ảnh"}
+    assert js["noImg"]["minh"] == {"desc": False, "reason": ""}
+    assert js["noImg"]["msgs"] == ["Nam chưa có ảnh tham chiếu — chỉ dùng mô tả"]
+
+
+def test_i2v_and_unknown_scene_send_no_picture(js):
+    assert js["i2v"] == {"desc": True, "reason": "chưa có ảnh"}
+    assert js["unknownScene"] == {"desc": True, "reason": "chưa có ảnh"}

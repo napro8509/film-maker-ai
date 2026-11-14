@@ -108,9 +108,9 @@ def test_payload_fields(client):
     pid = project(client)
     d = get(client, pid)
     s01, s02 = d["scene_state"]["s01"], d["scene_state"]["s02"]
-    assert s01["refs"] == ["Minh", "Lan"]  # character names only
-    assert s01["ref_labels"] == ["bối cảnh Phòng khách", "Minh", "Lan"]
-    assert s01["char_ref_limit"] == 2 and s01["location"] == "Phòng khách"
+    assert s01["refs"] == ["Minh", "Lan", "Tuan"]  # character names only, no cap
+    assert s01["ref_labels"] == ["bối cảnh Phòng khách", "Minh", "Lan", "Tuan"]
+    assert s01["location"] == "Phòng khách"
     assert s01["keyframe_from"] is None and s01["continuity_source"] is None and s01["continuity_outdated"] is False
     assert "Setting: long dark teak table, brass ceiling lamp." in s01["image_prompt"]
     assert d["locations_state"] == [{
@@ -121,7 +121,7 @@ def test_payload_fields(client):
     run(client, pid, action="keyframes")
     d = get(client, pid)
     s02 = d["scene_state"]["s02"]
-    assert s02["ref_labels"] == ["keyframe s01", "Minh", "Lan"] and s02["refs"] == ["Minh", "Lan"]
+    assert s02["ref_labels"] == ["keyframe s01", "Minh", "Lan", "Tuan"] and s02["refs"] == ["Minh", "Lan", "Tuan"]
     assert s02["keyframe_from"] == "s01" and s02["continuity_source"] == "s01"
     assert s02["continuity_outdated"] is False
     assert not any(c[0] == "video" for c in client.calls())  # AC29
@@ -135,7 +135,7 @@ def test_payload_without_location_unchanged(client):
     pid = project(client, sb)
     st = get(client, pid)["scene_state"]["s01"]
     assert st["refs"] == ["Minh", "Lan", "Tuan"] and st["ref_labels"] == ["Minh", "Lan", "Tuan"]
-    assert st["char_ref_limit"] == 3 and st["location"] is None and st["continuity_source"] is None
+    assert st["location"] is None and st["continuity_source"] is None
     assert get(client, pid)["locations_state"] == []
 
 
@@ -145,7 +145,7 @@ def test_i2v_payload(client):
                          "location": "Phòng khách"})
     pid = project(client, sb)
     st = get(client, pid)["scene_state"]["s04"]
-    assert st["location"] is None and st["char_ref_limit"] == 3 and st["continuity_source"] is None
+    assert st["location"] is None and st["continuity_source"] is None
     assert st["refs"] == [] and st["ref_labels"] == []
     assert "Setting:" not in st["video_prompt"]
 

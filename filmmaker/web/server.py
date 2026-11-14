@@ -634,7 +634,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                                      if status != "done" and dur.is_bad(sb, s, meta) else None),
                     "refs": [n for n, _ in sb.scene_char_refs(s)],  # character names only
                     "ref_labels": [it.label for it in ref_items],  # every reference image, in sending order
-                    "char_ref_limit": sb.char_ref_limit(s),
                     "location": loc.name if loc else None,
                     "keyframe_from": st.get("keyframe_from"),
                     "continuity_source": src.id if src else None,

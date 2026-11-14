@@ -313,8 +313,6 @@ class Pipeline:
             return
         if items:
             self.log(f"  ảnh tham chiếu: {', '.join(it.label for it in items)}")
-        for name in self.sb.dropped_char_refs(s):
-            self.log(f"  bỏ ảnh {name}: hết chỗ (tối đa {MAX_REFS})")
 
     def scene_status(self, s: Scene) -> str:
         """done | changed | interrupted | failed | todo"""

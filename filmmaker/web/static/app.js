@@ -714,11 +714,6 @@ function sceneLoc(sb, sc) {
   return ((sb && sb.locations) || []).find((l) => locKey(l && l.name) === locKey(sc.location)) || null;
 }
 function sceneHasLoc(sb, sc) { return !!sceneLoc(sb, sc); }
-/* How many character pictures a scene sends: from the server, or 2 with a location / 3 without. */
-function charRefLimit(sc) {
-  const n = S.cur?.scene_state?.[sc && sc.id]?.char_ref_limit;
-  return Number.isFinite(n) ? n : sceneHasLoc(S.cur && S.cur.storyboard, sc) ? 2 : 3;
-}
 /* Number of scenes with a clip ("done", not i2v) that an action turns "Đã đổi".
    kind "assign": scene gets location name `to` ("" = none); "edit" | "image" | "delete": the location object
    `location` (or its name) changes; "rename": never. */
@@ -1219,12 +1214,9 @@ function renderScene(sc, i) {
             : new RegExp(`\\b${c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(text)));
           if (!found.length) return h("div");
           const refsOn = sb.use_character_refs !== false && sc.mode !== "i2v";
-          let nRefs = 0;
-          const lim = charRefLimit(sc);
           return h("div", { class: "char-chips" }, h("span", { class: "small muted", title: refsOn ? "Mô tả nhân vật được tự thêm vào prompt và ảnh nhân vật được gửi kèm làm tham chiếu" : "Mô tả nhân vật được tự thêm vào prompt" }, (refsOn ? "Nhân vật · mô tả + ảnh" : "Nhân vật · mô tả") + (picked ? " (chọn trên Bảng):" : ":")),
             found.map((c) => {
-              const url = refsOn && c.image && nRefs < lim ? charImageUrl(c) : null;
-              if (url) nRefs++;
+              const url = refsOn && c.image ? charImageUrl(c) : null;
               return h("span", { class: "char-chip" + (url ? " has-img" : ""), title: url ? `${c.description}\n(gửi kèm ảnh nhân vật)` : c.description },
                 url ? h("img", { src: url, alt: "" }) : null, c.name);
             }));
@@ -1807,7 +1799,7 @@ function renderCharacters(sb) {
       missing.length ? h("button", { class: "btn sm", disabled: busy, title: "Ảnh trên Flow miễn phí",
         onclick: () => makePortraits([]) }, icon("image"), `Tạo ảnh cho ${missing.length} nhân vật`, FREE()) : null,
       h("button", { class: "btn sm", onclick: add }, icon("plus"), "Thêm nhân vật"),
-      h("p", { class: "help" }, "Mô tả ngoại hình một lần và tạo hoặc tải lên một ảnh. Khi tên nhân vật xuất hiện trong prompt của cảnh, mô tả được tự thêm vào và ảnh được gửi kèm làm tham chiếu (tối đa 3 nhân vật mỗi cảnh; 2 nếu cảnh có bối cảnh) để khuôn mặt giống nhau ở mọi cảnh.")),
+      h("p", { class: "help" }, "Mô tả ngoại hình một lần và tạo hoặc tải lên một ảnh. Khi tên nhân vật xuất hiện trong prompt của cảnh (hoặc được chọn trên Bảng), mô tả được tự thêm vào và ảnh của mọi nhân vật trong cảnh được gửi kèm làm tham chiếu để khuôn mặt giống nhau ở mọi cảnh.")),
     h("label", { class: "check", style: { marginBottom: "16px" } },
       h("input", { type: "checkbox", checked: sb.use_character_refs !== false,
         onchange: (e) => { sb.use_character_refs = e.target.checked ? undefined : false; changed(); renderMain(); } }),

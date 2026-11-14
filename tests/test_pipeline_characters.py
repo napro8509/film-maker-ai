@@ -1,6 +1,6 @@
 """Pipeline argv with `Scene.characters` (storyboard-board AC11, AC12): the `--ref` images sent to gflow
-follow the scene's character list (storyboard order, at most MAX_REFS), for image i2i, video r2v and the
-fallback_t2v branch of keyframe scenes."""
+follow the scene's character list (storyboard order, every character with a picture — no cap), for image i2i,
+video r2v and the fallback_t2v branch of keyframe scenes."""
 import json
 import shutil
 import sys
@@ -119,8 +119,8 @@ def test_i2i_refs_follow_scene_characters(env):
     k1 = call_for(calls, ("image", "i2i"), "k1.png")
     assert refs(k1) == [HOA_MID, "<tmp>/bao.png"]
     assert "Lan:" not in k1[2] and "Hoa: white ao dai" in k1[2] and "Bao: black cat" in k1[2]
-    # Five names, four with images: the first MAX_REFS (3) in storyboard order.
-    assert refs(call_for(calls, ("image", "i2i"), "k2.png")) == ["<tmp>/lan.png", HOA_MID, "<tmp>/tuan.png"]
+    # Five names, four with images: all four in storyboard order (no 3-image cap).
+    assert refs(call_for(calls, ("image", "i2i"), "k2.png")) == ["<tmp>/lan.png", HOA_MID, "<tmp>/tuan.png", "<tmp>/bao.png"]
     # Empty list: no references at all, plain text-to-image.
     assert call_for(calls, ("image", "i2i"), "k3.png") is None
     assert call_for(calls, ("image", "t2i"), "k3.png") is not None
@@ -155,8 +155,8 @@ def test_r2v_refs_follow_scene_characters(env):
     assert "Lan:" not in t1[2] and "Bao: black cat" in t1[2]
     assert call_for(calls, ("video", "r2v"), "t2.mp4") is None
     assert call_for(calls, ("video", "t2v"), "t2.mp4") is not None
-    # r2v sends files (no media-id lookup); 3 of 4, storyboard order.
-    assert refs(call_for(calls, ("video", "r2v"), "t3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png"]
+    # r2v sends files (no media-id lookup); all four, storyboard order (no cap).
+    assert refs(call_for(calls, ("video", "r2v"), "t3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png", "<tmp>/bao.png"]
     assert refs(call_for(calls, ("video", "r2v"), "t4.mp4")) == ["<tmp>/lan.png", "<tmp>/tuan.png"]
 
 
@@ -192,7 +192,7 @@ def test_fallback_t2v_refs_follow_scene_characters(env, monkeypatch):
     assert "Lan:" not in k1[2] and "Hoa: white ao dai" in k1[2]
     assert call_for(calls, ("video", "r2v"), "k2.mp4") is None
     assert call_for(calls, ("video", "t2v"), "k2.mp4") is not None
-    assert refs(call_for(calls, ("video", "r2v"), "k3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png"]
+    assert refs(call_for(calls, ("video", "r2v"), "k3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png", "<tmp>/bao.png"]
     assert refs(call_for(calls, ("video", "r2v"), "k4.mp4")) == ["<tmp>/tuan.png"]
     # Later keyframe scenes skip the keyframe and i2v entirely.
     assert all(Path(c[c.index("-o") + 1]).stem == "k1" for c in calls if c[:2] in (["image", "i2i"], ["video", "i2v"]))

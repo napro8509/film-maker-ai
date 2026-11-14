@@ -27,7 +27,8 @@ BAO_PNG = b"golden-bao-portrait-v1"
 I2V_IMAGE = "/golden/fixed/start.png"  # absolute and fixed: the i2v source path is part of the fingerprint
 
 # Lan, Hoa, Tuan, Bao have images; Minh has none. Every mode, image_prompt empty and set, camera or not,
-# names in different case, a name only in image_prompt, more than MAX_REFS characters in one scene.
+# names in different case, a name only in image_prompt, four characters with pictures in one scene (k4) —
+# all of them are now sent as references (the old 3-image cap is gone).
 SAMPLE = f"""
 title: Golden sample
 aspect: "9:16"
@@ -274,8 +275,9 @@ GOLDEN_PROMPTS = {'sample': {'k1': {'image_prompt': 'Lan and Minh at a cafe tabl
                    'text_only_prompt': 'Lan, Hoa, Tuan and Bao run through the rain. Lan: short black hair, red '
                                        'scarf. Hoa: elderly woman, white ao dai. Tuan: boy of ten, yellow raincoat. '
                                        'Bao: a black cat with green eyes. Style: anime, soft pastel colors.',
-                   'scene_refs': [['Lan', '<tmp>/lan.png'], ['Hoa', '<tmp>/hoa.png'], ['Tuan', '<tmp>/tuan.png']],
-                   'fingerprint': '024800d89d730d85'},
+                   'scene_refs': [['Lan', '<tmp>/lan.png'], ['Hoa', '<tmp>/hoa.png'], ['Tuan', '<tmp>/tuan.png'],
+                                  ['Bao', '<tmp>/bao.png']],
+                   'fingerprint': 'ab14b7e0c3716aa1'},
             't1': {'image_prompt': 'Tuan jumps into a puddle, LAN watches. Shot: wide shot. Lan: short black hair, '
                                    'red scarf. Tuan: boy of ten, yellow raincoat. Style: anime, soft pastel colors.',
                    'video_prompt': 'Tuan jumps into a puddle, LAN watches. Shot: wide shot. Camera movement: '
@@ -524,6 +526,8 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'media-hoa-0001',
              '--ref',
              '<tmp>/tuan.png',
+             '--ref',
+             '<tmp>/bao.png',
              '--aspect',
              '9:16',
              '--model',
@@ -716,6 +720,8 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/hoa.png',
                    '--ref',
                    '<tmp>/tuan.png',
+                   '--ref',
+                   '<tmp>/bao.png',
                    '--aspect',
                    '9:16',
                    '-o',

@@ -121,9 +121,6 @@ function linkKind(name, sid, ci = bResolve(name)) {
   const c = bChars()[ci];
   const old = c && S.charSaved && typeof S.charSaved.get === "function" ? S.charSaved.get(c) : null;
   if (refs.some((r) => bKey(r) === bKey(name) || (old && bKey(r) === bKey(old)))) return { desc: false, reason: "" };
-  // 2 pictures when the scene has a location (slot 1 is the location / previous keyframe), else 3 (app.js charRefLimit).
-  const lim = charRefLimit((sb.scenes || []).find((x) => x.id === sid) || { id: sid });
-  if (c && charImageUrl(c) && refs.length >= lim) return { desc: true, reason: `đã đủ ${lim} ảnh nhân vật: ${refs.join(", ")}` };
   return { desc: true, reason: "chưa có ảnh" };
 }
 
@@ -767,11 +764,7 @@ function bSceneCharMsgs(sc) {
   for (const n of L.unknown) kids.push(h("div", { class: "scene-msg err" }, h("div", {}, `Không có nhân vật “${n}”`),
     h("div", { class: "row", style: { marginTop: "6px" } }, h("button", { class: "btn sm", onclick: () => bRemoveUnknown(sc, n) }, icon("x"), "Bỏ khỏi cảnh"))));
   if (st && S.cur.storyboard.use_character_refs !== false) {
-    const refs = st.refs || [];
     const linked = L.idx.map((i) => bChars()[i]).filter(Boolean);
-    const withImg = linked.filter((c) => charImageUrl(c));
-    const lim = charRefLimit(sc);
-    if (withImg.length > lim && refs.length) kids.push(h("div", { class: "scene-msg warn" }, `Chỉ gửi ảnh của ${lim} nhân vật: ${refs.join(", ")}`));
     for (const c of linked) if (!charImageUrl(c)) kids.push(h("div", { class: "scene-msg warn" }, `${c.name} chưa có ảnh tham chiếu — chỉ dùng mô tả`));
   }
   return kids;

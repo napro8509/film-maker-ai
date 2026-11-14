@@ -988,11 +988,6 @@ class Storyboard(StoryboardDraft):
                 out[s.id] = msgs
         return out
 
-    def char_ref_limit(self, scene: Scene) -> int:
-        """How many character pictures a scene may send: slot 1 is kept for the location (or the previous
-        scene's keyframe) when the scene has one, even while that slot is empty."""
-        return MAX_REFS - 1 if self.scene_location(scene) is not None else MAX_REFS
-
     def _char_ref_candidates(self, scene: Scene) -> list[tuple[str, Path]]:
         if not self.use_character_refs or scene.mode == "i2v":
             return []
@@ -1000,17 +995,15 @@ class Storyboard(StoryboardDraft):
                 if c.image and Path(c.image).is_file()]
 
     def scene_char_refs(self, scene: Scene) -> list[tuple[str, Path]]:
-        """(name, image) of characters in this scene that have a reference image on disk and are sent."""
-        return self._char_ref_candidates(scene)[:self.char_ref_limit(scene)]
-
-    def dropped_char_refs(self, scene: Scene) -> list[str]:
-        """Characters with a picture that is not sent because there is no slot left."""
-        return [n for n, _ in self._char_ref_candidates(scene)[self.char_ref_limit(scene):]]
+        """(name, image) of every character picked for this scene that has a reference image on disk. All of
+        them are sent: characters are made as Flow characters and attached by name (the picked-on-Board flow),
+        not uploaded one picture at a time, so a scene is no longer capped at a few reference images."""
+        return self._char_ref_candidates(scene)
 
     def scene_ref_items(self, scene: Scene, prev: tuple[str, Path] | None = None) -> list[RefItem]:
         """Every reference image of the scene in sending order. With a location: slot 1 is the previous
         scene's keyframe (`prev` = (id, path), keyframe scenes only) or else the location's picture (or nothing),
-        then at most 2 characters. Without one: only the characters, as before."""
+        then all the scene's characters. Without one: only the characters, as before."""
         chars = [RefItem("character", n, p) for n, p in self.scene_char_refs(scene)]
         loc = self.scene_location(scene)
         if loc is None:

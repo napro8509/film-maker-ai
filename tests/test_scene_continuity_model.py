@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from filmmaker.storyboard import (MAX_REFS, Location, RefItem, Storyboard, StoryboardDraft, load_storyboard,
+from filmmaker.storyboard import (Location, RefItem, Storyboard, StoryboardDraft, load_storyboard,
                                   save_storyboard)
 
 ROOM = "long dark teak table, six chairs, brass ceiling lamp, window on the left."
@@ -165,7 +165,7 @@ def test_empty_description_no_setting(tmp_path):
 def test_i2v_ignores_location(tmp_path):
     sb = load(tmp_path, sb_dict())
     s = sb.scenes[2]
-    assert sb.scene_location(s) is None and sb.char_ref_limit(s) == MAX_REFS
+    assert sb.scene_location(s) is None
     assert "Setting:" not in sb.image_prompt(s) + sb.video_prompt(s) + sb.text_only_prompt(s)
     assert sb.scene_refs(s) == [] and sb.refs_signature(s) == []
     fp = sb.scene_fingerprint(s)
@@ -199,16 +199,16 @@ def test_location_prompt(tmp_path):
 # --- AC16 / AC18 / AC19 / AC20: reference slots ------------------------------------------------------------
 
 def test_refs_with_location_three_characters(tmp_path):
+    """Characters are no longer capped: a scene sends its location picture plus every picked character."""
     sb = load(tmp_path, sb_dict())
     s = sb.scenes[0]
-    assert sb.char_ref_limit(s) == 2
     assert sb.scene_refs(s) == [("bối cảnh Phòng khách", (tmp_path / "room.png").resolve()),
                                 ("Minh", (tmp_path / "minh.png").resolve()),
-                                ("Lan", (tmp_path / "lan.png").resolve())]
-    assert sb.dropped_char_refs(s) == ["Tuan"]
-    assert [n for n, _ in sb.scene_char_refs(s)] == ["Minh", "Lan"]
+                                ("Lan", (tmp_path / "lan.png").resolve()),
+                                ("Tuan", (tmp_path / "tuan.png").resolve())]
+    assert [n for n, _ in sb.scene_char_refs(s)] == ["Minh", "Lan", "Tuan"]
     sig = sb.refs_signature(s)
-    assert sig[0] == f"loc:{sha12(b'room-v1')}" and [x.split(':')[0] for x in sig[1:]] == ["Minh", "Lan"]
+    assert sig[0] == f"loc:{sha12(b'room-v1')}" and [x.split(':')[0] for x in sig[1:]] == ["Minh", "Lan", "Tuan"]
 
 
 def test_refs_with_location_chained_prev(tmp_path):
@@ -217,7 +217,7 @@ def test_refs_with_location_chained_prev(tmp_path):
     kf = tmp_path / "keyframes" / "s00.png"
     items = sb.scene_ref_items(s, prev=("s00", kf))
     assert items[0] == RefItem("keyframe", "keyframe s00", kf)
-    assert [it.label for it in items] == ["keyframe s00", "Minh", "Lan"]
+    assert [it.label for it in items] == ["keyframe s00", "Minh", "Lan", "Tuan"]
     # t2v never sends a keyframe
     assert [it.kind for it in sb.scene_ref_items(sb.scenes[1], prev=("s00", kf))] == ["location", "character",
                                                                                      "character"]
@@ -226,15 +226,15 @@ def test_refs_with_location_chained_prev(tmp_path):
 
 
 def test_refs_with_location_without_image(tmp_path):
-    """AC18: slot 1 stays reserved (2 characters at most) and there is no loc: entry; adding the picture keeps
-    the characters but adds loc:."""
+    """AC18: slot 1 stays reserved for the location/keyframe and there is no loc: entry while the picture is
+    missing; adding the picture keeps the characters but adds loc:. Characters themselves are never capped."""
     sb = load(tmp_path, sb_dict(), room=None)
     s = sb.scenes[0]
-    assert [n for n, _ in sb.scene_refs(s)] == ["Minh", "Lan"]
+    assert [n for n, _ in sb.scene_refs(s)] == ["Minh", "Lan", "Tuan"]
     before = sb.refs_signature(s)
     assert not any(x.startswith("loc:") for x in before)
     (tmp_path / "room.png").write_bytes(b"room-v1")
-    assert [n for n, _ in sb.scene_char_refs(s)] == ["Minh", "Lan"]
+    assert [n for n, _ in sb.scene_char_refs(s)] == ["Minh", "Lan", "Tuan"]
     assert sb.refs_signature(s) == [f"loc:{sha12(b'room-v1')}", *before]
 
 
@@ -244,7 +244,6 @@ def test_refs_with_location_character_refs_off(tmp_path):
     s = sb.scenes[0]
     assert [n for n, _ in sb.scene_refs(s)] == ["bối cảnh Phòng khách"]
     assert [it.label for it in sb.scene_ref_items(s, prev=("s00", tmp_path / "x.png"))] == ["keyframe s00"]
-    assert sb.dropped_char_refs(s) == []
 
 
 def test_refs_without_location_unchanged(tmp_path):
@@ -252,7 +251,6 @@ def test_refs_without_location_unchanged(tmp_path):
     data["scenes"][0].pop("location")
     sb = load(tmp_path, data)
     s = sb.scenes[0]
-    assert sb.char_ref_limit(s) == MAX_REFS
     assert [n for n, _ in sb.scene_refs(s)] == ["Minh", "Lan", "Tuan"]
     assert sb.scene_ref_items(s, prev=("s00", tmp_path / "x.png")) == [
         RefItem("character", n, p) for n, p in sb.scene_refs(s)]

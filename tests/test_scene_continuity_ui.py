@@ -4,8 +4,8 @@ Two layers, as in test_dialogue_language_ui.py:
 - static checks on filmmaker/web/static/app.js / progress.js (handlers writing `undefined`, confirmModal before
   every action that turns scenes "Đã đổi" with a Huỷ branch that neither saves nor starts a job, chip limit,
   job kind "locations");
-- the pure helpers (locationImpact, locsLocked, rememberLocNames, renameLocationsInScenes, removeLocation,
-  charRefLimit) and the real save() cut out of app.js and run under node with stubs.
+- the pure helpers (locationImpact, locsLocked, rememberLocNames, renameLocationsInScenes, removeLocation)
+  and the real save() cut out of app.js and run under node with stubs.
 """
 import json
 import re
@@ -62,7 +62,7 @@ const setSaveState = (st) => { saveState = st; };
 const applyMeta = () => {};
 eval(cut("function nameKey(", "/* Scenes linked to a character") + cut("/* ---------- locations (shared", "/* ---------- top bar")
      + _save + "; globalThis.L = { locKey, locNameProblems, locsLocked, locNamePairs, rememberLocNames, renameLocationsInScenes,"
-     + " removeLocation, sceneHasLoc, charRefLimit, locationImpact, save };");
+     + " removeLocation, sceneHasLoc, locationImpact, save };");
 """
 
 HARNESS_BODY = r"""
@@ -94,10 +94,6 @@ const out = {};
     editUnused: L.locationImpact(sb, st, { location: B, kind: "edit" }),
     none: L.locationImpact(sb, {}, { location: A, kind: "edit" }),
   };
-  // charRefLimit: server value first, else 2 with a location (not i2v), 3 otherwise
-  S.cur = { storyboard: sb, scene_state: { s1: { char_ref_limit: 2 }, s5: { char_ref_limit: 3 } } };
-  out.limit = { s1: L.charRefLimit(sc("s1")), s5: L.charRefLimit(sc("s5")), s2: L.charRefLimit(sc("s2")),
-                s3: L.charRefLimit(sc("s3")), s4unknown: L.charRefLimit({ id: "x", location: "Không có" }) };
 }
 
 // AC38: rename, swap, typing through an existing name, new location, save() blocked / sent
@@ -184,10 +180,6 @@ def test_location_impact(js):  # AC37
         "assignNew": 1, "assignCase": 0, "assignOther": 1, "assignNone": 1, "assignI2v": 0, "assignTodo": 0,
         "edit": 2, "image": 2, "imageByName": 2, "del": 2, "rename": 0, "editUnused": 0, "none": 0,
     }
-
-
-def test_char_ref_limit(js):  # AC36 fallback
-    assert js["limit"] == {"s1": 2, "s5": 3, "s2": 2, "s3": 3, "s4unknown": 3}
 
 
 def test_rename_and_lock(js):  # AC38
