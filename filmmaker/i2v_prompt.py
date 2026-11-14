@@ -369,7 +369,12 @@ _IDENTICAL = [
 
 # Google's child-safety filter blocks pictures of children described with an exact age ("age 8", "8-year-old"),
 # above all as a full-body shot on a plain studio background. A minor's age becomes "young" (adults keep theirs).
-_AGE = re.compile(r"(?i)\b(?:aged?\s+(\d{1,2})\b|(\d{1,2})\s*[- ]\s*(?:years?|yrs?)\s*[- ]\s*old\b|(\d{1,2})\s+years?\s+of\s+age\b)")
+_AGE = re.compile(r"(?i)\b(?:(?:about|around|approximately|roughly|nearly|almost)\s+)?"
+                  r"(?:aged?\s+(\d{1,2})\b|(\d{1,2})\s*[- ]\s*(?:years?|yrs?)\s*[- ]\s*old\b|"
+                  r"(\d{1,2})\s+years?\s+of\s+age\b)")
+# "10 months old", "about 18 months": always a baby
+_MONTHS = re.compile(r"(?i),?\s*\b(?:(?:about|around|approximately|roughly|nearly|almost)\s+)?\d{1,2}\s*[- ]?\s*"
+                     r"months?(?:\s*[- ]\s*old)?\b")
 
 
 def child_safe(text: str) -> str:
@@ -386,11 +391,16 @@ def child_safe(text: str) -> str:
         minor = True
         return "young"
     t = _AGE.sub(sub, text)
+    if _MONTHS.search(t):
+        minor = True
+        t = _MONTHS.sub("", t)
     if re.search(r"(?i)\b(?:school(?:girl|boy)|little (?:girl|boy)|child|kid|toddler)\b", t) or minor:
         # tested on Flow: the same child prompt passed without "lively expression" and was blocked with it
         t = re.sub(r"(?i),?\s*\b(?:lively|neutral|playful|innocent|cute|sweet|bright|blank)\s+expression\b", "", t)
     if minor:
-        t = re.sub(r"(?i)\b(girl|boy)\b", lambda m: ("S" if m.group(0)[0].isupper() else "s") + "chool" + m.group(1).lower(), t)
+        # a baby / toddler girl stays one (not a "schoolgirl")
+        t = re.sub(r"(?i)(?<!toddler )(?<!baby )(?<!infant )\b(girl|boy)\b",
+                   lambda m: ("S" if m.group(0)[0].isupper() else "s") + "chool" + m.group(1).lower(), t)
         t = re.sub(r"(?i),\s*young\b", "", t)
     # tested on Flow: "A little Vietnamese girl ..." blocked three times, "A cheerful Vietnamese schoolgirl ..." passed
     t = re.sub(r"(?i)\b(?:little|young|small)\s+((?:[A-Z][\w-]*\s+)?)(girl|boy)\b",
@@ -401,7 +411,48 @@ def child_safe(text: str) -> str:
         t = re.sub(r"(?i)\b(?:chubby|plump|pudgy),?\s*", "", t)
     t = re.sub(r"(?i)\ban young\b", lambda m: "A young" if m.group(0)[0] == "A" else "a young", t)
     t = re.sub(r"(?i)\byoung,?\s+young\b", "young", t)
-    return re.sub(r"\s+([,.])", r"\1", t)
+    t = re.sub(r"\s+([,.])", r"\1", t)
+    return t.rstrip(", ") if not text.rstrip().endswith(",") else t
+
+
+_MINOR_WORDS = re.compile(r"(?i)\b(?:girl|boy|schoolgirl|schoolboy|child|kid|toddler|baby|infant|teen(?:ager)?|"
+                         r"daughter|son|granddaughter|grandson|niece|nephew|preschooler|kindergartener)s?\b")
+_ADULT_WORDS = re.compile(r"(?i)\b(?:man|woman|men|women|lady|gentleman|mother|father|mom|dad|grandmother|"
+                          r"grandfather|grandma|grandpa|wife|husband|adult)\b")
+_SMALL_CHILD = re.compile(r"(?i)\b(?:baby|infant|toddler|newborn|months?\s+old)\b")
+
+
+def is_minor(description: str) -> bool:
+    """A character description of a child: an age under 18, or child words (girl, boy, baby...) and no adult ones.
+    "a young woman" or "the boy's father" are adults; "a 15-year-old boy" and "toddler girl" are children."""
+    ages = [int(next(g for g in m.groups() if g)) for m in _AGE.finditer(description)]
+    if ages:
+        return min(ages) < 18
+    lead = description.split(",")[0]  # "Vietnamese woman, mother of a toddler" is an adult
+    return bool(_MINOR_WORDS.search(lead)) and not _ADULT_WORDS.search(lead)
+
+
+def child_portrait(description: str, style: str = "") -> str:
+    """Reference-picture prompt for a child that Google's child-safety filter lets through (tested on Flow): an
+    everyday film still of the child DOING something at home, a natural sentence starting "A cheerful ...", no
+    exact age, no body details, no studio "reference image" pose. Babies and toddlers sit and play instead."""
+    desc = child_safe(description.strip().rstrip("."))
+    # tested on Flow: the opening "A cheerful <child>" passes where a bare descriptor list is blocked
+    desc = re.sub(r"(?i)^(?:a|an|the)\s+(?!cheerful\b)", "", desc)
+    if not desc.lower().startswith("cheerful"):
+        desc = f"cheerful {desc}"
+    desc = "A " + desc
+    if _SMALL_CHILD.search(description):
+        action = "sitting on a soft play mat in a bright, everyday living room, holding a wooden toy"
+    else:
+        who = ("she" if re.search(r"(?i)\b(?:girl|schoolgirl|daughter|sister|she|her)\b", desc)
+               else "he" if re.search(r"(?i)\b(?:boy|schoolboy|son|brother|he|his)\b", desc) else "they")
+        action = f"smiling as {who} {'help' if who == 'they' else 'helps'} set the kitchen table in a bright, everyday home"
+    base = (f"{desc}, {action}. Medium shot, face clearly visible, fully and casually dressed, softly blurred "
+            "background, soft natural light, film still.")
+    if style.strip():
+        base += f" Style: {style.strip().rstrip('.')}."
+    return child_safe(soften_identical(base))
 
 
 def soften_identical(text: str) -> str:

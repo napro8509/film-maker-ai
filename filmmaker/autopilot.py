@@ -170,10 +170,22 @@ class Autopilot:
 
     # --- run -----------------------------------------------------------------------
 
+    def _warn_deprecated(self) -> None:
+        """One line in the log when this film uses the old (deprecated) short drama flow."""
+        from . import formats
+
+        try:
+            fmt = self.sb().format
+        except Exception:  # noqa: BLE001 - a broken storyboard is reported by the first stage
+            return
+        if formats.is_deprecated(fmt):
+            self.log(f"⚠ {formats.DEPRECATED_NOTE}")
+
     def run(self) -> dict[str, Any]:
         started = time.time()
         steps = [k for k, _ in STAGES]
         result: dict[str, Any] = {}
+        self._warn_deprecated()
         try:
             for i, key in enumerate(steps, 1):
                 self.check_stop()

@@ -216,6 +216,9 @@ class Gflow:
     ui_enabled: bool = True  # image-to-video through the Flow chat page when gflow refuses it
     ui_max_credits: int = 0  # reject Flow's offer above this (0 = no limit)
     ui_window: str = "hidden"  # show | hidden | headless (browser window of the Flow chat driver)
+    # Character pictures are made as Flow characters (left panel Characters) when the Flow page driver works,
+    # and keyframes then attach those characters by name instead of uploading their pictures.
+    flow_characters: bool = True
     _ui_profile: Any = field(default=None, init=False, repr=False)
     # Progress hook (web UI): on_event("start" | "downloading" | "percent", data) for the running command.
     on_event: Callable[[str, dict], None] | None = field(default=None, repr=False)
@@ -482,6 +485,32 @@ class Gflow:
         payload = self._run_ui(args, "ảnh có thể vẫn đang tạo trên Flow", spent=False)
         local = payload.get("local_path")
         return Path(local) if local else out
+
+    def ui_create_character(self, name: str, prompt: str, *, out: Path, project: str | None, info: str | None = None,
+                            retire: tuple[str, str] | None = None) -> dict[str, Any]:
+        """A Flow character (left panel Characters -> New character) made from `prompt` and named `name`; its
+        picture is saved to `out`. Free (an image). `retire` = (entity id, new name): rename that older character
+        first so `name` stays unique in the project. Returns {"local_path", "entity_id", "name", "media_id"}."""
+        cmd = self.ui_command()
+        profile = self.ui_profile_dir()
+        if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):
+            raise GflowError("không tìm thấy Python/profile trình duyệt của gflow-cli để điều khiển Flow", exit_code=2)
+        if not project:
+            raise GflowError("cần project Flow để tạo nhân vật", exit_code=2)
+        args = [*cmd, "char", "--project", project, "--name", name, "--prompt", prompt, "-o", str(out),
+                "--profile-dir", str(profile or "none"), "--timeout", str(min(600, self.timeout))]
+        if info:
+            args += ["--info", info]
+        if retire:
+            args += ["--retire-id", retire[0], "--retire-name", retire[1]]
+        if self.ui_window in ("show", "hidden", "headless"):
+            args += ["--window", self.ui_window]
+        self.log(ui_log_line(cmd, "char", ["--name", name], prompt))
+        if self.dry_run:
+            return {"local_path": str(out), "entity_id": None, "name": name, "media_id": None}
+        payload = self._run_ui(args, "nhân vật có thể vẫn đang tạo trên Flow", spent=False)
+        return {"local_path": payload.get("local_path") or str(out), "entity_id": payload.get("entity_id"),
+                "name": payload.get("name") or name, "media_id": payload.get("media_id")}
 
     def _run_ui(self, args: list[str], timeout_note: str, *, spent: bool) -> dict:
         """Run the Flow chat driver (streams its log and "@@progress" lines) and return its ok payload."""

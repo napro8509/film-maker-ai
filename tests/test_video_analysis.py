@@ -162,6 +162,24 @@ def test_read_reel_long_timeline_is_parsed_whole(tmp_path):
     assert len(va.parse_timeline("```reel-timeline\n#01 0.0-1.0 | cam static\n")) == 1  # no closing fence
 
 
+def test_read_reel_videomd_layout(tmp_path):
+    # Current rea-video writes VIDEO.md + video/<part>.md with a ```videomd-timeline block.
+    (tmp_path / "video").mkdir()
+    (tmp_path / "VIDEO.md").write_text("---\nvideomd: 1\nshots: 2\ndescription: 'Made with (inferred): AI video 87%'\n---\n")
+    (tmp_path / "video" / "timeline.md").write_text(
+        "---\nvideomd: 1\npart: timeline\n---\n```videomd-timeline\n"
+        "#01 0.0-0.5 | camera smooth move | made~ AI-generated video 48% | flag low confidence\n"
+        "#02 0.5-5.3 | camera static | transition dissolve 0.5s | overlay text\n```\n")
+    (tmp_path / "video" / "sound.md").write_text("---\nvideomd: 1\n---\nBGM 90 BPM")
+    (tmp_path / "video" / "remake.md").write_text("Seedance calls")  # not sent to Claude
+    reel = va.read_reel(tmp_path)
+    assert reel["card"]["shots"] == 2 and reel["card"]["description"].startswith("Made with")
+    assert [(r["start"], r["end"]) for r in reel["timeline"]] == [(0.0, 0.5), (0.5, 5.3)]
+    assert reel["timeline"][0]["camera"] == "smooth move" and reel["timeline"][1]["transition"] == "dissolve 0.5s"
+    assert "90 BPM" in reel["texts"]["video/sound.md"] and "VIDEO.md" in reel["texts"]
+    assert not any("remake" in k for k in reel["texts"])
+
+
 def test_ratio_label():
     assert va.ratio_label(1920, 1080) == "16:9" and va.ratio_label(1080, 1920) == "9:16"
     assert va.ratio_label(1280, 536) == "2.39:1" and va.ratio_label(1000, 1000) == "1:1"
@@ -366,34 +384,48 @@ def analysis_data(aspect="9:16") -> dict:
     return data
 
 
+def _fake_basic(got):
+    def fake_plan_basic(idea, **kw):
+        got["idea"], got["kw"] = idea, kw
+        return Storyboard.model_validate({"title": "Phim mới", "format": kw["fmt"], "audio": kw["audio"],
+                                          "style": kw["custom_style"], "scenes": [
+            {"id": f"s{i:02d}", "prompt": "a"} for i in range(1, kw["scenes"] + 1)]}), "api"
+    return fake_plan_basic
+
+
 def test_plan_from_analysis(monkeypatch):
+    from filmmaker import basic_planner
+    got = {}
+    monkeypatch.setattr(basic_planner, "plan_basic", _fake_basic(got))
+    sb, used = va.plan_from_analysis(analysis_data(), "", language_hint="Vietnamese", dialogue_language="Thai")
+    assert used == "api" and sb.style == "warm cinematic drama, teal-orange grade"
+    assert sb.format == "clip" and got["kw"]["audio"] == "dialogue"  # the new flow, not the deprecated drama
+    assert "Measured on the reference (40s): 3 shots" in sb.edit_style and "Cut every 1-2 s" in sb.edit_style
+    assert got["kw"]["aspect"] == "9:16" and got["kw"]["scenes"] == 7  # 2.5 + 1.5 s, then 36 s in 5 clip-sized scenes
+    assert got["kw"]["language"] == "Thai" and got["kw"]["visual"] == "other"
+    assert "Một người cha giấu bí mật" in got["idea"]  # no idea given: the suggested one
+    assert "REFERENCE STYLE" in got["idea"] and "do NOT copy" in got["idea"] and "twist" in got["idea"]
+    sb2, _ = va.plan_from_analysis(analysis_data("16:9"), "Chuyện cô giáo", scenes=4, dialogue_language="none")
+    assert got["idea"].startswith("Chuyện cô giáo") and got["kw"]["scenes"] == 4 and got["kw"]["aspect"] == "16:9"
+    assert got["kw"]["audio"] == "silent"
+
+
+def test_plan_from_analysis_old_drama_flow_only_when_asked(monkeypatch):
     got = {}
 
     def fake_plan_auto(idea, **kw):
-        got["idea"], got["kw"] = idea, kw
-        return Storyboard.model_validate({"title": "Phim mới", "scenes": [{"id": "s01", "prompt": "a"}]}), "api"
+        got["kw"] = kw
+        return Storyboard.model_validate({"title": "x", "scenes": [{"id": "s01", "prompt": "a"}]}), "api"
 
     monkeypatch.setattr(planner, "plan_auto", fake_plan_auto)
-    sb, used = va.plan_from_analysis(analysis_data(), "", language_hint="Vietnamese", dialogue_language="Thai")
-    assert used == "api" and sb.style == "warm cinematic drama, teal-orange grade"
-    assert "Measured on the reference (40s): 3 shots" in sb.edit_style and "Cut every 1-2 s" in sb.edit_style
-    assert got["kw"]["aspect"] == "9:16" and got["kw"]["scenes"] == 7  # 2.5 + 1.5 s, then 36 s in 5 clip-sized scenes
-    assert got["kw"]["dialogue_language"] == "Thai" and got["kw"]["language_hint"] == "Vietnamese"
-    assert "Một người cha giấu bí mật" in got["idea"]  # no idea given: the suggested one
-    assert "REFERENCE STYLE" in got["idea"] and "do NOT copy" in got["idea"] and "twist" in got["idea"]
-    sb2, _ = va.plan_from_analysis(analysis_data("16:9"), "Chuyện cô giáo", scenes=4)
-    assert got["idea"].startswith("Chuyện cô giáo") and got["kw"]["scenes"] == 4 and got["kw"]["aspect"] == "16:9"
+    sb, _ = va.plan_from_analysis(analysis_data(), "", dialogue_language="Thai", fmt="short_drama")
+    assert sb.format == "short_drama" and got["kw"]["dialogue_language"] == "Thai"
 
 
 def test_plan_from_analysis_remake_keeps_the_film_and_recasts_people(monkeypatch):
+    from filmmaker import basic_planner
     got = {}
-
-    def fake_plan_auto(idea, **kw):
-        got["idea"], got["kw"] = idea, kw
-        return Storyboard.model_validate({"title": "Làm lại", "model": "veo-lite", "scenes": [
-            {"id": f"s{i:02d}", "prompt": "a"} for i in range(1, kw["scenes"] + 1)]}), "api"
-
-    monkeypatch.setattr(planner, "plan_auto", fake_plan_auto)
+    monkeypatch.setattr(basic_planner, "plan_basic", _fake_basic(got))
     data = analysis_data()
     data["measured"]["duration"] = 8.0  # 0-2.5 (shots 1+2), 2.5-4 (shot 3), 4-8
     data["subtitles"] = "00:01 Anh về rồi!"
@@ -424,8 +456,8 @@ def test_clip_too_short_for_its_screen_time_falls_back_to_flow_default():
 
 
 def test_style_mode_also_times_each_scene(monkeypatch):
-    monkeypatch.setattr(planner, "plan_auto", lambda idea, **kw: (Storyboard.model_validate(
-        {"title": "x", "scenes": [{"id": f"s{i:02d}", "prompt": "a"} for i in range(1, kw["scenes"] + 1)]}), "api"))
+    from filmmaker import basic_planner
+    monkeypatch.setattr(basic_planner, "plan_basic", _fake_basic({}))
     data = analysis_data()
     data["measured"]["duration"] = 15.0
     sb, _ = va.plan_from_analysis(data, "Chuyện mới", scenes=7)
@@ -589,11 +621,8 @@ def test_web_analysis_flow(client, monkeypatch):
 
     got = {}
 
-    def fake_plan_auto(idea, **kw):
-        got["idea"], got["kw"] = idea, kw
-        return Storyboard.model_validate({"title": "Phim theo mẫu", "scenes": [{"id": "s01", "prompt": "a"}]}), "api"
-
-    monkeypatch.setattr(planner, "plan_auto", fake_plan_auto)
+    from filmmaker import basic_planner
+    monkeypatch.setattr(basic_planner, "plan_basic", _fake_basic(got))
     j = _wait(c, c.post(f"/api/analyses/{aid}/film", json={"idea": "", "scenes": 5, "language": "Vietnamese",
                                                            "dialogue_language": "Thai"}).json())
     assert j["status"] == "done", j["lines"]
@@ -646,8 +675,8 @@ def test_cli_analyze_and_film(tmp_path, monkeypatch):
 
     calls = []
     monkeypatch.setattr(va, "analyze", _fake_analyze(calls))
-    monkeypatch.setattr(planner, "plan_auto", lambda idea, **kw: (
-        Storyboard.model_validate({"title": "CLI", "scenes": [{"id": "s01", "prompt": "a"}]}), "api"))
+    from filmmaker import basic_planner
+    monkeypatch.setattr(basic_planner, "plan_basic", _fake_basic({}))
     out = tmp_path / "an"
     film = tmp_path / "proj" / "storyboard.yaml"
     film.parent.mkdir()
@@ -656,7 +685,7 @@ def test_cli_analyze_and_film(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert calls[0][1]["use_rea"] is False and calls[0][1]["allow_local"] is True
     sb = load_storyboard(film)
-    assert sb.title == "CLI" and "Cut every 1-2 s" in sb.edit_style
+    assert sb.title == "Phim mới" and sb.format == "clip" and "Cut every 1-2 s" in sb.edit_style
     assert (film.parent / "reference" / "analysis.json").is_file()
 
 

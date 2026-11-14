@@ -686,7 +686,9 @@ class Storyboard(StoryboardDraft):
 
     def for_flow(self, prompt: str) -> str:
         """The prompt as actually sent to Flow. Not part of the fingerprints, so turning this on or
-        off does not mark finished scenes for re-rendering."""
+        off does not mark finished scenes for re-rendering. Children are always described in the wording Google's
+        child-safety filter lets through (`i2v_prompt.child_safe`: no exact ages or body details)."""
+        prompt = i2v_prompt.child_safe(prompt)
         if not self.no_text or NO_TEXT in prompt:
             return prompt
         if self.basic:  # I2V guide rule 6: one short closing sentence, not a long list of negatives
@@ -838,6 +840,11 @@ class Storyboard(StoryboardDraft):
         return self.for_flow(f"{base} {rule}" if base else rule)
 
     def portrait_prompt(self, c: Character) -> str:
+        if not self.basic and i2v_prompt.is_minor(c.description):
+            # A child's reference picture: never the studio "full body, facing the camera" pose (Google's
+            # child-safety filter blocks it), even when the planner wrote one; the look comes from the description.
+            # Not part of any fingerprint: an existing portrait is not remade.
+            return i2v_prompt.child_portrait(c.description, self.style)
         if self.basic and not (c.image_prompt and c.image_prompt.strip()):
             # A natural everyday setting, not "full body on a plain studio background": that framing of a child
             # is blocked by Google's child-safety filter (and no exact ages: child_safe).

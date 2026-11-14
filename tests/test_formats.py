@@ -155,8 +155,10 @@ def test_plan_basic_refuses_the_drama_format():
 def test_public_choices_for_the_ui():
     pub = formats.public()
     keys = [f["key"] for f in pub["formats"]]
-    assert keys == ["feature", "series", "short_film", "short_drama", "clip"]
-    assert [f["basic"] for f in pub["formats"]] == [True, True, True, False, True]
+    assert keys == ["feature", "series", "short_film", "clip", "short_drama"]  # the deprecated drama comes last
+    assert [f["basic"] for f in pub["formats"]] == [True, True, True, True, False]
+    assert [f["deprecated"] for f in pub["formats"]] == [False, False, False, False, True]
+    assert pub["default"] == "clip" and pub["deprecated_note"]
     assert {a["value"]: a["enabled"] for a in pub["aspects"]} == {"9:16": True, "16:9": True, "1:1": False}
     assert len(pub["audio"]) == 5 and len(pub["visuals"]) == 5 and len(pub["genres"]) == 12
 
@@ -266,7 +268,9 @@ def test_child_safety_wording_for_basic_pictures():
     assert portrait.startswith("A cheerful Vietnamese schoolgirl, yellow t-shirt, smiling as she helps set the kitchen table in a bright, everyday home. Medium shot")
     assert "age 8" not in sb.image_prompt(sb.scenes[0])
     drama = Storyboard.model_validate({**sb.model_dump(exclude_none=True), "format": None, "audio": None})
-    assert "Full body" in drama.portrait_prompt(drama.characters[0])  # the drama is unchanged
+    # the drama too: a child's reference picture is never the studio full-body pose
+    drama_portrait = drama.portrait_prompt(drama.characters[0])
+    assert "Full body" not in drama_portrait and drama_portrait.startswith("A cheerful Vietnamese schoolgirl")
 
 
 def test_policy_block_is_reported_plainly(monkeypatch):
@@ -516,6 +520,100 @@ def test_plural_listeners_and_chubby_children():
     assert "the two children on the toilet lid face frame left" in assemble(shot, audio_mode="dialogue", language=None)
     assert child_safe("A little boy with short dark hair and a round chubby face") == \
         "A schoolboy with short dark hair and a round face"
+
+
+def test_is_minor_tells_children_from_adults():
+    from filmmaker.i2v_prompt import is_minor
+    assert is_minor("Vietnamese toddler girl, about 4 years old, pigtails")
+    assert is_minor("Chubby Vietnamese baby boy, about 10 months old")
+    assert is_minor("15-year-old Thai boy, buzz cut") and is_minor("A little girl in a yellow dress")
+    assert not is_minor("25-year-old Thai man") and not is_minor("Vietnamese woman, around 28")
+    assert not is_minor("Vietnamese man, father of two little girls") and not is_minor("A young woman, long hair")
+    assert not is_minor("18-year-old student, hoodie")
+
+
+def test_child_wording_for_ages_in_months_and_approximate_ages():
+    from filmmaker.i2v_prompt import child_portrait, child_safe
+    assert child_safe("Vietnamese toddler girl, about 4 years old, round cheeks, pink dress") == "Vietnamese toddler girl, pink dress"
+    assert child_safe("Chubby baby boy, about 10 months old, white onesie") == "baby boy, white onesie"
+    assert child_safe(child_safe("Vietnamese girl, age 8, round cheeks")) == "Vietnamese schoolgirl"
+    assert child_safe("A woman, about 30 years old") == "A woman, about 30 years old"
+    baby = child_portrait("Chubby Vietnamese baby boy, about 10 months old, white onesie", "warm light")
+    assert baby.startswith("A cheerful Vietnamese baby boy, white onesie, sitting on a soft play mat")
+    assert "months" not in baby and "Chubby" not in baby and baby.endswith("Style: warm light.")
+    girl = child_portrait("A little Vietnamese girl in a yellow dress")
+    assert girl.startswith("A cheerful Vietnamese schoolgirl in a yellow dress, smiling as she helps set")
+
+
+def test_drama_sends_children_in_safe_wording_without_touching_fingerprints():
+    sb = Storyboard.model_validate({
+        "title": "t", "characters": [{"name": "Na", "description": "Vietnamese toddler girl, about 4 years old, round cheeks",
+                                      "image_prompt": "Full-body portrait of a Vietnamese toddler girl about 4, plain studio background"},
+                                     {"name": "Mai", "description": "Vietnamese woman, around 28"}],
+        "scenes": [{"id": "s01", "mode": "keyframe", "image_prompt": "Na, 4 years old, hugs Mai", "prompt": "Na waves"}]})
+    s = sb.scenes[0]
+    before = sb.scene_fingerprint(s)
+    assert "4 years old" in sb.image_prompt(s)  # the stored prompt (fingerprint) is unchanged
+    sent = sb.for_flow_keyframe(sb.image_prompt(s), s)
+    assert "4 years old" not in sent and "round cheeks" not in sent
+    na = sb.portrait_prompt(sb.characters[0])
+    assert "studio" not in na and "Full-body" not in na and na.startswith("A cheerful Vietnamese toddler girl")
+    assert sb.portrait_prompt(sb.characters[1]).startswith("Character reference image of Mai")  # adults unchanged
+    assert sb.scene_fingerprint(s) == before
+
+
+# --- the old short drama flow is deprecated ------------------------------------------------------------------
+
+def test_drama_flow_is_deprecated():
+    assert formats.is_deprecated(None) and formats.is_deprecated("") and formats.is_deprecated(formats.DRAMA)
+    assert not formats.is_deprecated("clip") and not formats.is_deprecated(formats.DEFAULT_FORMAT)
+    assert formats.is_basic(formats.DEFAULT_FORMAT)
+
+
+def _fake_planners(monkeypatch, calls):
+    from filmmaker import basic_planner as bp, planner
+
+    def basic(idea, **kw):
+        calls.append(("basic", kw))
+        return Storyboard.model_validate({"title": "t", "format": kw["fmt"], "audio": kw["audio"],
+                                          "scenes": [{"id": "s01", "prompt": "p"}]}), "api"
+
+    def drama(idea, **kw):
+        calls.append(("drama", kw))
+        return Storyboard.model_validate({"title": "t", "scenes": [{"id": "s01", "prompt": "p"}]}), "api"
+
+    monkeypatch.setattr(bp, "plan_basic", basic)
+    monkeypatch.setattr(planner, "plan_auto", drama)
+
+
+def test_cli_plan_uses_the_new_flow_by_default(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from filmmaker.cli import main
+    import yaml
+
+    calls = []
+    _fake_planners(monkeypatch, calls)
+    out = tmp_path / "sb.yaml"
+    r = CliRunner().invoke(main, ["plan", "ý", "-o", str(out), "--dialogue-lang", "Thai", "--aspect", "9:16"])
+    assert r.exit_code == 0, r.output
+    kind, kw = calls[0]
+    assert kind == "basic" and kw["fmt"] == "clip" and kw["audio"] == "dialogue" and kw["language"] == "Thai"
+    assert yaml.safe_load(out.read_text())["format"] == "clip"
+    assert "deprecated" not in r.output
+
+
+def test_cli_plan_old_drama_flow_warns_and_records_its_format(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from filmmaker.cli import main
+    import yaml
+
+    calls = []
+    _fake_planners(monkeypatch, calls)
+    out = tmp_path / "sb.yaml"
+    r = CliRunner().invoke(main, ["plan", "ý", "-o", str(out), "--format", "short_drama"])
+    assert r.exit_code == 0, r.output
+    assert calls[0][0] == "drama" and "deprecated" in r.output
+    assert yaml.safe_load(out.read_text())["format"] == "short_drama"
 
 
 # --- dialogue films: the subtitle is the spoken line, nothing else -------------------------------------------------

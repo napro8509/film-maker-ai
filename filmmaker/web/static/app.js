@@ -3396,13 +3396,16 @@ function openNewProject() {
     const F = S.env.formats;
     if (!F) return dramaForm(null);
     const box = h("div", { class: "stack" });
-    let fmt = F.formats.some((f) => f.key === localGet("filmFormat")) ? localGet("filmFormat") : F.drama;
+    // The old short drama flow is deprecated: a new film never starts on it (not even when it was the last pick).
+    const saved = F.formats.find((f) => f.key === localGet("filmFormat") && !f.deprecated);
+    let fmt = saved ? saved.key : (F.default || F.formats.find((f) => !f.deprecated).key);
     const draw = () => {
       const info = F.formats.find((f) => f.key === fmt);
       put(box, h("div", { class: "field" }, h("span", { class: "lbl" }, "Định dạng", h("span", { class: "hint" }, " · quyết định số cảnh, nhịp kể và cách chia tập")),
         h("div", { class: "choice fmt-choice", role: "radiogroup", "aria-label": "Định dạng phim" }, F.formats.map((f) => h("button", {
-          class: fmt === f.key ? "on" : "", role: "radio", "aria-checked": String(fmt === f.key),
+          class: (fmt === f.key ? "on" : "") + (f.deprecated ? " deprecated" : ""), role: "radio", "aria-checked": String(fmt === f.key),
           onclick: () => { fmt = f.key; localSet("filmFormat", fmt); draw(); } }, h("b", {}, f.label), h("span", {}, f.desc))))),
+        info.deprecated ? h("div", { class: "banner warn flush", role: "note" }, icon("alert"), h("div", { class: "b-body" }, F.deprecated_note)) : null,
         info.basic ? basicForm(info) : dramaForm(fmt));
     };
     draw();
