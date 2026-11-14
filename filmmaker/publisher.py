@@ -26,10 +26,11 @@ from .storyboard import Storyboard, load_storyboard
 PUBLISH_FILE = "publish.json"
 PUBLISH_PLATFORMS: dict[str, str] = {
     "facebook_reel": "Facebook Reels",
+    "facebook_story": "Facebook Story",
     "youtube": "YouTube (Shorts / Video)",
 }
 
-PublishPlatform = Literal["facebook_reel", "youtube"]
+PublishPlatform = Literal["facebook_reel", "facebook_story", "youtube"]
 PrivacyStatus = Literal["public", "unlisted", "private"]
 
 # Facebook Graph API endpoints
@@ -113,7 +114,7 @@ def config_from_settings(settings: dict[str, Any]) -> PublishConfig:
 
 
 def platform_configured(cfg: PublishConfig, platform: str) -> bool:
-    if platform == "facebook_reel":
+    if platform in ("facebook_reel", "facebook_story"):
         return bool(cfg.fb_page_id and cfg.fb_access_token)
     if platform == "youtube":
         return bool(cfg.yt_client_id and cfg.yt_client_secret and cfg.yt_refresh_token)
@@ -140,7 +141,7 @@ def build_metadata(
         lang = "Vietnamese"
 
     # Pick the best matching post from social.json
-    target_social_plat = "facebook" if platform == "facebook_reel" else "tiktok"
+    target_social_plat = "facebook" if platform in ("facebook_reel", "facebook_story") else "tiktok"
     matched_post = next(
         (p for p in posts if p.get("platform") == target_social_plat and p.get("language") == lang),
         None,
@@ -181,6 +182,18 @@ def build_metadata(
             "description": desc[:4900],
             "tags": tags[:30],
             "is_short": is_short,
+        }
+
+    if platform == "facebook_story":
+        # Stories use a short text overlay; hashtags kept minimal
+        if not any(t.lower() == "story" for t in tags):
+            tags = ["Story", *tags]
+        hash_line = " ".join(f"#{t}" for t in tags[:10])
+        desc = f"{caption}\n\n{hash_line}".strip() if hash_line else caption
+        return {
+            "title": base_title[:255],
+            "description": desc[:2200],
+            "tags": tags,
         }
 
     # Facebook Reels
@@ -313,6 +326,90 @@ def upload_facebook_reel(
         "video_id": str(video_id),
         "url": reel_url,
         "title": title,
+        "description": description,
+        "at": _now(),
+        "response": finish_res,
+    }
+
+
+# --- Facebook Story uploader --------------------------------------------------
+
+
+def upload_facebook_story(
+    video_path: Path,
+    *,
+    page_id: str,
+    access_token: str,
+    description: str,
+    log: Callable[[str], None] = print,
+    http_fn: Callable[..., tuple[int, dict[str, str], dict[str, Any]]] = _http_json,
+) -> dict[str, Any]:
+    """Upload a video to Facebook Page Story via Graph API (start -> binary upload -> finish)."""
+    if not video_path.is_file():
+        raise PublishError(f"Không tìm thấy file video: {video_path}")
+    if not page_id or not access_token:
+        raise PublishError("Thiếu Facebook Page ID hoặc Page Access Token trong Cài đặt.")
+
+    file_size = video_path.stat().st_size
+    endpoint = f"{FB_GRAPH_BASE}/{urllib.parse.quote(page_id)}/video_stories"
+
+    # Phase 1: Start upload session
+    log(f"Facebook Story: khởi tạo phiên tải lên cho Page {page_id}…")
+    start_body = json.dumps({
+        "upload_phase": "start",
+        "access_token": access_token,
+    }).encode("utf-8")
+    _, _, start_res = http_fn(
+        endpoint,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=start_body,
+    )
+    video_id = start_res.get("video_id")
+    upload_url = start_res.get("upload_url") or f"https://rupload.facebook.com/video-upload/{FB_GRAPH_VERSION}/{video_id}"
+    if not video_id:
+        raise PublishError(f"Facebook không trả về video_id khi khởi tạo Story: {start_res}")
+
+    # Phase 2: Upload binary file
+    log(f"Facebook Story: đang tải video lên ({file_size / (1024 * 1024):.1f} MB)…")
+    video_bytes = video_path.read_bytes()
+    _, _, upload_res = http_fn(
+        upload_url,
+        method="POST",
+        headers={
+            "Authorization": f"OAuth {access_token}",
+            "offset": "0",
+            "file_size": str(file_size),
+            "Content-Type": "application/octet-stream",
+        },
+        data=video_bytes,
+        timeout=600,
+    )
+    if upload_res.get("success") is False:
+        raise PublishError(f"Facebook tải file Story thất bại: {upload_res}")
+
+    # Phase 3: Finish & publish Story
+    log("Facebook Story: hoàn tất và xuất bản…")
+    finish_params = {
+        "upload_phase": "finish",
+        "access_token": access_token,
+        "video_id": str(video_id),
+        "video_state": "PUBLISHED",
+        "description": description,
+    }
+    finish_body = json.dumps(finish_params).encode("utf-8")
+    _, _, finish_res = http_fn(
+        endpoint,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=finish_body,
+    )
+    story_url = f"https://www.facebook.com/stories/{page_id}/{video_id}"
+    log(f"✔ Facebook Story đã đăng: {story_url}")
+    return {
+        "platform": "facebook_story",
+        "video_id": str(video_id),
+        "url": story_url,
         "description": description,
         "at": _now(),
         "response": finish_res,
@@ -550,6 +647,15 @@ def publish_film(
                     page_id=cfg.fb_page_id,
                     access_token=cfg.fb_access_token,
                     title=meta["title"],
+                    description=meta["description"],
+                    log=log,
+                    http_fn=http_fn,
+                )
+            elif plat == "facebook_story":
+                info = upload_facebook_story(
+                    final_mp4,
+                    page_id=cfg.fb_page_id,
+                    access_token=cfg.fb_access_token,
                     description=meta["description"],
                     log=log,
                     http_fn=http_fn,

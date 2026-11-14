@@ -42,6 +42,7 @@ from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, NO_SUBTITLES, Scene, Storyboard, clean_dialogue_language, clean_language,
                           load_storyboard, merge_subtitles_raw, save_storyboard)
 from ..thumbnail import ThumbnailError
+from .. import crawler as cr
 from .. import video_analysis as va
 from . import ui_prefs
 
@@ -298,6 +299,25 @@ class NewProject(BaseModel):
 class AnalyzeBody(BaseModel):
     url: str
     use_rea: bool = True  # also run rea-video when it is installed
+
+
+class CrawlBody(BaseModel):
+    urls: str | list[str]
+    top_n: int = cr.DEFAULT_TOP
+    per_source: bool = False
+    scan_limit: int = cr.DEFAULT_SCAN_LIMIT
+    shorts_only: bool = False
+    min_duration: float | None = None
+    max_duration: float | None = None
+    cookies_from_browser: str | None = None
+    download: bool = False
+
+
+class CrawlAnalyzeBody(BaseModel):
+    urls: list[str]
+    use_rea: bool = True
+    force: bool = False
+    open_single: bool = False
 
 
 class StyleFilmBody(BaseModel):
@@ -759,6 +779,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "formats": formats.public(),
             "camera_presets": {k: [{"value": v, "label": l} for v, l in opts] for k, opts in CAMERA_PRESETS.items()},
             "video_analysis": {"ytdlp": bool(va.ytdlp_command()), "rea_video": bool(va.rea_binary())},
+            "crawler": {"ytdlp": bool(va.ytdlp_command()), "playwright": bool(cr.playwright_python()),
+                        "browsers": list(cr.BROWSER_CHOICES)},
             "qc": qc.status(),
         }
 
@@ -877,7 +899,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s["auto_qc"] = bool(s.get("auto_qc", True))
         s["auto_publish"] = bool(s.get("auto_publish"))
         if isinstance(s.get("auto_publish_platforms"), list):
-            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "youtube")]
+            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "facebook_story", "youtube")]
         else:
             s["auto_publish_platforms"] = []
         if s.get("yt_privacy") not in ("public", "unlisted", "private"):
@@ -2487,7 +2509,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.delete("/api/analyses/{aid}")
     def delete_analysis(aid: str) -> dict[str, Any]:
         d = adir(aid)
-        if jobs.current and jobs.current.status == "running" and jobs.current.kind == "analyze":
+        if jobs.current and jobs.current.status == "running" and jobs.current.kind in ("analyze", "crawl_analyze"):
             raise HTTPException(409, detail={"message": "Đang có phân tích chạy; chờ xong rồi xoá.",
                                              "reason": "job_running"})
         shutil.rmtree(d)
@@ -2527,6 +2549,165 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"project": pid}
 
         return jobs.start("plan", "Viết phim theo video mẫu", None, work).public()
+
+    # ---- video crawler (Crawl video) ----
+
+    crawls_root = workspace / ".crawls"
+
+    def cdir(cid: str) -> Path:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", cid) or not (crawls_root / cid / cr.CRAWL_FILE).is_file():
+            raise HTTPException(404, "không có đợt crawl này")
+        return crawls_root / cid
+
+    def crawl_file_url(cid: str, rel: str | None) -> str | None:
+        return f"/api/crawls/{cid}/file/{rel}" if rel else None
+
+    @app.get("/api/crawls")
+    def crawls() -> list[dict[str, Any]]:
+        return cr.list_crawls(crawls_root, analyses_root)
+
+    @app.post("/api/crawls")
+    def start_crawl(body: CrawlBody) -> dict[str, Any]:
+        try:
+            urls = cr.parse_sources(body.urls)
+            browser = cr.validate_browser(body.cookies_from_browser)
+        except cr.CrawlError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if not (1 <= body.top_n <= cr.MAX_TOP):
+            raise HTTPException(400, f"top_n phải từ 1 đến {cr.MAX_TOP}.")
+        if not (5 <= body.scan_limit <= cr.MAX_SCAN_LIMIT):
+            raise HTTPException(400, f"scan_limit phải từ 5 đến {cr.MAX_SCAN_LIMIT}.")
+        if body.min_duration is not None and body.min_duration < 0:
+            raise HTTPException(400, "Độ dài tối thiểu không hợp lệ.")
+        if body.max_duration is not None and body.max_duration <= 0:
+            raise HTTPException(400, "Độ dài tối đa không hợp lệ.")
+        if (body.min_duration is not None and body.max_duration is not None
+                and body.min_duration > body.max_duration):
+            raise HTTPException(400, "Độ dài tối thiểu không được lớn hơn độ dài tối đa.")
+        if not va.ytdlp_command():
+            raise HTTPException(400, "Cần cài yt-dlp (brew install yt-dlp) để crawl video từ YouTube / TikTok / Facebook.")
+
+        first_host = re.sub(r"^https?://(www\.)?", "", urls[0]).split("/")[0]
+        base_cid = va.new_id(f"crawl-{first_host}")
+        cid, k = base_cid, 2
+        while (crawls_root / cid).exists():
+            cid, k = f"{base_cid}-{k}", k + 1
+        folder = crawls_root / cid
+
+        def work(job: Job) -> dict[str, Any]:
+            try:
+                data = cr.crawl(
+                    urls,
+                    folder,
+                    top_n=body.top_n,
+                    per_source=body.per_source,
+                    scan_limit=body.scan_limit,
+                    shorts_only=body.shorts_only,
+                    min_duration=body.min_duration,
+                    max_duration=body.max_duration,
+                    cookies_from_browser=browser,
+                    log=job.log,
+                    should_stop=lambda: job.stop_requested,
+                )
+                if body.download:
+                    data = cr.download_top_videos(
+                        data, folder, log=job.log, should_stop=lambda: job.stop_requested,
+                    )
+            except cr.CrawlStopped:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise Stopped() from None
+            except cr.CrawlError as exc:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise RuntimeError(str(exc)) from None
+            except Exception:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
+            return {"crawl": cid, "title": data.get("title", ""), "count": len(data.get("videos") or [])}
+
+        return jobs.start("crawl", f"Crawl {len(urls)} kênh/trang", None, work).public()
+
+    @app.get("/api/crawls/{cid}")
+    def get_crawl(cid: str) -> dict[str, Any]:
+        d = cdir(cid).resolve()
+        data = cr.link_analyses(cr.load(d), analyses_root)
+        for v in data.get("videos") or []:
+            rel = str(v.get("downloaded_file") or "").strip()
+            local_ok = False
+            if rel:
+                cand = (d / rel).resolve()
+                local_ok = d in cand.parents and cand.is_file()
+            v["local_video_url"] = crawl_file_url(cid, rel) if local_ok else None
+        data["folder"] = str(d)
+        data["report_url"] = crawl_file_url(cid, "report.md") if (d / "report.md").is_file() else None
+        data["urls_file_url"] = crawl_file_url(cid, "urls.txt") if (d / "urls.txt").is_file() else None
+        return data
+
+    @app.get("/api/crawls/{cid}/file/{rel:path}")
+    def crawl_file(cid: str, rel: str):
+        base = cdir(cid).resolve()
+        p = (base / rel).resolve()
+        if base not in p.parents or not p.is_file():
+            raise HTTPException(404)
+        return FileResponse(p)
+
+    @app.delete("/api/crawls/{cid}")
+    def delete_crawl(cid: str) -> dict[str, Any]:
+        d = cdir(cid)
+        if jobs.current and jobs.current.status == "running" and jobs.current.kind in ("crawl", "crawl_analyze"):
+            raise HTTPException(409, detail={"message": "Đang có tác vụ crawl/phân tích chạy; chờ xong rồi xoá.",
+                                             "reason": "job_running"})
+        shutil.rmtree(d)
+        return {"ok": True}
+
+    @app.post("/api/crawls/{cid}/analyze")
+    def analyze_from_crawl(cid: str, body: CrawlAnalyzeBody) -> dict[str, Any]:
+        d = cdir(cid)
+        if not body.urls:
+            raise HTTPException(400, "Hãy chọn ít nhất một video để phân tích.")
+        backend = planner_backend()
+        if not backend:
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        key = load_settings().get("anthropic_api_key") or None
+        saved = cr.load(d)
+        by_key = {cr.canonical_video_key(v.get("url") or ""): v for v in saved.get("videos") or []}
+
+        targets: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for raw_u in body.urls[:cr.MAX_TOP]:
+            u = cr.safe_http_url(raw_u)
+            if not u:
+                raise HTTPException(400, f"Link video không hợp lệ: {str(raw_u)[:100]}")
+            ck = cr.canonical_video_key(u)
+            if ck in seen_keys:
+                continue
+            seen_keys.add(ck)
+            targets.append(dict(by_key[ck]) if ck in by_key else {"url": u})
+
+        def work(job: Job) -> dict[str, Any]:
+            try:
+                res = cr.analyze_crawled(
+                    targets,
+                    analyses_root,
+                    crawl_dir=d,
+                    use_rea=body.use_rea,
+                    force=body.force,
+                    backend=backend,
+                    api_key=key,
+                    log=job.log,
+                    should_stop=lambda: job.stop_requested,
+                )
+            except cr.CrawlStopped:
+                raise Stopped() from None
+            except cr.CrawlError as exc:
+                raise RuntimeError(str(exc)) from None
+            return {
+                "crawl": cid,
+                **res,
+                "open_single": bool(body.open_single and len(targets) == 1),
+            }
+
+        label = "Phân tích video từ crawl" if len(targets) == 1 else f"Phân tích {len(targets)} video từ crawl"
+        return jobs.start("crawl_analyze", label, None, work).public()
 
     # ---- jobs ----
 

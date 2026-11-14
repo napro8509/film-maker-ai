@@ -168,6 +168,11 @@ def test_build_metadata_for_platforms(project_dir):
     assert "Mỗi sáng góc phố ấy" in fb_meta["description"]
     assert "#Reels" in fb_meta["description"]
 
+    story_meta = build_metadata(sb, out, "facebook_story")
+    assert "Gói xôi 10k và câu chuyện ấm lòng" in story_meta["title"]
+    assert "Mỗi sáng góc phố ấy" in story_meta["description"]
+    assert "#Story" in story_meta["description"]
+
 
 def test_cli_publish_dry_run(project_dir):
     d, out = project_dir
@@ -176,6 +181,15 @@ def test_cli_publish_dry_run(project_dir):
     assert res.exit_code == 0
     assert "[DRY RUN] Sẽ đăng lên Facebook Reels:" in res.output
     assert "[DRY RUN] Sẽ đăng lên YouTube (Shorts / Video):" in res.output
+
+
+def test_cli_publish_dry_run_story(project_dir):
+    d, out = project_dir
+    runner = CliRunner()
+    res = runner.invoke(main, ["publish", str(d / "storyboard.yaml"), "--out", str(out),
+                               "--platform", "facebook_story", "--dry-run"])
+    assert res.exit_code == 0
+    assert "[DRY RUN] Sẽ đăng lên Facebook Story:" in res.output
 
 
 def test_web_publish_endpoints(project_dir):
@@ -190,12 +204,13 @@ def test_web_publish_endpoints(project_dir):
     r0 = client.get(f"/api/projects/{pid}/publish")
     assert r0.status_code == 200
     assert "facebook_reel" in r0.json()["platforms"]
+    assert "facebook_story" in r0.json()["platforms"]
     assert "youtube" in r0.json()["platforms"]
 
     r_pub = client.post(
         f"/api/projects/{pid}/publish",
         headers=hdr,
-        json={"platforms": ["facebook_reel", "youtube"], "dry_run": True},
+        json={"platforms": ["facebook_reel", "facebook_story", "youtube"], "dry_run": True},
     )
     assert r_pub.status_code == 200
     job_id = r_pub.json()["id"]
@@ -206,5 +221,6 @@ def test_web_publish_endpoints(project_dir):
         time.sleep(0.05)
     assert j["status"] == "done"
     assert "facebook_reel" in j["result"]["published"]
+    assert "facebook_story" in j["result"]["published"]
     assert "youtube" in j["result"]["published"]
 
