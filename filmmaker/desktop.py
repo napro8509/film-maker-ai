@@ -78,6 +78,26 @@ def _check_flow_driver_access() -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# sh -c snippet: wait until pid $0 is gone, then run "$@".
+WAIT_THEN_RUN = 'while kill -0 "$0" 2>/dev/null; do sleep 0.2; done; exec "$@"'
+
+
+def relaunch_command() -> list[str]:
+    """How to start this app again: `open` the .app bundle, or rerun the same Python command."""
+    try:
+        import AppKit
+
+        bundle = str(AppKit.NSBundle.mainBundle().bundlePath() or "")
+        if bundle.endswith(".app") and Path(bundle).name != "Python.app":  # not the bare python framework app
+            return ["/usr/bin/open", bundle]
+    except Exception:
+        pass
+    argv = list(getattr(sys, "orig_argv", []) or [])
+    if argv:
+        return [sys.executable, *argv[1:]]
+    return [sys.executable, "-m", "filmmaker.desktop"]
+
+
 class Bridge:
     """Functions the page can call as window.pywebview.api.* (things WKWebView
     can't do on its own: notifications and saving downloads)."""
@@ -85,6 +105,32 @@ class Bridge:
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url
         self.window = None
+        self.restarting = False
+
+    def restart(self) -> bool:
+        """Quit and open the app again (Cmd+R), so code changes are picked up."""
+        cmd = relaunch_command()
+        # A detached helper waits for this process to end, then starts a fresh one.
+        subprocess.Popen(["/bin/sh", "-c", WAIT_THEN_RUN,
+                          str(os.getpid()), *cmd],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print(f"[restart] mở lại bằng: {' '.join(cmd)}", flush=True)
+        self.restarting = True
+
+        def close() -> None:
+            # Not from inside this JS call: closing the window waits on the main thread, which is
+            # waiting on this call to return. If the window still hasn't gone, exit anyway.
+            time.sleep(0.3)
+            try:
+                self.window.destroy()
+            except Exception as exc:
+                print(f"[restart] không đóng được cửa sổ: {exc}", flush=True)
+            time.sleep(3)
+            os._exit(0)
+
+        threading.Thread(target=close, daemon=True).start()
+        return True
 
     def notify(self, message: str) -> None:
         _notify("Film Maker", message)
@@ -143,7 +189,7 @@ def main(workspace: Path | None = None) -> None:
 
     def on_closing():
         job = app.state.jobs.current
-        if not (job and job.status == "running"):
+        if bridge.restarting or not (job and job.status == "running"):
             return True
         import AppKit  # runs on the main thread, so show the alert directly
 

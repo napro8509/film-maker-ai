@@ -297,6 +297,18 @@ function popMenu(anchor, items, head) {
   m.querySelector(".m-item")?.focus();
 }
 
+let restarting = false;
+async function restartApp() {
+  if (restarting) return;
+  if (jobRunning() && !(await confirmModal("Khởi động lại app?",
+    `“${S.job.title || "Việc đang chạy"}” đang chạy. Khởi động lại bây giờ sẽ dừng ngay, cảnh đang render có thể bị ngắt.`,
+    "Khởi động lại", true))) return;
+  restarting = true;
+  toast("Đang khởi động lại Film Maker…", "", 4000);
+  try { await flushSave(); } catch (_) { /* restart anyway */ }
+  try { await NATIVE().restart(); } catch (err) { restarting = false; toast("Không khởi động lại được: " + err.message, "error"); }
+}
+
 function confirmModal(title, text, okLabel = "Đồng ý", danger = false) {
   return new Promise((resolve) => {
     let done = false;
@@ -371,6 +383,8 @@ async function init() {
   $("#scrim").onclick = () => toggleSidebar(false);
   document.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); flushSave().then(() => toast("Đã lưu", "ok", 1500)); }
+    // Cmd+R in the macOS app: quit and reopen the whole app (backend too), so new code is loaded.
+    if (e.metaKey && !e.altKey && e.code === "KeyR" && NATIVE() && NATIVE().restart) { e.preventDefault(); restartApp(); }
   });
   document.addEventListener("click", (e) => {  // WKWebView can't do <a download>: use a native Save dialog
     const a = e.target.closest && e.target.closest("a[download]");
