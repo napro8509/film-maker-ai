@@ -103,7 +103,9 @@ def _no_real_claude(monkeypatch):
     monkeypatch.setattr(planner, "claude_code_binary", lambda: real() if os.environ.get("CLAUDE_BIN") else None)
     real_gemini = ai.gemini_cli_binary
     monkeypatch.setattr(ai, "gemini_cli_binary", lambda: real_gemini() if os.environ.get("GEMINI_BIN") else None)
-    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_CLI_LOGGED_IN"):
+    real_agy = ai.agy_binary
+    monkeypatch.setattr(ai, "agy_binary", lambda: real_agy() if os.environ.get("AGY_BIN") else None)
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_CLI_LOGGED_IN", "AGY_LOGGED_IN", "FILMMAKER_AGY_MODEL"):
         monkeypatch.delenv(k, raising=False)
 
     def blocked(*_a, **_k):

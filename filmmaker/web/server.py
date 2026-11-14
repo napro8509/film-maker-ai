@@ -60,7 +60,7 @@ BOARD_MAX_BYTES = 256 * 1024  # PUT /board body limit
 DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": "",
                     "planner": "auto",  # auto | claude_code | api
                     "gemini_api_key": "",
-                    "gemini_backend": "auto",  # auto | gemini_api | gemini_cli
+                    "gemini_backend": "auto",  # auto | gemini_api | gemini_agy | gemini_cli
                     "flow_ui": True,  # image-to-video through the Flow chat page when gflow refuses it
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
                     "flow_ui_window": "hidden",  # show | hidden | headless
@@ -465,6 +465,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     app.state.sb_lock = sb_lock
     claude_cache: dict[str, Any] = {}
     gemini_cache: dict[str, Any] = {}
+    agy_cache: dict[str, Any] = {}
 
     def claude_code(refresh: bool = False) -> dict[str, Any]:
         from ..planner import claude_code_status
@@ -479,6 +480,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             gemini_cache.clear()
             gemini_cache.update(ai_mod.gemini_cli_status())
         return dict(gemini_cache)
+
+    def agy_cli(refresh: bool = False) -> dict[str, Any]:
+        if refresh or not agy_cache:
+            agy_cache.clear()
+            agy_cache.update(ai_mod.agy_status())
+        return dict(agy_cache)
 
     def planner_backend() -> str | None:
         """Which backend Claude will use right now, or None if neither works."""
@@ -502,9 +509,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         choice = s.get("gemini_backend") or "auto"
         if choice in ("gemini_api", "api"):
             return "gemini_api" if has_key else None
+        ag = agy_cli()
+        if choice == "gemini_agy":
+            return "gemini_agy" if ag["available"] else None
         if choice == "gemini_cli":
             return "gemini_cli" if gc["available"] else None
-        return "gemini_api" if has_key else ("gemini_cli" if has_cli else None)
+        if has_key:
+            return "gemini_api"
+        if ag["available"] and ag["logged_in"]:
+            return "gemini_agy"
+        return "gemini_cli" if has_cli else None
 
     def _ai_model_or_400(value: object) -> str:
         try:
@@ -534,10 +548,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         return out
 
     def _via_label(backend: str) -> str:
-        if backend == "gemini_cli":
-            return "Gemini CLI"
-        if backend == "gemini_api":
-            return "Google Gemini API"
+        if backend in ai_mod.GEMINI_BACKENDS:
+            return ai_mod.gemini_backend_label(backend)
         if backend == "claude_code":
             return "Claude Code (gói Claude của bạn)"
         return "Anthropic API"
@@ -844,6 +856,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         g = gflow()
         cc = claude_code(refresh=refresh)
         gc = gemini_cli(refresh=refresh)
+        ag = agy_cli(refresh=refresh)
         pb = planner_backend()
         gb = gemini_backend()
         has_gkey = bool(s.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
@@ -860,6 +873,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "planner": pb,
             "gemini_key": has_gkey,
             "gemini_cli": gc,
+            "gemini_agy": ag,
             "gemini_backend": gb,
             "default_ai_model": ai_mod.DEFAULT_AI_MODEL,
             "ai_models": [
@@ -984,7 +998,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s = load_settings()
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
-        if body.get("gemini_backend") in ("auto", "gemini_api", "gemini_cli"):
+        if body.get("gemini_backend") in ("auto", *ai_mod.GEMINI_BACKENDS):
             s["gemini_backend"] = body["gemini_backend"]
         for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
                   "auto_backup", "auto_qc", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):

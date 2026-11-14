@@ -2,7 +2,8 @@
 
 Supports two AI models per project (`ai_model`):
 - `claude` (default): Claude via Claude Code CLI subscription or Anthropic API.
-- `gemini-pro`: Google Gemini Pro (`gemini-2.5-pro`) via Gemini REST API (`GEMINI_API_KEY`) or Gemini CLI (`gemini`).
+- `gemini-pro`: Google Gemini Pro via Gemini REST API (`GEMINI_API_KEY`), Antigravity CLI (`agy`)
+  or Gemini CLI (`gemini`).
 
 Pictures are shrunk to small JPEGs first: the reviews and QC only need to see what is in the frame,
 and small files keep calls fast.
@@ -40,9 +41,13 @@ AI_MODELS: dict[str, dict[str, str]] = {
     "gemini-pro": {
         "key": "gemini-pro",
         "label": "Gemini Pro",
-        "description": "Google Gemini 2.5 Pro (qua Gemini API key hoặc Gemini CLI)",
+        "description": "Google Gemini Pro (qua Gemini API key, Antigravity agy hoặc Gemini CLI)",
     },
 }
+
+# Every backend that runs Gemini Pro (pick_backend's answers for ai_model='gemini-pro').
+GEMINI_BACKENDS = ("gemini_api", "gemini_agy", "gemini_cli")
+GEMINI_BACKEND_LABELS = {"gemini_api": "Google Gemini API", "gemini_agy": "Antigravity (agy)", "gemini_cli": "Gemini CLI"}
 
 _GEMINI_ALIASES = frozenset({"gemini", "gemini-pro", "gemini_pro", "gemini-2.5-pro", "geminipro"})
 
@@ -105,6 +110,46 @@ def gemini_cli_status() -> dict[str, Any]:
     return {"available": True, "logged_in": False, "method": None}
 
 
+def agy_binary() -> str | None:
+    """The Antigravity CLI (`agy`), or None. AGY_BIN overrides the command."""
+    val = os.environ.get("AGY_BIN", "agy")
+    if not val:
+        return None
+    found = shutil.which(val)
+    if not found and val == "agy":
+        local = Path.home() / ".local" / "bin" / "agy"  # the installer's default spot, often missing from a GUI PATH
+        found = str(local) if local.is_file() and os.access(local, os.X_OK) else None
+    return found
+
+
+def agy_status() -> dict[str, Any]:
+    """{"available": bool, "logged_in": bool, "method": str | None} for Antigravity — fast, never blocks."""
+    binary = agy_binary()
+    if not binary:
+        return {"available": False, "logged_in": False, "method": None}
+    override = os.environ.get("AGY_LOGGED_IN")
+    if override == "1":
+        return {"available": True, "logged_in": True, "method": "antigravity"}
+    if override == "0":
+        return {"available": True, "logged_in": False, "method": None}
+    home = Path(os.environ.get("GEMINI_CLI_HOME") or Path.home()) / ".gemini" / "antigravity-cli"
+    try:
+        if (home / "installation_id").is_file() and any((home / d).is_dir() for d in ("conversations", "brain")):
+            return {"available": True, "logged_in": True, "method": "antigravity"}
+    except OSError:
+        pass
+    return {"available": True, "logged_in": False, "method": None}
+
+
+def agy_model_id() -> str | None:
+    """Model passed to `agy --model` (FILMMAKER_AGY_MODEL); None = Antigravity's own default."""
+    return (os.environ.get("FILMMAKER_AGY_MODEL") or "").strip() or None
+
+
+def gemini_backend_label(backend: str | None) -> str:
+    return GEMINI_BACKEND_LABELS.get(backend or "", "Gemini")
+
+
 def pick_backend(pref: str = "auto", api_key: str | None = None, *,
                  ai_model: str | None = None, gemini_api_key: str | None = None) -> str | None:
     """Resolve the backend that can run now for `ai_model` ('claude' default or 'gemini-pro'), or None."""
@@ -113,12 +158,17 @@ def pick_backend(pref: str = "auto", api_key: str | None = None, *,
         has_key = bool(resolve_gemini_key(gemini_api_key))
         cli_st = gemini_cli_status()
         has_cli = bool(cli_st["available"] and cli_st["logged_in"])
+        agy_st = agy_status()
         if pref in ("gemini_api", "api"):
             return "gemini_api" if has_key else None
+        if pref == "gemini_agy":
+            return "gemini_agy" if agy_st["available"] else None
         if pref == "gemini_cli":
             return "gemini_cli" if gemini_cli_binary() else None
         if has_key:
             return "gemini_api"
+        if agy_st["available"] and agy_st["logged_in"]:
+            return "gemini_agy"
         if has_cli:
             return "gemini_cli"
         return None
@@ -138,7 +188,7 @@ def pick_backend(pref: str = "auto", api_key: str | None = None, *,
 def not_ready_message(ai_model: str | None = None) -> str:
     if effective_ai_model(ai_model) == GEMINI_PRO:
         return ("Chưa dùng được Gemini Pro: thêm Gemini API key (GEMINI_API_KEY) trong Cài đặt, "
-                "hoặc cài và đăng nhập Gemini CLI.")
+                "hoặc cài và đăng nhập Antigravity (lệnh agy) / Gemini CLI.")
     return "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key."
 
 
@@ -170,7 +220,9 @@ def ask(system: str, user: str, schema: type[T], *, images: Sequence[tuple[str, 
         small = [(label, shrink(p, Path(tmp) / "img" / f"{i:02d}.jpg")) for i, (label, p) in enumerate(images)]
         if model == GEMINI_PRO:
             raw_schema = schema.model_json_schema()
-            if chosen == "gemini_cli":
+            if chosen == "gemini_agy":
+                raw = _ask_agy(system, user, raw_schema, small, Path(tmp), timeout)
+            elif chosen == "gemini_cli":
                 raw = _ask_gemini_cli(system, user, raw_schema, small, Path(tmp), timeout)
             else:
                 raw = _ask_gemini_api_json(system, user, raw_schema, small, gemini_api_key, timeout)
@@ -192,6 +244,8 @@ def ask_text(system: str, user: str, *, images: Sequence[tuple[str, Path]] = (),
     with tempfile.TemporaryDirectory(prefix="fm-ai-") as tmp:
         small = [(label, shrink(p, Path(tmp) / "img" / f"{i:02d}.jpg")) for i, (label, p) in enumerate(images)]
         if model == GEMINI_PRO:
+            if chosen == "gemini_agy":
+                return _ask_agy(system, user, None, small, Path(tmp), timeout)
             if chosen == "gemini_cli":
                 return _ask_gemini_cli(system, user, None, small, Path(tmp), timeout)
             return _ask_gemini_api_text(system, user, small, gemini_api_key, timeout)
@@ -204,7 +258,7 @@ def draft_json(system: str, user: str, schema: type[BaseModel] | dict[str, Any],
                images: Sequence[tuple[str, Path]] = (), backend: str = "auto",
                gemini_api_key: str | None = None, timeout: int = 900,
                max_output_tokens: int = 32768) -> dict[str, Any]:
-    """Structured JSON dict call to Gemini Pro (via Gemini API or Gemini CLI)."""
+    """Structured JSON dict call to Gemini Pro (via Gemini API, Antigravity or Gemini CLI)."""
     chosen = pick_backend(backend, ai_model=GEMINI_PRO, gemini_api_key=gemini_api_key)
     if chosen is None:
         raise RuntimeError(not_ready_message(GEMINI_PRO))
@@ -212,7 +266,9 @@ def draft_json(system: str, user: str, schema: type[BaseModel] | dict[str, Any],
     valid_imgs = [(label, Path(p)) for label, p in images if p and Path(p).is_file()]
     with tempfile.TemporaryDirectory(prefix="fm-gemini-") as tmp:
         small = [(label, shrink(p, Path(tmp) / "img" / f"{i:02d}.jpg")) for i, (label, p) in enumerate(valid_imgs)]
-        if chosen == "gemini_cli":
+        if chosen == "gemini_agy":
+            out = _ask_agy(system, user, raw_schema, small, Path(tmp), timeout)
+        elif chosen == "gemini_cli":
             out = _ask_gemini_cli(system, user, raw_schema, small, Path(tmp), timeout)
         else:
             out = _ask_gemini_api_json(system, user, raw_schema, small, gemini_api_key, timeout,
@@ -530,3 +586,78 @@ def _ask_gemini_cli(system: str, user: str, json_schema: dict[str, Any] | None,
         return _extract_json(reply_text)
     except ValueError:
         raise RuntimeError(f"Gemini CLI trả về JSON không hợp lệ: {(reply_text or stderr)[:400]}") from None
+
+
+def _ask_agy(system: str, user: str, json_schema: dict[str, Any] | None,
+             images: list[tuple[str, Path]], cwd: Path, timeout: int) -> Any:
+    """One print-mode turn of the Antigravity CLI (`agy -p`), using the account already signed in there."""
+    binary = agy_binary()
+    if not binary:
+        raise RuntimeError("không thấy lệnh `agy` (Antigravity CLI)")
+    sections: list[str] = []
+    if system:
+        sections.append(f"System instructions:\n{system}")
+    sections.append(user)
+    if images:
+        listing = "\n".join(f"- {label}: ./{p.relative_to(cwd).as_posix()}" for label, p in images)
+        sections.append("Pictures to look at (image files in the current folder; open EVERY one with your file "
+                        f"viewing tool before answering; they are part of the task):\n{listing}")
+    if json_schema is None:
+        sections.append("Answer directly in plain text. Do not create or edit any files.")
+    else:
+        sections.append("Do not create or edit any files; just answer.")
+    cmd = [binary, "-p", "\n\n".join(sections), "--output-format", "json", "--disable-slash-commands",
+           "--print-timeout", f"{max(int(timeout), 1)}s"]
+    if json_schema is not None:
+        cmd += ["--json-schema", json.dumps(json_schema)]
+    model = agy_model_id()
+    if model:
+        cmd += ["--model", model]
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60, cwd=cwd, env=env,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Antigravity (agy) chạy quá lâu.") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Không chạy được Antigravity (agy): {exc}") from exc
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    envelope: Any = None
+    # stdout may carry warning lines before the JSON envelope: read the last line that parses.
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                envelope = json.loads(line)
+                break
+            except ValueError:
+                continue
+    if envelope is None:
+        try:
+            envelope = json.loads(stdout)
+        except ValueError:
+            envelope = None
+    if not isinstance(envelope, dict):
+        tail = (stderr or stdout)[-400:] or f"exit {proc.returncode}"
+        if any(w in tail.lower() for w in ("login", "sign in", "auth")):
+            tail += " — chạy `agy` trong Terminal để đăng nhập."
+        raise RuntimeError(f"Antigravity (agy) lỗi: {tail}")
+    status = str(envelope.get("status") or "").upper()
+    if envelope.get("error") or (status and status != "SUCCESS"):
+        err = envelope.get("error")
+        msg = (err.get("message") if isinstance(err, dict) else err) or envelope.get("response") or status
+        raise RuntimeError(f"Antigravity (agy) không trả lời được: {str(msg)[:400]}")
+    if json_schema is not None:
+        if isinstance(envelope.get("structured_output"), (dict, list)):
+            return envelope["structured_output"]
+        try:
+            return _extract_json(str(envelope.get("response") or ""))
+        except ValueError:
+            raise RuntimeError(f"Antigravity (agy) trả về JSON không hợp lệ: "
+                               f"{str(envelope.get('response') or stderr)[:400]}") from None
+    text = str(envelope.get("response") or "").strip()
+    if not text:
+        raise RuntimeError(f"Antigravity (agy) không trả lời được: {(stderr or 'không có kết quả')[-400:]}")
+    return text

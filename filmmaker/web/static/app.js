@@ -795,9 +795,10 @@ function aiModelSelect(value, onchange, attrs = {}) {
 }
 function aiModelBanner(m, onOpenSettings) {
   if (cleanAiModel(m) === "gemini-pro") {
-    const gc = S.env?.gemini_cli || {};
+    const gc = S.env?.gemini_cli || {}, ag = S.env?.gemini_agy || {};
     return h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {},
-      gc.available ? "Chưa thiết lập Gemini Pro. Thêm Gemini API key hoặc đăng nhập lệnh gemini trên máy. "
+      ag.available ? "Chưa thiết lập Gemini Pro. Thêm Gemini API key hoặc đăng nhập Antigravity (chạy “agy” trong Terminal). "
+      : gc.available ? "Chưa thiết lập Gemini Pro. Thêm Gemini API key hoặc đăng nhập lệnh gemini trên máy. "
         : "Chưa thiết lập Gemini Pro. Cần thêm Gemini API key (Google AI Studio) hoặc cài Gemini CLI. ",
       h("a", { href: "#", onclick: (e) => { e.preventDefault(); onOpenSettings(); } }, "Mở Cài đặt"), ".")));
   }
@@ -820,6 +821,8 @@ function geminiChip() {
   const e = S.env || {};
   if (e.gemini_backend === "gemini_api")
     return h("span", { class: "pill ok", title: "Gemini Pro sẵn sàng qua Google Gemini API key" }, "Gemini Pro");
+  if (e.gemini_backend === "gemini_agy")
+    return h("span", { class: "pill ok", title: "Gemini Pro sẵn sàng qua Antigravity (lệnh agy) trên máy" }, "Gemini Pro · agy");
   if (e.gemini_backend === "gemini_cli")
     return h("span", { class: "pill ok", title: "Gemini Pro sẵn sàng qua Gemini CLI trên máy" }, "Gemini Pro · CLI");
   if (cleanAiModel(S.cur?.storyboard?.ai_model || S.cur?.ai_model) === "gemini-pro")
@@ -3630,7 +3633,7 @@ function openNewProject() {
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
     const modelNote = aiModel === "gemini-pro"
-      ? (S.env.gemini_backend === "gemini_cli" ? "Dùng Gemini CLI trên máy." : "Dùng Google Gemini Pro API key.")
+      ? (S.env.gemini_backend === "gemini_agy" ? "Dùng Antigravity (agy) trên máy." : S.env.gemini_backend === "gemini_cli" ? "Dùng Gemini CLI trên máy." : "Dùng Google Gemini Pro API key.")
       : (S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng).");
     return h("div", { class: "stack" },
       field("Ý tưởng phim", idea),
@@ -3689,7 +3692,7 @@ function openAnalyzeVideo() {
     const v = url.value.trim();
     if (!/^https?:\/\//i.test(v)) { toast("Hãy dán một link http(s) tới video", "error"); url.focus(); return; }
     if (!aiModelReady(aiModel)) {
-      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI để phân tích" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích", "error");
+      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Antigravity (agy) để phân tích" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích", "error");
       return;
     }
     const btn = e.currentTarget; btn.disabled = true;
@@ -3875,7 +3878,7 @@ function renderAnalysisFilmForm(d) {
     if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); return; }
     if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); return; }
     if (!aiModelReady(aiModel)) {
-      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key", "error");
+      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Antigravity (agy)" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key", "error");
       return;
     }
     const btn = e.currentTarget; btn.disabled = true;
@@ -4069,7 +4072,7 @@ function renderCrawlResult(c, urlsBox) {
   const runAnalyze = async (urls, { force = false, openSingle = false } = {}, btn = null) => {
     if (!urls.length) { toast("Hãy chọn ít nhất 1 video để phân tích", "error"); return; }
     if (crawlAiModel === "gemini-pro" ? !S.env?.gemini_backend : !S.env?.planner) {
-      toast(crawlAiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI để phân tích video" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích video", "error");
+      toast(crawlAiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Antigravity (agy) để phân tích video" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích video", "error");
       return;
     }
     if (btn) btn.disabled = true;
@@ -4302,6 +4305,7 @@ async function openSettings() {
   let clearGeminiKey = false;
   const cc = S.env.claude_code || {};
   const gc = S.env.gemini_cli || {};
+  const ag = S.env.gemini_agy || {};
   const planner = h("select", { value: s.planner || "auto" },
     h("option", { value: "auto" }, "Tự động (ưu tiên Claude Code)"),
     h("option", { value: "claude_code" }, "Claude Code — dùng gói Claude Pro/Max của bạn"),
@@ -4309,6 +4313,7 @@ async function openSettings() {
   const geminiKey = h("input", { type: "password", placeholder: s.gemini_key_set ? `Đã lưu (${s.gemini_key_hint}) · nhập để thay` : s.gemini_key_from_env ? "Đang dùng biến môi trường GEMINI_API_KEY / GOOGLE_API_KEY" : "AIza…", autocomplete: "off" });
   const geminiBackend = h("select", { value: s.gemini_backend || "auto" },
     h("option", { value: "auto" }, "Tự động (ưu tiên Gemini API key)"),
+    h("option", { value: "gemini_agy" }, "Antigravity — lệnh agy trên máy (dùng tài khoản đã đăng nhập)"),
     h("option", { value: "gemini_api" }, "Google Gemini API key"),
     h("option", { value: "gemini_cli" }, "Gemini CLI — lệnh gemini trên máy"));
   const remote = h("input", { type: "text", value: s.backup_remote || "gdrive:FilmMaker", placeholder: "gdrive:FilmMaker" });
@@ -4373,11 +4378,13 @@ async function openSettings() {
         h("div", { class: "stack" },
           field("Cách gọi Gemini Pro", geminiBackend),
           h("div", { class: "row small" },
-            h("span", { class: "pill " + ((s.gemini_key_set || s.gemini_key_from_env) ? "ok" : gc.available ? (gc.logged_in ? "ok" : "warn") : "") },
+            h("span", { class: "pill " + ((s.gemini_key_set || s.gemini_key_from_env) ? "ok" : ag.available ? (ag.logged_in ? "ok" : "warn") : gc.available ? (gc.logged_in ? "ok" : "warn") : "") },
               (s.gemini_key_set || s.gemini_key_from_env) ? "Đã có Gemini API key"
+                : ag.available ? (ag.logged_in ? "Antigravity (agy) đã đăng nhập" : "Antigravity (agy) chưa đăng nhập")
                 : gc.available ? (gc.logged_in ? "Gemini CLI đã đăng nhập" : "Gemini CLI chưa đăng nhập") : "Chưa thiết lập Gemini Pro"),
             h("span", { class: "muted" }, (s.gemini_key_set || s.gemini_key_from_env)
               ? "Dùng model gemini-2.5-pro qua Google AI Studio API."
+              : ag.available ? (ag.logged_in ? "Gọi Gemini qua lệnh agy với tài khoản Antigravity của bạn, không cần API key." : "Mở Terminal, chạy “agy” để đăng nhập.")
               : gc.available ? "Có thể thêm Gemini API key hoặc đăng nhập lệnh gemini trong Terminal."
                 : "Nhập Gemini API key từ Google AI Studio để chọn Gemini Pro khi tạo dự án.")),
           field("Gemini API key", geminiKey, "dùng khi chọn Model AI là Gemini Pro"),

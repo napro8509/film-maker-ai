@@ -888,11 +888,11 @@ def ask_claude(brief: str, sheets: list[dict], folder: Path, *, backend: str = "
     if sheets:
         user += ("\n\nContact sheets (image files in the current folder; open EVERY one with the Read tool before "
                  "answering; the shot number is printed on the first frame of each shot):\n" + _sheet_text(sheets))
-    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO or backend in ai_mod.GEMINI_BACKENDS:
         chosen = ai_mod.pick_backend(backend, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
         if not chosen:
             raise AnalysisError(ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
-        log(f"Gemini Pro ({'Gemini CLI' if chosen == 'gemini_cli' else 'API'}) đang xem {len(sheets)} bảng ảnh "
+        log(f"Gemini Pro ({ai_mod.gemini_backend_label(chosen)}) đang xem {len(sheets)} bảng ảnh "
             "và viết bản phân tích… (thường 2–6 phút)")
         try:
             return ai_mod.ask(SYSTEM, user, VideoAnalysis,

@@ -431,7 +431,7 @@ def fix_vietnamese_diacritics(sb: Storyboard, *, backend: str, api_key: str | No
     bad = vietnamese_without_marks(sb)
     if not bad:
         return sb
-    use_gemini = effective_ai_model(ai_model or sb.ai_model) == GEMINI_PRO or backend in ("gemini_api", "gemini_cli")
+    use_gemini = effective_ai_model(ai_model or sb.ai_model) == GEMINI_PRO or backend in ai.GEMINI_BACKENDS
     if log:
         log(f"⚠ {len(bad)} câu tiếng Việt bị thiếu dấu: nhờ {'Gemini Pro' if use_gemini else 'Claude'} thêm dấu lại…")
     user = "Items:\n" + json.dumps([{"key": k, "text": v} for k, v in bad.items()], ensure_ascii=False)
@@ -536,7 +536,7 @@ class _SubLines(BaseModel):
 def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None, timeout: int,
                      ai_model: str | None = None, gemini_api_key: str | None = None) -> dict[str, dict]:
     user = "Subtitle lines (id: text):\n" + "\n".join(f"{k}: {v}" for k, v in lines.items())
-    if effective_ai_model(ai_model) == GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+    if effective_ai_model(ai_model) == GEMINI_PRO or backend in ai.GEMINI_BACKENDS:
         out = _draft_gemini(user, timeout, system=TRANSLATE_SYSTEM, schema_model=_SubLines,
                             backend=backend, gemini_api_key=gemini_api_key)
         items = out.get("lines") or []
@@ -683,7 +683,7 @@ def suggest_titles(sb: Storyboard, *, backend: str = "auto", api_key: str | None
     """A few title ideas for the thumbnail, written by Claude or Gemini Pro."""
     user = f"{_story_summary(sb)}\n\nWrite {n} title options."
     model = effective_ai_model(ai_model or sb.ai_model)
-    if model == GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+    if model == GEMINI_PRO or backend in ai.GEMINI_BACKENDS:
         out = _draft_gemini(user, timeout, system=TITLE_SYSTEM, schema_model=_TitleOpts,
                             backend=backend, gemini_api_key=gemini_api_key)
         return _clean_titles(out.get("titles"), n)

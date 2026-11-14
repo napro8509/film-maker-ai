@@ -657,11 +657,11 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
     if sheets:
         user += "\n\nContact sheets of the footage" + (
             " (image files in the current folder; open each one with the Read tool first):" + looks)
-    if ai_mod.effective_ai_model(ai_model or sb.ai_model) == ai_mod.GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+    if ai_mod.effective_ai_model(ai_model or sb.ai_model) == ai_mod.GEMINI_PRO or backend in ai_mod.GEMINI_BACKENDS:
         chosen = ai_mod.pick_backend(backend, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
         if not chosen:
             raise RuntimeError(ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
-        log(f"Agent dựng phim (Gemini Pro, {'Gemini CLI' if chosen == 'gemini_cli' else 'API'}) đang xem kịch bản và các clip…")
+        log(f"Agent dựng phim (Gemini Pro, {ai_mod.gemini_backend_label(chosen)}) đang xem kịch bản và các clip…")
         plan = ai_mod.ask(system, user, EditPlan, images=[(p.name, p) for p, _ in sheets],
                           backend=chosen, timeout=timeout, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
         plan.source = "ai"

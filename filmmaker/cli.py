@@ -230,9 +230,9 @@ def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: i
                    "Được ép vào mọi prompt video. --lang vẫn là ngôn ngữ phụ đề (narration).")
 @click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
               default="claude", show_default=True, help="Model AI xử lý kịch bản (mặc định: claude).")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_agy", "gemini_cli"]),
               default="auto", show_default=True,
-              help="claude_code/api (Claude) hoặc gemini_api/gemini_cli (Gemini Pro).")
+              help="claude_code/api (Claude) hoặc gemini_api/gemini_agy/gemini_cli (Gemini Pro).")
 @_format_options
 def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
          ai_model: str, backend: str, fmt: str, audio: str, visual: str, genres) -> None:
@@ -618,7 +618,7 @@ def _edit_options(f):
     f = click.option("--engine", type=click.Choice(["auto", "ai", "rules"]), default="auto", show_default=True,
                      help="ai = agent AI lập kế hoạch dựng; rules = luật mặc định; auto = AI nếu có.")(f)
     f = click.option("--replan", is_flag=True, help="Bỏ kế hoạch dựng đã lưu (edit.json), làm bản mới.")(f)
-    f = click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+    f = click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_agy", "gemini_cli"]),
                      default="auto", show_default=True)(f)
     return f
 
@@ -1252,7 +1252,7 @@ def template(output: Path) -> None:
 @click.option("--dialogue-lang", "dialogue_lang", default=None, help="Ngôn ngữ nhân vật nói ('none' = không thoại).")
 @click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
               default="claude", show_default=True, help="Model AI phân tích video / viết kịch bản (mặc định: claude).")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_agy", "gemini_cli"]),
               default="auto", show_default=True)
 def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea: str, scenes: int | None,
             language: str, dialogue_lang: str | None, ai_model: str, backend: str) -> None:
@@ -1316,7 +1316,7 @@ def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea
 @click.option("--no-rea", is_flag=True, help="Khi dùng --analyze: không chạy rea-video dù đã cài.")
 @click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
               default="claude", show_default=True, help="Model AI khi dùng --analyze (mặc định: claude).")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_agy", "gemini_cli"]),
               default="auto", show_default=True, help="Backend AI khi dùng --analyze.")
 @click.option("--json", "as_json", is_flag=True, help="In đúng một object JSON kết quả ra stdout.")
 def crawl(sources: tuple[str, ...], from_file: Path | None, top_n: int, per_source: bool, scan_limit: int,
