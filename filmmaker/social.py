@@ -74,8 +74,9 @@ def _clean_tag(tag: str) -> str:
 
 def generate(project_dir: Path, out_dir: Path, platforms: list[str], languages: list[str], *, note: str = "",
              with_pictures: bool = True, backend: str = "auto", api_key: str | None = None,
-             timeout: int = 600) -> dict[str, Any]:
-    """Write the posts and save them. ValueError for bad choices, RuntimeError when Claude cannot answer."""
+             timeout: int = 600, ai_model: str | None = None,
+             gemini_api_key: str | None = None) -> dict[str, Any]:
+    """Write the posts and save them. ValueError for bad choices, RuntimeError when AI cannot answer."""
     platforms = [p for p in PLATFORMS if p in set(platforms)]
     languages = [lang for lang in LANGUAGES if lang in set(languages)]
     if not platforms:
@@ -83,6 +84,12 @@ def generate(project_dir: Path, out_dir: Path, platforms: list[str], languages: 
     if not languages:
         raise ValueError("Chọn ít nhất một ngôn ngữ.")
     note = (note or "").strip()[:1000]
+    model = ai_model if ai_model is not None else film_chat._project_ai_model(project_dir)
+    extra_kw: dict[str, Any] = {}
+    if model is not None:
+        extra_kw["ai_model"] = model
+    if gemini_api_key is not None:
+        extra_kw["gemini_api_key"] = gemini_api_key
     with film_chat.lock(out_dir):
         sections = film_chat.gather(project_dir, out_dir)
         images = [x for x in film_chat.pictures(project_dir, out_dir) if not x[0].startswith("Ảnh tham chiếu")] \
@@ -95,7 +102,7 @@ def generate(project_dir: Path, out_dir: Path, platforms: list[str], languages: 
             f"Extra wishes from the user: {note}" if note else "",
         ]).strip()
         pack = ai.ask(SYSTEM, user, SocialPack, images=images, backend=backend, api_key=api_key,
-                      timeout=timeout, effort="medium")
+                      timeout=timeout, effort="medium", **extra_kw)
         posts: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for post in pack.posts:
@@ -107,7 +114,7 @@ def generate(project_dir: Path, out_dir: Path, platforms: list[str], languages: 
             d["hashtags"] = [t for t in (_clean_tag(x) for x in post.hashtags) if t][:20]
             posts.append(d)
         if not posts:
-            raise RuntimeError("Claude không viết được bài đăng nào.")
+            raise RuntimeError(f"{ai.ai_model_label(model)} không viết được bài đăng nào.")
         order = {(p, lang): i for i, (lang, p) in enumerate((lang, p) for lang in languages for p in platforms)}
         posts.sort(key=lambda d: order[(d["platform"], d["language"])])
         missing = [f"{PLATFORMS[p]} / {LANGUAGES[lang]}" for lang in languages for p in platforms if (p, lang) not in seen]

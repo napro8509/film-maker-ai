@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from . import formats
 from . import i2v_prompt
+from .ai import DEFAULT_AI_MODEL, clean_ai_model
 from .i2v_prompt import VideoShot
 
 Aspect = Literal["16:9", "9:16"]
@@ -505,6 +506,18 @@ class Storyboard(StoryboardDraft):
     visual_style: str | None = Field(default=None, description="Visual style picked when planning (realistic, 2d, "
                                      "3d, anime, other); its sentence is already in `style`.")
     genres: list[str] | None = Field(default=None, description="Genres picked when planning (family, romance...).")
+    ai_model: str | None = Field(default=None, description="AI model used for storyboard, review, QC, editing and "
+                                 "chat in this project: 'claude' (default) or 'gemini-pro'. Never sent to Flow.")
+
+    @field_validator("ai_model", mode="before")
+    @classmethod
+    def _ai_model(cls, v: object) -> str | None:
+        return clean_ai_model(v)
+
+    @property
+    def effective_ai_model(self) -> str:
+        """AI model for this project ('claude' when unset)."""
+        return self.ai_model or DEFAULT_AI_MODEL
 
     @field_validator("format", "audio", "visual_style", mode="before")
     @classmethod

@@ -13,8 +13,10 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import ai
 from . import durations as durations_mod
 from . import formats, i2v_prompt, model_meta, planner
+from .ai import GEMINI_PRO, clean_ai_model
 from .i2v_prompt import Listener, Speaker, VideoShot
 from .storyboard import NO_DIALOGUE, NO_SUBTITLES, Storyboard, Thumbnail, clean_language
 
@@ -289,8 +291,10 @@ def _repair(draft: dict, draft_fn, audio: str, base: str, log=None) -> dict:
 
 def plan_basic(idea: str, *, fmt: str, audio: str = "silent", visual: str = "realistic", custom_style: str = "",
                genres: list[str] | None = None, scenes: int = 6, aspect: str = "16:9", language: str | None = None,
-               backend: str = "auto", api_key: str | None = None, log=None) -> tuple[Storyboard, str]:
-    """Storyboard for a basic format. Returns (storyboard, backend used: claude_code | api)."""
+               backend: str = "auto", api_key: str | None = None, ai_model: str | None = None,
+               gemini_api_key: str | None = None, log=None) -> tuple[Storyboard, str]:
+    """Storyboard for a basic format. Returns (storyboard, backend used)."""
+    chosen_model = clean_ai_model(ai_model)
     if not formats.is_basic(fmt):
         raise ValueError(f"định dạng {fmt!r} không dùng luồng cơ bản")
     if audio not in formats.AUDIO:
@@ -304,26 +308,41 @@ def plan_basic(idea: str, *, fmt: str, audio: str = "silent", visual: str = "rea
         language = None
     base = user_message(idea, fmt=fmt, audio=audio, visual=visual, style=style, genres=genres, scenes=scenes,
                         aspect=aspect, language=language)
-    if backend == "auto":
-        backend = "claude_code" if planner.claude_code_binary() else "api"
-    if backend == "claude_code":
-        def draft_fn(user: str) -> dict:
-            return planner._draft_claude_code(user, system=SYSTEM, schema_model=BasicDraft)
-    else:
-        if api_key:
-            os.environ["ANTHROPIC_API_KEY"] = api_key
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+    if chosen_model == GEMINI_PRO:
+        used = ai.pick_backend(backend, ai_model=GEMINI_PRO, gemini_api_key=gemini_api_key)
+        if used is None:
+            raise RuntimeError(ai.not_ready_message(GEMINI_PRO))
 
         def draft_fn(user: str) -> dict:
-            return planner._draft_api(user, system=SYSTEM, schema_model=BasicDraft)
-    draft = planner._draft_in_parts(draft_fn, base, scenes, log)
+            return planner._draft_gemini(user, system=SYSTEM, schema_model=BasicDraft,
+                                         backend=used, gemini_api_key=gemini_api_key)
+
+        draft = planner._draft_in_parts(draft_fn, base, scenes, log, model_label="Gemini Pro")
+        backend = used
+    else:
+        if backend == "auto":
+            backend = "claude_code" if planner.claude_code_binary() else "api"
+        if backend == "claude_code":
+            def draft_fn(user: str) -> dict:
+                return planner._draft_claude_code(user, system=SYSTEM, schema_model=BasicDraft)
+        else:
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+
+            def draft_fn(user: str) -> dict:
+                return planner._draft_api(user, system=SYSTEM, schema_model=BasicDraft)
+        draft = planner._draft_in_parts(draft_fn, base, scenes, log)
     draft["scenes"] = [{**sc, "id": f"s{i:02d}"} for i, sc in
                        enumerate([x for x in draft.get("scenes") or [] if isinstance(x, dict)], 1)]
     draft = _repair(draft, draft_fn, audio, base, log)
     sb = _to_storyboard(draft, fmt=fmt, audio=audio, visual=visual, style=style, genres=genres, aspect=aspect,
                         language=language)
-    sb = planner.fix_vietnamese_diacritics(sb, backend=backend, api_key=api_key, log=log)
+    if chosen_model == GEMINI_PRO:
+        sb.ai_model = GEMINI_PRO
+    sb = planner.fix_vietnamese_diacritics(sb, backend=backend, api_key=api_key, ai_model=chosen_model,
+                                           gemini_api_key=gemini_api_key, log=log)
     meta = model_meta.load()
     sb = model_meta.normalize_new_storyboard(sb, meta)
     return durations_mod.round_new_storyboard(sb, meta), backend

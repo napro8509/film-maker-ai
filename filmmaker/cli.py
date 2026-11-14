@@ -186,16 +186,24 @@ def _format_options(f):
 
 
 def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: int, aspect: str,
-              language: str | None, dialogue_lang: str | None, backend: str = "auto", api_key: str | None = None):
+              language: str | None, dialogue_lang: str | None, backend: str = "auto", api_key: str | None = None,
+              ai_model: str | None = None, gemini_api_key: str | None = None):
     """Storyboard for a new film: the basic flow, or the deprecated drama planner for `--format short_drama`."""
+    from . import ai as ai_mod
     from . import formats as fm
+
+    extra_ai: dict[str, Any] = {}
+    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO:
+        extra_ai["ai_model"] = ai_mod.GEMINI_PRO
+        if gemini_api_key:
+            extra_ai["gemini_api_key"] = gemini_api_key
 
     if fm.is_deprecated(fmt):
         click.echo(f"⚠ {fm.DEPRECATED_NOTE}")
         from .planner import plan_auto
 
         sb, _ = plan_auto(idea, backend=backend, api_key=api_key, scenes=scenes, aspect=aspect,
-                          language_hint=language, dialogue_language=dialogue_lang, log=click.echo)
+                          language_hint=language, dialogue_language=dialogue_lang, log=click.echo, **extra_ai)
         sb.format = fm.DRAMA
         return sb
     from .basic_planner import plan_basic
@@ -205,7 +213,7 @@ def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: i
     click.echo(f"Định dạng: {fm.FORMATS[fmt]['label']} · Âm thanh: {fm.AUDIO[audio]['label']} · "
                f"Hình ảnh: {fm.VISUALS[visual]['label']} · Khung: {aspect}")
     sb, _ = plan_basic(idea, fmt=fmt, audio=audio, visual=visual, genres=list(genres), scenes=scenes, aspect=aspect,
-                       language=words, backend=backend, api_key=api_key, log=click.echo)
+                       language=words, backend=backend, api_key=api_key, log=click.echo, **extra_ai)
     return sb
 
 
@@ -220,26 +228,35 @@ def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: i
 @click.option("--dialogue-lang", "dialogue_lang", default=None,
               help="Ngôn ngữ nhân vật nói, tên tiếng Anh (vd Vietnamese, English, Thai); 'none' = không thoại. "
                    "Được ép vào mọi prompt video. --lang vẫn là ngôn ngữ phụ đề (narration).")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
-              help="claude_code = dùng gói Claude (Pro/Max) qua lệnh `claude`; api = dùng ANTHROPIC_API_KEY.")
+@click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
+              default="claude", show_default=True, help="Model AI xử lý kịch bản (mặc định: claude).")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+              default="auto", show_default=True,
+              help="claude_code/api (Claude) hoặc gemini_api/gemini_cli (Gemini Pro).")
 @_format_options
 def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
-         backend: str, fmt: str, audio: str, visual: str, genres) -> None:
-    """Viết storyboard từ một ý tưởng bằng Claude (qua Claude Code hoặc API key).
+         ai_model: str, backend: str, fmt: str, audio: str, visual: str, genres) -> None:
+    """Viết storyboard từ một ý tưởng bằng AI (mặc định Claude, hoặc Gemini Pro với --ai-model gemini-pro).
 
     Mặc định dùng luồng mới (--format clip: chữ -> ảnh -> video). --format short_drama là luồng cũ, đã ngừng dùng.
     """
+    from . import ai as ai_mod
 
-    if dialogue_lang is not None:  # checked before overwriting or calling Claude
+    if dialogue_lang is not None:  # checked before overwriting or calling AI
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
         if language is not None:
             language = _cli_lang(language, "--lang", clean_language)
     if output.exists() and not click.confirm(f"{output} đã tồn tại. Ghi đè?"):
         return
+    chosen_model = ai_mod.effective_ai_model(ai_model)
+    s = user_settings.load() if chosen_model == ai_mod.GEMINI_PRO else {}
+    gkey = (s.get("gemini_api_key") or None) if chosen_model == ai_mod.GEMINI_PRO else None
+    eff_backend = (s.get("gemini_backend") or "auto") if (chosen_model == ai_mod.GEMINI_PRO and backend == "auto") else backend
     click.echo("Đang viết storyboard...")
     try:
         sb = _plan_new(idea, fmt=fmt, audio=audio, visual=visual, genres=genres, scenes=scenes, aspect=aspect,
-                       language=language, dialogue_lang=dialogue_lang, backend=backend)
+                       language=language, dialogue_lang=dialogue_lang, backend=eff_backend,
+                       ai_model=chosen_model, gemini_api_key=gkey)
     except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     save_storyboard(sb, output)
@@ -427,14 +444,21 @@ def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str |
 
     s = user_settings.load()
     key = s.get("anthropic_api_key") or None
-    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    is_gemini = sb.effective_ai_model == ai.GEMINI_PRO
+    gkey = (s.get("gemini_api_key") or None) if is_gemini else None
+    backend = (ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+               if is_gemini else ai.pick_backend(s.get("planner") or "auto", key))
     if not backend:
-        click.echo("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
+        if is_gemini:
+            click.echo(f"⚠ Bỏ qua AI QC: {ai.not_ready_message(ai.GEMINI_PRO)}")
+        else:
+            click.echo("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
         return {}
     click.echo("")
     click.echo("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
     pipe = Pipeline(sb, out_dir, Gflow(profile=profile, dry_run=True, log=lambda *_: None), log=lambda *_: None)
-    done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key)
+    extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
+    done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key, **extra)
     failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
     if failed:
         click.echo(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — render lại nếu muốn: "
@@ -481,17 +505,24 @@ def _clips(sb, out_dir: Path) -> tuple[list[tuple[str, Path]], list[str]]:
 
 
 def _fill_subtitles(sb, storyboard: Path, backend: str = "auto") -> None:
-    """Translate missing vi / th / en subtitle lines with Claude and save them into the YAML (best effort)."""
+    """Translate missing vi / th / en subtitle lines with the project's AI model and save them into the YAML."""
+    from . import ai as ai_mod
     from .planner import translate_subtitles
     from .storyboard import merge_subtitles_raw
 
     if not sb.missing_subtitles():
         return
-    if not _ai_ready(backend):
-        click.echo("⚠ Chưa có Claude để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
+    is_gemini = sb.effective_ai_model == ai_mod.GEMINI_PRO
+    if not _ai_ready(backend, ai_model=sb.ai_model):
+        label = ai_mod.ai_model_label(sb.ai_model)
+        click.echo(f"⚠ Chưa có {label} để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
         return
+    s = user_settings.load()
+    extra = ({"ai_model": ai_mod.GEMINI_PRO, "gemini_api_key": s.get("gemini_api_key") or None}
+             if is_gemini else {})
+    eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
     try:
-        added = translate_subtitles(sb, backend=backend, api_key=user_settings.load().get("anthropic_api_key") or None)
+        added = translate_subtitles(sb, backend=eff_backend, api_key=s.get("anthropic_api_key") or None, **extra)
     except RuntimeError as exc:
         click.echo(f"⚠ Không dịch được phụ đề ({exc}); track còn thiếu dùng tạm lời dẫn gốc.")
         return
@@ -536,10 +567,16 @@ def stitch(storyboard: Path, out, output, music, volume, subtitles, burn_lang, a
     _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang)
 
 
-def _ai_ready(backend: str) -> bool:
+def _ai_ready(backend: str, ai_model: str | None = None) -> bool:
+    from . import ai as ai_mod
     from .planner import claude_code_binary
 
-    has_key = bool(user_settings.load().get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+    s = user_settings.load()
+    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO:
+        pref = backend if backend != "auto" else (s.get("gemini_backend") or "auto")
+        return bool(ai_mod.pick_backend(pref, ai_model=ai_mod.GEMINI_PRO,
+                                        gemini_api_key=s.get("gemini_api_key") or None))
+    has_key = bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
     if backend == "claude_code":
         return bool(claude_code_binary())
     if backend == "api":
@@ -549,13 +586,22 @@ def _ai_ready(backend: str) -> bool:
 
 def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
              burn_lang: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
+    from . import ai as ai_mod
     from .editor import edit_film, make_plan, plan_path
 
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
-    kw = dict(engine=engine, replan=replan, backend=backend, ai_available=_ai_ready(backend),
-              api_key=user_settings.load().get("anthropic_api_key") or None, log=click.echo)
+    s = user_settings.load()
+    is_gemini = sb.effective_ai_model == ai_mod.GEMINI_PRO
+    eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
+    kw: dict[str, Any] = dict(engine=engine, replan=replan, backend=eff_backend,
+                              ai_available=_ai_ready(backend, ai_model=sb.ai_model),
+                              api_key=s.get("anthropic_api_key") or None, log=click.echo)
+    if is_gemini:
+        kw["ai_model"] = ai_mod.GEMINI_PRO
+        if s.get("gemini_api_key"):
+            kw["gemini_api_key"] = s["gemini_api_key"]
     try:
         if plan_only:
             make_plan(sb, clips, out_dir, has_music=bool(music), **kw)
@@ -570,9 +616,10 @@ def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, a
 
 def _edit_options(f):
     f = click.option("--engine", type=click.Choice(["auto", "ai", "rules"]), default="auto", show_default=True,
-                     help="ai = agent Claude lập kế hoạch dựng; rules = luật mặc định; auto = AI nếu có.")(f)
+                     help="ai = agent AI lập kế hoạch dựng; rules = luật mặc định; auto = AI nếu có.")(f)
     f = click.option("--replan", is_flag=True, help="Bỏ kế hoạch dựng đã lưu (edit.json), làm bản mới.")(f)
-    f = click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True)(f)
+    f = click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+                     default="auto", show_default=True)(f)
     return f
 
 
@@ -623,6 +670,7 @@ def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing,
     Mở dự án trong CapCut để xem, chỉnh thêm hiệu ứng / âm thanh rồi bấm Export ở đó.
     Dự án bạn đã sửa trong CapCut không bị ghi đè: lần dựng sau lưu thành dự án mới.
     """
+    from . import ai as ai_mod
     from . import capcut as cc
 
     sb = load_storyboard(storyboard)
@@ -632,12 +680,17 @@ def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing,
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
+    s = user_settings.load()
+    is_gemini = sb.effective_ai_model == ai_mod.GEMINI_PRO
+    eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
+    cc_extra = ({"ai_model": ai_mod.GEMINI_PRO, "gemini_api_key": s.get("gemini_api_key") or None}
+                if is_gemini else {})
     try:
         folder, _ = cc.export_film(
             sb, clips, out_dir, music=music, music_volume=volume, subtitles=subtitles, subtitle_language=lang,
-            name=name, root=capcut_dir or user_settings.load().get("capcut_drafts_dir") or None, engine=engine,
-            replan=replan, backend=backend, ai_available=_ai_ready(backend),
-            api_key=user_settings.load().get("anthropic_api_key") or None, log=click.echo)
+            name=name, root=capcut_dir or s.get("capcut_drafts_dir") or None, engine=engine,
+            replan=replan, backend=eff_backend, ai_available=_ai_ready(backend, ai_model=sb.ai_model),
+            api_key=s.get("anthropic_api_key") or None, log=click.echo, **cc_extra)
     except (AssembleError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"🎬 Dự án CapCut: {folder}")
@@ -833,11 +886,13 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 @click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
 @click.option("--profile", help="gflow profile (tài khoản Google).")
 @click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần render video.")
+@click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False), default=None,
+              help="Model AI xử lý kịch bản và review (mặc định: claude khi tạo mới, hoặc theo storyboard có sẵn).")
 @click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
               help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
 @_format_options
 def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause, publish_to, fmt, audio, visual, genres) -> None:
+         burn_subtitles, music, profile, pause, ai_model, publish_to, fmt, audio, visual, genres) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
@@ -845,6 +900,7 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
     chỉ đánh dấu, không tự render lại) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
     Phim mới mặc định dùng luồng mới (--format clip); --format short_drama là luồng cũ, đã ngừng dùng.
     """
+    from . import ai as ai_mod
     from . import formats as fm
     from . import publisher
     from .autopilot import AutoError, Autopilot, AutoSettings, slug
@@ -856,15 +912,20 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
     s = user_settings.load()
     key = s.get("anthropic_api_key") or None
+    gkey = s.get("gemini_api_key") or None
     if existing:
         sb_path = existing
+        chosen_model = ai_mod.effective_ai_model(ai_model or load_storyboard(sb_path).ai_model)
     else:
+        chosen_model = ai_mod.effective_ai_model(ai_model or ai_mod.DEFAULT_AI_MODEL)
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
         language = _cli_lang(language, "--lang", clean_language)
-        click.echo(f"Claude đang viết storyboard {scenes} cảnh…")
+        click.echo(f"{ai_mod.ai_model_label(chosen_model)} đang viết storyboard {scenes} cảnh…")
+        plan_backend = (s.get("gemini_backend") or "auto") if chosen_model == ai_mod.GEMINI_PRO else "auto"
         try:
             sb = _plan_new(idea, fmt=fmt, audio=audio, visual=visual, genres=genres, scenes=scenes, aspect=aspect,
-                           language=language, dialogue_lang=dialogue_lang, api_key=key)
+                           language=language, dialogue_lang=dialogue_lang, backend=plan_backend, api_key=key,
+                           ai_model=chosen_model, gemini_api_key=gkey)
         except (RuntimeError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
         ws = workspace or Path.home() / "FilmMaker"
@@ -880,8 +941,12 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         review = False  # the review agents check drama direction (camera, dialogue rows, locations); like the app
     pub_cfg = publisher.config_from_settings(s)
     plats = _resolve_publish_platforms(publish_to, pub_cfg)
+    is_gemini = chosen_model == ai_mod.GEMINI_PRO
     cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
-                       api_key=key, pause=_parse_pause(pause), publish_platforms=plats, publish_config=pub_cfg)
+                       ai_backend=(s.get("gemini_backend") or "auto") if is_gemini else "auto",
+                       api_key=key, ai_model=ai_mod.GEMINI_PRO if is_gemini else None,
+                       gemini_api_key=gkey if is_gemini else None,
+                       pause=_parse_pause(pause), publish_platforms=plats, publish_config=pub_cfg)
     pilot = Autopilot(sb_path, _out_dir(sb_path, None), g, settings=cfg, log=click.echo)
     try:
         result = pilot.run()
@@ -1085,10 +1150,15 @@ def _maybe_publish_after(storyboard: Path, out_dir: Path, publish_to: tuple[str,
     plats = _resolve_publish_platforms(publish_to, pub_cfg)
     if not plats:
         return
+    is_gemini = load_storyboard(storyboard).effective_ai_model == ai.GEMINI_PRO
     key = s.get("anthropic_api_key") or None
-    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    gkey = (s.get("gemini_api_key") or None) if is_gemini else None
+    backend = (ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+               if is_gemini else ai.pick_backend(s.get("planner") or "auto", key))
+    extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
     try:
-        publisher.publish_film(storyboard.parent, out_dir, plats, pub_cfg, ai_backend=backend, api_key=key, log=click.echo)
+        publisher.publish_film(storyboard.parent, out_dir, plats, pub_cfg, ai_backend=backend, api_key=key,
+                               log=click.echo, **extra)
     except Exception as exc:
         click.echo(f"⚠ Không đăng được video: {exc}")
 
@@ -1118,13 +1188,17 @@ def publish(storyboard: Path, out: Path | None, platforms: tuple[str, ...], priv
         picked = ["facebook_reel", "youtube"]
     else:
         picked = list(dict.fromkeys(platforms))
+    is_gemini = load_storyboard(storyboard).effective_ai_model == ai.GEMINI_PRO
     key = s.get("anthropic_api_key") or None
-    backend = ai.pick_backend(s.get("planner") or "auto", key)
+    gkey = (s.get("gemini_api_key") or None) if is_gemini else None
+    backend = (ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+               if is_gemini else ai.pick_backend(s.get("planner") or "auto", key))
+    extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
     try:
         res = publisher.publish_film(
             storyboard.parent, out_dir, picked, cfg,
             force=force, dry_run=dry_run, custom_title=custom_title, custom_description=custom_desc,
-            ai_backend=backend, api_key=key, log=click.echo,
+            ai_backend=backend, api_key=key, log=click.echo, **extra,
         )
     except (publisher.PublishError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1176,20 +1250,30 @@ def template(output: Path) -> None:
 @click.option("--scenes", type=int, default=None, help="Số cảnh phim mới (mặc định: gợi ý theo video mẫu).")
 @click.option("--lang", "language", default="Vietnamese", show_default=True, help="Ngôn ngữ phụ đề phim mới.")
 @click.option("--dialogue-lang", "dialogue_lang", default=None, help="Ngôn ngữ nhân vật nói ('none' = không thoại).")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True)
+@click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
+              default="claude", show_default=True, help="Model AI phân tích video / viết kịch bản (mặc định: claude).")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+              default="auto", show_default=True)
 def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea: str, scenes: int | None,
-            language: str, dialogue_lang: str | None, backend: str) -> None:
+            language: str, dialogue_lang: str | None, ai_model: str, backend: str) -> None:
     """Phân tích một video mẫu (link hoặc file): nhịp dựng, chuyển cảnh, máy quay, màu, âm thanh, chữ, nhân vật,
     nhịp truyện → report.md + analysis.json; --film viết storyboard phim mới cùng phong cách."""
+    from . import ai as ai_mod
     from . import video_analysis as va
 
     if dialogue_lang is not None:
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
     language = _cli_lang(language, "--lang", clean_language)
+    is_gemini = ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO
+    s = user_settings.load() if is_gemini else {}
+    eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
+    extra = ({"ai_model": ai_mod.GEMINI_PRO, "gemini_api_key": s.get("gemini_api_key") or None}
+             if is_gemini else {})
     folder = out or Path.home() / "FilmMaker" / ".analyses" / va.new_id(Path(source).stem if not va.is_url(source) else
                                                                           source.split("//", 1)[-1].split("/")[0])
     try:
-        data = va.analyze(source, folder, use_rea=not no_rea, backend=backend, allow_local=True, log=click.echo)
+        data = va.analyze(source, folder, use_rea=not no_rea, backend=eff_backend, allow_local=True, log=click.echo,
+                          **extra)
     except (va.AnalysisError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"✔ {folder / 'report.md'}")
@@ -1199,7 +1283,7 @@ def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea
         click.echo("Đang viết storyboard theo phong cách video mẫu...")
         try:
             sb, _ = va.plan_from_analysis(data, idea, scenes=scenes, language_hint=language,
-                                          dialogue_language=dialogue_lang, backend=backend)
+                                          dialogue_language=dialogue_lang, backend=eff_backend, **extra)
         except RuntimeError as exc:
             raise click.ClickException(str(exc)) from exc
         save_storyboard(sb, film)
@@ -1230,14 +1314,17 @@ def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea
 @click.option("--analyses-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
               help="Thư mục lưu bản phân tích khi bật --analyze (mặc định ~/FilmMaker/.analyses).")
 @click.option("--no-rea", is_flag=True, help="Khi dùng --analyze: không chạy rea-video dù đã cài.")
-@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
-              help="Backend Claude khi dùng --analyze.")
+@click.option("--ai-model", type=click.Choice(["claude", "gemini-pro"], case_sensitive=False),
+              default="claude", show_default=True, help="Model AI khi dùng --analyze (mặc định: claude).")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api", "gemini_api", "gemini_cli"]),
+              default="auto", show_default=True, help="Backend AI khi dùng --analyze.")
 @click.option("--json", "as_json", is_flag=True, help="In đúng một object JSON kết quả ra stdout.")
 def crawl(sources: tuple[str, ...], from_file: Path | None, top_n: int, per_source: bool, scan_limit: int,
           shorts_only: bool, min_duration: float | None, max_duration: float | None,
           cookies_from_browser: str | None, out: Path | None, do_download: bool, do_analyze: bool,
-          analyses_dir: Path | None, no_rea: bool, backend: str, as_json: bool) -> None:
+          analyses_dir: Path | None, no_rea: bool, ai_model: str, backend: str, as_json: bool) -> None:
     """Crawl các trang Facebook, kênh TikTok, kênh YouTube để lấy top video nhiều view nhất, sẵn sàng phân tích."""
+    from . import ai as ai_mod
     from . import crawler as cr
     from . import video_analysis as va
 
@@ -1266,13 +1353,19 @@ def crawl(sources: tuple[str, ...], from_file: Path | None, top_n: int, per_sour
             data = cr.download_top_videos(data, folder, log=log)
         ana_root = analyses_dir or (Path.home() / "FilmMaker" / ".analyses")
         if do_analyze:
+            is_gemini = ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO
+            s = user_settings.load() if is_gemini else {}
+            eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
+            extra = ({"ai_model": ai_mod.GEMINI_PRO, "gemini_api_key": s.get("gemini_api_key") or None}
+                     if is_gemini else {})
             ana_res = cr.analyze_crawled(
                 data["videos"],
                 ana_root,
                 crawl_dir=folder,
                 use_rea=not no_rea,
-                backend=backend,
+                backend=eff_backend,
                 log=log,
+                **extra,
             )
             data["analysis_run"] = ana_res
         data = cr.link_analyses(data, ana_root)

@@ -272,24 +272,40 @@ def build_prompt(sections: list[tuple[str, str]], history: list[dict[str, Any]],
     return "\n\n".join(parts)
 
 
+def _project_ai_model(project_dir: Path) -> str | None:
+    try:
+        from .storyboard import load_storyboard
+
+        return load_storyboard(Path(project_dir) / "storyboard.yaml").ai_model
+    except Exception:
+        return None
+
+
 def ask(project_dir: Path, out_dir: Path, question: str, *, with_pictures: bool = True,
-        backend: str = "auto", api_key: str | None = None, timeout: int = 600) -> list[dict[str, Any]]:
+        backend: str = "auto", api_key: str | None = None, timeout: int = 600,
+        ai_model: str | None = None, gemini_api_key: str | None = None) -> list[dict[str, Any]]:
     """Ask about the film; returns the whole conversation with the new question and answer appended.
-    ValueError for an empty or too long question, RuntimeError when Claude cannot answer (nothing is saved)."""
+    ValueError for an empty or too long question, RuntimeError when AI cannot answer (nothing is saved)."""
     question = (question or "").strip()
     if not question:
         raise ValueError("Hãy nhập câu hỏi.")
     if len(question) > MAX_QUESTION:
         raise ValueError(f"Câu hỏi quá dài (tối đa {MAX_QUESTION} ký tự).")
+    model = ai_model if ai_model is not None else _project_ai_model(project_dir)
+    extra_kw: dict[str, Any] = {}
+    if model is not None:
+        extra_kw["ai_model"] = model
+    if gemini_api_key is not None:
+        extra_kw["gemini_api_key"] = gemini_api_key
     with lock(out_dir):
         history = load(out_dir)
         sections = gather(project_dir, out_dir)
         images = pictures(project_dir, out_dir) if with_pictures else []
         text = ai.ask_text(SYSTEM, build_prompt(sections, history, question), images=images,
-                           backend=backend, api_key=api_key, timeout=timeout, effort="medium")
+                           backend=backend, api_key=api_key, timeout=timeout, effort="medium", **extra_kw)
         answer, follow_ups = split_follow_ups(text)
         if not answer:
-            raise RuntimeError("Claude không trả lời câu hỏi này.")
+            raise RuntimeError(f"{ai.ai_model_label(model)} không trả lời câu hỏi này.")
         history += [{"role": "user", "content": question, "at": _now()},
                     {"role": "assistant", "content": answer, "at": _now(), "follow_ups": follow_ups}]
         save(out_dir, history)

@@ -1612,8 +1612,9 @@ def download_top_videos(data: dict[str, Any], folder: Path, *, log: Log = print,
 
 def analyze_crawled(videos: list[dict[str, Any]], analyses_root: Path, *,
                     crawl_dir: Path | None = None, use_rea: bool = True, force: bool = False,
-                    backend: str = "auto", api_key: str | None = None, log: Log = print,
-                    should_stop: StopCheck = lambda: False) -> dict[str, Any]:
+                    backend: str = "auto", api_key: str | None = None,
+                    ai_model: str | None = None, gemini_api_key: str | None = None,
+                    log: Log = print, should_stop: StopCheck = lambda: False) -> dict[str, Any]:
     """Run `video_analysis.analyze()` on one or multiple crawled videos, reusing pre-downloaded files if present."""
     if not videos:
         raise CrawlError("Chưa chọn video nào để phân tích.")
@@ -1661,10 +1662,15 @@ def analyze_crawled(videos: list[dict[str, Any]], analyses_root: Path, *,
 
         log(f"[{idx}/{len(videos)}] Phân tích video #{v.get('rank') or idx} ({fmt_views_vi(v.get('view_count'))} view): "
             f"{v.get('title') or url}")
+        extra_va: dict[str, Any] = {}
+        if ai_model:
+            extra_va["ai_model"] = ai_model
+        if gemini_api_key:
+            extra_va["gemini_api_key"] = gemini_api_key
         try:
             if local_video is not None:
                 data = va.analyze(str(local_video), dest, use_rea=use_rea, backend=backend, api_key=api_key,
-                                  allow_local=True, log=log, should_stop=should_stop)
+                                  allow_local=True, log=log, should_stop=should_stop, **extra_va)
                 # Restore original web metadata when analyzed from pre-downloaded local cache
                 src = data.setdefault("source", {})
                 src["url"] = src.get("url") or url
@@ -1678,7 +1684,7 @@ def analyze_crawled(videos: list[dict[str, Any]], analyses_root: Path, *,
                 (dest / "report.md").write_text(va.report_markdown(data), encoding="utf-8")
             else:
                 data = va.analyze(url, dest, use_rea=use_rea, backend=backend, api_key=api_key,
-                                  allow_local=False, log=log, should_stop=should_stop)
+                                  allow_local=False, log=log, should_stop=should_stop, **extra_va)
         except va.AnalysisStopped:
             shutil.rmtree(dest, ignore_errors=True)
             raise CrawlStopped() from None

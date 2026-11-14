@@ -775,7 +775,8 @@ def export_film(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *,
                 music_volume: float = 0.25, subtitles: bool = True, subtitle_language: str | None = None,
                 name: str | None = None, root: str | Path | None = None, engine: str = "auto",
                 replan: bool = False, backend: str = "auto", api_key: str | None = None,
-                ai_available: bool = True, log: Log = print) -> tuple[Path, EditPlan]:
+                ai_available: bool = True, ai_model: str | None = None, gemini_api_key: str | None = None,
+                log: Log = print) -> tuple[Path, EditPlan]:
     """Editor agent's plan (made now, or the saved edit.json) -> CapCut project. Returns (folder, plan)."""
     from .editor import make_plan
 
@@ -785,9 +786,14 @@ def export_film(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *,
                             "hoặc chỉ thư mục bằng --capcut-dir / FILMMAKER_CAPCUT_DRAFTS.")
     from .resources import Library
 
+    extra_kw: dict[str, Any] = {}
+    if ai_model:
+        extra_kw["ai_model"] = ai_model
+    if gemini_api_key:
+        extra_kw["gemini_api_key"] = gemini_api_key
     plan, infos = make_plan(sb, clips, out_dir, engine=engine, replan=replan, has_music=bool(music),
                             backend=backend, api_key=api_key, ai_available=ai_available, capcut=True, pro=True,
-                            log=log)
+                            log=log, **extra_kw)
     library = Library(out_dir / "edit_assets", log=log)
     folder = export_draft(sb, clips, plan, infos, music=music, music_volume=music_volume, subtitles=subtitles,
                           subtitle_language=subtitle_language, name=name, root=root, library=library, log=log)

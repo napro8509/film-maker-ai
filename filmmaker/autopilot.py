@@ -65,6 +65,8 @@ class AutoSettings:
     engine: str = "auto"  # editor: auto | ai | rules
     ai_backend: str = "auto"
     api_key: str | None = None
+    ai_model: str | None = None
+    gemini_api_key: str | None = None
     max_retries: int = 2
     pause: tuple[float, float] = (8.0, 20.0)
     publish_platforms: list[str] = field(default_factory=list)  # e.g. ["facebook_reel", "youtube"]
@@ -141,8 +143,22 @@ class Autopilot:
     def opts(self, **kw: Any) -> RunOptions:
         return RunOptions(max_retries=self.cfg.max_retries, pause=self.cfg.pause, should_stop=self.should_stop, **kw)
 
+    def _ai_model(self) -> str:
+        raw = self.cfg.ai_model
+        if not raw:
+            try:
+                raw = self.sb().ai_model
+            except Exception:  # noqa: BLE001
+                raw = None
+        return reviewer.ai.effective_ai_model(raw)
+
     def ai_kw(self) -> dict[str, Any]:
-        return {"backend": self.cfg.ai_backend, "api_key": self.cfg.api_key}
+        kw: dict[str, Any] = {"backend": self.cfg.ai_backend, "api_key": self.cfg.api_key}
+        if self._ai_model() == reviewer.ai.GEMINI_PRO:
+            kw["ai_model"] = reviewer.ai.GEMINI_PRO
+            if self.cfg.gemini_api_key:
+                kw["gemini_api_key"] = self.cfg.gemini_api_key
+        return kw
 
     def stage(self, key: str) -> dict[str, Any]:
         return self.data["stages"].setdefault(key, {})
@@ -219,7 +235,12 @@ class Autopilot:
         self.log("")
         self.log("=== Tự động đăng video lên mạng xã hội ===")
         cfg = self.cfg.publish_config or publisher.config_from_settings(user_settings.load())
-        backend = reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key)
+        is_gemini = self._ai_model() == reviewer.ai.GEMINI_PRO
+        backend = (reviewer.ai.pick_backend(self.cfg.ai_backend, ai_model=reviewer.ai.GEMINI_PRO,
+                                            gemini_api_key=self.cfg.gemini_api_key)
+                   if is_gemini else reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key))
+        pub_extra = ({"ai_model": reviewer.ai.GEMINI_PRO, "gemini_api_key": self.cfg.gemini_api_key}
+                     if is_gemini else {})
         try:
             pub_res = publisher.publish_film(
                 self.sb_path.parent,
@@ -229,6 +250,7 @@ class Autopilot:
                 ai_backend=backend,
                 api_key=self.cfg.api_key,
                 log=self.log,
+                **pub_extra,
             )
             result["published"] = pub_res["results"]
             if pub_res["errors"]:
@@ -648,11 +670,17 @@ class Autopilot:
             result["final"] = str(final)
             return
         sb = self.sb()
-        ai_ok = self.cfg.engine != "rules" and reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key) is not None
+        is_gemini = self._ai_model() == reviewer.ai.GEMINI_PRO
+        picked = (reviewer.ai.pick_backend(self.cfg.ai_backend, ai_model=reviewer.ai.GEMINI_PRO,
+                                           gemini_api_key=self.cfg.gemini_api_key)
+                  if is_gemini else reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key))
+        ai_ok = self.cfg.engine != "rules" and picked is not None
+        edit_extra = ({"ai_model": reviewer.ai.GEMINI_PRO, "gemini_api_key": self.cfg.gemini_api_key}
+                      if is_gemini else {})
         output, plan = edit_film(sb, clips, self.out, final, music=self.cfg.music, music_volume=self.cfg.music_volume,
                                  burn_subtitles=self.cfg.burn_subtitles, engine=self.cfg.engine, replan=True,
-                                 backend=reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key) or "auto",
-                                 ai_available=ai_ok, api_key=self.cfg.api_key, log=self.log)
+                                 backend=picked or "auto", ai_available=ai_ok, api_key=self.cfg.api_key,
+                                 log=self.log, **edit_extra)
         result["final"] = str(output)
         self.mark("edit", "done", f"{len(clips)} clip, dựng bằng {plan.source}", sig=sig)
 
@@ -662,7 +690,10 @@ class Autopilot:
             try:
                 from .planner import suggest_titles
 
-                titles = suggest_titles(sb, backend=self.cfg.ai_backend, api_key=self.cfg.api_key)
+                is_gemini = self._ai_model() == reviewer.ai.GEMINI_PRO
+                title_extra = ({"ai_model": reviewer.ai.GEMINI_PRO, "gemini_api_key": self.cfg.gemini_api_key}
+                               if is_gemini else {})
+                titles = suggest_titles(sb, backend=self.cfg.ai_backend, api_key=self.cfg.api_key, **title_extra)
                 if titles:
                     title = titles[0]["text"]
 
@@ -672,7 +703,7 @@ class Autopilot:
                         raw["thumbnail"] = th
                         return True
                     self.edit_raw(fn)
-                    self.log(f"Tiêu đề (Claude gợi ý): {title}")
+                    self.log(f"Tiêu đề ({reviewer.ai.ai_model_label(self._ai_model())} gợi ý): {title}")
                     sb = self.sb()
             except Exception as exc:
                 self.log(f"  (không gợi ý được tiêu đề: {exc}; dùng tên phim)")

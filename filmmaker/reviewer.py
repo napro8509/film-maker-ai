@@ -311,9 +311,15 @@ def _sheet(video: Path, dest: Path, *, cols: int, rows: int, height: int) -> Pat
 # --- the reviews -----------------------------------------------------------------
 
 
+def _ai_kw(sb: Storyboard, kw: dict) -> dict:
+    if "ai_model" not in kw and sb.ai_model:
+        return {"ai_model": sb.ai_model, **kw}
+    return kw
+
+
 def review_storyboard(sb: Storyboard, **kw) -> StoryboardReview:
     user = storyboard_brief(sb) + "\n\nReview this storyboard."
-    return ai.ask(STORYBOARD_SYSTEM, user, StoryboardReview, **kw)
+    return ai.ask(STORYBOARD_SYSTEM, user, StoryboardReview, **_ai_kw(sb, kw))
 
 
 def review_keyframes(sb: Storyboard, keyframes: list[tuple[str, Path]], **kw) -> KeyframeReview:
@@ -322,7 +328,7 @@ def review_keyframes(sb: Storyboard, keyframes: list[tuple[str, Path]], **kw) ->
     user = (storyboard_brief(sb) + f"\n\nReview the opening-frame picture of scenes {ids}. "
             "Return one entry per scene, in that order.")
     images = portraits(sb) + [(f"scene {sid} keyframe", p) for sid, p in keyframes]
-    return ai.ask(KEYFRAME_SYSTEM, user, KeyframeReview, images=images, **kw)
+    return ai.ask(KEYFRAME_SYSTEM, user, KeyframeReview, images=images, **_ai_kw(sb, kw))
 
 
 def review_clips(sb: Storyboard, strips: list[tuple[str, Path]], **kw) -> ClipReview:
@@ -330,7 +336,7 @@ def review_clips(sb: Storyboard, strips: list[tuple[str, Path]], **kw) -> ClipRe
     user = (storyboard_brief(sb) + f"\n\nReview the rendered clips of scenes {ids}. "
             "Return one entry per scene, in that order.")
     images = portraits(sb) + [(f"scene {sid} clip: start | middle | end", p) for sid, p in strips]
-    return ai.ask(CLIP_SYSTEM, user, ClipReview, images=images, **kw)
+    return ai.ask(CLIP_SYSTEM, user, ClipReview, images=images, **_ai_kw(sb, kw))
 
 
 def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extra: str = "", **kw) -> FilmReview:
@@ -345,7 +351,7 @@ def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extr
         images.append(("contact sheet of the whole film", sheet))
     if thumbnail:
         images.append(("cover thumbnail", thumbnail))
-    return ai.ask(FILM_SYSTEM, user, FilmReview, images=images, **kw)
+    return ai.ask(FILM_SYSTEM, user, FilmReview, images=images, **_ai_kw(sb, kw))
 
 
 def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SceneFix:
@@ -373,7 +379,7 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
     if AUDIO_FAILED in error.lower():
         user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
                  "the instructions say, keeping the story point.")
-    return ai.ask(SOFTEN_SYSTEM, user, SceneFix, **kw)
+    return ai.ask(SOFTEN_SYSTEM, user, SceneFix, **_ai_kw(sb, kw))
 
 
 # --- applying fixes to the storyboard (raw YAML dict) ----------------------------

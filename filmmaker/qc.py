@@ -348,6 +348,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         f"Opening frame: {s.image_prompt or '-'}",
         f"Content direction: {s.content_direction or '-'}",
         expected_dialogue(sb, s), "", *facts])
+    if "ai_model" not in ai_kw and sb.ai_model:
+        ai_kw = {"ai_model": sb.ai_model, **ai_kw}
     ans = ai.ask(SYSTEM, user, QCAnswer, images=images, **ai_kw)
     verdict, issues = ans.verdict, list(ans.issues)
     if match is not None and match < WRONG_START and verdict != "FAIL":  # never trust a clip of another picture

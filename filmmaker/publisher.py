@@ -570,12 +570,14 @@ def publish_film(
     custom_description: str = "",
     ai_backend: str | None = None,
     api_key: str | None = None,
+    ai_model: str | None = None,
+    gemini_api_key: str | None = None,
     log: Callable[[str], None] = print,
     http_fn: Callable[..., tuple[int, dict[str, str], dict[str, Any]]] = _http_json,
 ) -> dict[str, Any]:
     """Publish `<out>/final.mp4` to the selected platforms (`facebook_reel`, `youtube`).
 
-    - Automatically generates social copy via `social.generate()` if `social.json` is missing and Claude is available.
+    - Automatically generates social copy via `social.generate()` if `social.json` is missing and AI is available.
     - Skips platforms that already published the exact same `final.mp4` unless `force=True`.
     - Records outcomes in `<out>/publish.json`.
     """
@@ -597,7 +599,8 @@ def publish_film(
             lang = language or sb.subtitle_language or "Vietnamese"
             if lang not in social.LANGUAGES:
                 lang = "Vietnamese"
-            social.generate(project_dir, out_dir, ["facebook", "tiktok"], [lang], backend=ai_backend, api_key=api_key)
+            social.generate(project_dir, out_dir, ["facebook", "tiktok"], [lang], backend=ai_backend, api_key=api_key,
+                            ai_model=ai_model or sb.ai_model, gemini_api_key=gemini_api_key)
         except Exception as exc:
             log(f"  (không tạo được bài đăng AI: {exc}; dùng thông tin từ storyboard)")
 

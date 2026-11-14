@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from .. import ai as ai_mod
 from .. import durations as dur
 from .. import autopilot, film_chat, flow_caps, formats, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
@@ -58,6 +59,8 @@ BOARD_MAX_BYTES = 256 * 1024  # PUT /board body limit
 
 DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": "",
                     "planner": "auto",  # auto | claude_code | api
+                    "gemini_api_key": "",
+                    "gemini_backend": "auto",  # auto | gemini_api | gemini_cli
                     "flow_ui": True,  # image-to-video through the Flow chat page when gflow refuses it
                     "flow_ui_max_credits": 0,  # reject Flow's offer above this (0 = no limit)
                     "flow_ui_window": "hidden",  # show | hidden | headless
@@ -294,11 +297,13 @@ class AskBody(BaseModel):
 class NewProject(BaseModel):
     title: str = "Phim mới"
     source: str = "blank"  # blank | template
+    ai_model: str | None = None  # None / claude (default) | gemini-pro
 
 
 class AnalyzeBody(BaseModel):
     url: str
     use_rea: bool = True  # also run rea-video when it is installed
+    ai_model: str | None = None
 
 
 class CrawlBody(BaseModel):
@@ -318,14 +323,16 @@ class CrawlAnalyzeBody(BaseModel):
     use_rea: bool = True
     force: bool = False
     open_single: bool = False
+    ai_model: str | None = None
 
 
 class StyleFilmBody(BaseModel):
-    idea: str = ""  # empty: Claude invents a new story in the same format
+    idea: str = ""  # empty: AI invents a new story in the same format
     scenes: int | None = None  # None: suggested from the reference
     language: str = "Vietnamese"  # subtitle (narration) language
     dialogue_language: str | None = None
     mode: Literal["style", "same"] = "style"  # same: remake the reference, only the characters are new
+    ai_model: str | None = None
 
 
 class PlanBody(BaseModel):
@@ -341,6 +348,7 @@ class PlanBody(BaseModel):
     visual_style: str = "realistic"
     custom_style: str = ""
     genres: list[str] = []
+    ai_model: str | None = None  # None / claude (default) | gemini-pro
 
 
 def _credits(out: Path) -> str | None:
@@ -456,6 +464,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     app.state.sb_lock = sb_lock
     claude_cache: dict[str, Any] = {}
+    gemini_cache: dict[str, Any] = {}
 
     def claude_code(refresh: bool = False) -> dict[str, Any]:
         from ..planner import claude_code_status
@@ -465,8 +474,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             claude_cache.update(claude_code_status())
         return dict(claude_cache)
 
+    def gemini_cli(refresh: bool = False) -> dict[str, Any]:
+        if refresh or not gemini_cache:
+            gemini_cache.clear()
+            gemini_cache.update(ai_mod.gemini_cli_status())
+        return dict(gemini_cache)
+
     def planner_backend() -> str | None:
-        """Which backend `plan` will use right now, or None if neither works."""
+        """Which backend Claude will use right now, or None if neither works."""
         s = load_settings()
         has_key = bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"))
         cc = claude_code()
@@ -477,6 +492,55 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if choice == "api":
             return "api" if has_key else None
         return "claude_code" if cc_ok else ("api" if has_key else ("claude_code" if cc["available"] else None))
+
+    def gemini_backend() -> str | None:
+        """Which backend Gemini Pro will use right now, or None if neither works."""
+        s = load_settings()
+        has_key = bool(s.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+        gc = gemini_cli()
+        has_cli = bool(gc["available"] and gc["logged_in"])
+        choice = s.get("gemini_backend") or "auto"
+        if choice in ("gemini_api", "api"):
+            return "gemini_api" if has_key else None
+        if choice == "gemini_cli":
+            return "gemini_cli" if gc["available"] else None
+        return "gemini_api" if has_key else ("gemini_cli" if has_cli else None)
+
+    def _ai_model_or_400(value: object) -> str:
+        try:
+            cleaned = ai_mod.clean_ai_model(value)
+        except ValueError as exc:
+            raise HTTPException(400, f"Model AI: {exc}.")
+        return ai_mod.effective_ai_model(cleaned)
+
+    def _backend_for(model: str) -> str | None:
+        return gemini_backend() if model == ai_mod.GEMINI_PRO else planner_backend()
+
+    def _ai_backend_or_400(model: str) -> str:
+        b = _backend_for(model)
+        if not b:
+            if model == ai_mod.GEMINI_PRO:
+                raise HTTPException(400, ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
+            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        return b
+
+    def _ai_extra_kw(model: str, s: dict[str, Any] | None = None) -> dict[str, Any]:
+        if model != ai_mod.GEMINI_PRO:
+            return {}
+        s = s if s is not None else load_settings()
+        out: dict[str, Any] = {"ai_model": ai_mod.GEMINI_PRO}
+        if s.get("gemini_api_key"):
+            out["gemini_api_key"] = s["gemini_api_key"]
+        return out
+
+    def _via_label(backend: str) -> str:
+        if backend == "gemini_cli":
+            return "Gemini CLI"
+        if backend == "gemini_api":
+            return "Google Gemini API"
+        if backend == "claude_code":
+            return "Claude Code (gói Claude của bạn)"
+        return "Anthropic API"
 
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost", "testserver"}
 
@@ -550,6 +614,21 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                      ui_window=s.get("flow_ui_window") or "hidden",
                      flow_characters=bool(s.get("flow_characters", True)))
 
+    def _safe_ai_model(raw: dict[str, Any]) -> str:
+        try:
+            return ai_mod.effective_ai_model(raw.get("ai_model"))
+        except ValueError:
+            return ai_mod.DEFAULT_AI_MODEL
+
+    def _project_ai_model(pid: str) -> str:
+        try:
+            return load_storyboard(sb_path(pid)).effective_ai_model
+        except Exception:
+            try:
+                return _safe_ai_model(read_raw(pid))
+            except Exception:
+                return ai_mod.DEFAULT_AI_MODEL
+
     # ---- project summary / detail ----
 
     def summary(pid: str) -> dict[str, Any]:
@@ -572,6 +651,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     break
         return {
             "id": pid, "title": raw.get("title") or pid, "aspect": raw.get("aspect", "16:9"),
+            "ai_model": _safe_ai_model(raw),
             "scenes": len(scenes), "done": done, "has_final": final.is_file(), "thumb": thumb,
             "updated": sb_path(pid).stat().st_mtime,
         }
@@ -762,6 +842,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def env(refresh: bool = False) -> dict[str, Any]:
         s = load_settings()
         g = gflow()
+        cc = claude_code(refresh=refresh)
+        gc = gemini_cli(refresh=refresh)
+        pb = planner_backend()
+        gb = gemini_backend()
+        has_gkey = bool(s.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
         return {
             "gflow": shutil.which(g.binary.split()[0]) if g.available() else None,
             "gflow_version": gflow_ver(g, refresh),
@@ -771,8 +856,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "capcut": _capcut_installed(s),
             "credit_balance": credit_view(),
             "anthropic_key": bool(s.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
-            "claude_code": claude_code(refresh=refresh),
-            "planner": planner_backend(),
+            "claude_code": cc,
+            "planner": pb,
+            "gemini_key": has_gkey,
+            "gemini_cli": gc,
+            "gemini_backend": gb,
+            "default_ai_model": ai_mod.DEFAULT_AI_MODEL,
+            "ai_models": [
+                {"key": "claude", "label": "Claude", "default": True, "ready": bool(pb), "backend": pb},
+                {"key": "gemini-pro", "label": "Gemini Pro", "default": False, "ready": bool(gb), "backend": gb},
+            ],
             "workspace": str(workspace),
             "profile": s.get("profile") or None,
             "platform": sys.platform,
@@ -874,6 +967,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s["anthropic_key_set"] = bool(key)
         s["anthropic_key_hint"] = f"…{key[-4:]}" if key else ""
         s["anthropic_key_from_env"] = bool(os.environ.get("ANTHROPIC_API_KEY")) and not key
+        gkey = s.get("gemini_api_key") or ""
+        s["gemini_api_key"] = ""
+        s["gemini_key_set"] = bool(gkey)
+        s["gemini_key_hint"] = f"…{gkey[-4:]}" if gkey else ""
+        s["gemini_key_from_env"] = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")) and not gkey
         for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
             val = s.get(sec) or ""
             s[sec] = ""
@@ -886,6 +984,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         s = load_settings()
         if body.get("planner") in ("auto", "claude_code", "api"):
             s["planner"] = body["planner"]
+        if body.get("gemini_backend") in ("auto", "gemini_api", "gemini_cli"):
+            s["gemini_backend"] = body["gemini_backend"]
         for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
                   "auto_backup", "auto_qc", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
             if k in body:
@@ -908,6 +1008,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             s["anthropic_api_key"] = body["anthropic_api_key"].strip()
         if body.get("clear_anthropic_key"):
             s["anthropic_api_key"] = ""
+        if body.get("gemini_api_key"):
+            s["gemini_api_key"] = str(body["gemini_api_key"]).strip()
+        if body.get("clear_gemini_key"):
+            s["gemini_api_key"] = ""
         for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
             if body.get(sec):
                 s[sec] = str(body[sec]).strip()
@@ -939,6 +1043,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects")
     def create_project(body: NewProject) -> dict[str, Any]:
+        chosen_model = _ai_model_or_400(body.ai_model)
         title = body.title.strip() or "Phim mới"
         pid, d = new_project_dir(title)
         if body.source == "template":
@@ -947,6 +1052,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         else:
             data = {"title": title, "aspect": "16:9", "model": None, "image_model": "nano2", "style": "",
                     "characters": [], "scenes": [{"id": "s01", "mode": "keyframe", "image_prompt": "", "prompt": ""}]}
+        if chosen_model == ai_mod.GEMINI_PRO:
+            data["ai_model"] = ai_mod.GEMINI_PRO
         data["model"] = model_meta.load().default_video_model  # new projects never start on a retiring model
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
@@ -1003,7 +1110,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         With `on_disk`, a key left unchanged is not checked: a bad value hand-written in the YAML must not
         block every autosave of the other fields (it is still reported by the model errors)."""
         for key, label, clean in (("dialogue_language", "Ngôn ngữ thoại", clean_dialogue_language),
-                                  ("subtitle_language", "Ngôn ngữ phụ đề", clean_language)):
+                                  ("subtitle_language", "Ngôn ngữ phụ đề", clean_language),
+                                  ("ai_model", "Model AI", ai_mod.clean_ai_model)):
             if key in data and not (on_disk is not None and key in on_disk and on_disk[key] == data[key]):
                 try:
                     clean(data[key])
@@ -1026,12 +1134,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "Flow chỉ tạo được video ngang 16:9 hoặc dọc 9:16.")
         return True
 
-    def plan_basic_job(job: Job, body: PlanBody, scenes: int, backend: str, key: str | None, language: str) -> Any:
+    def plan_basic_job(job: Job, body: PlanBody, scenes: int, backend: str, key: str | None, language: str,
+                       *, ai_model: str = ai_mod.DEFAULT_AI_MODEL, extra_ai: dict[str, Any] | None = None) -> Any:
         from ..basic_planner import plan_basic
 
-        via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+        via = _via_label(backend)
         f = formats.FORMATS[body.format]
-        job.log(f"Claude đang viết kịch bản {scenes} cảnh qua {via}…")
+        job.log(f"{ai_mod.ai_model_label(ai_model)} đang viết kịch bản {scenes} cảnh qua {via}…")
         job.log(f"Định dạng: {f['label']} · Âm thanh: {formats.AUDIO[body.audio]['label']} · "
                 f"Hình ảnh: {formats.VISUALS[body.visual_style]['label']} · Khung: {body.aspect}")
         genres = formats.clean_genres(body.genres)
@@ -1040,21 +1149,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         job.log(f"Ý tưởng: {body.idea[:300]}")
         sb, _ = plan_basic(body.idea, fmt=body.format, audio=body.audio, visual=body.visual_style,
                            custom_style=body.custom_style, genres=genres, scenes=scenes, aspect=body.aspect,
-                           language=language, backend=backend, api_key=key, log=job.log)
+                           language=language, backend=backend, api_key=key, log=job.log, **(extra_ai or {}))
         return sb
 
     @app.post("/api/projects/plan")
     def plan_project(body: PlanBody) -> dict[str, Any]:
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        chosen_model = _ai_model_or_400(body.ai_model)
         basic = check_format(body)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        key = load_settings().get("anthropic_api_key") or None
+        backend = _ai_backend_or_400(chosen_model)
+        s = load_settings()
+        key = s.get("anthropic_api_key") or None
+        extra_ai = _ai_extra_kw(chosen_model, s)
 
         def work(job: Job) -> dict[str, Any]:
             from ..planner import MAX_SCENES, plan_auto
@@ -1063,18 +1173,18 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if n != body.scenes:
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
             if basic:
-                sb = plan_basic_job(job, body, n, backend, key, language)
+                sb = plan_basic_job(job, body, n, backend, key, language, ai_model=chosen_model, extra_ai=extra_ai)
             else:
-                via = "Claude Code (gói Claude của bạn)" if backend == "claude_code" else "Anthropic API"
+                via = _via_label(backend)
                 job.log(f"⚠ {formats.DEPRECATED_NOTE}")
-                job.log(f"Claude đang viết storyboard {n} cảnh qua {via}…")
+                job.log(f"{ai_mod.ai_model_label(chosen_model)} đang viết storyboard {n} cảnh qua {via}…")
                 job.log(f"Ý tưởng: {body.idea[:300]}")
                 dl_label = ("chưa đặt (Veo tự đoán)" if dialogue is None
                             else "không thoại" if dialogue == NO_DIALOGUE else dialogue)
                 job.log(f"Ngôn ngữ — nhân vật nói: {dl_label}; phụ đề: "
                         f"{'không phụ đề' if language.casefold() == NO_SUBTITLES else language}")
                 sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
-                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue, **extra_ai)
                 if body.format:
                     sb.format = body.format
             pid, d = new_project_dir(sb.title)
@@ -1097,6 +1207,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except (HTTPException, yaml.YAMLError, OSError):
             on_disk = None
         check_lang_fields(body.storyboard, on_disk)
+        if "ai_model" in body.storyboard and ai_mod.clean_ai_model(body.storyboard.get("ai_model")) == ai_mod.DEFAULT_AI_MODEL:
+            body.storyboard["ai_model"] = None
         write_raw(pid, body.storyboard)
         return detail(pid)
 
@@ -1258,13 +1370,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def suggest_titles_for(pid: str, sb: Storyboard, log: Callable[[str], None] = lambda *_: None) -> list[dict[str, str]]:
         from ..planner import suggest_titles
 
-        backend = planner_backend()
+        model = sb.effective_ai_model
+        s = load_settings()
+        backend = _backend_for(model)
         if not backend:
+            if model == ai_mod.GEMINI_PRO:
+                raise RuntimeError(ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
             raise RuntimeError("Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        log("Claude đang nghĩ tiêu đề cho video…")
-        titles = suggest_titles(sb, backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
+        label = ai_mod.ai_model_label(model)
+        log(f"{label} đang nghĩ tiêu đề cho video…")
+        titles = suggest_titles(sb, backend=backend, api_key=s.get("anthropic_api_key") or None,
+                                **_ai_extra_kw(model, s))
         if not titles:
-            raise RuntimeError("Claude không trả về tiêu đề nào.")
+            raise RuntimeError(f"{label} không trả về tiêu đề nào.")
         ui_prefs.update(pdir(pid), lambda p: p.__setitem__("thumbnail_titles", titles))
         return titles
 
@@ -1301,15 +1419,15 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects/{pid}/ask")
     def post_ask(pid: str, body: AskBody) -> dict[str, Any]:
-        """A question about the film (Claude, free on Flow). Not a job: it can run while Flow renders."""
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        """A question about the film (AI, free on Flow). Not a job: it can run while Flow renders."""
+        model = _project_ai_model(pid)
+        backend = _ai_backend_or_400(model)
+        s = load_settings()
         if film_chat.lock(out_dir(pid)).locked():
             raise HTTPException(409, detail={"message": "Đang trả lời câu hỏi trước, đợi một chút.", "reason": "ask_busy"})
         try:
             film_chat.ask(pdir(pid), out_dir(pid), body.question, with_pictures=body.pictures, backend=backend,
-                          api_key=load_settings().get("anthropic_api_key") or None)
+                          api_key=s.get("anthropic_api_key") or None, **_ai_extra_kw(model, s))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         except RuntimeError as exc:
@@ -1329,16 +1447,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects/{pid}/social")
     def post_social(pid: str, body: SocialBody) -> dict[str, Any]:
-        """Write Facebook / TikTok / Instagram posts in the chosen languages (Claude, free on Flow)."""
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        """Write Facebook / TikTok / Instagram posts in the chosen languages (AI, free on Flow)."""
+        model = _project_ai_model(pid)
+        backend = _ai_backend_or_400(model)
+        s = load_settings()
         if film_chat.lock(out_dir(pid)).locked():
             raise HTTPException(409, detail={"message": "AI đang bận với phim này, đợi một chút.", "reason": "ask_busy"})
         try:
             social.generate(pdir(pid), out_dir(pid), body.platforms, body.languages, note=body.note,
                             with_pictures=body.pictures, backend=backend,
-                            api_key=load_settings().get("anthropic_api_key") or None)
+                            api_key=s.get("anthropic_api_key") or None, **_ai_extra_kw(model, s))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         except RuntimeError as exc:
@@ -1429,7 +1547,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 raise HTTPException(400, f"Chưa cấu hình tài khoản cho: {', '.join(unconfigured)}. Hãy mở Cài đặt để điền thông tin kết nối.")
 
         def work(job: Job) -> dict[str, Any]:
-            backend = planner_backend()
+            model = _project_ai_model(pid)
+            backend = _backend_for(model)
             res = publisher.publish_film(
                 pdir(pid),
                 out_dir(pid),
@@ -1442,6 +1561,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 ai_backend=backend,
                 api_key=s.get("anthropic_api_key") or None,
                 log=job.log,
+                **_ai_extra_kw(model, s),
             )
             out_res: dict[str, Any] = {"published": res["results"], "errors": res["errors"]}
             if res["errors"]:
@@ -1827,9 +1947,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
         if not any(x.id == sid for x in sb.scenes):
             raise HTTPException(404, f"Không có cảnh: {sid}")
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        model = sb.effective_ai_model
+        backend = _ai_backend_or_400(model)
+        s = load_settings()
         st = State(out_dir(pid) / "state.json").scene(sid)
         error = str(st.get("error") or "").strip()
         if not error:
@@ -1845,9 +1965,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             earlier = [_scene_snapshot(scene)]  # the version that just failed
         try:
             fix = reviewer.soften_scene(sb, sid, error, earlier=earlier or None, backend=backend,
-                                        api_key=load_settings().get("anthropic_api_key") or None)
+                                        api_key=s.get("anthropic_api_key") or None, **_ai_extra_kw(model, s))
         except (RuntimeError, ValueError) as exc:
-            raise HTTPException(502, f"Claude không viết lại được: {exc}")
+            raise HTTPException(502, f"{ai_mod.ai_model_label(model)} không viết lại được: {exc}")
         fix.id = sid
         changed = reviewer.apply_scene_fixes(raw, [fix])
         restaged = bool(changed and earlier)
@@ -2041,13 +2161,15 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
             if not sb.missing_subtitles():
                 return
-            backend = planner_backend()
+            model = sb.effective_ai_model
+            backend = _backend_for(model)
             if backend is None:
-                job.log("⚠ Chưa có Claude để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
+                job.log(f"⚠ Chưa có {ai_mod.ai_model_label(model)} để dịch phụ đề; track còn thiếu bản dịch dùng tạm lời dẫn gốc.")
                 return
             job.log("Dịch phụ đề sang Tiếng Việt / Thái / Anh…")
             try:
-                added = translate_subtitles(sb, backend=backend, api_key=settings.get("anthropic_api_key") or None)
+                added = translate_subtitles(sb, backend=backend, api_key=settings.get("anthropic_api_key") or None,
+                                            **_ai_extra_kw(model, settings))
             except Exception as exc:  # the film still gets three tracks (untranslated lines fall back)
                 job.log(f"⚠ Không dịch được phụ đề ({exc}); track còn thiếu dùng tạm lời dẫn gốc.")
                 return
@@ -2063,12 +2185,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
             clips = ready_clips(job)
             fill_subtitles(job)
-            backend = planner_backend()
+            model = sb.effective_ai_model
+            backend = _backend_for(model)
             output, plan = edit_film(
                 sb, clips, out_dir(pid), music=music, music_volume=body.volume, burn_subtitles=body.burn_subtitles,
                 burn_language=body.burn_language,
                 engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
-                api_key=settings.get("anthropic_api_key") or None, log=job.log)
+                api_key=settings.get("anthropic_api_key") or None, log=job.log, **_ai_extra_kw(model, settings))
             job.log(f"🎬 Phim đã dựng: {output}")
             return {"final": str(output), "edit_source": plan.source}
 
@@ -2078,12 +2201,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             clips = ready_clips(job)
             if body.burn_subtitles:
                 fill_subtitles(job)
-            backend = planner_backend()
+            model = sb.effective_ai_model
+            backend = _backend_for(model)
             folder, plan = cc.export_film(
                 sb, clips, out_dir(pid), music=music, music_volume=body.volume, subtitles=body.burn_subtitles,
                 subtitle_language=body.burn_language, root=settings.get("capcut_drafts_dir") or None,
                 engine=body.engine, replan=body.replan, backend=backend or "auto", ai_available=backend is not None,
-                api_key=settings.get("anthropic_api_key") or None, log=job.log)
+                api_key=settings.get("anthropic_api_key") or None, log=job.log, **_ai_extra_kw(model, settings))
             opened = body.open_capcut and cc.open_capcut()
             job.log(f"🎬 Dự án CapCut “{folder.name}” đã sẵn sàng. {'Đã mở CapCut: c' if opened else 'Mở CapCut và c'}họn "
                     "dự án ở màn hình chính (chưa thấy thì đóng rồi mở lại CapCut), chỉnh thêm rồi bấm Export.")
@@ -2100,7 +2224,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         def do_thumbnail(job: Job, remake: bool) -> dict[str, Any]:
             res: dict[str, Any] = {}
-            if not (sb.thumbnail.text or "").strip():  # no title yet: let Claude write one (editable later)
+            if not (sb.thumbnail.text or "").strip():  # no title yet: let AI write one (editable later)
                 try:
                     titles = saved_titles(pid) or suggest_titles_for(pid, sb, job.log)
                     title = titles[0]["text"]
@@ -2114,7 +2238,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                             raw["thumbnail"]["text"] = title
                             write_raw(pid, raw)
                     vi = f" ({titles[0]['vi']})" if titles[0]["vi"] else ""
-                    job.log(f"Tiêu đề (Claude gợi ý, sửa được): {title}{vi}")
+                    job.log(f"Tiêu đề ({ai_mod.ai_model_label(sb.ai_model)} gợi ý, sửa được): {title}{vi}")
                     res["title"] = title
                 except Exception as exc:  # no Claude: fall back to the film title
                     job.log(f"  (không gợi ý được tiêu đề: {exc}; dùng tên phim)")
@@ -2175,16 +2299,21 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     # ---- AI QC of rendered clips ----
 
     def run_qc(job: Job, pid: str, only: set[str] | None, force: bool) -> dict[str, Any]:
-        backend = planner_backend()
-        if not backend:
-            job.log("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
-            return {}
         sb = load_storyboard(sb_path(pid))
+        model = sb.effective_ai_model
+        s = load_settings()
+        backend = _backend_for(model)
+        if not backend:
+            if model == ai_mod.GEMINI_PRO:
+                job.log(f"⚠ Bỏ qua AI QC: {ai_mod.not_ready_message(ai_mod.GEMINI_PRO)}")
+            else:
+                job.log("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
+            return {}
         pipe = Pipeline(sb, out_dir(pid), gflow(True))
         job.log("")
         job.log("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
         done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
-                      backend=backend, api_key=load_settings().get("anthropic_api_key") or None)
+                      backend=backend, api_key=s.get("anthropic_api_key") or None, **_ai_extra_kw(model, s))
         failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
         if failed:
             job.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở từng cảnh; “Render lại” nếu muốn (tốn credit).")
@@ -2194,12 +2323,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def qc_project(pid: str, body: QCBody) -> dict[str, Any]:
         """AI QC of the rendered clips (all new ones, or `only`; `force` = check again). Free on Flow."""
         try:
-            load_storyboard(sb_path(pid))
+            sb = load_storyboard(sb_path(pid))
         except (ValidationError, ValueError) as exc:
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-        if not planner_backend():
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
+        _ai_backend_or_400(sb.effective_ai_model)
         scope = f" ({', '.join(body.only)})" if body.only else ""
         return jobs.start("qc", "AI QC clip" + scope, pid,
                           lambda job: run_qc(job, pid, set(body.only) or None, body.force)).public()
@@ -2228,10 +2356,12 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return
         job.log("")
         job.log("=== Tự động đăng video lên mạng xã hội ===")
+        model = _project_ai_model(pid)
         try:
             pub_res = publisher.publish_film(
                 pdir(pid), out_dir(pid), plats, pub_cfg,
-                ai_backend=planner_backend(), api_key=s.get("anthropic_api_key") or None, log=job.log,
+                ai_backend=_backend_for(model), api_key=s.get("anthropic_api_key") or None, log=job.log,
+                **_ai_extra_kw(model, s),
             )
             res["published"] = pub_res["results"]
             if pub_res["errors"]:
@@ -2268,10 +2398,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         def on_stage(info: dict) -> None:
             job.stage = {**job.stage, **info}
 
+        is_gemini = _project_ai_model(pid) == ai_mod.GEMINI_PRO
         pilot = Autopilot(sb_path(pid), out_dir(pid), g, settings=AutoSettings(
             review=body.review, burn_subtitles=body.burn_subtitles,
             rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
-            ai_backend=settings.get("planner") or "auto", api_key=settings.get("anthropic_api_key") or None,
+            ai_backend=(settings.get("gemini_backend") or "auto") if is_gemini else (settings.get("planner") or "auto"),
+            api_key=settings.get("anthropic_api_key") or None,
+            ai_model=ai_mod.GEMINI_PRO if is_gemini else None,
+            gemini_api_key=(settings.get("gemini_api_key") or None) if is_gemini else None,
             max_retries=int(settings.get("retries", 2)),
             pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
             publish_platforms=pub_plats, publish_config=pub_cfg),
@@ -2293,16 +2427,17 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        chosen_model = _ai_model_or_400(body.ai_model)
         basic = check_format(body)
         if basic:
             body.review = False  # the review agents check drama direction (camera, dialogue, locations)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        key = load_settings().get("anthropic_api_key") or None
+        backend = _ai_backend_or_400(chosen_model)
+        s = load_settings()
+        key = s.get("anthropic_api_key") or None
+        extra_ai = _ai_extra_kw(chosen_model, s)
 
         def work(job: Job) -> dict[str, Any]:
             from ..planner import plan_auto
@@ -2316,10 +2451,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if n != body.scenes:
                 job.log(f"⚠ Số cảnh {body.scenes} ngoài giới hạn 1–{MAX_SCENES}; dùng {n} cảnh.")
             if basic:
-                sb = plan_basic_job(job, body, n, backend, key, language)
+                sb = plan_basic_job(job, body, n, backend, key, language, ai_model=chosen_model, extra_ai=extra_ai)
             else:
                 sb, _ = plan_auto(body.idea, backend=backend, api_key=key, scenes=n, log=job.log,
-                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue)
+                                  aspect=body.aspect, language_hint=language, dialogue_language=dialogue, **extra_ai)
                 if body.format:
                     sb.format = body.format
             pid, d = new_project_dir(sb.title)
@@ -2450,10 +2585,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         url = body.url.strip()
         if not va.is_url(url):
             raise HTTPException(400, "Hãy dán một link http(s) tới video.")
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        key = load_settings().get("anthropic_api_key") or None
+        chosen_model = _ai_model_or_400(body.ai_model)
+        backend = _ai_backend_or_400(chosen_model)
+        s = load_settings()
+        key = s.get("anthropic_api_key") or None
+        extra_ai = _ai_extra_kw(chosen_model, s)
         aid = va.new_id(re.sub(r"^https?://(www\.)?", "", url).split("/")[0])
         folder = analyses_root / aid
 
@@ -2461,7 +2597,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log(f"Phân tích video: {url}")
             try:
                 data = va.analyze(url, folder, use_rea=body.use_rea, backend=backend, api_key=key,
-                                  allow_local=False, log=job.log, should_stop=lambda: job.stop_requested)
+                                  allow_local=False, log=job.log, should_stop=lambda: job.stop_requested,
+                                  **extra_ai)
             except va.AnalysisStopped:
                 shutil.rmtree(folder, ignore_errors=True)
                 raise Stopped() from None
@@ -2518,29 +2655,32 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.post("/api/analyses/{aid}/film")
     def film_from_analysis(aid: str, body: StyleFilmBody) -> dict[str, Any]:
         d = adir(aid)
+        chosen_model = _ai_model_or_400(body.ai_model)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        key = load_settings().get("anthropic_api_key") or None
+        backend = _ai_backend_or_400(chosen_model)
+        s = load_settings()
+        key = s.get("anthropic_api_key") or None
+        extra_ai = _ai_extra_kw(chosen_model, s)
         data = va.load(d)
 
         def work(job: Job) -> dict[str, Any]:
             n = body.scenes or va.suggested_scenes(data)
             title = data['ai'].get('title_vi', aid)
+            label = ai_mod.ai_model_label(chosen_model)
             if body.mode == "same":
-                job.log(f"Claude đang viết storyboard {n} cảnh làm lại giống “{title}”, chỉ đổi nhân vật…")
+                job.log(f"{label} đang viết storyboard {n} cảnh làm lại giống “{title}”, chỉ đổi nhân vật…")
             else:
-                job.log(f"Claude đang viết storyboard {n} cảnh theo phong cách “{title}”…")
+                job.log(f"{label} đang viết storyboard {n} cảnh theo phong cách “{title}”…")
             if body.idea.strip():
                 job.log(("Ghi chú: " if body.mode == "same" else "Ý tưởng: ") + body.idea.strip()[:300])
             elif body.mode == "style":
-                job.log("Chưa có ý tưởng: Claude tự nghĩ một câu chuyện mới cùng thể loại.")
+                job.log(f"Chưa có ý tưởng: {label} tự nghĩ một câu chuyện mới cùng thể loại.")
             job.log(va.recipe_timing_vi(data, n))
             sb, _ = va.plan_from_analysis(data, body.idea, scenes=n, language_hint=language,
-                                          dialogue_language=dialogue, backend=backend, api_key=key, mode=body.mode)
+                                          dialogue_language=dialogue, backend=backend, api_key=key, mode=body.mode,
+                                          **extra_ai)
             pid, pd = new_project_dir(sb.title)
             save_storyboard(sb, pd / "storyboard.yaml")
             va.copy_reference(d, pd)
@@ -2664,10 +2804,11 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         d = cdir(cid)
         if not body.urls:
             raise HTTPException(400, "Hãy chọn ít nhất một video để phân tích.")
-        backend = planner_backend()
-        if not backend:
-            raise HTTPException(400, "Chưa dùng được Claude: cài Claude Code và đăng nhập, hoặc thêm Anthropic API key trong Cài đặt.")
-        key = load_settings().get("anthropic_api_key") or None
+        chosen_model = _ai_model_or_400(body.ai_model)
+        backend = _ai_backend_or_400(chosen_model)
+        s = load_settings()
+        key = s.get("anthropic_api_key") or None
+        extra_ai = _ai_extra_kw(chosen_model, s)
         saved = cr.load(d)
         by_key = {cr.canonical_video_key(v.get("url") or ""): v for v in saved.get("videos") or []}
 
@@ -2695,6 +2836,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     api_key=key,
                     log=job.log,
                     should_stop=lambda: job.stop_requested,
+                    **extra_ai,
                 )
             except cr.CrawlStopped:
                 raise Stopped() from None

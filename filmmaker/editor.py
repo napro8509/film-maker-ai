@@ -634,10 +634,12 @@ def frame_sheets(clips: list[tuple[str, Path]], infos: dict[str, ClipInfo], fold
 
 def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has_music: bool,
             backend: str = "auto", api_key: str | None = None, timeout: int = 900, capcut: bool = False,
-            pro: bool = False, sheets: list[tuple[Path, list[str]]] | None = None, log: Log = print) -> EditPlan:
+            pro: bool = False, sheets: list[tuple[Path, list[str]]] | None = None,
+            ai_model: str | None = None, gemini_api_key: str | None = None, log: Log = print) -> EditPlan:
     """capcut: the film is finished in CapCut, so the agent also picks a CapCut transition for every cut.
     pro: the agent also does the finishing layer (colour, effects, camera moves, sound design, title) and,
     given `sheets` (frame_sheets), looks at the footage first."""
+    from . import ai as ai_mod
     from .planner import MODEL, _subscription_env, claude_code_binary
 
     system = SYSTEM
@@ -655,6 +657,16 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
     if sheets:
         user += "\n\nContact sheets of the footage" + (
             " (image files in the current folder; open each one with the Read tool first):" + looks)
+    if ai_mod.effective_ai_model(ai_model or sb.ai_model) == ai_mod.GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+        chosen = ai_mod.pick_backend(backend, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
+        if not chosen:
+            raise RuntimeError(ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
+        log(f"Agent dựng phim (Gemini Pro, {'Gemini CLI' if chosen == 'gemini_cli' else 'API'}) đang xem kịch bản và các clip…")
+        plan = ai_mod.ask(system, user, EditPlan, images=[(p.name, p) for p, _ in sheets],
+                          backend=chosen, timeout=timeout, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
+        plan.source = "ai"
+        plan.pro = bool(capcut and pro)
+        return sanitize(plan, infos, order, screen_times(sb))
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     log(f"Agent dựng phim (Claude, {'gói Claude Code' if backend == 'claude_code' else 'API'}) đang xem kịch bản và các clip…")
@@ -740,11 +752,14 @@ def save_plan(plan: EditPlan, out_dir: Path) -> Path:
 def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, engine: str = "auto",
               replan: bool = False, has_music: bool = False, backend: str = "auto", api_key: str | None = None,
               ai_available: bool = True, capcut: bool = False, pro: bool = False,
+              ai_model: str | None = None, gemini_api_key: str | None = None,
               log: Log = print) -> tuple[EditPlan, dict[str, ClipInfo]]:
     """engine: auto (Claude if available, else rules) | ai | rules. A saved plan is reused unless replan.
     capcut: the plan is for a CapCut project (the agent may use CapCut's transitions).
     pro: with capcut, the agent looks at the footage and adds the finishing layer; a saved plan the agent or
     the rules made without that layer is replaced (a plan the user edited by hand is kept)."""
+    from . import ai as ai_mod
+
     if not clips:
         raise AssembleError("không có clip nào để dựng")
     order = [sid for sid, _ in clips]
@@ -763,7 +778,8 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
         plan = sanitize(saved, infos, order, screen_times(sb))
     elif engine == "rules" or (engine == "auto" and not ai_available):
         if engine == "auto":
-            log("Chưa dùng được Claude nên dựng theo luật mặc định (vẫn có chuyển cảnh, cân âm, mở/kết mờ).")
+            label = ai_mod.ai_model_label(ai_model or sb.ai_model)
+            log(f"Chưa dùng được {label} nên dựng theo luật mặc định (vẫn có chuyển cảnh, cân âm, mở/kết mờ).")
         plan = auto_plan(sb, infos, order)
     else:
         try:
@@ -774,8 +790,13 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
                     log(f"Agent xem hình {len(clips)} cảnh ({len(sheets)} bảng ảnh)…")
                 except (AssembleError, OSError, subprocess.SubprocessError) as exc:
                     log(f"⚠ Không trích được ảnh cảnh ({exc}); agent dựng theo kịch bản.")
+            extra_kw: dict[str, Any] = {}
+            if ai_model:
+                extra_kw["ai_model"] = ai_model
+            if gemini_api_key:
+                extra_kw["gemini_api_key"] = gemini_api_key
             plan = ai_plan(sb, infos, order, has_music=has_music, backend=backend, api_key=api_key,
-                           capcut=capcut, pro=pro, sheets=sheets, log=log)
+                           capcut=capcut, pro=pro, sheets=sheets, log=log, **extra_kw)
         except RuntimeError as exc:
             if engine == "ai":
                 raise
@@ -812,9 +833,15 @@ def make_plan(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, *, e
 def edit_film(sb: Storyboard, clips: list[tuple[str, Path]], out_dir: Path, output: Path | None = None, *,
               music: Path | None = None, music_volume: float = 0.25, burn_subtitles: bool = False,
               burn_language: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", api_key: str | None = None,
-              ai_available: bool = True, log: Log = print) -> tuple[Path, EditPlan]:
+              ai_available: bool = True, ai_model: str | None = None, gemini_api_key: str | None = None,
+              log: Log = print) -> tuple[Path, EditPlan]:
+    extra_kw: dict[str, Any] = {}
+    if ai_model:
+        extra_kw["ai_model"] = ai_model
+    if gemini_api_key:
+        extra_kw["gemini_api_key"] = gemini_api_key
     plan, infos = make_plan(sb, clips, out_dir, engine=engine, replan=replan, has_music=bool(music),
-                            backend=backend, api_key=api_key, ai_available=ai_available, log=log)
+                            backend=backend, api_key=api_key, ai_available=ai_available, log=log, **extra_kw)
     output = output or out_dir / "final.mp4"
     render(sb, clips, plan, infos, output, music=music, music_volume=music_volume,
            burn_subtitles=burn_subtitles, burn_language=burn_language, log=log)

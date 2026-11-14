@@ -12,8 +12,10 @@ import tempfile
 
 from pydantic import BaseModel
 
+from . import ai
 from . import durations as durations_mod
 from . import model_meta
+from .ai import GEMINI_PRO, clean_ai_model, effective_ai_model
 from .storyboard import (NO_DIALOGUE, NO_SUBTITLES, Storyboard, StoryboardDraft, _line_key, clean_dialogue_language,
                          clean_language)
 
@@ -101,6 +103,7 @@ def _to_storyboard(data: dict) -> Storyboard:
     data = copy.deepcopy(data)
     data.pop("dialogue_language", None)  # set from the request by plan_auto, never by Claude
     data.pop("subtitle_language", None)
+    data.pop("ai_model", None)
     _clean_locations(data)
     said: set[str] = set()
     for scene in data.get("scenes") or []:
@@ -198,7 +201,7 @@ def _part_message(base: str, total: int, start: int, count: int, draft: dict | N
             f"dialogue line from the earlier scenes. {tail}\n\nAlready written:\n{_written_so_far(draft)}")
 
 
-def _draft_in_parts(draft_fn, base: str, total: int, log=None) -> dict:
+def _draft_in_parts(draft_fn, base: str, total: int, log=None, *, model_label: str = "Claude") -> dict:
     """Ask `draft_fn(user_message) -> draft dict` for the storyboard, in parts when `total` is large."""
     if total <= PART_SCENES:
         return draft_fn(base)
@@ -229,7 +232,7 @@ def _draft_in_parts(draft_fn, base: str, total: int, log=None) -> dict:
         if not new:
             tries += 1
             if tries >= 2:
-                raise RuntimeError(f"Claude dừng ở {len(merged['scenes'])}/{total} cảnh; hãy thử lại.")
+                raise RuntimeError(f"{model_label} dừng ở {len(merged['scenes'])}/{total} cảnh; hãy thử lại.")
         else:
             tries = 0
     if log:
@@ -298,31 +301,64 @@ def plan_with_claude_code(idea: str, *, scenes: int = 6, aspect: str = "16:9", l
     return sb
 
 
+def _draft_gemini(user: str, timeout: int = 900, *, system: str | None = None, schema_model=None,
+                  backend: str = "auto", gemini_api_key: str | None = None) -> dict:
+    """One planner call through Gemini Pro (Gemini API or Gemini CLI) -> raw draft dict."""
+    return ai.draft_json(system or SYSTEM, user, schema_model or StoryboardDraft,
+                         backend=backend, gemini_api_key=gemini_api_key, timeout=timeout)
+
+
+def plan_with_gemini(idea: str, *, scenes: int = 6, aspect: str = "16:9", language_hint: str | None = None,
+                     dialogue_language: str | None = None, timeout: int = 900,
+                     durations: list[int] | None | object = _DEFAULT, backend: str = "auto",
+                     gemini_api_key: str | None = None, log=None) -> Storyboard:
+    """Write a storyboard using Gemini Pro (Gemini API key or Gemini CLI)."""
+    base = _user_message(idea, scenes, aspect, language_hint, dialogue_language, _durations_arg(durations))
+    draft = _draft_in_parts(
+        lambda user: _draft_gemini(user, timeout, backend=backend, gemini_api_key=gemini_api_key),
+        base, scenes, log, model_label="Gemini Pro",
+    )
+    sb = _to_storyboard(draft)
+    sb.aspect = aspect  # type: ignore[assignment]
+    sb.ai_model = GEMINI_PRO
+    return sb
+
+
 def plan_auto(idea: str, *, backend: str = "auto", api_key: str | None = None, dialogue_language: str | None = None,
-              **kw) -> tuple[Storyboard, str]:
-    """backend: auto | claude_code | api. auto prefers Claude Code (subscription, no API credit needed).
+              ai_model: str | None = None, gemini_api_key: str | None = None, **kw) -> tuple[Storyboard, str]:
+    """Plan a storyboard with `ai_model` ('claude' default or 'gemini-pro').
+    backend: auto | claude_code | api | gemini_api | gemini_cli.
     dialogue_language (and language_hint as subtitle_language) are stored on the storyboard from the request,
     overriding anything the backend returned; without dialogue_language neither field is set."""
-    dialogue_language = clean_dialogue_language(dialogue_language)  # ValueError before any Claude call
+    dialogue_language = clean_dialogue_language(dialogue_language)  # ValueError before any AI call
+    chosen_model = clean_ai_model(ai_model)
     if dialogue_language is not None:
         kw["dialogue_language"] = dialogue_language
-    if backend == "auto":
-        backend = "claude_code" if claude_code_binary() else "api"
-    if backend == "claude_code":
-        sb, used = plan_with_claude_code(idea, **kw), "claude_code"
+    if chosen_model == GEMINI_PRO:
+        used = ai.pick_backend(backend, ai_model=GEMINI_PRO, gemini_api_key=gemini_api_key)
+        if used is None:
+            raise RuntimeError(ai.not_ready_message(GEMINI_PRO))
+        sb = plan_with_gemini(idea, backend=used, gemini_api_key=gemini_api_key, **kw)
+        sb.ai_model = GEMINI_PRO
     else:
-        if api_key:
-            os.environ["ANTHROPIC_API_KEY"] = api_key
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
-        sb, used = plan(idea, **kw), "api"
+        if backend == "auto":
+            backend = "claude_code" if claude_code_binary() else "api"
+        if backend == "claude_code":
+            sb, used = plan_with_claude_code(idea, **kw), "claude_code"
+        else:
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
+            sb, used = plan(idea, **kw), "api"
     sb.dialogue_language = dialogue_language
     sb.subtitle_language = clean_language(kw.get("language_hint")) if sb.dialogue_language else None
     if (kw.get("language_hint") or "").strip().casefold() == NO_SUBTITLES:
         sb.subtitle_language = NO_SUBTITLES
-        for sc in sb.scenes:  # "Không phụ đề": nothing to show even if Claude wrote a line anyway
+        for sc in sb.scenes:  # "Không phụ đề": nothing to show even if AI wrote a line anyway
             sc.narration, sc.subtitles = None, None
-    sb = fix_vietnamese_diacritics(sb, backend=used, api_key=api_key, log=kw.get("log"))
+    sb = fix_vietnamese_diacritics(sb, backend=used, api_key=api_key, ai_model=chosen_model,
+                                   gemini_api_key=gemini_api_key, log=kw.get("log"))
     # New projects never start on a model Flow is retiring (default: veo-lite).
     meta = model_meta.load()
     sb = model_meta.normalize_new_storyboard(sb, meta)
@@ -389,15 +425,20 @@ def vietnamese_without_marks(sb: Storyboard) -> dict[str, str]:
     return out if len(out) >= 2 and len(out) * 2 >= max(1, total) else {}
 
 
-def fix_vietnamese_diacritics(sb: Storyboard, *, backend: str, api_key: str | None = None, log=None) -> Storyboard:
+def fix_vietnamese_diacritics(sb: Storyboard, *, backend: str, api_key: str | None = None,
+                              ai_model: str | None = None, gemini_api_key: str | None = None, log=None) -> Storyboard:
     bad = vietnamese_without_marks(sb)
     if not bad:
         return sb
+    use_gemini = effective_ai_model(ai_model or sb.ai_model) == GEMINI_PRO or backend in ("gemini_api", "gemini_cli")
     if log:
-        log(f"⚠ {len(bad)} câu tiếng Việt bị thiếu dấu: nhờ Claude thêm dấu lại…")
+        log(f"⚠ {len(bad)} câu tiếng Việt bị thiếu dấu: nhờ {'Gemini Pro' if use_gemini else 'Claude'} thêm dấu lại…")
     user = "Items:\n" + json.dumps([{"key": k, "text": v} for k, v in bad.items()], ensure_ascii=False)
     try:
-        if backend == "claude_code":
+        if use_gemini:
+            out = _draft_gemini(user, 300, system=VN_FIX_SYSTEM, schema_model=_VnFix,
+                                backend=backend, gemini_api_key=gemini_api_key)
+        elif backend == "claude_code":
             out = _draft_claude_code(user, 300, system=VN_FIX_SYSTEM, schema_model=_VnFix)
         else:
             if api_key:
@@ -480,8 +521,25 @@ Vietnamese (`vi`), Thai (`th`) and English (`en`): natural, short subtitle wordi
 and tone; keep character names as they are. Return one item per input id, nothing else."""
 
 
-def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None, timeout: int) -> dict[str, dict]:
+class _SubLine(BaseModel):
+    id: str
+    vi: str
+    th: str
+    en: str
+
+
+class _SubLines(BaseModel):
+    lines: list[_SubLine]
+
+
+def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None, timeout: int,
+                     ai_model: str | None = None, gemini_api_key: str | None = None) -> dict[str, dict]:
     user = "Subtitle lines (id: text):\n" + "\n".join(f"{k}: {v}" for k, v in lines.items())
+    if effective_ai_model(ai_model) == GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+        out = _draft_gemini(user, timeout, system=TRANSLATE_SYSTEM, schema_model=_SubLines,
+                            backend=backend, gemini_api_key=gemini_api_key)
+        items = out.get("lines") or []
+        return {str(it.get("id")): it for it in items if isinstance(it, dict)}
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     if backend == "claude_code":
@@ -514,22 +572,12 @@ def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None
             raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
         try:
             import anthropic
-            from pydantic import BaseModel
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
-        class Line(BaseModel):
-            id: str
-            vi: str
-            th: str
-            en: str
-
-        class Lines(BaseModel):
-            lines: list[Line]
-
         response = anthropic.Anthropic().messages.parse(
             model=MODEL, max_tokens=8000, system=TRANSLATE_SYSTEM, messages=[{"role": "user", "content": user}],
-            output_format=Lines, output_config={"effort": "low"},
+            output_format=_SubLines, output_config={"effort": "low"},
             extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
         )
         if response.stop_reason == "refusal" or not response.parsed_output:
@@ -539,7 +587,8 @@ def _translate_items(lines: dict[str, str], *, backend: str, api_key: str | None
 
 
 def translate_subtitles(sb: Storyboard, *, backend: str = "auto", api_key: str | None = None,
-                        timeout: int = 300) -> dict[str, dict[str, str]]:
+                        timeout: int = 300, ai_model: str | None = None,
+                        gemini_api_key: str | None = None) -> dict[str, dict[str, str]]:
     """Fill the missing vi / th / en lines of scenes with narration (in place).
     Returns {scene id: {code: line}} of what was added; {} when nothing was missing."""
     from .storyboard import Subtitles
@@ -548,8 +597,10 @@ def translate_subtitles(sb: Storyboard, *, backend: str = "auto", api_key: str |
     if not missing:
         return {}
     scenes = {s.id: s for s in sb.scenes}
+    model = effective_ai_model(ai_model or sb.ai_model)
     got = _translate_items({sid: scenes[sid].narration.strip() for sid in missing},
-                           backend=backend, api_key=api_key, timeout=timeout)
+                           backend=backend, api_key=api_key, timeout=timeout,
+                           ai_model=model, gemini_api_key=gemini_api_key)
     added: dict[str, dict[str, str]] = {}
     for sid, codes in missing.items():
         it = got.get(sid) or {}
@@ -616,10 +667,25 @@ def _clean_titles(items, n: int) -> list[dict[str, str]]:
     return out[:n]
 
 
+class _TitleOpt(BaseModel):
+    text: str
+    vi: str
+
+
+class _TitleOpts(BaseModel):
+    titles: list[_TitleOpt]
+
+
 def suggest_titles(sb: Storyboard, *, backend: str = "auto", api_key: str | None = None, n: int = 5,
-                   timeout: int = 180) -> list[dict[str, str]]:
-    """A few title ideas for the thumbnail, written by Claude (Claude Code subscription or API key)."""
+                   timeout: int = 180, ai_model: str | None = None,
+                   gemini_api_key: str | None = None) -> list[dict[str, str]]:
+    """A few title ideas for the thumbnail, written by Claude or Gemini Pro."""
     user = f"{_story_summary(sb)}\n\nWrite {n} title options."
+    model = effective_ai_model(ai_model or sb.ai_model)
+    if model == GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+        out = _draft_gemini(user, timeout, system=TITLE_SYSTEM, schema_model=_TitleOpts,
+                            backend=backend, gemini_api_key=gemini_api_key)
+        return _clean_titles(out.get("titles"), n)
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     if backend == "claude_code":
@@ -652,20 +718,12 @@ def suggest_titles(sb: Storyboard, *, backend: str = "auto", api_key: str | None
         raise RuntimeError("chưa có ANTHROPIC_API_KEY (hoặc cài Claude Code để dùng gói Claude của bạn)")
     try:
         import anthropic
-        from pydantic import BaseModel
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("cần cài thêm: pip install 'film-maker-ai[ai]' (gói anthropic)") from exc
 
-    class Title(BaseModel):
-        text: str
-        vi: str
-
-    class Titles(BaseModel):
-        titles: list[Title]
-
     response = anthropic.Anthropic().messages.parse(
         model=MODEL, max_tokens=2000, system=TITLE_SYSTEM, messages=[{"role": "user", "content": user}],
-        output_format=Titles, output_config={"effort": "low"},
+        output_format=_TitleOpts, output_config={"effort": "low"},
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
     )
     if response.stop_reason == "refusal" or not response.parsed_output:

@@ -93,20 +93,27 @@ def no_ffprobe(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_real_claude(monkeypatch):
-    """Tests never call the real Claude: no `claude` binary and no Anthropic API unless a test fakes them.
-    (The web server now runs AI QC after every render; on a machine with Claude Code installed that would
+    """Tests never call the real Claude or Gemini: no `claude`/`gemini` binary and no live API unless a test fakes them.
+    (The web server now runs AI QC after every render; on a machine with Claude Code / Gemini CLI installed that would
     reach the real service from a test and take minutes.) A test that wants a backend patches these itself."""
     from filmmaker import ai, planner
 
     real = planner.claude_code_binary
-    # A test's own fake (CLAUDE_BIN set by the test) still works; the real `claude` on PATH is hidden.
+    # A test's own fake (CLAUDE_BIN / GEMINI_BIN set by the test) still works; real binaries on PATH are hidden.
     monkeypatch.setattr(planner, "claude_code_binary", lambda: real() if os.environ.get("CLAUDE_BIN") else None)
+    real_gemini = ai.gemini_cli_binary
+    monkeypatch.setattr(ai, "gemini_cli_binary", lambda: real_gemini() if os.environ.get("GEMINI_BIN") else None)
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_CLI_LOGGED_IN"):
+        monkeypatch.delenv(k, raising=False)
 
     def blocked(*_a, **_k):
-        raise RuntimeError("tests: real Anthropic API is blocked")
+        raise RuntimeError("tests: real Anthropic/Gemini API is blocked")
 
+    if not hasattr(ai, "_real_gemini_http_post"):
+        ai._real_gemini_http_post = ai._gemini_http_post
     monkeypatch.setattr(ai, "_ask_api", blocked)
     monkeypatch.setattr(ai, "_ask_api_text", blocked)
+    monkeypatch.setattr(ai, "_gemini_http_post", blocked)
 
 
 @pytest.fixture(autouse=True)

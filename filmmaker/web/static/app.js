@@ -464,6 +464,7 @@ async function openProject(id) {
   if (document.body.classList.contains("side-open")) toggleSidebar(false); // close the drawer; never collapse the rail
   if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
   S.saveState = "saved";
+  renderTopbar();
   renderSidebar();
   renderMain();
   return true;
@@ -767,6 +768,7 @@ function renderTopbar() {
   put(box,
     authChip(),
     claudeChip(),
+    geminiChip(),
     h("span", { class: "pill " + (e.gflow ? "ok" : "bad"), title: e.gflow || "Chưa cài gflow-cli" }, e.gflow ? "gflow" : "Thiếu gflow"),
     h("span", { class: "pill " + (e.ffmpeg ? "ok" : "bad"), title: e.ffmpeg || "Chưa cài ffmpeg" }, e.ffmpeg ? "ffmpeg" : "Thiếu ffmpeg"),
   );
@@ -779,6 +781,32 @@ function renderSideEnv() {
   put(el, [...$("#envchips").children].map((n) => { const c = n.cloneNode(true); c.onclick = n.onclick; return c; }));
 }
 
+const AI_MODEL_OPTIONS = [["claude", "Claude (mặc định)"], ["gemini-pro", "Gemini Pro"]];
+function cleanAiModel(m) {
+  const k = String(m || "").trim().toLowerCase().replace(/_/g, "-");
+  return k === "gemini-pro" || k === "gemini" || k === "gemini-2.5-pro" || k === "geminipro" ? "gemini-pro" : "claude";
+}
+function aiModelLabel(m) { return cleanAiModel(m) === "gemini-pro" ? "Gemini Pro" : "Claude"; }
+function aiModelReady(m) { return cleanAiModel(m) === "gemini-pro" ? !!S.env?.gemini_backend : !!S.env?.planner; }
+function aiModelSelect(value, onchange, attrs = {}) {
+  const cur = cleanAiModel(value);
+  return h("select", { "aria-label": "Model AI", ...attrs, value: cur, onchange: (e) => onchange && onchange(cleanAiModel(e.target.value)) },
+    AI_MODEL_OPTIONS.map(([v, label]) => h("option", { value: v, selected: v === cur }, label)));
+}
+function aiModelBanner(m, onOpenSettings) {
+  if (cleanAiModel(m) === "gemini-pro") {
+    const gc = S.env?.gemini_cli || {};
+    return h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {},
+      gc.available ? "Chưa thiết lập Gemini Pro. Thêm Gemini API key hoặc đăng nhập lệnh gemini trên máy. "
+        : "Chưa thiết lập Gemini Pro. Cần thêm Gemini API key (Google AI Studio) hoặc cài Gemini CLI. ",
+      h("a", { href: "#", onclick: (e) => { e.preventDefault(); onOpenSettings(); } }, "Mở Cài đặt"), ".")));
+  }
+  return h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {},
+    S.env?.claude_code?.available ? "Claude Code chưa đăng nhập. Mở Terminal, chạy “claude” rồi gõ /login bằng tài khoản Claude của bạn. "
+      : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
+    h("a", { href: "#", onclick: (e) => { e.preventDefault(); onOpenSettings(); } }, "Mở Cài đặt"), ".")));
+}
+
 function claudeChip() {
   const e = S.env, cc = e.claude_code || {};
   if (e.planner === "claude_code" && cc.logged_in)
@@ -786,6 +814,17 @@ function claudeChip() {
   if (e.planner === "api") return h("span", { class: "pill ok", title: "Viết storyboard bằng Anthropic API key" }, "Claude · API key");
   if (cc.available) return h("button", { class: "pill warn", onclick: claudeLoginHelp, title: "Claude Code chưa đăng nhập. Bấm để xem cách đăng nhập" }, "Claude chưa đăng nhập");
   return h("button", { class: "pill warn", onclick: openSettings, title: "Bấm để mở Cài đặt" }, "Claude chưa thiết lập");
+}
+
+function geminiChip() {
+  const e = S.env || {};
+  if (e.gemini_backend === "gemini_api")
+    return h("span", { class: "pill ok", title: "Gemini Pro sẵn sàng qua Google Gemini API key" }, "Gemini Pro");
+  if (e.gemini_backend === "gemini_cli")
+    return h("span", { class: "pill ok", title: "Gemini Pro sẵn sàng qua Gemini CLI trên máy" }, "Gemini Pro · CLI");
+  if (cleanAiModel(S.cur?.storyboard?.ai_model || S.cur?.ai_model) === "gemini-pro")
+    return h("button", { class: "pill warn", onclick: openSettings, title: "Dự án này dùng Gemini Pro nhưng chưa thiết lập key/CLI. Bấm để mở Cài đặt" }, "Gemini Pro chưa thiết lập");
+  return null;
 }
 
 function claudeLoginHelp() {
@@ -856,6 +895,7 @@ function renderSidebar() {
           h("div", { class: "name" }, p.title),
           h("div", { class: "sub" },
             running === p.id ? h("span", { class: "badge running mini" }, "Đang chạy") : p.has_final ? h("span", { class: "badge film mini" }, "Có phim") : null,
+            p.ai_model === "gemini-pro" ? h("span", { class: "badge mini" }, "Gemini Pro") : null,
             h("span", {}, `${p.done}/${p.scenes} cảnh`)),
           h("div", { class: "bar" }, h("i", { style: { width: pct + "%" } }))));
     }),
@@ -937,6 +977,7 @@ function renderHeader() {
           h("span", {}, h("span", { class: "bar" }, h("i", { style: { width: (total ? done / total * 100 : 0) + "%" } })), `${done}/${total} cảnh xong`),
           h("span", {}, `~${fmtDur(len)}`),
           h("span", {}, sb.aspect === "9:16" ? "Dọc 9:16" : "Ngang 16:9"),
+          cleanAiModel(sb.ai_model) === "gemini-pro" ? h("span", { title: "Dự án này dùng Gemini Pro cho các tác vụ AI" }, "AI: Gemini Pro") : null,
           S.cur.has_final ? h("a", { href: "#", onclick: (e) => { e.preventDefault(); switchTab("final"); } }, "Xem phim đã ghép") : null,
           h("span", { id: "savestate" }, renderSaveState()));
       })),
@@ -1636,6 +1677,11 @@ function renderStory() {
         field("Phong cách hình ảnh",
           h("textarea", { rows: 2, value: sb.style || "", placeholder: "cinematic, warm morning light, shallow depth of field, 35mm film grain",
             oninput: (e) => set("style", e.target.value) }), "thêm vào mọi prompt"),
+        field("Model AI",
+          aiModelSelect(sb.ai_model, (v) => {
+            if (v === "claude") delete sb.ai_model; else sb.ai_model = v;
+            changed(); renderTopbar(); refreshZone("stats-zone");
+          }), "xử lý các tác vụ AI của dự án (kịch bản, QC, phụ đề, dựng phim, chat); mặc định là Claude"),
         sb.edit_style != null ? field("Phong cách dựng (từ video mẫu)",
           h("textarea", { rows: 5, class: "mono", value: sb.edit_style || "", placeholder: "Trống: agent dựng phim tự chọn nhịp, chuyển cảnh, âm thanh",
             oninput: (e) => set("edit_style", e.target.value) }), "agent dựng phim làm theo; không gửi Flow") : null,
@@ -3425,10 +3471,11 @@ async function stopJob() {
 /* ---------- new project ---------- */
 
 function openNewProject() {
-  let mode = S.env.planner ? "ai" : "template";
+  let mode = (S.env.planner || S.env.gemini_backend) ? "ai" : "template";
+  let aiModel = "claude";
   const body = h("div");
   const render = () => {
-    const choices = [["ai", "sparkle", "Từ ý tưởng", "Claude viết storyboard cho bạn"], ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
+    const choices = [["ai", "sparkle", "Từ ý tưởng", "AI viết storyboard cho bạn"], ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
       ["blank", "file", "Trống", "Tự viết từng cảnh"], ["import", "import", "Nhập file", "Mở file storyboard .yaml có sẵn"],
       ["drive", "cloud", "Từ Drive", "Khôi phục dự án đã backup"]];
     const form = { ai: aiForm, template: () => titleForm("Ly cà phê đầu tiên"), blank: () => titleForm(""), import: importForm, drive: driveForm }[mode]();
@@ -3439,20 +3486,19 @@ function openNewProject() {
     const inp = h("input", { type: "text", value: def, placeholder: "Tên phim" });
     setTimeout(() => inp.focus(), 30);
     const go = async () => {
-      try { const r = await api("POST", "/api/projects", { title: inp.value, source: mode }); close(); await loadProjects(); await openProject(r.id); }
+      try { const r = await api("POST", "/api/projects", { title: inp.value, source: mode, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) }); close(); await loadProjects(); await openProject(r.id); }
       catch (e) { toast(e.message, "error"); }
     };
     inp.onkeydown = (e) => { if (e.key === "Enter") go(); };
     return h("div", { class: "stack" }, field("Tên phim", inp),
+      field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; }), "xử lý các tác vụ AI của dự án; mặc định là Claude"),
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, "Tạo dự án")));
   };
   const aiForm = () => {
-    if (!S.env.planner) return h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {},
-      S.env.claude_code?.available ? "Claude Code chưa đăng nhập. Mở Terminal, chạy “claude” rồi gõ /login bằng tài khoản Claude của bạn. "
-        : "Cần cài Claude Code (dùng gói Claude của bạn) hoặc thêm Anthropic API key. ",
-      h("a", { href: "#", onclick: (e) => { e.preventDefault(); close(); openSettings(); } }, "Mở Cài đặt"), ".")));
+    const modelRow = field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; render(); }), "xử lý viết kịch bản và các tác vụ AI của dự án; mặc định là Claude");
+    if (!aiModelReady(aiModel)) return h("div", { class: "stack" }, modelRow, aiModelBanner(aiModel, () => { close(); openSettings(); }));
     const F = S.env.formats;
-    if (!F) return dramaForm(null);
+    if (!F) return h("div", { class: "stack" }, modelRow, dramaForm(null));
     const box = h("div", { class: "stack" });
     // The old short drama flow is deprecated: a new film never starts on it (not even when it was the last pick).
     const saved = F.formats.find((f) => f.key === localGet("filmFormat") && !f.deprecated);
@@ -3467,7 +3513,7 @@ function openNewProject() {
         info.basic ? basicForm(info) : dramaForm(fmt));
     };
     draw();
-    return box;
+    return h("div", { class: "stack" }, modelRow, box);
   };
   /* Formats other than the drama: text -> image -> video, without the drama's direction, camera or dialogue rows. */
   const basicForm = (info) => {
@@ -3512,12 +3558,13 @@ function openNewProject() {
       if (!l.ok) { toast("Ngôn ngữ: " + l.msg, "error"); lang.input.focus(); return null; }
       localSet("filmLang", l.value);
       return { idea: idea.value, scenes: Math.max(1, Math.min(80, +n.value || info.scenes)), aspect: aspect.value, language: l.value,
-        format: info.key, audio, visual_style: visual, custom_style: visual === "other" ? custom.value : "", genres: [...genres] };
+        format: info.key, audio, visual_style: visual, custom_style: visual === "other" ? custom.value : "", genres: [...genres],
+        ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) };
     };
     const planOnly = async (e) => {
       const body = payload(); if (!body) return;
       const btn = e.currentTarget; btn.disabled = true;
-      try { const j = await api("POST", "/api/projects/plan", body); close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết kịch bản, thường mất 1–3 phút…", "", 6000); }
+      try { const j = await api("POST", "/api/projects/plan", body); close(); localSet("draftIdea", ""); startJob(j); toast(`${aiModelLabel(aiModel)} đang viết kịch bản, thường mất 1–3 phút…`, "", 6000); }
       catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
     const planAll = async (e) => {
@@ -3537,7 +3584,7 @@ function openNewProject() {
       h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Phong cách hình ảnh"), styleBox), field("Khung hình", aspect)),
       h("div", { class: "field" }, h("span", { class: "lbl" }, "Thể loại", h("span", { class: "hint" }, " · chọn nhiều")), genreChips),
       h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh"), n, minutes), h("div", { class: "stack tight" }, langBox)),
-      h("p", { class: "help" }, "Luồng I2V: mỗi cảnh Claude viết một ảnh mở đầu và một chuyển động theo chuẩn prompt I2V → tạo ảnh → ảnh thành video. Bối cảnh được mô tả một lần và giữ nguyên giữa các cảnh. Không có chỉ đạo nội dung, camera hay thoại từng dòng như Short drama."),
+      h("p", { class: "help" }, `Luồng I2V: mỗi cảnh ${aiModelLabel(aiModel)} viết một ảnh mở đầu và một chuyển động theo chuẩn prompt I2V → tạo ảnh → ảnh thành video. Bối cảnh được mô tả một lần và giữ nguyên giữa các cảnh. Không có chỉ đạo nội dung, camera hay thoại từng dòng như Short drama.`),
       h("div", { class: "row" }, h("span", { class: "spacer" }),
         h("button", { class: "btn", onclick: planOnly, title: "Chỉ viết kịch bản để bạn xem và sửa trước" }, "Chỉ viết kịch bản"),
         h("button", { class: "btn primary", onclick: planAll, title: "Kịch bản → ảnh nhân vật → ảnh cảnh → video → dựng phim → thumbnail" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
@@ -3565,7 +3612,7 @@ function openNewProject() {
       btn.disabled = true;
       try {
         const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
-          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, ...(fmt ? { format: fmt } : {}) });
+          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
         close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -3578,17 +3625,19 @@ function openNewProject() {
       localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); // remembered even if the plan job fails
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value, ...(fmt ? { format: fmt } : {}) });
-        close(); localSet("draftIdea", ""); startJob(j); toast("Claude đang viết storyboard, thường mất 1–3 phút…", "", 6000);
+        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
+        close(); localSet("draftIdea", ""); startJob(j); toast(`${aiModelLabel(aiModel)} đang viết storyboard, thường mất 1–3 phút…`, "", 6000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
+    const modelNote = aiModel === "gemini-pro"
+      ? (S.env.gemini_backend === "gemini_cli" ? "Dùng Gemini CLI trên máy." : "Dùng Google Gemini Pro API key.")
+      : (S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng).");
     return h("div", { class: "stack" },
       field("Ý tưởng phim", idea),
       h("div", { class: "grid2" }, field("Số cảnh", n), field("Khung hình", aspect)),
       h("div", { class: "grid2" }, field("Nhân vật nói", speak.el), field("Ngôn ngữ phụ đề", sub.el)),
       h("p", { class: "help" }, "Câu “nhân vật nói …” được thêm vào mọi prompt video gửi Flow để cả phim cùng một thứ tiếng."),
-      h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ",
-        S.env.planner === "claude_code" ? "Dùng Claude Code với gói Claude của bạn, không tốn thêm tiền API." : "Dùng Anthropic API key (tính phí theo lượt dùng)."),
+      h("p", { class: "help" }, "Prompt sẽ được viết bằng tiếng Anh cho Veo hiểu tốt nhất. Bạn xem và sửa lại trước khi tạo bất cứ thứ gì. ", modelNote),
       h("div", { class: "auto-opts" },
         h("label", { class: "check" }, autoReview, h("span", {}, "Agent review từng bước", h("span", { class: "sub" }, "Review storyboard, keyframe (tự tạo lại ảnh lỗi), clip (render lại clip hỏng, tối đa 3) và cả phim."))),
         h("label", { class: "check" }, autoSubs, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng.")))),
@@ -3631,6 +3680,7 @@ function openNewProject() {
 
 function openAnalyzeVideo() {
   const va = S.env?.video_analysis || {};
+  let aiModel = "claude";
   const url = h("input", { type: "url", placeholder: "https://www.youtube.com/shorts/…  ·  TikTok  ·  Facebook  ·  link .mp4", value: localGet("anaUrl", "") });
   const rea = h("input", { type: "checkbox", checked: !!va.rea_video && localGet("anaRea", true) !== false, disabled: !va.rea_video });
   const list = h("div", { class: "stack", style: { gap: "6px" } }, h("p", { class: "row muted small" }, h("span", { class: "spinner" }), "Đang tải các bản phân tích…"));
@@ -3638,16 +3688,20 @@ function openAnalyzeVideo() {
   const go = async (e) => {
     const v = url.value.trim();
     if (!/^https?:\/\//i.test(v)) { toast("Hãy dán một link http(s) tới video", "error"); url.focus(); return; }
-    if (!S.env?.planner) { toast("Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích", "error"); return; }
+    if (!aiModelReady(aiModel)) {
+      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI để phân tích" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích", "error");
+      return;
+    }
     const btn = e.currentTarget; btn.disabled = true;
     localSet("anaUrl", v); localSet("anaRea", rea.checked);
-    try { startJob(await api("POST", "/api/analyses", { url: v, use_rea: rea.checked })); close(); localSet("anaUrl", ""); toast("Đang phân tích video, thường mất 3–10 phút…", "", 6000); }
+    try { startJob(await api("POST", "/api/analyses", { url: v, use_rea: rea.checked, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) })); close(); localSet("anaUrl", ""); toast("Đang phân tích video, thường mất 3–10 phút…", "", 6000); }
     catch (err) { toast(err.message, "error"); btn.disabled = false; }
   };
   url.onkeydown = (e) => { if (e.key === "Enter") go({ currentTarget: e.target.closest(".modal").querySelector(".btn.primary") }); };
   const body = h("div", { class: "stack" },
     field("Link video", url),
-    h("p", { class: "help" }, "Film Maker tải video về máy, tìm từng điểm cắt, đo âm thanh, cho Claude xem ảnh từng shot rồi viết bản phân tích: nhịp dựng, chuyển cảnh, góc máy, màu, nhạc & âm thanh, chữ trên hình, nhân vật, bối cảnh, nhịp truyện. Sau đó bạn tạo phim mới cùng phong cách bằng một nút."),
+    field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; }), "mặc định là Claude"),
+    h("p", { class: "help" }, "Film Maker tải video về máy, tìm từng điểm cắt, đo âm thanh, cho AI xem ảnh từng shot rồi viết bản phân tích: nhịp dựng, chuyển cảnh, góc máy, màu, nhạc & âm thanh, chữ trên hình, nhân vật, bối cảnh, nhịp truyện. Sau đó bạn tạo phim mới cùng phong cách bằng một nút."),
     h("p", { class: "help" }, "Muốn quét trang Facebook, kênh TikTok hoặc YouTube để lấy top video nhiều view nhất trước? ",
       h("a", { href: "#crawl", onclick: (ev) => { ev.preventDefault(); close(); openCrawler(S.lastCrawlId || null); } }, "Mở Crawl video →")),
     va.ytdlp ? null : h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {}, "Chưa cài yt-dlp nên chỉ tải được link thẳng tới file video (.mp4). Link YouTube / TikTok / Facebook cần: ", h("code", {}, "brew install yt-dlp"), "."))),
@@ -3779,8 +3833,7 @@ function renderAnalysisFilmForm(d) {
   const MODES = [["same", "copy", "Làm giống video gốc", "Giữ nguyên truyện, cảnh, góc máy, nhịp; chỉ tạo nhân vật mới"],
     ["style", "sparkle", "Phong cách tương tự", "Câu chuyện và nhân vật mới, cùng thể loại và nhịp dựng"]];
   let mode = localGet("anaFilmMode") === "same" ? "same" : "style";
-  const PH = { style: "Để trống: Claude tự nghĩ câu chuyện mới cùng thể loại. Gợi ý: " + (ai.idea_suggestion_vi || ""),
-    same: "Tuỳ chọn, ví dụ: nhân vật là gia đình người Việt, chồng khoảng 35 tuổi, vợ tóc ngắn…" };
+  let aiModel = "claude";
   const idea = h("textarea", { rows: 4 });
   const ideaField = field("Ý tưởng phim mới", idea, "tuỳ chọn");
   const ideaLabel = ideaField.querySelector(".lbl");
@@ -3805,6 +3858,8 @@ function renderAnalysisFilmForm(d) {
   const goLabel = h("span", {});
   const picker = h("div", { class: "choice", role: "radiogroup", "aria-label": "Cách làm phim từ video mẫu" });
   const paint = () => {
+    const PH = { style: `Để trống: ${aiModelLabel(aiModel)} tự nghĩ câu chuyện mới cùng thể loại. Gợi ý: ` + (ai.idea_suggestion_vi || ""),
+      same: "Tuỳ chọn, ví dụ: nhân vật là gia đình người Việt, chồng khoảng 35 tuổi, vợ tóc ngắn…" };
     picker.replaceChildren(...MODES.map(([k, ic, t, desc]) => h("button", { type: "button", class: mode === k ? "on" : "", role: "radio", "aria-checked": String(mode === k),
       onclick: () => { mode = k; localSet("anaFilmMode", k); paint(); } }, icon(ic), h("b", {}, t), h("span", {}, desc))));
     idea.placeholder = PH[mode];
@@ -3819,15 +3874,20 @@ function renderAnalysisFilmForm(d) {
     const a = speak.read(), b = sub.read();
     if (!a.ok) { toast("Nhân vật nói: " + a.msg, "error"); return; }
     if (!b.ok) { toast("Ngôn ngữ phụ đề: " + b.msg, "error"); return; }
+    if (!aiModelReady(aiModel)) {
+      toast(aiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key", "error");
+      return;
+    }
     const btn = e.currentTarget; btn.disabled = true;
     localSet("dialogueLang", a.value); localSet("subtitleLang", b.value);
-    try { startJob(await api("POST", `/api/analyses/${d.id}/film`, { idea: idea.value, scenes: +n.value || null, language: b.value, dialogue_language: a.value, mode })); toast(mode === "same" ? "Claude đang viết storyboard giống video mẫu, nhân vật mới…" : "Claude đang viết storyboard theo phong cách video mẫu…", "", 6000); }
+    try { startJob(await api("POST", `/api/analyses/${d.id}/film`, { idea: idea.value, scenes: +n.value || null, language: b.value, dialogue_language: a.value, mode, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) })); toast(mode === "same" ? `${aiModelLabel(aiModel)} đang viết storyboard giống video mẫu, nhân vật mới…` : `${aiModelLabel(aiModel)} đang viết storyboard theo phong cách video mẫu…`, "", 6000); }
     catch (err) { toast(err.message, "error"); }
     btn.disabled = false;
   };
   paint();
   return h("section", { class: "card ana-card ana-film" }, h("div", { class: "card-head" }, h("h3", {}, "Tạo phim từ video mẫu")),
     h("div", { class: "card-body stack" },
+      field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; paint(); }), "xử lý viết kịch bản và các tác vụ AI của phim mới; mặc định là Claude"),
       picker,
       ideaField, hint,
       h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh ", h("span", { class: "hint" }, "· ", reset)), n), field("Khung hình", h("input", { type: "text", value: (d.measured?.aspect === "9:16" ? "Dọc 9:16" : "Ngang 16:9") + " (như video mẫu)", disabled: true }))),
@@ -4001,9 +4061,17 @@ function renderCrawlResult(c, urlsBox) {
     onchange: (e) => localSet("anaRea", e.target.checked),
   });
 
+  let crawlAiModel = "claude";
+  const crawlAiSel = h("select", { class: "sm", "aria-label": "Model AI phân tích", onchange: (e) => { crawlAiModel = e.target.value === "gemini-pro" ? "gemini-pro" : "claude"; } },
+    h("option", { value: "claude" }, "AI: Claude (mặc định)"),
+    h("option", { value: "gemini-pro" }, "AI: Gemini Pro"));
+
   const runAnalyze = async (urls, { force = false, openSingle = false } = {}, btn = null) => {
     if (!urls.length) { toast("Hãy chọn ít nhất 1 video để phân tích", "error"); return; }
-    if (!S.env?.planner) { toast("Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích video", "error"); return; }
+    if (crawlAiModel === "gemini-pro" ? !S.env?.gemini_backend : !S.env?.planner) {
+      toast(crawlAiModel === "gemini-pro" ? "Cần thêm Gemini API key hoặc đăng nhập Gemini CLI để phân tích video" : "Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích video", "error");
+      return;
+    }
     if (btn) btn.disabled = true;
     try {
       const j = await api("POST", `/api/crawls/${encodeURIComponent(c.id)}/analyze`, {
@@ -4011,6 +4079,7 @@ function renderCrawlResult(c, urlsBox) {
         use_rea: reaChk.checked,
         force,
         open_single: openSingle,
+        ...(crawlAiModel === "gemini-pro" ? { ai_model: "gemini-pro" } : {}),
       });
       startJob(j);
       toast(urls.length === 1 ? "Đang phân tích video…" : `Đang phân tích lần lượt ${urls.length} video…`, "", 6000);
@@ -4066,8 +4135,10 @@ function renderCrawlResult(c, urlsBox) {
             } }),
             h("span", {}, "Chọn tất cả đang hiện")))),
       h("div", { class: "row", style: { justifyContent: "space-between", width: "100%" } },
-        h("label", { class: "check small" }, reaChk,
-          h("span", {}, "Dùng rea-video khi phân tích", va.rea_video ? null : h("span", { class: "muted" }, " (chưa cài)"))),
+        h("div", { class: "row" },
+          crawlAiSel,
+          h("label", { class: "check small" }, reaChk,
+            h("span", {}, "Dùng rea-video khi phân tích", va.rea_video ? null : h("span", { class: "muted" }, " (chưa cài)")))),
         h("button", {
           class: "btn primary sm",
           disabled: jobRunning() || !selected.size,
@@ -4228,11 +4299,18 @@ async function openSettings() {
     h("option", { value: "headless" }, "Ẩn hoàn toàn (headless) — có thể bị Google chặn"),
     h("option", { value: "show" }, "Hiện cửa sổ — để xem nó thao tác"));
   let clearKey = false;
+  let clearGeminiKey = false;
   const cc = S.env.claude_code || {};
+  const gc = S.env.gemini_cli || {};
   const planner = h("select", { value: s.planner || "auto" },
     h("option", { value: "auto" }, "Tự động (ưu tiên Claude Code)"),
     h("option", { value: "claude_code" }, "Claude Code — dùng gói Claude Pro/Max của bạn"),
     h("option", { value: "api" }, "Anthropic API key — tính phí riêng"));
+  const geminiKey = h("input", { type: "password", placeholder: s.gemini_key_set ? `Đã lưu (${s.gemini_key_hint}) · nhập để thay` : s.gemini_key_from_env ? "Đang dùng biến môi trường GEMINI_API_KEY / GOOGLE_API_KEY" : "AIza…", autocomplete: "off" });
+  const geminiBackend = h("select", { value: s.gemini_backend || "auto" },
+    h("option", { value: "auto" }, "Tự động (ưu tiên Gemini API key)"),
+    h("option", { value: "gemini_api" }, "Google Gemini API key"),
+    h("option", { value: "gemini_cli" }, "Gemini CLI — lệnh gemini trên máy"));
   const remote = h("input", { type: "text", value: s.backup_remote || "gdrive:FilmMaker", placeholder: "gdrive:FilmMaker" });
   const autoBackup = h("input", { type: "checkbox", checked: !!s.auto_backup });
   const autoQC = h("input", { type: "checkbox", checked: s.auto_qc !== false });
@@ -4278,7 +4356,7 @@ async function openSettings() {
           field("Nghỉ tối đa (giây)", pmax),
           field("Số lần thử lại khi lỗi tạm", retries)),
         h("p", { class: "help", style: { marginTop: "8px" } }, "Nghỉ ngẫu nhiên giữa các lần gửi để Flow không coi là bot. Chỉ thử lại các lỗi mà gflow báo là tạm thời.")),
-      h("section", { class: "settings-sec" }, h("h3", {}, "Claude AI (viết storyboard)"),
+      h("section", { class: "settings-sec" }, h("h3", {}, "Claude AI (mặc định)"),
         h("div", { class: "stack" },
           field("Cách gọi Claude", planner),
           h("div", { class: "row small" },
@@ -4291,6 +4369,22 @@ async function openSettings() {
             s.anthropic_key_set ? h("label", { class: "check" }, h("input", { type: "checkbox", onchange: (e) => { clearKey = e.target.checked; } }), h("span", { class: "small" }, "Xoá key đã lưu")) : null,
             h("span", { class: "spacer" }), h("a", { class: "small", href: "https://console.anthropic.com/settings/keys", target: "_blank", rel: "noopener" }, "Lấy API key ↗")),
           h("p", { class: "help" }, "Key được lưu trên máy này ở ~/.config/filmmaker/settings.json (chỉ tài khoản của bạn đọc được)."))),
+      h("section", { class: "settings-sec" }, h("h3", {}, "Gemini Pro (tuỳ chọn khi tạo dự án)"),
+        h("div", { class: "stack" },
+          field("Cách gọi Gemini Pro", geminiBackend),
+          h("div", { class: "row small" },
+            h("span", { class: "pill " + ((s.gemini_key_set || s.gemini_key_from_env) ? "ok" : gc.available ? (gc.logged_in ? "ok" : "warn") : "") },
+              (s.gemini_key_set || s.gemini_key_from_env) ? "Đã có Gemini API key"
+                : gc.available ? (gc.logged_in ? "Gemini CLI đã đăng nhập" : "Gemini CLI chưa đăng nhập") : "Chưa thiết lập Gemini Pro"),
+            h("span", { class: "muted" }, (s.gemini_key_set || s.gemini_key_from_env)
+              ? "Dùng model gemini-2.5-pro qua Google AI Studio API."
+              : gc.available ? "Có thể thêm Gemini API key hoặc đăng nhập lệnh gemini trong Terminal."
+                : "Nhập Gemini API key từ Google AI Studio để chọn Gemini Pro khi tạo dự án.")),
+          field("Gemini API key", geminiKey, "dùng khi chọn Model AI là Gemini Pro"),
+          h("div", { class: "row" },
+            s.gemini_key_set ? h("label", { class: "check" }, h("input", { type: "checkbox", onchange: (e) => { clearGeminiKey = e.target.checked; } }), h("span", { class: "small" }, "Xoá key đã lưu")) : null,
+            h("span", { class: "spacer" }), h("a", { class: "small", href: "https://aistudio.google.com/apikey", target: "_blank", rel: "noopener" }, "Lấy Gemini API key ↗")),
+          h("p", { class: "help" }, "Khi tạo dự án mới, model mặc định vẫn là Claude; bạn có thể chuyển sang Gemini Pro cho từng dự án."))),
       h("section", { class: "settings-sec" }, h("h3", {}, "Backup lên Google Drive"),
         h("div", { class: "stack" },
           backupState,
@@ -4354,7 +4448,9 @@ async function openSettings() {
           yt_privacy: document.getElementById("set-yt-priv")?.value || "public",
           auto_publish: !!document.getElementById("set-auto-pub")?.checked,
           auto_publish_platforms: pubPlats,
-          anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey });
+          anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey,
+          gemini_backend: geminiBackend.value,
+          gemini_api_key: geminiKey.value.trim() || undefined, clear_gemini_key: clearGeminiKey });
         S.env = await api("GET", "/api/env"); if (S.cur) loadPublish(true); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }
     } }],

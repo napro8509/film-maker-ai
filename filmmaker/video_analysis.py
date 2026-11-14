@@ -879,13 +879,28 @@ def _sheet_text(sheets: list[dict]) -> str:
 
 
 def ask_claude(brief: str, sheets: list[dict], folder: Path, *, backend: str = "auto", api_key: str | None = None,
-               timeout: int = 1200, log: Log = print, should_stop: StopCheck = lambda: False) -> VideoAnalysis:
+               timeout: int = 1200, ai_model: str | None = None, gemini_api_key: str | None = None,
+               log: Log = print, should_stop: StopCheck = lambda: False) -> VideoAnalysis:
+    from . import ai as ai_mod
     from .planner import MODEL, _subscription_env, claude_code_binary
 
     user = brief + "\n\nWrite the analysis."
     if sheets:
         user += ("\n\nContact sheets (image files in the current folder; open EVERY one with the Read tool before "
                  "answering; the shot number is printed on the first frame of each shot):\n" + _sheet_text(sheets))
+    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO or backend in ("gemini_api", "gemini_cli"):
+        chosen = ai_mod.pick_backend(backend, ai_model=ai_mod.GEMINI_PRO, gemini_api_key=gemini_api_key)
+        if not chosen:
+            raise AnalysisError(ai_mod.not_ready_message(ai_mod.GEMINI_PRO))
+        log(f"Gemini Pro ({'Gemini CLI' if chosen == 'gemini_cli' else 'API'}) đang xem {len(sheets)} bảng ảnh "
+            "và viết bản phân tích… (thường 2–6 phút)")
+        try:
+            return ai_mod.ask(SYSTEM, user, VideoAnalysis,
+                              images=[(s["file"], folder / s["file"]) for s in sheets],
+                              backend=chosen, timeout=timeout, ai_model=ai_mod.GEMINI_PRO,
+                              gemini_api_key=gemini_api_key)
+        except RuntimeError as exc:
+            raise AnalysisError(str(exc)) from None
     if backend == "auto":
         backend = "claude_code" if claude_code_binary() else "api"
     log(f"Claude ({'gói Claude Code' if backend == 'claude_code' else 'API'}) đang xem {len(sheets)} bảng ảnh "
@@ -984,8 +999,11 @@ def load(folder: Path) -> dict[str, Any]:
 
 
 def analyze(source: str, folder: Path, *, use_rea: bool = True, backend: str = "auto", api_key: str | None = None,
+            ai_model: str | None = None, gemini_api_key: str | None = None,
             allow_local: bool = True, log: Log = print, should_stop: StopCheck = lambda: False) -> dict[str, Any]:
     """Run every step and save folder/analysis.json + report.md. Returns the saved data."""
+    from . import ai as ai_mod
+
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "meta.json").write_text(json.dumps({"source": source, "started": time.time()}), encoding="utf-8")
     src = fetch(source, folder, allow_local=allow_local, log=log, should_stop=should_stop)
@@ -1002,14 +1020,20 @@ def analyze(source: str, folder: Path, *, use_rea: bool = True, backend: str = "
                 m["shots"], m["shot_source"] = shots, "rea-video"
     else:
         log("Bỏ qua rea-video (đã tắt).")
-    log("Trích ảnh từng shot cho Claude xem…")
+    log(f"Trích ảnh từng shot cho {ai_mod.ai_model_label(ai_model)} xem…")
     sheets = contact_sheets(video, m["shots"], folder / "frames", aspect=m["aspect"], should_stop=should_stop)
     brief = _brief(src, m, reel)
     (folder / "brief.txt").write_text(brief, encoding="utf-8")
+    extra_kw: dict[str, Any] = {}
+    if ai_model:
+        extra_kw["ai_model"] = ai_model
+    if gemini_api_key:
+        extra_kw["gemini_api_key"] = gemini_api_key
     ai = ask_claude(brief, sheets, folder / "frames", backend=backend, api_key=api_key, log=log,
-                    should_stop=should_stop)
+                    should_stop=should_stop, **extra_kw)
     data = {
         "version": 1, "id": folder.name, "created": time.time(),
+        **({"ai_model": ai_mod.GEMINI_PRO} if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO else {}),
         "source": {k: v for k, v in src.items() if k != "subtitles"},
         "subtitles": src.get("subtitles", ""),
         "measured": {**{k: v for k, v in m.items() if k != "shots"},
@@ -1199,6 +1223,7 @@ def _clip_durations(sb, meta) -> None:
 
 def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None, language_hint: str | None = None,
                        dialogue_language: str | None = None, backend: str = "auto", api_key: str | None = None,
+                       ai_model: str | None = None, gemini_api_key: str | None = None,
                        mode: str = "style", fmt: str | None = None):
     """A new Storyboard from the analysed video. Returns (storyboard, backend).
 
@@ -1208,10 +1233,16 @@ def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None,
     mode "style": a NEW story in the same format and style; "same": a remake of the reference where only the
     characters are new. Either way each scene gets `screen_time` from the scene budget, so the cut film is as
     long as the reference (a scene can be 2 s on screen; its clip is rendered short and trimmed)."""
+    from . import ai as ai_mod
     from . import formats, model_meta
 
     if mode not in FILM_MODES:
         raise ValueError(f"mode must be one of {FILM_MODES}")
+    extra_ai: dict[str, Any] = {}
+    if ai_mod.effective_ai_model(ai_model) == ai_mod.GEMINI_PRO:
+        extra_ai["ai_model"] = ai_mod.GEMINI_PRO
+    if gemini_api_key:
+        extra_ai["gemini_api_key"] = gemini_api_key
     ai = data.get("ai") or {}
     aspect = (data.get("measured") or {}).get("aspect") or "16:9"
     n = max(1, min(MAX_SCENES, scenes or suggested_scenes(data)))
@@ -1232,7 +1263,7 @@ def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None,
         from .planner import plan_auto
 
         sb, used = plan_auto(prompt, backend=backend, api_key=api_key, scenes=n, aspect=aspect,
-                             language_hint=language_hint, dialogue_language=dialogue_language)
+                             language_hint=language_hint, dialogue_language=dialogue_language, **extra_ai)
         sb.format = formats.DRAMA
     else:
         from .basic_planner import plan_basic
@@ -1242,7 +1273,7 @@ def plan_from_analysis(data: dict, idea: str = "", *, scenes: int | None = None,
                               visual="other" if style_prompt else "realistic", custom_style=style_prompt,
                               scenes=n, aspect=aspect if aspect in ("16:9", "9:16") else "9:16",
                               language=dialogue_language if speaks else language_hint,
-                              backend=backend, api_key=api_key)
+                              backend=backend, api_key=api_key, **extra_ai)
     budget = scene_budget(data.get("measured") or {}, len(sb.scenes) or n)
     for s, b in zip(sb.scenes, budget):
         s.screen_time = b["length"]
