@@ -43,8 +43,9 @@ AUDIO: dict[str, dict] = {
     "dialogue": {
         "label": "Có thoại", "desc": "Kịch bản có lời nhân vật, cần lồng tiếng hoặc khớp môi",
         "guide": ("Characters speak. A scene with words has ONE `speaker` (face visible, one line of at most 12 "
-                  "words) and every other visible person in `listeners`; `narration` = that line (the subtitle). "
-                  "Scenes without words leave `speaker` empty."),
+                  "words) and every other visible person in `listeners`; `narration` = exactly that line (the subtitle). "
+                  "Scenes without words leave both `speaker` and `narration` empty: never a `narration` without "
+                  "a `speaker`."),
         "rule": "Spoken language: {lang}. Only one person speaks; everyone else keeps lips closed.",
     },
     "silent": {

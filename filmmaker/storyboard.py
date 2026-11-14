@@ -555,6 +555,23 @@ class Storyboard(StoryboardDraft):
         return self.subtitle_language != NO_SUBTITLES
 
     @model_validator(mode="after")
+    def _dialogue_subtitles(self) -> "Storyboard":
+        """Basic films with spoken dialogue: the subtitle IS the speaker's line, nothing else. A scene without a
+        `speaker` has no subtitle: a free `narration` there read like dialogue but never reached the video prompt.
+        Translations are kept while the line is unchanged and dropped (re-translated when editing) otherwise."""
+        if not (self.basic and self.audio == "dialogue"):
+            return self
+        for s in self.scenes:
+            sp = s.video_shot.speaker if s.video_shot else None
+            line = " ".join(str(sp.line or "").split()) if sp else ""
+            if line == " ".join(str(s.narration or "").split()):
+                if not line:
+                    s.narration, s.subtitles = None, None
+                continue
+            s.narration, s.subtitles = (line or None), None
+        return self
+
+    @model_validator(mode="after")
     def _check_scene_characters(self) -> "Storyboard":
         if all(s.characters is None for s in self.scenes):
             return self  # old storyboards: duplicate / empty names stay allowed

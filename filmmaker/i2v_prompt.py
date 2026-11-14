@@ -244,10 +244,9 @@ def _gaze(sp: Speaker, shot: VideoShot, side: str) -> tuple[str, str]:
     if target is None and listeners:
         target = listeners[0]
     if target is not None:
-        d = frame_side(target.position) or _other(side) or "right"
-        if d == "center":
-            d = _other(side) or "right"
-        return d, f"locks gaze onto {_tag(target.visual_tag)} on frame {d} {level}"
+        where = frame_side(target.position) or _other(side) or "right"
+        d = _other(side) or "right" if where == "center" else where  # a center partner: turn inward, say center
+        return d, f"locks gaze onto {_tag(target.visual_tag)} on frame {where} {level}"
     d = _other(side) or "right"
     return d, f"holds steady focus toward the {d} edge of the frame {level}"
 

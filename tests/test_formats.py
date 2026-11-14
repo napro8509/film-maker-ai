@@ -516,3 +516,62 @@ def test_plural_listeners_and_chubby_children():
     assert "the two children on the toilet lid face frame left" in assemble(shot, audio_mode="dialogue", language=None)
     assert child_safe("A little boy with short dark hair and a round chubby face") == \
         "A schoolboy with short dark hair and a round face"
+
+
+# --- dialogue films: the subtitle is the spoken line, nothing else -------------------------------------------------
+
+def _talk(line=None, narration=None, subtitles=None):
+    shot = {"camera": "Static locked-off medium shot", "action": "the mother holds the spoon"}
+    if line is not None:
+        shot["speaker"] = {"position": "frame right", "visual_tag": "the woman in the cream cardigan", "line": line}
+    sc = {"id": "s01", "mode": "keyframe", "image_prompt": "a mother and a toddler", "prompt": "x", "video_shot": shot}
+    if narration is not None:
+        sc["narration"] = narration
+    if subtitles is not None:
+        sc["subtitles"] = subtitles
+    return Storyboard.model_validate({"title": "t", "style": "s", "format": "clip", "audio": "dialogue",
+                                      "dialogue_language": "Vietnamese", "scenes": [sc]})
+
+
+def test_dialogue_film_scene_without_speaker_has_no_subtitle():
+    sb = _talk(narration="Há miệng nào, bé của mẹ ơi.", subtitles={"en": "Open wide"})
+    s = sb.scenes[0]
+    assert s.narration is None and s.subtitles is None
+    assert "Há miệng" not in sb.video_prompt(s)
+
+
+def test_dialogue_film_subtitle_follows_the_speaker_line():
+    sb = _talk(line="Há miệng nào, bé của mẹ ơi.", narration="Một câu khác.", subtitles={"en": "Another line"})
+    s = sb.scenes[0]
+    assert s.narration == "Há miệng nào, bé của mẹ ơi." and s.subtitles is None  # stale translation dropped
+    assert "Há miệng nào, bé của mẹ ơi." in sb.video_prompt(s)
+    kept = _talk(line="Ăn nào", narration="Ăn nào", subtitles={"en": "Eat up"}).scenes[0]
+    assert kept.subtitles.en == "Eat up"
+    assert _talk(line="Ăn nào").scenes[0].narration == "Ăn nào"
+
+
+def test_voiceover_narration_is_untouched():
+    sb = Storyboard.model_validate({"title": "t", "style": "s", "format": "clip", "audio": "voiceover", "scenes": [
+        {"id": "s01", "mode": "keyframe", "image_prompt": "a", "prompt": "x", "narration": "Ngày xưa."}]})
+    assert sb.scenes[0].narration == "Ngày xưa."
+
+
+def test_planner_flags_narration_without_speaker_in_dialogue_film():
+    draft = {"characters": [], "scenes": [
+        {"id": "s01", "camera": "Static shot", "action": "the toddler opens her mouth", "narration": "Há miệng nào"},
+        {"id": "s02", "camera": "Static shot", "action": "the toddler squirms"}]}
+    bad = basic_planner.problems(draft, "dialogue")
+    assert any("no `speaker`" in m for m in bad.get("s01", []))
+    assert "s02" not in bad
+    assert "s01" not in basic_planner.problems(draft, "voiceover")
+
+
+def test_center_partner_gaze_says_frame_center():
+    from filmmaker import i2v_prompt
+    shot = i2v_prompt.VideoShot.model_validate({
+        "camera": "Static locked-off medium shot", "action": "a",
+        "speaker": {"position": "frame right", "visual_tag": "the woman in the cream cardigan", "line": "Ăn nào",
+                    "gaze": "the toddler girl in the pink romper"},
+        "listeners": [{"position": "frame center", "visual_tag": "the toddler girl in the pink romper"}]})
+    text = i2v_prompt.assemble(shot, audio_mode="dialogue", language="Vietnamese")
+    assert "turns head toward frame left" in text and "pink romper on frame center" in text
