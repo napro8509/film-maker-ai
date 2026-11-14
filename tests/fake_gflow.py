@@ -99,6 +99,36 @@ for rule in filter(None, os.environ.get("FAKE_GFLOW_FAIL", "").split(",")):
 def out_path():
     return Path(argv[argv.index("-o") + 1])
 
+
+# --ref caps of the real gflow-cli (mirror of filmmaker/ref_caps.py): too many references -> exit 2, like
+# "veo-lite allows at most 3 reference image(s); got 4." No JSON payload with an exit_code, as gflow does.
+IMAGE_REF_CAPS = {"nano2": 10, "nano-pro": 10, "nanopro": 10, "imagen4": 3, "nano2-lite": 3}
+VIDEO_REF_CAPS = {"veo-lite": 3, "veo-lite-lp": 3, "veo-fast": 3, "veo-quality": 3}
+
+
+def _model_arg():
+    return argv[argv.index("--model") + 1] if "--model" in argv else None
+
+
+def _ref_count():
+    return argv.count("--ref")
+
+
+def _enforce_ref_cap(caps, default):
+    cap = caps.get(_model_arg(), default)
+    n = _ref_count()
+    if n > cap:
+        print(json.dumps({"status": "fail", "error": {
+            "title": "too many references", "detail": f"{_model_arg() or 'model'} allows at most {cap} "
+            f"reference image(s); got {n}.", "exit_code": 2, "retryable": False}}))
+        sys.exit(2)
+
+
+if argv[:2] == ["image", "i2i"]:
+    _enforce_ref_cap(IMAGE_REF_CAPS, 3)
+elif argv[:2] == ["video", "r2v"]:
+    _enforce_ref_cap(VIDEO_REF_CAPS, 3)
+
 if argv[:2] == ["project", "create"]:
     print(json.dumps({"status": "ok", "project_id": "proj-123", "title": "t"}))
 elif argv[:2] in (["image", "t2i"], ["image", "i2i"]):

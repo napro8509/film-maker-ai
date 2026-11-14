@@ -69,11 +69,19 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def build_prompt(motion: str, *, refs: int, aspect: str, model: str | None, duration: int | None) -> str:
-    parts = ["Make exactly 1 video from the first attached image: use that image as the exact first frame "
-             "and keep the same people, faces, clothes, lighting and setting."]
-    if refs:
-        parts.append(f"The other {refs} attached image(s) are character references: keep those characters' faces identical.")
+def build_prompt(motion: str, *, refs: int, aspect: str, model: str | None, duration: int | None,
+                 image: bool = True) -> str:
+    if image:
+        parts = ["Make exactly 1 video from the first attached image: use that image as the exact first frame "
+                 "and keep the same people, faces, clothes, lighting and setting."]
+        if refs:
+            parts.append(f"The other {refs} attached image(s) are character references: keep those characters' "
+                         "faces identical.")
+    else:
+        parts = ["Make exactly 1 video."]
+        if refs:
+            parts.append(f"The {refs} attached image(s)/characters are references: keep those characters' faces, "
+                         "hair and clothes identical.")
     spec = [f"aspect ratio {aspect}"]
     if model:
         spec.append(f"model {model}")
@@ -825,31 +833,36 @@ def check_start_frame(image: Path, out: Path) -> None:
 
 def run_i2v(args) -> dict:
     dl = Deadline(args.timeout)  # first: the budget counts from the moment the driver starts
-    image = Path(args.image).expanduser()
+    image = Path(args.image).expanduser() if args.image else None  # None = reference-to-video (characters only)
     refs = list(args.ref or [])
-    for p in [image, *(Path(v).expanduser() for k, v in split_refs(refs) if k == "file")]:
+    if image is None and not refs:
+        raise Fail(EXIT_USAGE, "cần ảnh bắt đầu (--image) hoặc ít nhất một ảnh/nhân vật tham chiếu (--ref)")
+    to_check = [p for k, v in split_refs(refs) if k == "file" for p in (Path(v).expanduser(),)]
+    for p in ([image] if image is not None else []) + to_check:
         if not p.is_file():
             raise Fail(EXIT_USAGE, f"không thấy ảnh {p}")
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    prompt = build_prompt(args.prompt, refs=len(refs), aspect=args.aspect, model=args.model, duration=args.duration)
+    prompt = build_prompt(args.prompt, refs=len(refs), aspect=args.aspect, model=args.model, duration=args.duration,
+                          image=image is not None)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise Fail(EXIT_USAGE, f"Python này chưa có Playwright ({sys.executable}). Hãy dùng Python của gflow-cli.") from exc
 
+    files = ([str(image)] if image is not None else []) + refs
     with sync_playwright() as pw:
         window = "headless" if args.headless else args.window
         ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project, deadline=dl)
         try:
-            result = _i2v_on_page(page, args, prompt, [str(image), *refs], out, dl)
+            result = _i2v_on_page(page, args, prompt, files, out, dl)
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
-    if result.get("status") == "ok" and not result.get("dry_run"):
-        check_start_frame(image, out)
+    if result.get("status") == "ok" and not result.get("dry_run") and image is not None:
+        check_start_frame(image, out)  # only image-to-video must start on the attached frame
     return result
 
 
@@ -1197,7 +1210,7 @@ def main(argv: list[str] | None = None) -> int:
 
     a = sub.add_parser("i2v")
     common(a, 1800)
-    a.add_argument("--image", required=True)
+    a.add_argument("--image", help="start frame (image-to-video); omit for reference-to-video (characters only)")
     a.add_argument("--ref", action="append")
     a.add_argument("--duration", type=int)
     a.add_argument("--max-credits", type=int, default=0, help="reject Flow's offer above this many credits (0 = no limit)")

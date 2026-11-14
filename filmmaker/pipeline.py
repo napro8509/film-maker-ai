@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Literal
 
 from . import durations as dur
-from . import flow_caps, manual_clip, model_meta
+from . import flow_caps, manual_clip, model_meta, ref_caps
 from . import progress as prog
 from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
 from .flow_ui import character_ref
@@ -147,14 +147,40 @@ class Pipeline:
             out.append(mid or p)
         return out
 
+    def _has_flow_char_ref(self, refs: list[tuple[str, Path]], project: str) -> bool:
+        """True when any of these references is a character made on Flow's Characters page (attached by name
+        on the chat composer, not uploaded as a file)."""
+        return any(self.flow_character(name, project, p) for name, p in refs)
+
+    def _prefer_ui(self, refs: list[tuple[str, Path]], project: str, cap: int) -> bool:
+        """Drive the Flow chat page instead of the gflow CLI for these references: when a character is a Flow
+        character (attached by name), or there are more references than the CLI model accepts (it rejects the
+        extra ones with exit 2). Only matters when the chat driver is available."""
+        return bool(self.g.ui_available() and (len(refs) > cap or self._has_flow_char_ref(refs, project)))
+
+    def _cap_cli_refs(self, items: list, refs: list[tuple[str, Path]], cap: int, what: str) -> list:
+        """Trim `items` (parallel to `refs`) to the model's `--ref` cap so the gflow CLI does not crash with
+        exit 2, logging which characters were dropped. Reached only when the chat page is unavailable (there,
+        references are attached by name with no cap)."""
+        if cap is None or len(items) <= cap:
+            return items
+        dropped = ", ".join(n for n, _ in refs[cap:])
+        self.log(f"  ⚠ {what}: gflow chỉ nhận {cap} ảnh tham chiếu nên chỉ gửi {cap}/{len(refs)} ảnh "
+                 f"(bỏ: {dropped}). Bật giao diện chat của Flow để gắn mọi nhân vật không giới hạn.")
+        return items[:cap]
+
     def _image_with_refs(self, what: str, prompt: str, refs: list[tuple[str, Path]], project: str,
                          kw: dict, opts: RunOptions, *, log_line: str | None = None) -> Path | None:
         """i2i with the characters' pictures; None when Flow can't do it here (the caller makes a text-only image).
 
-        The migrated Flow frontend (flow.google.com) refuses some media ids as references (exit 36, gflow #639)
-        but takes local files, so on that error the request is sent again with the files. On the agent-only
-        composer gflow refuses i2i altogether (#799): then the Flow chat page is driven instead (flow_ui i2i),
-        and the project remembers it so the next images go there straight away.
+        When a scene's characters are Flow characters, or there are more references than the image model's
+        `--ref` cap, and the Flow chat driver is available, the keyframe is made on the Flow chat composer
+        (flow_ui i2i): the Flow characters are attached by name and there is no 3-image cap.
+
+        Otherwise the migrated Flow frontend (flow.google.com) is used: it refuses some media ids as references
+        (exit 36, gflow #639) but takes local files, so on that error the request is sent again with the files.
+        On the agent-only composer gflow refuses i2i altogether (#799): then the Flow chat page is driven
+        (flow_ui i2i), and the project remembers it so the next images go there straight away.
 
         `log_line` None logs the usual "ảnh tham chiếu nhân vật" line; "" logs nothing (the caller already did)."""
         if log_line is None:
@@ -168,9 +194,12 @@ class Pipeline:
             f"the {order[i] if i < len(order) else str(i + 1) + 'th'} is {n} (keep {n}'s face, hair and clothes exactly)"
             for i, (n, _) in enumerate(refs)) + ". " + prompt)
         # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
-        if self.state.data.get("i2i_ui") and self.g.ui_available():
+        cap = ref_caps.image_cap(kw.get("model"))
+        if (self.state.data.get("i2i_ui") or self._prefer_ui(refs, project, cap)) and self.g.ui_available():
             return self._image_via_ui(what, ui_prompt, self.ui_refs(refs, project), kw)
         ref_args = files if project in self._no_media_refs else self.flow_refs(refs, project)
+        ref_args = self._cap_cli_refs(ref_args, refs, cap, "ảnh")
+        files = files[:cap] if cap is not None else files
         while True:
             try:
                 return self._with_retries(what, lambda: self.g.image_to_image(self.sb.for_flow(prompt), ref_args, **kw),
@@ -764,15 +793,24 @@ class Pipeline:
     def _text_video(self, s: Scene, prompt: str, common: dict, opts: RunOptions) -> tuple[Path, str | None, str]:
         """Text-to-video, with the characters' reference images (r2v) when there are any."""
         refs = self.sb.scene_refs(s)  # location picture + characters; never the previous keyframe
+        project = common["project"]
         if refs and not self.state.data.get("r2v_unsupported"):
             if self.sb.scene_location(s) is not None:
                 self._log_refs(s, self.sb.scene_ref_items(s))
             else:
                 self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
+            # Flow characters (or more references than the CLI accepts): attach them by name on the chat page,
+            # which has no --ref cap, instead of uploading each picture through `gflow video r2v`.
+            cap = ref_caps.video_cap(common.get("model"))
+            if self._prefer_ui(refs, project, cap):
+                self.log("  → Tạo video có nhân vật tham chiếu qua giao diện chat của Flow (gắn nhân vật theo tên).")
+                video, media_id = self._ref_video_via_ui(s, prompt, self.ui_refs(refs, project), common)
+                return video, media_id, "flow-ui-r2v"
             try:
+                send = self._cap_cli_refs([p for _, p in refs], refs, cap, "video r2v")
                 video, media_id = self._with_retries(
                     "render video",
-                    lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), [p for _, p in refs], **common), opts.max_retries)
+                    lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), send, **common), opts.max_retries)
                 return video, media_id, "r2v"
             except GflowError as exc:
                 if exc.exit_code != EXIT_NOT_PORTED:
@@ -832,7 +870,10 @@ class Pipeline:
                               submitted_at=None)
             return Path(video)
         if ui:
-            return self._render_via_ui(s, start_image, prompt, common)
+            # Attach the scene's characters too (Flow characters by name, others as pictures) so their faces
+            # stay identical even where the start frame does not show everyone.
+            char_refs = self.ui_refs(self.sb.scene_char_refs(s), project)
+            return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
         call = lambda: self.g.image_to_video(start_image, self.sb.for_flow_video(prompt, s), end_image=s.end_image, **common)
         try:
             video, media_id = self._with_retries("render video", call, opts.max_retries)
@@ -849,7 +890,8 @@ class Pipeline:
             self._remember(i2v_unsupported=True, i2v_error=str(exc))
             if self.g.ui_available():
                 self.log("  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).")
-                return self._render_via_ui(s, start_image, prompt, common)
+                char_refs = self.ui_refs(self.sb.scene_char_refs(s), project)
+                return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
             if s.mode == "i2v":
                 raise GflowError(
                     "tài khoản Flow của bạn (giao diện mới flow.google.com) chưa hỗ trợ tạo video từ ảnh qua gflow. "
@@ -943,47 +985,65 @@ class Pipeline:
                        "(có thể tốn credit)"))
         return msg
 
-    def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict) -> Path:
-        """Image-to-video by driving the Flow chat page (flow_ui.py). Never retried: Flow may have billed it."""
+    def _reject_duplicate_media(self, s: Scene, video: Path | str, media_id: str | None) -> None:
+        """Never accept a clip the chat driver downloaded that already belongs to another scene: move it out of
+        clips/<id>.mp4 (or the next run would adopt it here) and raise. No-op when the media id is new."""
+        other = next((sid for sid, st in self.state.data["scenes"].items()
+                      if sid != s.id and media_id and st.get("media_id") == media_id), None)
+        if not other:
+            return
+        tag = re.sub(r"[^A-Za-z0-9_-]", "", media_id)[:12] or "x"
+        dup = self.clip_path(s).with_name(f"{s.id}.dup-{tag}.mp4")
+        # Only ever touch a file in our clips/ that is not another scene's clip (the driver's
+        # local_path is not checked to be clips/<id>.mp4).
+        vpath = Path(video).resolve()
+        theirs = {self.clip_path(x).resolve() for x in self.sb.scenes if x.id != s.id} | {
+            Path(st["video"]).resolve() for sid, st in self.state.data["scenes"].items()
+            if sid != s.id and st.get("video")}
+        if (self.out / "clips").resolve() not in vpath.parents or vpath in theirs:
+            moved = f"; KHÔNG dời file {video} vì không phải clip của cảnh này, hãy kiểm tra tay"
+        else:
+            try:
+                Path(video).replace(dup)
+                moved = f"; đã chuyển file sang {dup}"
+            except OSError:
+                try:
+                    Path(video).unlink(missing_ok=True)
+                    moved = "; đã xoá file tải về"
+                except OSError:
+                    moved = f"; KHÔNG dời được file {video}, hãy xoá tay trước khi chạy lại"
+        raise GflowError(f"video tải về trùng với cảnh {other} (media {media_id}); video mới có thể vẫn "
+                         "đang tạo trên Flow — hãy kiểm tra trên Flow" + moved, exit_code=42,
+                         payload={"error": {"spent": True}})
+
+    def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict,
+                       refs: list[Path | str] | None = None) -> Path:
+        """Image-to-video by driving the Flow chat page (flow_ui.py). `refs` = extra character references (Flow
+        characters by name / pictures) attached after the start frame. Never retried: Flow may have billed it."""
         if s.end_image:
             self.log("  ! Ảnh kết thúc chưa dùng được qua giao diện chat; chỉ dùng ảnh bắt đầu.")
         if not self.g.dry_run:
             self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
                               submitted_at=manual_clip.stamp_now())
-        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s), **common)
+        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s), refs=refs, **common)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"không thấy file video {video}", exit_code=1)
-            other = next((sid for sid, st in self.state.data["scenes"].items()
-                          if sid != s.id and media_id and st.get("media_id") == media_id), None)
-            if other:  # never accept a clip that already belongs to another scene
-                # Move it out of clips/<id>.mp4, or the next run would adopt it as this scene's clip.
-                tag = re.sub(r"[^A-Za-z0-9_-]", "", media_id)[:12] or "x"
-                dup = self.clip_path(s).with_name(f"{s.id}.dup-{tag}.mp4")
-                # Only ever touch a file in our clips/ that is not another scene's clip (the driver's
-                # local_path is not checked to be clips/<id>.mp4).
-                vpath = Path(video).resolve()
-                theirs = {self.clip_path(x).resolve() for x in self.sb.scenes if x.id != s.id} | {
-                    Path(st["video"]).resolve() for sid, st in self.state.data["scenes"].items()
-                    if sid != s.id and st.get("video")}
-                if (self.out / "clips").resolve() not in vpath.parents or vpath in theirs:
-                    moved = f"; KHÔNG dời file {video} vì không phải clip của cảnh này, hãy kiểm tra tay"
-                else:
-                    try:
-                        Path(video).replace(dup)
-                        moved = f"; đã chuyển file sang {dup}"
-                    except OSError:
-                        try:
-                            Path(video).unlink(missing_ok=True)
-                            moved = "; đã xoá file tải về"
-                        except OSError:
-                            moved = f"; KHÔNG dời được file {video}, hãy xoá tay trước khi chạy lại"
-                raise GflowError(f"video tải về trùng với cảnh {other} (media {media_id}); video mới có thể vẫn "
-                                 "đang tạo trên Flow — hãy kiểm tra trên Flow" + moved, exit_code=42,
-                                 payload={"error": {"spent": True}})
+            self._reject_duplicate_media(s, video, media_id)
             self.state.update(s.id, status=DONE, video=str(video), media_id=media_id, rendered_as="flow-ui",
                               submitted_at=None)
         return Path(video)
+
+    def _ref_video_via_ui(self, s: Scene, prompt: str, refs: list[Path | str], common: dict) -> tuple[Path, str | None]:
+        """Reference-to-video by driving the Flow chat page: no start frame, the characters are attached (Flow
+        characters by name, others as pictures) with no --ref cap. Never retried: Flow may have billed it. The
+        caller (which already marked the scene "submitting") writes the "done" state."""
+        video, media_id = self.g.ui_image_to_video(None, self.sb.for_flow_video(prompt, s), refs=refs, **common)
+        if not self.g.dry_run:
+            if not Path(video).is_file():
+                raise GflowError(f"không thấy file video {video}", exit_code=1)
+            self._reject_duplicate_media(s, video, media_id)
+        return Path(video), media_id
 
     # --- thumbnail -------------------------------------------------------------
 

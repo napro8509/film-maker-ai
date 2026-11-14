@@ -430,15 +430,18 @@ class Gflow:
     def ui_available(self) -> bool:
         return bool(self.ui_enabled and self.ui_command() and (os.environ.get("FLOW_UI_CMD") or self.ui_profile_dir()))
 
-    def ui_image_to_video(self, image: Path, prompt: str, *, refs: list[Path] | None = None, aspect: str,
+    def ui_image_to_video(self, image: Path | None, prompt: str, *, refs: list[Path] | None = None, aspect: str,
                           model: str | None, duration: int | None, project: str | None, out: Path) -> tuple[Path, str | None]:
+        """Video through the Flow chat page. `image` is the start frame for image-to-video, or None for
+        reference-to-video (characters only, attached by name / picture). `refs` are the extra references."""
         cmd = self.ui_command()
         profile = self.ui_profile_dir()
         if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):
             raise GflowError("không tìm thấy Python/profile trình duyệt của gflow-cli để điều khiển Flow", exit_code=2)
         if not project:
             raise GflowError("cần project Flow để tạo video qua giao diện chat", exit_code=2)
-        args = [*cmd, "i2v", "--project", project, "--image", str(image), "--prompt", prompt, "--aspect", aspect,
+        start = ["--image", str(image)] if image is not None else []
+        args = [*cmd, "i2v", "--project", project, *start, "--prompt", prompt, "--aspect", aspect,
                 "-o", str(out), "--profile-dir", str(profile or "none"), "--timeout", str(self.timeout - 120)]
         for r in refs or []:
             args += ["--ref", str(r)]
@@ -450,7 +453,7 @@ class Gflow:
             args += ["--max-credits", str(self.ui_max_credits)]
         if self.ui_window in ("show", "hidden", "headless"):
             args += ["--window", self.ui_window]
-        opts = ["--image", str(image), *(a for r in refs or [] for a in ("--ref", str(r))), "--aspect", aspect]
+        opts = [*start, *(a for r in refs or [] for a in ("--ref", str(r))), "--aspect", aspect]
         if model:
             opts += ["--model", MODEL_NAMES.get(model, model)]
         if duration:

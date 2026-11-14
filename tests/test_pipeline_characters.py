@@ -1,6 +1,10 @@
 """Pipeline argv with `Scene.characters` (storyboard-board AC11, AC12): the `--ref` images sent to gflow
-follow the scene's character list (storyboard order, every character with a picture — no cap), for image i2i,
-video r2v and the fallback_t2v branch of keyframe scenes."""
+follow the scene's character list (storyboard order, every character with a picture), for image i2i,
+video r2v and the fallback_t2v branch of keyframe scenes.
+
+Here the Flow chat driver is OFF (`ui_enabled=False`), so references go through the gflow CLI, which caps
+them at the model's `--ref` limit (nano2 image = 10, Veo video = 3). When the chat driver is available the
+pipeline attaches every Flow character by name with no cap instead — see test_flow_char_refs_ui.py."""
 import json
 import shutil
 import sys
@@ -155,8 +159,9 @@ def test_r2v_refs_follow_scene_characters(env):
     assert "Lan:" not in t1[2] and "Bao: black cat" in t1[2]
     assert call_for(calls, ("video", "r2v"), "t2.mp4") is None
     assert call_for(calls, ("video", "t2v"), "t2.mp4") is not None
-    # r2v sends files (no media-id lookup); all four, storyboard order (no cap).
-    assert refs(call_for(calls, ("video", "r2v"), "t3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png", "<tmp>/bao.png"]
+    # r2v sends files (no media-id lookup); four characters but the CLI (chat driver off) caps veo-lite at 3,
+    # so only the first three in storyboard order are sent (gflow would reject a fourth with exit 2).
+    assert refs(call_for(calls, ("video", "r2v"), "t3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png"]
     assert refs(call_for(calls, ("video", "r2v"), "t4.mp4")) == ["<tmp>/lan.png", "<tmp>/tuan.png"]
 
 
@@ -192,7 +197,8 @@ def test_fallback_t2v_refs_follow_scene_characters(env, monkeypatch):
     assert "Lan:" not in k1[2] and "Hoa: white ao dai" in k1[2]
     assert call_for(calls, ("video", "r2v"), "k2.mp4") is None
     assert call_for(calls, ("video", "t2v"), "k2.mp4") is not None
-    assert refs(call_for(calls, ("video", "r2v"), "k3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png", "<tmp>/bao.png"]
+    # Four characters, Veo cap 3 on the CLI (chat driver off): first three in storyboard order.
+    assert refs(call_for(calls, ("video", "r2v"), "k3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png"]
     assert refs(call_for(calls, ("video", "r2v"), "k4.mp4")) == ["<tmp>/tuan.png"]
     # Later keyframe scenes skip the keyframe and i2v entirely.
     assert all(Path(c[c.index("-o") + 1]).stem == "k1" for c in calls if c[:2] in (["image", "i2i"], ["video", "i2v"]))
