@@ -110,6 +110,7 @@ Giao diện có:
 - **Model sắp/đã ngừng**: banner đầu dự án báo cảnh nào dùng model sắp ngừng; dropdown "Model video" gắn nhãn "sắp ngừng dd/mm" hoặc "đã ngừng"; nút "Đổi model cho các cảnh chưa render" (xem mục "Model video và ngày ngừng").
 - **Log trực tiếp** và trạng thái từng cảnh (xong / đã sửa / bị ngắt / lỗi); thông báo trên máy khi xong.
 - **Phim hoàn chỉnh**: xem nối tiếp các clip kèm phụ đề, chọn nhạc nền + âm lượng, in phụ đề lên hình, ghép, tải MP4 / .srt, mở trong Finder.
+- **Crawl video nhiều view & Phân tích video**: nhập danh sách link trang Facebook, kênh TikTok, kênh YouTube để quét và xếp hạng top video nhiều view nhất, chọn 1 hoặc nhiều video đưa thẳng sang **Phân tích video**, rồi tạo phim mới cùng phong cách.
 - **Cài đặt**: tài khoản gflow, thời gian nghỉ giữa các lần gửi, số lần thử lại, cách gọi Claude, Anthropic API key (lưu ở `~/.config/filmmaker/settings.json`), chế độ sáng/tối; kiểm tra đăng nhập Google, xem credit.
 
 ### Viết storyboard bằng gói Claude (Pro/Max), không cần API key
@@ -237,6 +238,29 @@ filmmaker analyze video.mp4 --film phim-moi/storyboard.yaml --idea "..."      # 
   ```
 
   Lần đầu nó tải ~200 MB model. Không cài thì Film Maker dùng ffmpeg + Claude.
+
+### Crawl video nhiều view → Phân tích video
+
+Bấm **Crawl video** (ở thanh bên trái, dưới nút Phân tích video), dán danh sách link trang Facebook, kênh TikTok,
+kênh YouTube (mỗi dòng 1 link hoặc cách nhau dấu phẩy). Crawler tự động quét danh sách video công khai (gồm cả tab
+`Videos` và `Shorts` trên YouTube, kênh `@handle` trên TikTok, trang/reel trên Facebook), đọc lượt xem, khử trùng lặp
+và xếp hạng từ cao xuống thấp. Trên bảng kết quả, bạn có thể lọc theo nền tảng, bấm **Phân tích** từng video hoặc tích
+chọn nhiều video rồi bấm **Phân tích N video đã chọn** để tạo sẵn các bản phân tích ở `~/FilmMaker/.analyses/`.
+Kết quả crawl lưu ở `~/FilmMaker/.crawls/<id>/` (`crawl.json`, `report.md`, `urls.txt`).
+
+```bash
+# Crawl top 10 video nhiều view nhất từ nhiều kênh YouTube / TikTok / trang Facebook
+filmmaker crawl "https://www.youtube.com/@kenhA" "https://www.tiktok.com/@kenhB" "https://www.facebook.com/pageC" -n 10
+
+# Đọc danh sách kênh từ file, lấy top 3 mỗi kênh, chỉ lấy Shorts/Reels, tải sẵn MP4
+filmmaker crawl -f sources.txt -n 3 --per-source --shorts-only --download
+
+# Crawl xong tự chạy phân tích cho top 3 video nhiều view nhất (sẵn sàng tạo storyboard)
+filmmaker crawl "https://www.youtube.com/@kenhA" -n 3 --analyze
+
+# Dùng cookie trình duyệt (khi trang Facebook / TikTok yêu cầu đăng nhập để xem danh sách video)
+filmmaker crawl "https://www.facebook.com/pageC" --cookies-from-browser chrome
+```
 
 ## Backup lên Google Drive
 

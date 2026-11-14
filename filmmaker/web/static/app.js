@@ -7,6 +7,7 @@ const S = {
   assets: { images: [], audio: [] }, job: null, jobSince: 0, jobOpen: false, pollT: null,
   saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", auth: null,
   zones: new Map(), playIdx: 0,
+  crawlView: false, crawl: null, crawls: [], lastCrawlId: null,
   charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
   locSaved: new WeakMap(), // location object → the name scenes[].location use for it (last save)
   locDescBase: new WeakMap(), // location object → { desc, n } before the first edit of its description (warning)
@@ -66,6 +67,7 @@ const ICONS = {
   minus: '<path d="M5 12h14"/>',
   arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   scan: '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M9.5 9v6l5-3z"/>',
+  trend: '<path d="m3 17 6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
 };
 function icon(name, cls = "") {
   const t = document.createElement("template");
@@ -366,6 +368,8 @@ async function init() {
   window.addEventListener("beforeunload", (e) => { if (S.pendingSave || S.saving) { save(); e.preventDefault(); e.returnValue = ""; } });
   window.addEventListener("hashchange", () => {
     const id = decodeURIComponent(location.hash.slice(1));
+    if (id === "crawl") { if (!S.crawlView || S.crawl) openCrawler(null); return; }
+    if (id.startsWith("crawl/")) { const cid = id.slice(6); if (!S.crawlView || !S.crawl || S.crawl.id !== cid) openCrawler(cid); return; }
     if (id.startsWith("analysis/")) { const aid = id.slice(9); if (!S.ana || S.ana.id !== aid) openAnalysis(aid); return; }
     if (id && (!S.cur || S.cur.id !== id) && S.projects.some((p) => p.id === id)) openProject(id).then((ok) => {
       if (ok === false && S.cur) history.replaceState(null, "", "#" + S.cur.id); // user chose to stay
@@ -383,9 +387,11 @@ async function init() {
   renderTopbar();
   await loadProjects();
   const want = decodeURIComponent(location.hash.slice(1)) || localGet("lastProject") || "";
-  if (want.startsWith("analysis/")) { await openAnalysis(want.slice(9)); loadModels(null); }
+  if (want === "crawl") { await openCrawler(null); loadModels(null); }
+  else if (want.startsWith("crawl/")) { await openCrawler(want.slice(6)); loadModels(null); }
+  else if (want.startsWith("analysis/")) { await openAnalysis(want.slice(9)); loadModels(null); }
   const pick = S.projects.some((p) => p.id === want) ? want : S.projects[0]?.id;
-  if (S.ana) { /* an analysis is open (#analysis/<id>) */ } else if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
+  if (S.ana || S.crawlView) { /* an analysis or crawl view is open */ } else if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
   const j = await api("GET", "/api/jobs/current").catch(() => null);
   if (j) {
     S.job = { ...j, lines: [] }; S.jobSince = 0; S.jobOpen = j.status === "running"; renderJobbar();
@@ -435,7 +441,7 @@ async function openProject(id) {
   loadModels(id); // in the background, not awaited
   try {
     const [d, a] = await Promise.all([api("GET", `/api/projects/${id}`), api("GET", `/api/projects/${id}/assets`)]);
-    S.cur = d; S.assets = a; S.playIdx = 0; S.ana = null;
+    S.cur = d; S.assets = a; S.playIdx = 0; S.ana = null; S.crawlView = false; S.crawl = null; S.lastCrawlId = null;
     S.dlChanged = null; // the "N clips keep the old language" warning belongs to this visit only
   } catch (e) { toast(e.message, "error"); return false; }
   rememberCharNames(); rememberLocNames();
@@ -828,6 +834,7 @@ function renderSidebar() {
   put(sb,
     h("button", { class: "btn primary block", onclick: openNewProject, title: "Phim mới", "aria-label": "Phim mới" }, icon("plus"), h("span", { class: "new-label" }, "Phim mới")),
     h("button", { class: "btn block" + (S.ana ? " on" : ""), style: { marginTop: "8px" }, onclick: openAnalyzeVideo, "aria-label": "Phân tích video", title: "Dán link một video trên mạng: Film Maker phân tích cách dựng, màu, âm thanh… rồi làm phim mới cùng phong cách" }, icon("scan"), h("span", { class: "new-label" }, "Phân tích video")),
+    h("button", { class: "btn block" + (S.crawlView ? " on" : ""), style: { marginTop: "4px" }, onclick: () => openCrawler(S.crawl?.id || S.lastCrawlId || null), "aria-label": "Crawl video", title: "Nhập link trang Facebook, kênh TikTok, YouTube để lấy top video nhiều view nhất rồi đưa sang Phân tích video" }, icon("trend"), h("span", { class: "new-label" }, "Crawl video")),
     h("div", { class: "side-title" }, h("span", { class: "spacer" }, "Dự án"), h("span", {}, S.projects.length || "")),
     S.projects.length ? null : h("p", { class: "muted small", style: { padding: "0 8px" } }, "Chưa có dự án nào."),
     S.projects.map((p) => {
@@ -854,6 +861,7 @@ function renderSidebar() {
 function renderMain() {
   const m = $("#main");
   S.zones.clear();
+  if (S.crawlView) { put(m, renderCrawler()); return; }
   if (S.ana) { put(m, renderAnalysis()); return; }
   if (!S.cur) { put(m, renderEmpty()); return; }
   // Tabs follow the workflow: set up the look & cast → build scenes → finish the film. YAML is the escape hatch.
@@ -3201,6 +3209,11 @@ async function onJobDone() {
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
   if (j.kind === "analyze" && j.status === "done" && j.result?.analysis) { await openAnalysis(j.result.analysis); return; }
+  if (j.kind === "crawl" && j.status === "done" && j.result?.crawl) { await openCrawler(j.result.crawl); return; }
+  if (j.kind === "crawl_analyze" && j.status === "done") {
+    if (j.result?.open_single && j.result?.analyses?.length === 1) { await openAnalysis(j.result.analyses[0], j.result.crawl || S.crawl?.id || null); return; }
+    if (j.result?.crawl) { await openCrawler(j.result.crawl); return; }
+  }
   if (j.kind === "auto" && j.result?.project) {
     if (!S.cur || S.cur.id !== j.result.project) await openProject(j.result.project);
     else await refreshCurrent();
@@ -3574,6 +3587,8 @@ function openAnalyzeVideo() {
   const body = h("div", { class: "stack" },
     field("Link video", url),
     h("p", { class: "help" }, "Film Maker tải video về máy, tìm từng điểm cắt, đo âm thanh, cho Claude xem ảnh từng shot rồi viết bản phân tích: nhịp dựng, chuyển cảnh, góc máy, màu, nhạc & âm thanh, chữ trên hình, nhân vật, bối cảnh, nhịp truyện. Sau đó bạn tạo phim mới cùng phong cách bằng một nút."),
+    h("p", { class: "help" }, "Muốn quét trang Facebook, kênh TikTok hoặc YouTube để lấy top video nhiều view nhất trước? ",
+      h("a", { href: "#crawl", onclick: (ev) => { ev.preventDefault(); close(); openCrawler(S.lastCrawlId || null); } }, "Mở Crawl video →")),
     va.ytdlp ? null : h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {}, "Chưa cài yt-dlp nên chỉ tải được link thẳng tới file video (.mp4). Link YouTube / TikTok / Facebook cần: ", h("code", {}, "brew install yt-dlp"), "."))),
     h("label", { class: "check" }, rea, h("span", {}, "Dùng thêm rea-video: tách nhạc / giọng / tiếng động, BPM, đọc chữ trên hình (chậm hơn vài phút)",
       va.rea_video ? null : h("span", { class: "help" }, " — chưa cài (xem README, mục Phân tích video)"))),
@@ -3594,12 +3609,13 @@ function openAnalyzeVideo() {
   }).catch((e) => put(list, h("p", { class: "muted small" }, e.message)));
 }
 
-async function openAnalysis(id) {
+async function openAnalysis(id, fromCrawlId) {
   try { S.ana = await api("GET", `/api/analyses/${id}`); }
   catch (e) { toast(e.message, "error"); return; }
   await flushSave();
-  S.cur = null;
-  toggleSidebar(false);
+  if (fromCrawlId !== undefined) S.lastCrawlId = fromCrawlId;
+  S.cur = null; S.crawlView = false; S.crawl = null;
+  if (document.body.classList.contains("side-open")) toggleSidebar(false);
   if (location.hash.slice(1) !== "analysis/" + id) history.replaceState(null, "", "#analysis/" + id);
   renderSidebar(); renderMain();
   $("#main").scrollTop = 0;
@@ -3607,6 +3623,7 @@ async function openAnalysis(id) {
 
 function closeAnalysis() {
   S.ana = null;
+  if (S.lastCrawlId) { openCrawler(S.lastCrawlId); return; }
   history.replaceState(null, "", location.pathname);
   const last = localGet("lastProject"), pick = S.projects.some((p) => p.id === last) ? last : S.projects[0]?.id;
   if (pick) openProject(pick); else { renderSidebar(); renderMain(); }
@@ -3661,6 +3678,7 @@ function renderAnalysis() {
           src.url ? h("a", { href: src.url, target: "_blank", rel: "noopener noreferrer" }, "Video gốc ", icon("external")) : null,
           d.rea?.used ? h("span", { class: "badge done mini" }, "rea-video") : null)),
       h("div", { class: "actions" },
+        S.lastCrawlId ? h("button", { class: "btn", onclick: () => openCrawler(S.lastCrawlId) }, "← Kết quả crawl") : null,
         h("button", { class: "btn primary", onclick: () => film.scrollIntoView({ behavior: "smooth", block: "start" }) }, icon("sparkle"), "Tạo phim từ video này"),
         d.rea_report ? h("a", { class: "btn", href: d.rea_report, target: "_blank", rel: "noopener" }, "Báo cáo rea-video") : null,
         h("button", { class: "btn icon", title: "Đóng", "aria-label": "Đóng bản phân tích", onclick: closeAnalysis }, icon("x")))),
@@ -3756,6 +3774,380 @@ function renderAnalysisFilmForm(d) {
       h("div", { class: "grid2" }, field("Nhân vật nói", speak.el), field("Ngôn ngữ phụ đề", sub.el)),
       about,
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", disabled: jobRunning(), onclick: go }, icon("sparkle"), goLabel))));
+}
+
+/* ---------- video crawler (Crawl video nhiều view → Phân tích video) ---------- */
+
+function safeExternalUrl(u) {
+  if (typeof u !== "string") return null;
+  const s = u.trim();
+  return /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : null;
+}
+
+function fmtViewsVi(n) {
+  if (n == null || n === "" || !Number.isFinite(+n)) return "chưa rõ";
+  const v = Math.max(0, Math.round(+n));
+  if (v >= 1000000000) return (v / 1000000000).toFixed(1).replace(/\.0$/, "").replace(".", ",") + " tỷ";
+  if (v >= 1000000) return (v / 1000000).toFixed(1).replace(/\.0$/, "").replace(".", ",") + " Tr";
+  if (v >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, "").replace(".", ",") + " N";
+  return String(v);
+}
+
+function platLabel(p) {
+  return { youtube: "YouTube", tiktok: "TikTok", facebook: "Facebook" }[p] || "Web";
+}
+
+function fmtUploadDate(raw) {
+  const s = String(raw || "").trim();
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  return s;
+}
+
+async function openCrawler(id) {
+  await flushSave();
+  let detail = null;
+  const [listRes, detailRes] = await Promise.allSettled([
+    api("GET", "/api/crawls"),
+    id ? api("GET", `/api/crawls/${encodeURIComponent(id)}`) : Promise.resolve(null),
+  ]);
+  if (listRes.status === "fulfilled" && Array.isArray(listRes.value)) S.crawls = listRes.value;
+  if (id) {
+    if (detailRes.status === "fulfilled" && detailRes.value) {
+      detail = detailRes.value;
+      S.lastCrawlId = detail.id;
+    } else {
+      toast(detailRes.reason?.message || "Không mở được bản crawl", "error");
+    }
+  }
+  S.crawl = detail;
+  S.crawlView = true;
+  S.ana = null;
+  S.cur = null;
+  if (document.body.classList.contains("side-open")) toggleSidebar(false);
+  const hash = detail ? "crawl/" + encodeURIComponent(detail.id) : "crawl";
+  if (location.hash.slice(1) !== hash) history.replaceState(null, "", "#" + hash);
+  renderSidebar();
+  renderMain();
+  $("#main").scrollTop = 0;
+}
+
+function closeCrawler() {
+  S.crawlView = false;
+  S.crawl = null;
+  S.lastCrawlId = null;
+  history.replaceState(null, "", location.pathname);
+  const last = localGet("lastProject"), pick = S.projects.some((p) => p.id === last) ? last : S.projects[0]?.id;
+  if (pick) openProject(pick); else { renderSidebar(); renderMain(); }
+}
+
+function renderCrawler() {
+  const ce = S.env?.crawler || {}, va = S.env?.video_analysis || {};
+  const hasYtdlp = !!(ce.ytdlp ?? va.ytdlp);
+  const urlsBox = h("textarea", {
+    rows: 4,
+    placeholder: "Dán mỗi dòng 1 link trang Facebook, kênh TikTok hoặc kênh YouTube:\nhttps://www.youtube.com/@tenkenh\nhttps://www.tiktok.com/@tenkenh\nhttps://www.facebook.com/tenpage",
+    value: localGet("crawlUrls", ""),
+    oninput: (e) => localSet("crawlUrls", e.target.value),
+  });
+  const topInp = h("input", { type: "number", min: 1, max: 100, value: localGet("crawlTopN", 10),
+    oninput: (e) => localSet("crawlTopN", +e.target.value || 10) });
+  const scanInp = h("input", { type: "number", min: 5, max: 500, value: localGet("crawlScanLimit", 50),
+    oninput: (e) => localSet("crawlScanLimit", +e.target.value || 50) });
+  const browserSel = h("select", { value: localGet("crawlBrowser", ""), onchange: (e) => localSet("crawlBrowser", e.target.value) },
+    h("option", { value: "" }, "Không dùng cookie"),
+    (ce.browsers || ["chrome", "safari", "brave", "edge", "firefox"]).map((b) =>
+      h("option", { value: b }, b.charAt(0).toUpperCase() + b.slice(1))));
+  const perSourceChk = h("input", { type: "checkbox", checked: !!localGet("crawlPerSourceBool", false),
+    onchange: (e) => localSet("crawlPerSourceBool", e.target.checked) });
+  const shortsChk = h("input", { type: "checkbox", checked: !!localGet("crawlShortsOnly", false),
+    onchange: (e) => localSet("crawlShortsOnly", e.target.checked) });
+  const dlChk = h("input", { type: "checkbox", checked: !!localGet("crawlDownload", false),
+    onchange: (e) => localSet("crawlDownload", e.target.checked) });
+
+  const startCrawlJob = async (e) => {
+    const raw = urlsBox.value.trim();
+    if (!raw) { toast("Hãy nhập ít nhất một link trang Facebook, kênh TikTok hoặc YouTube", "error"); urlsBox.focus(); return; }
+    if (!hasYtdlp) { toast("Cần cài yt-dlp (brew install yt-dlp) để crawl video", "error"); return; }
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    const body = {
+      urls: raw,
+      top_n: Math.max(1, Math.min(100, +topInp.value || 10)),
+      per_source: perSourceChk.checked,
+      scan_limit: Math.max(5, Math.min(500, +scanInp.value || 50)),
+      shorts_only: shortsChk.checked,
+      cookies_from_browser: browserSel.value || null,
+      download: dlChk.checked,
+    };
+    try {
+      startJob(await api("POST", "/api/crawls", body));
+      toast("Đang quét kênh/trang và xếp hạng video nhiều view nhất…", "", 5000);
+    } catch (err) {
+      toast(err.message, "error");
+      btn.disabled = false;
+    }
+  };
+
+  const formCard = h("section", { class: "card card-pad stack" },
+    h("div", { class: "card-head", style: { marginBottom: 0 } },
+      h("h3", {}, "Nguồn kênh / trang cần crawl"),
+      h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, "Hỗ trợ Facebook Page · TikTok @kênh · YouTube @kênh (cả Videos & Shorts)")),
+    hasYtdlp ? null : h("div", { class: "banner warn flush" }, icon("alert"),
+      h("div", { class: "b-body" }, h("div", {}, "Chưa cài yt-dlp. Mở Terminal chạy ", h("code", {}, "brew install yt-dlp"), " để crawl được YouTube / TikTok / Facebook."))),
+    field("Danh sách link (mỗi dòng 1 link hoặc cách nhau dấu phẩy)", urlsBox),
+    h("div", { class: "grid3 crawl-opts-grid" },
+      field("Số top video cần lấy", topInp, "tối đa 100"),
+      field("Số video quét / kênh", scanInp, "5–500"),
+      field("Cookie trình duyệt", browserSel, "hữu ích cho Facebook/TikTok")),
+    h("div", { class: "stack tight" },
+      h("label", { class: "check" }, perSourceChk, h("span", {}, "Lấy top N riêng cho mỗi kênh/trang (thay vì gộp chung bảng xếp hạng)")),
+      h("label", { class: "check" }, shortsChk, h("span", {}, "Chỉ lấy video ngắn (Shorts / Reels / TikTok ≤ 3 phút)")),
+      h("label", { class: "check" }, dlChk, h("span", {}, "Tải sẵn file MP4 (≤720p) của top video về máy",
+        h("span", { class: "sub" }, "Khi bấm Phân tích sẽ dùng ngay file đã tải, không phải tải lại.")))),
+    h("div", { class: "row" },
+      h("span", { class: "help" }, "Không tốn credit Flow. Xếp hạng ưu tiên theo lượt xem cao nhất."),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn primary", disabled: jobRunning(), onclick: startCrawlJob }, icon("trend"), "Bắt đầu crawl", FREE())));
+
+  const resultSection = S.crawl ? renderCrawlResult(S.crawl, urlsBox) : null;
+  const historyCard = renderCrawlHistory();
+
+  return h("div", { class: "main-inner crawl-page stack" },
+    h("div", { class: "phead", style: { marginBottom: 0 } },
+      h("div", { class: "title-col" },
+        h("div", { class: "muted small" }, "Crawl & chọn lọc video mẫu"),
+        h("h1", {}, "Crawl video nhiều view"),
+        h("p", { class: "muted small" }, "Quét hàng loạt trang Facebook, kênh TikTok, kênh YouTube để lấy những video nhiều view nhất, sẵn sàng đưa thẳng sang Phân tích video và tạo phim cùng phong cách.")),
+      h("div", { class: "actions" },
+        h("button", { class: "btn", onclick: openAnalyzeVideo }, icon("scan"), "Phân tích 1 link lẻ"),
+        h("button", { class: "btn icon", title: "Đóng", "aria-label": "Đóng Crawl video", onclick: closeCrawler }, icon("x")))),
+    formCard,
+    resultSection,
+    historyCard);
+}
+
+function renderCrawlResult(c, urlsBox) {
+  const videos = c.videos || [], sources = c.sources || [];
+  const va = S.env?.video_analysis || {};
+  const selected = new Set(videos.filter((v) => !v.analysis_id).slice(0, 3).map((v) => v.url).filter(Boolean));
+  let platFilter = "all";
+  let stateFilter = "all";
+  const reaChk = h("input", {
+    type: "checkbox",
+    checked: !!va.rea_video && localGet("anaRea", true) !== false,
+    disabled: !va.rea_video,
+    onchange: (e) => localSet("anaRea", e.target.checked),
+  });
+
+  const runAnalyze = async (urls, { force = false, openSingle = false } = {}, btn = null) => {
+    if (!urls.length) { toast("Hãy chọn ít nhất 1 video để phân tích", "error"); return; }
+    if (!S.env?.planner) { toast("Cần Claude Code (đã đăng nhập) hoặc Anthropic API key để phân tích video", "error"); return; }
+    if (btn) btn.disabled = true;
+    try {
+      const j = await api("POST", `/api/crawls/${encodeURIComponent(c.id)}/analyze`, {
+        urls,
+        use_rea: reaChk.checked,
+        force,
+        open_single: openSingle,
+      });
+      startJob(j);
+      toast(urls.length === 1 ? "Đang phân tích video…" : `Đang phân tích lần lượt ${urls.length} video…`, "", 6000);
+    } catch (err) {
+      toast(err.message, "error");
+      if (btn) btn.disabled = false;
+    }
+  };
+
+  const listBox = h("div", { class: "stack tight" });
+  const toolbarBox = h("div", { class: "crawl-toolbar" });
+
+  const visibleVideos = () => videos.filter((v) => {
+    if (platFilter !== "all" && v.platform !== platFilter) return false;
+    if (stateFilter === "todo" && v.analysis_id) return false;
+    if (stateFilter === "done" && !v.analysis_id) return false;
+    return true;
+  });
+
+  const redraw = () => {
+    const shown = visibleVideos();
+    const allShownSelected = shown.length > 0 && shown.every((v) => selected.has(v.url));
+    const plats = ["all", ...new Set(videos.map((v) => v.platform).filter(Boolean))];
+    const analyzedTotal = videos.filter((v) => v.analysis_id).length;
+
+    put(toolbarBox,
+      h("div", { class: "row", style: { justifyContent: "space-between", width: "100%" } },
+        h("div", { class: "row" },
+          plats.length > 2 ? h("div", { class: "seg sm", role: "group", "aria-label": "Lọc nền tảng" },
+            plats.map((p) => h("button", {
+              type: "button",
+              class: platFilter === p ? "on" : "",
+              onclick: () => { platFilter = p; redraw(); },
+            }, p === "all" ? `Tất cả (${videos.length})` : `${platLabel(p)} (${videos.filter((v) => v.platform === p).length})`))) : null,
+          h("div", { class: "seg sm", role: "group", "aria-label": "Lọc trạng thái phân tích" },
+            [["all", `Mọi trạng thái`], ["todo", `Chưa phân tích (${videos.length - analyzedTotal})`], ["done", `Đã phân tích (${analyzedTotal})`]]
+              .map(([k, lbl]) => h("button", {
+                type: "button",
+                class: stateFilter === k ? "on" : "",
+                onclick: () => { stateFilter = k; redraw(); },
+              }, lbl)))),
+        h("div", { class: "row" },
+          h("button", { class: "btn sm ghost", type: "button", onclick: () => {
+            selected.clear();
+            shown.filter((v) => !v.analysis_id).slice(0, 3).forEach((v) => selected.add(v.url));
+            redraw();
+          } }, "Chọn top 3 chưa phân tích"),
+          h("label", { class: "check small" },
+            h("input", { type: "checkbox", checked: allShownSelected, disabled: !shown.length, onchange: (e) => {
+              if (e.target.checked) shown.forEach((v) => { if (v.url) selected.add(v.url); });
+              else shown.forEach((v) => selected.delete(v.url));
+              redraw();
+            } }),
+            h("span", {}, "Chọn tất cả đang hiện")))),
+      h("div", { class: "row", style: { justifyContent: "space-between", width: "100%" } },
+        h("label", { class: "check small" }, reaChk,
+          h("span", {}, "Dùng rea-video khi phân tích", va.rea_video ? null : h("span", { class: "muted" }, " (chưa cài)"))),
+        h("button", {
+          class: "btn primary sm",
+          disabled: jobRunning() || !selected.size,
+          onclick: (e) => runAnalyze([...selected], { openSingle: selected.size === 1 }, e.currentTarget),
+        }, icon("scan"), selected.size ? `Phân tích ${selected.size} video đã chọn` : "Chọn video để phân tích", FREE())));
+
+    if (!shown.length) {
+      put(listBox, h("div", { class: "empty-inline" }, icon("video"), "Không có video nào khớp bộ lọc hiện tại."));
+      return;
+    }
+
+    put(listBox, shown.map((v) => {
+      const extUrl = safeExternalUrl(v.url);
+      const thumbUrl = safeExternalUrl(v.thumbnail);
+      const checked = selected.has(v.url);
+      const rank = v.rank || (videos.indexOf(v) + 1);
+      const metaParts = [
+        v.channel || v.uploader || "",
+        v.duration ? fmtDur(v.duration) : "",
+        v.like_count != null ? fmtViewsVi(v.like_count) + " thích" : "",
+        v.comment_count != null ? fmtViewsVi(v.comment_count) + " bình luận" : "",
+        fmtUploadDate(v.upload_date),
+      ].filter(Boolean);
+
+      return h("div", { class: "crawl-row" + (checked ? " selected" : "") + (v.analysis_id ? " analyzed" : "") },
+        h("div", { class: "crawl-select" },
+          h("input", {
+            type: "checkbox",
+            checked,
+            "aria-label": "Chọn " + (v.title || v.url),
+            onchange: (e) => { if (e.target.checked) selected.add(v.url); else selected.delete(v.url); redraw(); },
+          }),
+          h("span", { class: "crawl-rank" + (rank <= 3 ? " top" : "") }, "#" + rank)),
+        h("a", {
+          class: "crawl-thumb",
+          href: v.local_video_url || extUrl || "#",
+          target: v.local_video_url || extUrl ? "_blank" : null,
+          rel: "noopener noreferrer",
+          onclick: v.local_video_url || extUrl ? null : (e) => e.preventDefault(),
+          title: v.local_video_url ? "Mở file MP4 đã tải" : "Mở video gốc",
+        },
+          thumbUrl ? h("img", { src: thumbUrl, alt: "", loading: "lazy", referrerpolicy: "no-referrer",
+            onerror: (e) => e.currentTarget.remove() }) : icon("video"),
+          v.duration ? h("span", { class: "dur-tag" }, fmtDur(v.duration)) : null),
+        h("div", { class: "crawl-meta" },
+          h("div", { class: "row", style: { gap: "6px" } },
+            h("span", { class: "plat-badge " + (v.platform || "web") }, platLabel(v.platform)),
+            v.is_short ? h("span", { class: "badge mini" }, "Short/Reel") : null,
+            v.local_video_url ? h("span", { class: "badge done mini" }, "Đã tải MP4") : null,
+            v.analysis_id ? h("span", { class: "badge film mini" }, "Sẵn sàng tạo phim") : null),
+          extUrl
+            ? h("a", { class: "crawl-title", href: extUrl, target: "_blank", rel: "noopener noreferrer" }, v.title || extUrl, " ", icon("external"))
+            : h("div", { class: "crawl-title" }, v.title || v.url),
+          metaParts.length ? h("div", { class: "muted small" }, metaParts.join(" · ")) : null),
+        h("div", { class: "crawl-views", title: v.view_count != null ? Number(v.view_count).toLocaleString("vi-VN") + " lượt xem" : "Chưa đọc được số lượt xem công khai" },
+          h("div", { class: "v-num" }, fmtViewsVi(v.view_count)),
+          h("div", { class: "muted small" }, "lượt xem")),
+        h("div", { class: "crawl-actions" },
+          v.analysis_id
+            ? h("button", { class: "btn primary sm", onclick: () => openAnalysis(v.analysis_id, c.id) }, icon("eye"), "Xem phân tích")
+            : h("button", { class: "btn primary sm", disabled: jobRunning(), onclick: (e) => runAnalyze([v.url], { openSingle: true }, e.currentTarget) }, icon("scan"), "Phân tích"),
+          v.analysis_id
+            ? h("button", { class: "btn sm ghost", disabled: jobRunning(), title: "Chạy phân tích lại từ đầu",
+                onclick: (e) => runAnalyze([v.url], { force: true, openSingle: true }, e.currentTarget) }, icon("refresh"))
+            : null,
+          v.local_video_url ? h("a", { class: "btn sm ghost icon", href: v.local_video_url, download: "", title: "Tải file MP4 đã lưu" }, icon("download")) : null,
+          v.url ? h("button", { class: "btn sm ghost icon", title: "Chép link video", "aria-label": "Chép link video", onclick: () => copyText(v.url) }, icon("copy")) : null));
+    }));
+  };
+
+  redraw();
+
+  const warnSources = sources.filter((s) => s.error || s.status === "empty");
+  return h("section", { class: "card card-pad stack" },
+    h("div", { class: "card-head", style: { marginBottom: 0 } },
+      h("div", { class: "stack", style: { gap: "2px", flex: "1", minWidth: "220px" } },
+        h("h3", {}, c.title || c.id),
+        h("div", { class: "muted small" },
+          `${videos.length} video xếp hạng cao nhất · quét ${c.total_scanned ?? videos.length} video từ ${sources.length} nguồn`
+          + (c.created ? ` · ${ago(c.created)}` : ""))),
+      h("div", { class: "row" },
+        sources.length && urlsBox ? h("button", { class: "btn sm ghost", onclick: () => {
+          const joined = sources.map((s) => s.input_url || s.normalized_url).filter(Boolean).join("\n");
+          urlsBox.value = joined; localSet("crawlUrls", joined); urlsBox.focus();
+          toast("Đã nạp lại danh sách link nguồn", "", 2000);
+        } }, icon("refresh"), "Nạp lại nguồn") : null,
+        videos.length ? h("button", { class: "btn sm", onclick: () => copyText(videos.map((v) => v.url).filter(Boolean).join("\n")) }, icon("copy"), "Chép các link") : null,
+        c.report_url ? h("a", { class: "btn sm", href: c.report_url, download: `${c.id}.md` }, icon("download"), "report.md") : null,
+        c.urls_file_url ? h("a", { class: "btn sm", href: c.urls_file_url, download: `${c.id}-urls.txt` }, icon("download"), "urls.txt") : null)),
+    sources.length ? h("div", { class: "chips" }, sources.map((s) => {
+      const srcHref = safeExternalUrl(s.normalized_url || s.input_url);
+      const srcLabel = s.channel || s.normalized_url || s.input_url;
+      return h("span", { class: "chip" },
+        h("span", { class: "plat-dot " + (s.platform || "web") }),
+        srcHref ? h("a", { href: srcHref, target: "_blank", rel: "noopener noreferrer" }, srcLabel) : srcLabel,
+        `: `, h("b", {}, `${s.scanned ?? 0} quét · giữ ${s.kept ?? 0}`),
+        s.error ? h("span", { class: "warn-text" }, " · lỗi") : null);
+    })) : null,
+    warnSources.length ? h("div", { class: "banner warn flush" }, icon("alert"),
+      h("div", { class: "b-body" }, warnSources.map((s) => h("div", { class: "small" },
+        h("b", {}, (s.channel || s.input_url) + ": "), s.error || "Không tìm thấy video công khai nào.")))) : null,
+    videos.length ? toolbarBox : null,
+    listBox);
+}
+
+function renderCrawlHistory() {
+  const items = S.crawls || [];
+  return h("section", { class: "card card-pad stack" },
+    h("div", { class: "card-head", style: { marginBottom: 0 } },
+      h("h3", {}, "Lịch sử crawl"),
+      h("span", { class: "spacer" }),
+      h("span", { class: "small muted" }, items.length ? `${items.length} bản lưu trong .crawls/` : "")),
+    items.length
+      ? h("div", { class: "stack", style: { gap: "6px" } }, items.map((it) => {
+        const active = S.crawl && S.crawl.id === it.id;
+        const vidCount = it.videos_count ?? it.count ?? 0;
+        const sub = [
+          `${vidCount} video`,
+          it.top_views != null ? `top ${fmtViewsVi(it.top_views)} view` : "",
+          it.analyzed_count ? `${it.analyzed_count} đã phân tích` : "",
+          it.created ? ago(it.created) : "",
+        ].filter(Boolean).join(" · ");
+        return h("div", { class: "row ana-item" + (active ? " crawl-hist-active" : "") },
+          h("div", { class: "ana-thumb", style: safeExternalUrl(it.thumb) ? { backgroundImage: `url("${safeExternalUrl(it.thumb)}")` } : null }),
+          h("div", { class: "grow", style: { minWidth: 0 } },
+            h("div", { class: "row", style: { gap: "6px" } },
+              h("span", { class: "name" }, it.title || it.id),
+              (it.platforms || []).map((p) => h("span", { class: "plat-badge mini " + p }, platLabel(p)))),
+            h("div", { class: "muted small ellipsis" }, sub)),
+          h("button", { class: "btn sm" + (active ? " primary" : ""), onclick: () => openCrawler(it.id) }, active ? "Đang xem" : "Xem"),
+          h("button", { class: "btn sm ghost icon", title: "Xoá bản crawl", "aria-label": "Xoá bản crawl", onclick: async () => {
+            if (!(await confirmModal("Xoá kết quả crawl?", `Xoá “${it.title || it.id}” khỏi .crawls? Các bản phân tích video đã tạo vẫn giữ nguyên.`, "Xoá", true))) return;
+            try {
+              await api("DELETE", `/api/crawls/${encodeURIComponent(it.id)}`);
+              S.crawls = (S.crawls || []).filter((x) => x.id !== it.id);
+              if (S.crawl?.id === it.id) { S.crawl = null; S.lastCrawlId = null; history.replaceState(null, "", "#crawl"); }
+              renderMain();
+            } catch (err) { toast(err.message, "error"); }
+          } }, icon("trash")));
+      }))
+      : h("p", { class: "muted small" }, "Chưa có lần crawl nào. Dán danh sách link ở trên và bấm “Bắt đầu crawl”."));
 }
 
 /* ---------- settings & credits ---------- */

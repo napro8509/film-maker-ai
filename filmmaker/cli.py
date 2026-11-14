@@ -1163,6 +1163,93 @@ def analyze(source: str, out: Path | None, no_rea: bool, film: Path | None, idea
 
 
 @main.command()
+@click.argument("sources", nargs=-1)
+@click.option("-f", "--from-file", "from_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="Đọc danh sách link trang/kênh từ file text (mỗi dòng một link).")
+@click.option("-n", "--top", "top_n", type=click.IntRange(1, 100), default=10, show_default=True,
+              help="Số video nhiều view nhất cần lấy.")
+@click.option("--per-source", is_flag=True, help="Lấy top N riêng cho từng trang/kênh thay vì gộp chung.")
+@click.option("--scan-limit", type=click.IntRange(5, 500), default=50, show_default=True,
+              help="Số video tối đa quét ở mỗi kênh/tab.")
+@click.option("--shorts-only", is_flag=True, help="Chỉ lấy video ngắn (TikTok / Reels / YouTube Shorts ≤ 3 phút).")
+@click.option("--min-duration", type=float, default=None, help="Độ dài video tối thiểu (giây).")
+@click.option("--max-duration", type=float, default=None, help="Độ dài video tối đa (giây).")
+@click.option("--cookies-from-browser", type=click.Choice(["chrome", "safari", "brave", "edge", "firefox"],
+              case_sensitive=False), default=None, help="Lấy cookie từ trình duyệt khi Facebook/TikTok yêu cầu đăng nhập.")
+@click.option("-o", "--out", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục lưu kết quả crawl (mặc định ~/FilmMaker/.crawls/<ngày>-<tên>, hiện trong web UI).")
+@click.option("--download", "do_download", is_flag=True,
+              help="Tải sẵn file video (≤ 720p) của top video về máy để phân tích tức thì.")
+@click.option("--analyze", "do_analyze", is_flag=True,
+              help="Chạy luôn phân tích video (Claude + ffmpeg) cho các top video tìm được.")
+@click.option("--analyses-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục lưu bản phân tích khi bật --analyze (mặc định ~/FilmMaker/.analyses).")
+@click.option("--no-rea", is_flag=True, help="Khi dùng --analyze: không chạy rea-video dù đã cài.")
+@click.option("--backend", type=click.Choice(["auto", "claude_code", "api"]), default="auto", show_default=True,
+              help="Backend Claude khi dùng --analyze.")
+@click.option("--json", "as_json", is_flag=True, help="In đúng một object JSON kết quả ra stdout.")
+def crawl(sources: tuple[str, ...], from_file: Path | None, top_n: int, per_source: bool, scan_limit: int,
+          shorts_only: bool, min_duration: float | None, max_duration: float | None,
+          cookies_from_browser: str | None, out: Path | None, do_download: bool, do_analyze: bool,
+          analyses_dir: Path | None, no_rea: bool, backend: str, as_json: bool) -> None:
+    """Crawl các trang Facebook, kênh TikTok, kênh YouTube để lấy top video nhiều view nhất, sẵn sàng phân tích."""
+    from . import crawler as cr
+    from . import video_analysis as va
+
+    raw_items: list[str] = list(sources)
+    if from_file is not None:
+        raw_items.append(from_file.read_text(encoding="utf-8"))
+    log = (lambda msg: click.echo(msg, err=True)) if as_json else click.echo
+
+    try:
+        parsed_urls = cr.parse_sources(raw_items)
+        first_host = parsed_urls[0].split("//", 1)[-1].split("/")[0].removeprefix("www.")
+        folder = out or (Path.home() / "FilmMaker" / ".crawls" / va.new_id(f"crawl-{first_host}"))
+        data = cr.crawl(
+            parsed_urls,
+            folder,
+            top_n=top_n,
+            per_source=per_source,
+            scan_limit=scan_limit,
+            shorts_only=shorts_only,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            cookies_from_browser=cookies_from_browser,
+            log=log,
+        )
+        if do_download:
+            data = cr.download_top_videos(data, folder, log=log)
+        ana_root = analyses_dir or (Path.home() / "FilmMaker" / ".analyses")
+        if do_analyze:
+            ana_res = cr.analyze_crawled(
+                data["videos"],
+                ana_root,
+                crawl_dir=folder,
+                use_rea=not no_rea,
+                backend=backend,
+                log=log,
+            )
+            data["analysis_run"] = ana_res
+        data = cr.link_analyses(data, ana_root)
+    except (cr.CrawlError, va.AnalysisError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    click.echo("")
+    for v in data["videos"]:
+        plat = cr.PLATFORM_LABELS.get(v["platform"], v["platform"])
+        dur_txt = va.fmt_time(v["duration"]) if v.get("duration") else "--:--"
+        ana_txt = f"  [đã phân tích: {v['analysis_id']}]" if v.get("analysis_id") else ""
+        click.echo(f"  #{v['rank']:02d}  {cr.fmt_views_vi(v.get('view_count')):>9} view  ({dur_txt})  "
+                   f"[{plat}] {v['title'][:65]} — {v['url']}{ana_txt}")
+    click.echo(f"\n✔ Đã lưu kết quả: {folder / 'report.md'}")
+    click.echo(f"✔ Danh sách link: {folder / 'urls.txt'}")
+
+
+@main.command()
 @click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
               help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
 @click.option("--port", default=8765, show_default=True)
