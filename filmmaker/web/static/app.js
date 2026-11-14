@@ -5,7 +5,7 @@ const TOKEN = document.querySelector('meta[name="token"]').content;
 const S = {
   env: null, settings: null, models: { video: [], image: [] }, projects: [], cur: null, tab: "scenes",
   assets: { images: [], audio: [] }, job: null, jobSince: 0, jobOpen: false, jobOnlyKey: false, pollT: null,
-  saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", auth: null,
+  saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", themeSave: null, auth: null,
   zones: new Map(), playIdx: 0,
   crawlView: false, crawl: null, crawls: [], lastCrawlId: null,
   charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
@@ -412,6 +412,7 @@ async function init() {
       h("p", { class: "muted" }, e.message), h("button", { class: "btn primary", onclick: () => location.reload() }, icon("refresh"), "Thử lại")));
     return;
   }
+  syncThemeOnBoot();
   S.auth = localGet("auth");
   renderTopbar();
   await loadProjects();
@@ -565,6 +566,7 @@ function withoutBlankLocations(sb) {
 
 async function flushSave() {
   clearTimeout(S.saveTimer);
+  if (S.themeSave) await S.themeSave;
   while (S.saving) await new Promise((r) => setTimeout(r, 50));
   if (S.pendingSave) await save();
 }
@@ -4352,7 +4354,7 @@ async function openSettings() {
         : b.configured ? (b.version || "rclone") : `Mở Terminal, chạy: rclone config → n → tên ${name} → Google Drive → đăng nhập Google.`));
   }).catch((e) => put(backupState, h("span", { class: "pill bad" }, "Lỗi"), h("span", { class: "muted" }, e.message)));
   checkBackup();
-  const theme = h("select", { value: localGet("theme", "auto"), onchange: (e) => { localSet("theme", e.target.value); applyTheme(); } },
+  const theme = h("select", { value: currentTheme(s), onchange: (e) => saveTheme(e.target.value) },
     h("option", { value: "auto" }, "Theo hệ thống"), h("option", { value: "light" }, "Sáng"), h("option", { value: "dark" }, "Tối"));
   modal({
     title: "Cài đặt", wide: true,
@@ -4454,10 +4456,12 @@ async function openSettings() {
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
+        if (S.themeSave) await S.themeSave;
         const pubPlats = [];
         if (document.getElementById("set-pub-fb")?.checked) pubPlats.push("facebook_reel");
         if (document.getElementById("set-pub-fb-story")?.checked) pubPlats.push("facebook_story");
         if (document.getElementById("set-pub-yt")?.checked) pubPlats.push("youtube");
+        const chosenTheme = cleanTheme(theme.value) || "auto";
         S.settings = await api("PUT", "/api/settings", { planner: planner.value, profile: profile.value.trim(), pause_min: +pmin.value, pause_max: +pmax.value, retries: +retries.value,
           flow_ui: flowUi.checked, flow_ui_max_credits: +maxCredits.value || 0, flow_ui_window: flowWin.value,
           backup_remote: remote.value.trim(), auto_backup: autoBackup.checked, auto_qc: autoQC.checked,
@@ -4471,7 +4475,9 @@ async function openSettings() {
           auto_publish_platforms: pubPlats,
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey,
           gemini_backend: geminiBackend.value,
-          gemini_api_key: geminiKey.value.trim() || undefined, clear_gemini_key: clearGeminiKey });
+          gemini_api_key: geminiKey.value.trim() || undefined, clear_gemini_key: clearGeminiKey,
+          theme: chosenTheme });
+        applyTheme(S.settings.theme);
         S.env = await api("GET", "/api/env"); if (S.cur) loadPublish(true); renderTopbar(); c(); toast("Đã lưu cài đặt", "ok");
       } catch (e) { toast(e.message, "error"); }
     } }],
@@ -4501,10 +4507,48 @@ async function openCredits() {
   } catch (e) { put(body, h("div", { class: "banner err flush" }, icon("alert"), h("div", { class: "b-body" }, e.message))); }
 }
 
-function applyTheme() {
-  const t = localGet("theme", "auto");
+const THEMES = ["auto", "light", "dark"];
+function cleanTheme(v) { return THEMES.includes(v) ? v : null; }
+function themeMeta() { return document.querySelector?.('meta[name="theme"]') || null; }
+function currentTheme(settings = S.settings) {
+  const fromSettings = cleanTheme(settings?.theme);
+  const fromMeta = cleanTheme(themeMeta()?.content);
+  const fromLocal = cleanTheme(localGet("theme"));
+  if (fromMeta) return fromSettings || fromMeta;
+  if (fromSettings && fromSettings !== "auto") return fromSettings;
+  return fromLocal || fromSettings || "auto";
+}
+function applyTheme(next) {
+  const explicit = cleanTheme(next);
+  const t = explicit || currentTheme();
+  localSet("theme", t);
+  if (explicit) {
+    const m = themeMeta();
+    if (m) m.content = t;
+    if (S.settings) S.settings.theme = t;
+  }
   if (t === "auto") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
+  return t;
+}
+function saveTheme(next) {
+  const t = applyTheme(next);
+  const prev = S.themeSave || Promise.resolve();
+  let done;
+  const req = prev.then(() => api("PUT", "/api/settings", { theme: t }))
+    .then((r) => { if (S.themeSave === done) S.settings = r; return r; })
+    .catch(() => null);
+  done = req.finally(() => { if (S.themeSave === done) S.themeSave = null; });
+  S.themeSave = done;
+  return done;
+}
+function syncThemeOnBoot() {
+  const fromMeta = cleanTheme(themeMeta()?.content);
+  const fromSettings = cleanTheme(S.settings?.theme);
+  const fromLocal = cleanTheme(localGet("theme"));
+  if (fromMeta || (fromSettings && fromSettings !== "auto")) applyTheme(fromSettings || fromMeta);
+  else if (fromLocal && fromLocal !== "auto") saveTheme(fromLocal);
+  else applyTheme(fromSettings || "auto");
 }
 
 applyTheme();

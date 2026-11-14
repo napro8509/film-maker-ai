@@ -43,6 +43,12 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _window_background() -> str:
+    from . import settings as user_settings
+
+    return "#f5f5f3" if user_settings.load().get("theme") == "light" else "#131211"
+
+
 def _notify(title: str, message: str) -> None:
     def esc(s: str) -> str:
         return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -184,7 +190,7 @@ def main(workspace: Path | None = None) -> None:
     webview.settings["ALLOW_DOWNLOADS"] = True
     window = webview.create_window(
         "Film Maker", base, js_api=bridge, width=1400, height=900, min_size=(900, 600),
-        text_select=True, background_color="#111317")
+        text_select=True, background_color=_window_background())
     bridge.window = window
 
     def on_closing():

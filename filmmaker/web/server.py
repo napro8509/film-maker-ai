@@ -14,6 +14,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -57,6 +58,8 @@ BOARD_MAX_BYTES = 256 * 1024  # PUT /board body limit
 
 # --- settings -----------------------------------------------------------------
 
+THEMES = ("auto", "light", "dark")
+
 DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2, "anthropic_api_key": "",
                     "planner": "auto",  # auto | claude_code | api
                     "gemini_api_key": "",
@@ -69,15 +72,23 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "auto_qc": True,  # AI QC of every new clip after a render (free; only flags problems)
                     "fb_page_id": "", "fb_access_token": "",
                     "yt_client_id": "", "yt_client_secret": "", "yt_refresh_token": "",
-                    "yt_privacy": "public", "auto_publish": False, "auto_publish_platforms": []}
+                    "yt_privacy": "public", "auto_publish": False, "auto_publish_platforms": [],
+                    "theme": "auto"}  # auto | light | dark
+
+
+def _raw_settings() -> dict[str, Any]:
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_settings() -> dict[str, Any]:
     data = dict(DEFAULT_SETTINGS)
-    try:
-        data.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+    data.update(_raw_settings())
+    if data.get("theme") not in THEMES:
+        data["theme"] = "auto"
     return data
 
 
@@ -135,13 +146,26 @@ def record_spend(cost: float | None) -> None:
         _write_ledger(d)
 
 
+_settings_lock = threading.Lock()
+
+
 def save_settings(data: dict[str, Any]) -> None:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(dir=SETTINGS_PATH.parent, prefix=SETTINGS_PATH.name + ".", suffix=".tmp")
     try:
-        SETTINGS_PATH.chmod(0o600)  # holds the API key
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2))
+        try:
+            os.chmod(tmp, 0o600)  # holds the API key
+        except OSError:
+            pass
+        os.replace(tmp, SETTINGS_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --- background jobs ----------------------------------------------------------
@@ -824,6 +848,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
+        raw = _raw_settings()
+        s = load_settings()
+        theme = s.get("theme") if s.get("theme") in THEMES else "auto"
+        saved_theme = theme if (raw.get("theme") in THEMES or theme != "auto") else ""
+        if saved_theme in ("light", "dark"):
+            html = html.replace('<html lang="vi">', f'<html lang="vi" data-theme="{saved_theme}">', 1)
+        html = html.replace("__THEME__", saved_theme)
         return html.replace("__TOKEN__", token)
 
     @app.get("/static/{name}")
@@ -995,50 +1026,55 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.put("/api/settings")
     def put_settings(body: dict[str, Any]) -> dict[str, Any]:
-        s = load_settings()
-        if body.get("planner") in ("auto", "claude_code", "api"):
-            s["planner"] = body["planner"]
-        if body.get("gemini_backend") in ("auto", *ai_mod.GEMINI_BACKENDS):
-            s["gemini_backend"] = body["gemini_backend"]
-        for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
-                  "auto_backup", "auto_qc", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
-            if k in body:
-                s[k] = body[k]
-        if "backup_remote" in body:
-            try:
-                s["backup_remote"] = check_remote(str(body["backup_remote"] or DEFAULT_BACKUP_REMOTE))
-            except BackupError as exc:
-                raise HTTPException(400, str(exc))
-        s["auto_backup"] = bool(s.get("auto_backup"))
-        s["auto_qc"] = bool(s.get("auto_qc", True))
-        s["auto_publish"] = bool(s.get("auto_publish"))
-        if isinstance(s.get("auto_publish_platforms"), list):
-            s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "facebook_story", "youtube")]
-        else:
-            s["auto_publish_platforms"] = []
-        if s.get("yt_privacy") not in ("public", "unlisted", "private"):
-            s["yt_privacy"] = "public"
-        if body.get("anthropic_api_key"):
-            s["anthropic_api_key"] = body["anthropic_api_key"].strip()
-        if body.get("clear_anthropic_key"):
-            s["anthropic_api_key"] = ""
-        if body.get("gemini_api_key"):
-            s["gemini_api_key"] = str(body["gemini_api_key"]).strip()
-        if body.get("clear_gemini_key"):
-            s["gemini_api_key"] = ""
-        for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
-            if body.get(sec):
-                s[sec] = str(body[sec]).strip()
-            if body.get(f"clear_{sec}"):
-                s[sec] = ""
-        s["pause_min"] = max(0.0, float(s.get("pause_min") or 0))
-        s["pause_max"] = max(float(s["pause_min"]), float(s.get("pause_max") or 0))
-        s["retries"] = max(0, min(5, int(s.get("retries") or 0)))
-        s["flow_ui"] = bool(s.get("flow_ui", True))
-        s["flow_ui_max_credits"] = max(0, int(s.get("flow_ui_max_credits") or 0))
-        if s.get("flow_ui_window") not in ("show", "hidden", "headless"):
-            s["flow_ui_window"] = "hidden"
-        save_settings(s)
+        with _settings_lock:
+            s = load_settings()
+            if body.get("planner") in ("auto", "claude_code", "api"):
+                s["planner"] = body["planner"]
+            if body.get("gemini_backend") in ("auto", *ai_mod.GEMINI_BACKENDS):
+                s["gemini_backend"] = body["gemini_backend"]
+            if body.get("theme") in THEMES:
+                s["theme"] = body["theme"]
+            for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
+                      "auto_backup", "auto_qc", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
+                if k in body:
+                    s[k] = body[k]
+            if "backup_remote" in body:
+                try:
+                    s["backup_remote"] = check_remote(str(body["backup_remote"] or DEFAULT_BACKUP_REMOTE))
+                except BackupError as exc:
+                    raise HTTPException(400, str(exc))
+            s["auto_backup"] = bool(s.get("auto_backup"))
+            s["auto_qc"] = bool(s.get("auto_qc", True))
+            s["auto_publish"] = bool(s.get("auto_publish"))
+            if isinstance(s.get("auto_publish_platforms"), list):
+                s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "facebook_story", "youtube")]
+            else:
+                s["auto_publish_platforms"] = []
+            if s.get("yt_privacy") not in ("public", "unlisted", "private"):
+                s["yt_privacy"] = "public"
+            if body.get("anthropic_api_key"):
+                s["anthropic_api_key"] = body["anthropic_api_key"].strip()
+            if body.get("clear_anthropic_key"):
+                s["anthropic_api_key"] = ""
+            if body.get("gemini_api_key"):
+                s["gemini_api_key"] = str(body["gemini_api_key"]).strip()
+            if body.get("clear_gemini_key"):
+                s["gemini_api_key"] = ""
+            for sec in ("fb_access_token", "yt_client_secret", "yt_refresh_token"):
+                if body.get(sec):
+                    s[sec] = str(body[sec]).strip()
+                if body.get(f"clear_{sec}"):
+                    s[sec] = ""
+            s["pause_min"] = max(0.0, float(s.get("pause_min") or 0))
+            s["pause_max"] = max(float(s["pause_min"]), float(s.get("pause_max") or 0))
+            s["retries"] = max(0, min(5, int(s.get("retries") or 0)))
+            s["flow_ui"] = bool(s.get("flow_ui", True))
+            s["flow_ui_max_credits"] = max(0, int(s.get("flow_ui_max_credits") or 0))
+            if s.get("flow_ui_window") not in ("show", "hidden", "headless"):
+                s["flow_ui_window"] = "hidden"
+            if s.get("theme") not in THEMES:
+                s["theme"] = "auto"
+            save_settings(s)
         return get_settings()
 
     # ---- projects ----
