@@ -273,3 +273,16 @@ def test_control_and_format_chars_rejected(raw):
 @pytest.mark.parametrize("raw", ["Viet nam", "Viet\x0bnam", "Viet\x85nam", "Tiếng Việt", "日本語"])
 def test_whitespace_and_unicode_letters_still_ok(raw):
     assert clean_language(raw) in ("Viet nam", "Tiếng Việt", "日本語")
+
+
+def test_no_music_is_asked_of_veo():
+    """Each clip is generated alone: music asked of Veo was different in every clip and jumped at each cut.
+    The background score is added for the whole film when editing."""
+    from filmmaker import planner
+    from filmmaker.storyboard import OLD_NO_DIALOGUE_RULE
+    assert "music" not in NO_DIALOGUE_RULE.lower()
+    assert "Never write music" in planner.SYSTEM
+    assert "sound effects and music" not in planner.SYSTEM
+    sb = _sb(dialogue_language="none")
+    out = sb.for_flow_video(f"Lan walks. {OLD_NO_DIALOGUE_RULE}")  # a prompt saved with the old sentence
+    assert OLD_NO_DIALOGUE_RULE not in out and out.count(NO_DIALOGUE_RULE) == 1
