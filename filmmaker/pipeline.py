@@ -893,10 +893,7 @@ class Pipeline:
                               submitted_at=None)
             return Path(video)
         if ui:
-            # Attach the scene's characters too (Flow characters by name, others as pictures) so their faces
-            # stay identical even where the start frame does not show everyone.
-            char_refs = self.ui_refs(self.sb.scene_ui_char_refs(s), project)
-            return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
+            return self._render_via_ui(s, start_image, prompt, common, refs=self._start_frame_refs(s, project))
         call = lambda: self.g.image_to_video(start_image, self.sb.for_flow_video(prompt, s), end_image=s.end_image, **common)
         try:
             video, media_id = self._with_retries("render video", call, opts.max_retries)
@@ -913,8 +910,7 @@ class Pipeline:
             self._remember(i2v_unsupported=True, i2v_error=str(exc))
             if self.g.ui_available():
                 self.log("  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).")
-                char_refs = self.ui_refs(self.sb.scene_ui_char_refs(s), project)
-                return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
+                return self._render_via_ui(s, start_image, prompt, common, refs=self._start_frame_refs(s, project))
             if s.mode == "i2v":
                 raise GflowError(
                     "tài khoản Flow của bạn (giao diện mới flow.google.com) chưa hỗ trợ tạo video từ ảnh qua gflow. "
@@ -1038,6 +1034,17 @@ class Pipeline:
         raise GflowError(f"video tải về trùng với cảnh {other} (media {media_id}); video mới có thể vẫn "
                          "đang tạo trên Flow — hãy kiểm tra trên Flow" + moved, exit_code=42,
                          payload={"error": {"spent": True}})
+
+    def _start_frame_refs(self, s: Scene, project: str) -> list[Path | str]:
+        """The characters attached next to the start picture (Flow characters by name, others as pictures) so
+        their faces stay identical: at most 2, the ones who speak or act first (Flow takes 3 images in all on
+        Veo Lite; with more it stops and asks which mode to use, and the render hangs)."""
+        picked = self.sb.start_frame_char_refs(s)
+        left = [n for n, _ in self.sb.scene_ui_char_refs(s) if n not in {x for x, _ in picked}]
+        if left:
+            self.log(f"  Nhân vật gửi kèm ảnh bắt đầu: {', '.join(n for n, _ in picked)} "
+                     f"(bỏ {', '.join(left)}: Flow chỉ nhận 3 ảnh, ưu tiên người nói / tương tác).")
+        return self.ui_refs(picked, project)
 
     def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict,
                        refs: list[Path | str] | None = None) -> Path:

@@ -133,4 +133,5 @@ def test_i2v_fallback_passes_character_refs_to_chat(env):
 """, fail="video i2v:36:false")
     i2v = ui_call(ucalls, "i2v", "v1")
     assert i2v is not None and "--image" in i2v  # the start frame is still attached first
-    assert refs(i2v) == ["character:Lan", "character:Hoa", "character:Tuan"]
+    # At most 2 next to the start frame (Flow takes 3 images on Veo Lite): the two the prompt names, not Tuan.
+    assert refs(i2v) == ["character:Lan", "character:Hoa"]

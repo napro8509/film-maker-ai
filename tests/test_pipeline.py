@@ -419,7 +419,7 @@ def test_flow_ui_prompt_and_bad_input():
     from filmmaker import flow_ui
 
     p = flow_ui.build_prompt("she smiles", refs=1, aspect="9:16", model="Veo 3.1 Fast", duration=8)
-    assert "exactly 1 video" in p and "first frame" in p and "9:16" in p and "Veo 3.1 Fast" in p
+    assert "exactly 1 video" in p and "begin the video on that picture" in p and "9:16" in p and "Veo 3.1 Fast" in p
     assert "8 seconds" in p and p.endswith("Motion and action: she smiles") and "character references" in p
     import contextlib, io
     buf = io.StringIO()

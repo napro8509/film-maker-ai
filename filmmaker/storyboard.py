@@ -22,6 +22,13 @@ Mode = Literal["t2v", "i2v", "keyframe"]
 
 
 MAX_REFS = 3  # reference images sent with one generation (Flow accepts only a few)
+# Characters attached to a clip that starts from a picture (keyframe / i2v): Flow takes 3 images in all on Veo Lite,
+# and the start picture is one of them.
+START_FRAME_CHARS = MAX_REFS - 1
+# A sentence that places someone as an onlooker ("Behind them, Lan stands by the bath watching"): that character
+# is attached after the ones who act.
+BYSTANDER = re.compile(r"(?i)\b(?:behind|in the background|in the distance|far (?:back|away)|watch(?:es|ing)?|"
+                       r"looks? on|looking on|observ(?:es|ing)|out of focus|blurred)\b")
 # Added to every prompt sent to Flow: models like to burn dialogue/titles into the picture.
 NO_TEXT = ("No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; "
            "any dialogue is spoken audio only.")
@@ -1034,6 +1041,35 @@ class Storyboard(StoryboardDraft):
         by name, with no 3-image cap). Never part of scene_refs / refs_signature / the scene fingerprint, so
         attaching characters to an i2v clip does not change the i2v reference contract."""
         return self._char_ref_candidates(scene)
+
+    def start_frame_char_refs(self, scene: Scene, limit: int = START_FRAME_CHARS) -> list[tuple[str, Path]]:
+        """(name, image) of the characters attached to a clip that starts from a picture, at most `limit`: Flow
+        takes only a few images with one video (3 on Veo Lite) and the start picture is one of them. The ones who
+        carry the scene come first: whoever speaks (in the order spoken), then whoever acts, in the order the
+        scene text names them (picture prompt, action, content direction), then onlookers (named only in
+        sentences like "behind them, ... watching"), then characters the text never names. Never part of
+        scene_refs / refs_signature / the scene fingerprint."""
+        refs = self._char_ref_candidates(scene)
+        if len(refs) <= limit:
+            return refs
+        speakers = [d.character.strip().casefold() for d in scene.spoken_lines()]
+        text = " ".join(t for t in (scene.image_prompt, scene.prompt, scene.content_direction) if t)
+        sentences = re.split(r"(?<=[.!?;])\s+", text)
+
+        def rank(item: tuple[int, tuple[str, Path]]) -> tuple[int, int, int]:
+            order, (name, _) = item
+            key = name.strip().casefold()
+            if key in speakers:
+                return (0, speakers.index(key), order)
+            pat = re.compile(rf"(?i)(?<!\w){re.escape(name.strip())}(?!\w)")
+            m = pat.search(text)
+            if not m:
+                return (3, 0, order)
+            mine = [x for x in sentences if pat.search(x)]
+            onlooker = bool(mine) and all(BYSTANDER.search(x) for x in mine)
+            return (2 if onlooker else 1, m.start(), order)
+
+        return [ref for _, ref in sorted(enumerate(refs), key=rank)[:max(limit, 0)]]
 
     def scene_ref_items(self, scene: Scene, prev: tuple[str, Path] | None = None) -> list[RefItem]:
         """Every reference image of the scene in sending order. With a location: slot 1 is the previous

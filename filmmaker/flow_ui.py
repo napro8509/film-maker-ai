@@ -71,12 +71,18 @@ def log(msg: str) -> None:
 
 def build_prompt(motion: str, *, refs: int, aspect: str, model: str | None, duration: int | None,
                  image: bool = True) -> str:
-    if image:
+    if image and refs:
+        # Flow's first-frame mode takes ONE image: asked for "the exact first frame" plus character references,
+        # the agent stopped and asked which of the two to drop (and the render hung until the timeout). So this
+        # asks for reference-to-video outright, with the start picture as the scene to begin on.
+        parts = [f"Make exactly 1 video with Reference-to-Video, using all {refs + 1} attached images as "
+                 "references; do not ask which mode to use. The first attached image is the scene: begin the video "
+                 "on that picture, with the same composition, people, faces, clothes, lighting and setting.",
+                 f"The other {refs} attached image(s) are character references: keep those characters' "
+                 "faces identical."]
+    elif image:
         parts = ["Make exactly 1 video from the first attached image: use that image as the exact first frame "
                  "and keep the same people, faces, clothes, lighting and setting."]
-        if refs:
-            parts.append(f"The other {refs} attached image(s) are character references: keep those characters' "
-                         "faces identical.")
     else:
         parts = ["Make exactly 1 video."]
         if refs:
