@@ -389,6 +389,8 @@ textarea.yaml { font-family: var(--mono); font-size: var(--fs-1); min-height: 60
 .job-head .title { font-weight: var(--fw-bold); font-size: var(--fs-2); white-space: nowrap; }
 .job-head .last { color: var(--text-muted); font-size: var(--fs-1); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; min-width: 0; font-family: var(--mono); }
 .job-head .tools { display: flex; gap: var(--sp-1); align-items: center; }
+.job-head .tools .btn.on { background: var(--accent-soft); color: var(--accent-ink); border-color: var(--accent); }
+.job-head .tools .btn.on .ico { color: var(--accent-ink); }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-muted); }
 .dot.running { background: var(--info); animation: pulse 1.2s infinite; }
 .dot.done { background: var(--ok); }
@@ -396,10 +398,18 @@ textarea.yaml { font-family: var(--mono); font-size: var(--fs-1); min-height: 60
 .dot.stopped { background: var(--warn); }
 @keyframes pulse { 50% { opacity: .35; } }
 .joblog { margin: 0; max-height: 34vh; overflow: auto; padding: var(--sp-3) var(--sp-4); border-top: 1px solid var(--border); background: var(--surface-2); font-family: var(--mono); font-size: var(--fs-1); white-space: pre-wrap; word-break: break-word; }
-.joblog .l-err { color: var(--err); }
-.joblog .l-ok { color: var(--ok); }
-.joblog .l-cmd { color: var(--text-muted); }
-.joblog .l-warn { color: var(--warn); }
+/* Important lines stand out with a soft tinted stripe + accent border; verbose noise is dimmed. */
+.joblog .l-err, .joblog .l-ok, .joblog .l-warn, .joblog .l-head { padding: 1px var(--sp-2); border-radius: var(--r-1); border-left: 3px solid transparent; margin: 1px 0; }
+.joblog .l-err { color: var(--err-ink); font-weight: var(--fw-bold); background: var(--err-soft); border-left-color: var(--err); }
+.joblog .l-ok { color: var(--ok-ink); font-weight: var(--fw-bold); background: var(--ok-soft); border-left-color: var(--ok); }
+.joblog .l-warn { color: var(--warn-ink); font-weight: var(--fw-bold); background: var(--warn-soft); border-left-color: var(--warn); }
+.joblog .l-head { color: var(--text); font-weight: var(--fw-bold); background: var(--accent-soft); border-left-color: var(--accent); }
+.joblog .l-dim { color: var(--text-muted); opacity: .62; }
+.joblog .l-cmd { color: var(--text-muted); opacity: .62; }
+/* "Only important" filter: collapse the dimmed lines away. */
+.joblog.only-key .l-dim, .joblog.only-key .l-cmd { display: none; }
+/* Shown (by syncLogFilterNote) only while the filter hides every line, so the box never looks hung. */
+.joblog-empty { color: var(--text-muted); font-style: italic; opacity: .8; padding: var(--sp-2) 0; }
 
 /* ============ popover menu ============ */
 .menu {

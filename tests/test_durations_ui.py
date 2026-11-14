@@ -49,10 +49,19 @@ class El extends Node {
     this.style = {}; this.className = ""; this.disabled = false; this.checked = false; this.value = ""; }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
-  append(...cs) { this.children.push(...cs); }
+  append(...cs) { for (const c of cs) { if (c instanceof El) c.parent = this; this.children.push(c); } }
   replaceChildren(...cs) { this.children = cs.map((c) => (c instanceof Node ? c : new Text(String(c)))); }
-  remove() {}
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this); }
   focus() {}
+  get classList() { const self = this; const list = () => self.className.split(/\s+/).filter(Boolean);
+    const set = (xs) => { self.className = [...new Set(xs)].join(" "); };
+    return { add: (c) => set([...list(), c]), remove: (c) => set(list().filter((x) => x !== c)),
+      contains: (c) => list().includes(c),
+      toggle: (c, force) => { const on = force === undefined ? !list().includes(c) : force;
+        set(on ? [...list(), c] : list().filter((x) => x !== c)); return on; } }; }
+  querySelector(sel) { const cls = sel.replace(/^\./, "");
+    for (const c of this.children) { if (!(c instanceof El)) continue;
+      if (c.className.split(/\s+/).includes(cls)) return c; const d = c.querySelector(sel); if (d) return d; } return null; }
   get id() { return this.attrs.id; }
   get text() { return this.children.map((c) => c.text).join(""); }
   get textContent() { return this.text; }
@@ -61,12 +70,13 @@ class El extends Node {
   all() { const out = [this]; for (const c of this.children) if (c instanceof El) out.push(...c.all()); return out; }
 }
 const document = { createElement: (t) => new El(t), createTextNode: (t) => new Text(t),
-  getElementById: (id) => { for (const m of modals.filter((x) => x.open)) for (const b of m.btns) if (b.id === id) return b; return null; } };
+  getElementById: (id) => { if (elements[id]) return elements[id]; for (const m of modals.filter((x) => x.open)) for (const b of m.btns) if (b.id === id) return b; return null; } };
 
 // ---- fakes the cut code calls ----
-let S, calls, modals, toasts, flushes, saveBad, reloads, modelChanges, jobs, apiImpl, running;
+let S, calls, modals, toasts, flushes, saveBad, reloads, modelChanges, jobs, apiImpl, running, elements, localSets;
 const reset = () => { S = { cur: { id: "p1", errors: [], scene_state: {}, storyboard: { scenes: [] } }, env: { gflow: true, ffmpeg: true }, saveError: "disk full" };
   calls = []; modals = []; toasts = []; flushes = 0; saveBad = false; reloads = []; modelChanges = []; jobs = []; running = false;
+  elements = {}; localSets = [];
   apiImpl = () => { throw new Error("unexpected api"); }; };
 const api = async (method, url, body) => { calls.push({ method, url: url.replace("/api/projects/p1", ""), body: body === undefined ? null : JSON.parse(JSON.stringify(body)) }); return apiImpl(url.replace("/api/projects/p1", ""), body); };
 const httpErr = (status, detail) => { const e = new Error(detail.message || "err"); e.status = status; e.detail = detail; return e; };
@@ -87,10 +97,13 @@ const icon = () => null;
 const FREE = () => null, PAID = () => null;
 const NATIVE = () => true;
 const startJob = (j) => jobs.push(j);
-const refreshCurrent = () => {}, refreshZones = () => {}, applyMeta = () => {}, localGet = () => null, localSet = () => {};
+const refreshCurrent = () => {}, refreshZones = () => {}, applyMeta = () => {}, localGet = () => null;
+const localSet = (k, v) => localSets.push([k, v]);
+const updateJobHead = () => {};
 const prettyError = (e) => String(e), finalPrefs = () => ({}), confirmModal = async () => true, lightbox = () => {};
 const MODES = [["keyframe", "Ảnh → Video"]];
 
+// lineClass → … → toggleJobFilter are one block; appendLog (needs renderJobbar) stays out.
 eval(cut("function h(", "const $ = ") + cut("function put(", "const esc = ") +
      cut("function durationRowText(", "/* ---------- story tab") +
      cut("async function runAction(", "function startJob(") + cut("function lineClass(", "function appendLog("));
@@ -122,8 +135,57 @@ scenarios.helpers = async () => ({
         interruptedReasonText(""), interruptedReasonText(null), interruptedReasonText(undefined), interruptedReasonText("  ")],
   whyLong: interruptedReasonText("Flow (giao diện chat): " + "x".repeat(400)),
   why300: interruptedReasonText("y".repeat(300)),
-  lines: ["  $ flow_ui i2v --prompt 'Error in the rain'", "  ✘ LỖI s01", "Error: boom", "  OK -> clips/s01.mp4", "⚠ BỎ QUA s02", "plain", "$ not indented"].map(lineClass),
+  lines: [
+    "  $ flow_ui i2v --prompt 'Anna gasps! Error in the rain'", // l-cmd: command echo, "!"/"Error" in prompt ignored
+    "=== Bước 1/10: Viết storyboard (6 cảnh) ===",             // l-head: phase header
+    "== XEM TRƯỚC: không gửi gì lên Flow ==",                  // l-head
+    "XEM TRƯỚC: 6 cảnh sẽ được tạo, 1 cảnh đã có.",            // l-head: preview summary (no error count)
+    "Xong: 4 | Bỏ qua: 1 | Lỗi: 2",                            // l-err: summary that counted errors
+    "Xong: 2 ảnh nhân vật | Lỗi: 0",                           // l-ok: summary, no errors
+    "[s01] LỖI: GflowError boom",                              // l-err
+    "[s01] t2v: Anna gasps! Error lights up the sky",          // l-head: prompt "!"/"Error" is NOT err/warn
+    "  ✔ [s02] 9/10",                                          // l-ok: keyframe review PASS
+    "✔ Xong: “Phim” — 6 cảnh",                                 // l-ok
+    "OK -> clips/s01.mp4",                                     // l-ok
+    "Điểm storyboard: 8/10 (PASS). ok",                        // l-ok: review score
+    "⭐ Agent chấm cả phim: 9/10 — hay",                        // l-ok
+    "🖼 Thumbnail: cover.png",                                 // l-ok
+    "☁ Đã backup xong: drive:/x",                              // l-ok
+    "Ghép 6 clip (42.0s) -> final.mp4",                        // l-ok
+    "  ✎ [s02] 4/10 — khung hình lệch",                        // l-warn: review REVISE
+    "  ~ [s02] QC MINOR 6/10 — hơi tối",                       // l-warn: AI QC minor
+    "  ! Không tạo được ảnh theo ảnh nhân vật",                // l-warn: "!" warning prefix
+    "[s01] KHÔNG GỬI: ngoài khung giờ",                        // l-warn: refused scene
+    "⚠ Chưa có keyframe: s03",                                 // l-warn
+    "⏸ Đã dừng theo yêu cầu.",                                 // l-warn
+    "Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).",   // l-warn: no symbol, phrase match
+    "Có cảnh lỗi nên chưa ghép phim.",                         // l-warn
+    "Ý tưởng hay quá!",                                        // l-dim: mid-line "!" is not a warning
+    "  thoại mới: Anna: Chạy đi!",                             // l-dim: dialogue "!" is not a warning
+    "Agent review đang xem 3 keyframe (vòng 1/2)…",            // l-dim: verbose progress
+  ].map(lineClass),
 });
+
+// toggleJobFilter: flips state, persists, toggles the CSS hook, and shows a note when the filter
+// would blank the box (only dim/command lines) — the note clears once a key line arrives or filter off.
+scenarios.filter = async () => {
+  const el = h("pre", { id: "joblog" });
+  elements.joblog = el;
+  const lines = ["Agent review đang xem 3 keyframe…", "  $ flow_ui t2v --prompt 'x'"]; // all dim / command
+  S.job = { lines, status: "running" };
+  S.jobOnlyKey = false;
+  for (const l of lines) el.append(h("div", { class: lineClass(l) }, l));
+  toggleJobFilter(); // turn filter on while only noise exists
+  const onNoise = { key: S.jobOnlyKey, only: el.classList.contains("only-key"), note: !!el.querySelector(".joblog-empty"), saved: localSets.slice() };
+  const noteText = el.querySelector(".joblog-empty") ? el.querySelector(".joblog-empty").text : "";
+  lines.push("✔ [s01] 9/10"); // an important line arrives
+  el.append(h("div", { class: lineClass("✔ [s01] 9/10") }, "✔ [s01] 9/10"));
+  syncLogFilterNote();
+  const withKey = { note: !!el.querySelector(".joblog-empty") };
+  toggleJobFilter(); // turn filter off
+  const off = { key: S.jobOnlyKey, only: el.classList.contains("only-key"), note: !!el.querySelector(".joblog-empty"), saved: localSets.slice() };
+  return { onNoise, noteText, withKey, off };
+};
 
 scenarios.cards = async () => {
   const st = {
@@ -424,8 +486,30 @@ def test_pure_helpers(js):  # AC10, AC13, AC28
     assert h["why300"] == "y" * 300  # exactly 300 is kept whole
 
 
-def test_line_class(js):  # command lines with "Error" in the prompt are not error lines
-    assert js["helpers"]["lines"] == ["l-cmd", "l-err", "l-err", "l-ok", "l-warn", "", ""]
+def test_line_class(js):
+    # Real backend log patterns: phase headers, summaries (red only when Lỗi > 0), review/QC flags
+    # and finished milestones stay prominent; "!"/"Error" inside a prompt or dialogue line is NOT a
+    # warning/error; raw command echoes and verbose progress dim to filterable noise.
+    assert js["helpers"]["lines"] == [
+        "l-cmd", "l-head", "l-head", "l-head", "l-err", "l-ok", "l-err", "l-head",
+        "l-ok", "l-ok", "l-ok", "l-ok", "l-ok", "l-ok", "l-ok", "l-ok",
+        "l-warn", "l-warn", "l-warn", "l-warn", "l-warn", "l-warn", "l-warn", "l-warn",
+        "l-dim", "l-dim", "l-dim",
+    ]
+
+
+def test_job_filter(js):  # toggleJobFilter() behaviour + the "nothing visible" note
+    f = js["filter"]
+    # Filter on while only noise (dim/command) exists: state flips, persists, CSS hook + note appear
+    assert f["onNoise"]["key"] is True and f["onNoise"]["only"] is True
+    assert f["onNoise"]["note"] is True
+    assert f["onNoise"]["saved"] == [["jobOnlyKey", True]]
+    assert "Bấm nút lọc" in f["noteText"]
+    # An important line arrives -> the note clears (box is no longer blank)
+    assert f["withKey"]["note"] is False
+    # Filter off: state flips back, persisted again, CSS hook + note gone
+    assert f["off"]["key"] is False and f["off"]["only"] is False and f["off"]["note"] is False
+    assert f["off"]["saved"] == [["jobOnlyKey", True], ["jobOnlyKey", False]]
 
 
 def test_scene_cards(js):  # AC20, AC28

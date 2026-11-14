@@ -4,7 +4,7 @@
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const S = {
   env: null, settings: null, models: { video: [], image: [] }, projects: [], cur: null, tab: "scenes",
-  assets: { images: [], audio: [] }, job: null, jobSince: 0, jobOpen: false, pollT: null,
+  assets: { images: [], audio: [] }, job: null, jobSince: 0, jobOpen: false, jobOnlyKey: false, pollT: null,
   saveTimer: null, saving: false, pendingSave: false, saveState: "saved", saveError: "", auth: null,
   zones: new Map(), playIdx: 0,
   charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
@@ -66,6 +66,7 @@ const ICONS = {
   minus: '<path d="M5 12h14"/>',
   arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>',
   scan: '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M9.5 9v6l5-3z"/>',
+  filter: '<path d="M4 5h16l-6 7v6l-4 2v-8z"/>',
 };
 function icon(name, cls = "") {
   const t = document.createElement("template");
@@ -349,6 +350,7 @@ async function init() {
   $("#btn-menu").append(icon("menu"));
   $("#btn-menu").onclick = () => toggleSidebar();
   document.body.classList.toggle("side-collapsed", !!localGet("sideCollapsed", false));
+  S.jobOnlyKey = !!localGet("jobOnlyKey", false);
   window.matchMedia("(max-width: 720px)").addEventListener("change", syncMenuButton);
   syncMenuButton();
   $("#scrim").onclick = () => toggleSidebar(false);
@@ -3292,26 +3294,71 @@ function renderJobbar() {
   const bar = $("#jobbar");
   if (!S.job) { bar.classList.add("hidden"); return; }
   bar.classList.remove("hidden");
-  const log = h("pre", { class: "joblog" + (S.jobOpen ? "" : " hidden"), id: "joblog" });
+  const log = h("pre", { class: "joblog" + (S.jobOpen ? "" : " hidden") + (S.jobOnlyKey ? " only-key" : ""), id: "joblog" });
   put(bar, h("div", { class: "job-head", id: "jobhead" }), log);
   appendLog(S.job.lines, true);
   updateJobHead();
 }
 
+/* A log line is classed by importance so the UI can highlight what matters and dim the noise.
+   The classes, loud → quiet: l-err (errors), l-ok (success / scores / finished milestones),
+   l-warn (warnings, review & QC flags, refused scenes, stops), l-head (phase headers & step
+   markers) and l-dim / l-cmd (verbose stdout & command echoes — the only lines the "Chỉ việc
+   quan trọng" filter hides). Markers follow the backend's real conventions — symbols (✔ ✘ ⚠ ✎ ⏸),
+   line prefixes ("=== …", "  ! …", "  ~ …", "[id] …") and whole phrases — instead of loose
+   keywords, so a "!" or the word "Error" sitting inside a prompt or line of dialogue is never
+   mistaken for a warning or an error. */
 function lineClass(l) {
-  if (/^\s+\$ /.test(l)) return "l-cmd"; // command lines carry the prompt, which may say "Error"
-  if (/LỖI|✘|lỗi:|Error/.test(l)) return "l-err";
-  if (/OK ->|✔|🎬/.test(l)) return "l-ok";
-  if (/⚠|BỎ QUA|⏸|!/.test(l)) return "l-warn";
-  return "";
+  const s = String(l || "");
+  if (/^\s+\$ /.test(s)) return "l-cmd"; // "  $ flow_ui …": command echo carrying the raw prompt ("!", "Error"…)
+  if (/^\s*={2,}/.test(s)) return "l-head"; // phase header: "=== Bước 1/10: … ===", "== XEM TRƯỚC: … =="
+  if (/^\s*(Xong|XEM TRƯỚC):/.test(s)) { // end-of-stage summary — red only when it actually counted errors
+    const m = s.match(/Lỗi:\s*(\d+)/);
+    return m ? (Number(m[1]) > 0 ? "l-err" : "l-ok") : "l-head";
+  }
+  if (/✘|(^|\s)LỖI:/.test(s)) return "l-err"; // "[s01] LỖI: …", "  ✘ s01: …"
+  if (/✔|🎬|OK ->|^\s*Ghép \d|^\s*Điểm |^\s*⭐|^\s*🖼|^\s*☁ Đã/.test(s)) return "l-ok"; // success, scores, milestones
+  if (/⚠|⏸|✎|^\s*!\s|^\s*~\s|KHÔNG GỬI:|Đã dừng theo yêu cầu|Có cảnh lỗi/.test(s)) return "l-warn"; // flags & stops
+  if (/^\s*\[[^\]]+\]/.test(s)) return "l-head"; // step / scene marker, e.g. "[s01] t2v: …", "[portrait Anna]"
+  return "l-dim";
+}
+
+/* The "only important" filter keeps everything except raw stdout (l-dim) and command echoes (l-cmd). */
+function isKeyLine(cls) { return cls !== "l-dim" && cls !== "l-cmd"; }
+
+/* When the filter is on but nothing important has been logged yet (e.g. the opening minutes of
+   "Viết storyboard", or a Backup/Restore whose milestone line hasn't arrived), the box would look
+   blank and feel hung. Show a note so it's clear the lines are hidden, not missing. */
+function syncLogFilterNote() {
+  const el = document.getElementById("joblog");
+  if (!el || !S.job) return;
+  const note = el.querySelector(".joblog-empty");
+  const anyKey = S.job.lines.some((l) => isKeyLine(lineClass(l)));
+  if (S.jobOnlyKey && !anyKey) {
+    if (!note) el.append(h("div", { class: "joblog-empty" }, "Đang ẩn các dòng phụ (lệnh, nhật ký chi tiết). Bấm nút lọc để xem tất cả."));
+  } else if (note) { note.remove(); }
+}
+
+/* Toggle "only important lines": hides dimmed command / verbose output, keeps errors,
+   successes, warnings and section headers. Remembered across sessions. */
+function toggleJobFilter() {
+  S.jobOnlyKey = !S.jobOnlyKey;
+  localSet("jobOnlyKey", S.jobOnlyKey);
+  const el = document.getElementById("joblog");
+  if (el) { el.classList.toggle("only-key", S.jobOnlyKey); syncLogFilterNote(); el.scrollTop = el.scrollHeight; }
+  updateJobHead();
+  toast(S.jobOnlyKey ? "Chỉ hiện log quan trọng" : "Hiện tất cả log", "", 1500);
 }
 
 function appendLog(lines, reset = false) {
   const el = document.getElementById("joblog");
   if (!el) return;
-  if (reset) put(el, );
+  if (reset) put(el);
+  const note = el.querySelector(".joblog-empty");
+  if (note) note.remove(); // keep it last; re-added by syncLogFilterNote once the new lines are in
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   for (const l of lines) el.append(h("div", { class: lineClass(l) }, l || " "));
+  syncLogFilterNote();
   if (atBottom || reset) el.scrollTop = el.scrollHeight;
 }
 
@@ -3330,6 +3377,9 @@ function updateJobHead() {
     h("span", { class: "last", title: last }, last),
     h("div", { class: "tools" },
       j.status === "running" ? h("button", { class: "btn sm danger", disabled: j.stop_requested, onclick: stopJob }, icon("stop"), j.stop_requested ? "Đang dừng…" : "Dừng") : null,
+      S.jobOpen ? h("button", { class: "btn sm ghost icon" + (S.jobOnlyKey ? " on" : ""), "aria-pressed": String(!!S.jobOnlyKey),
+        title: S.jobOnlyKey ? "Đang chỉ hiện việc quan trọng — bấm để xem tất cả" : "Chỉ hiện việc quan trọng",
+        "aria-label": "Lọc log quan trọng", onclick: toggleJobFilter }, icon("filter")) : null,
       h("button", { class: "btn sm ghost icon", title: "Chép log", "aria-label": "Chép log", onclick: () => { navigator.clipboard?.writeText(j.lines.join("\n")); toast("Đã chép log", "", 1500); } }, icon("copy")),
       h("button", { class: "btn sm ghost", "aria-expanded": String(!!S.jobOpen), onclick: () => { S.jobOpen = !S.jobOpen; document.getElementById("joblog").classList.toggle("hidden", !S.jobOpen); updateJobHead(); } }, icon(S.jobOpen ? "down" : "up"), S.jobOpen ? "Ẩn log" : "Xem log"),
       j.status !== "running" ? h("button", { class: "btn sm ghost icon", title: "Đóng", "aria-label": "Đóng thanh tiến trình", onclick: () => { S.job = null; renderJobbar(); } }, icon("x")) : null),
