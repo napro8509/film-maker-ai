@@ -170,7 +170,8 @@ class Pipeline:
         return items[:cap]
 
     def _image_with_refs(self, what: str, prompt: str, refs: list[tuple[str, Path]], project: str,
-                         kw: dict, opts: RunOptions, *, log_line: str | None = None) -> Path | None:
+                         kw: dict, opts: RunOptions, *, log_line: str | None = None,
+                         kinds: list[str] | None = None) -> Path | None:
         """i2i with the characters' pictures; None when Flow can't do it here (the caller makes a text-only image).
 
         When a scene's characters are Flow characters, or there are more references than the image model's
@@ -188,11 +189,21 @@ class Pipeline:
         elif log_line:
             self.log(log_line)
         files = [p for _, p in refs]
-        # Say which picture is whom (Nano Banana follows labelled references better); not part of any fingerprint.
+        # Say what each picture is (Nano Banana follows labelled references better); not part of any fingerprint.
+        # A character keeps its face; a location/previous-keyframe reference is the setting to match, not a face.
+        kinds = kinds or ["character"] * len(refs)
         order = ["first", "second", "third", "fourth"]
-        ui_prompt = ("Reference images: " + "; ".join(
-            f"the {order[i] if i < len(order) else str(i + 1) + 'th'} is {n} (keep {n}'s face, hair and clothes exactly)"
-            for i, (n, _) in enumerate(refs)) + ". " + prompt)
+
+        def _slot(i: int, name: str) -> str:
+            pos = order[i] if i < len(order) else f"{i + 1}th"
+            if i < len(kinds) and kinds[i] == "location":
+                return f"the {pos} is {name}, the scene's location/background (keep this setting)"
+            if i < len(kinds) and kinds[i] == "keyframe":
+                return (f"the {pos} is {name}, the previous shot (continue from it, keeping the same setting, "
+                        "lighting and the characters' look)")
+            return f"the {pos} is {name} (keep {name}'s face, hair and clothes exactly)"
+
+        ui_prompt = "Reference images: " + "; ".join(_slot(i, n) for i, (n, _) in enumerate(refs)) + ". " + prompt
         # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
         cap = ref_caps.image_cap(kw.get("model"))
         if (self.state.data.get("i2i_ui") or self._prefer_ui(refs, project, cap)) and self.g.ui_available():
@@ -601,13 +612,14 @@ class Pipeline:
         # The sha of the keyframe chained from, read before the call (`keyframe_from_sha`).
         src_sha = file_sha(self.keyframe_path(src)) if src is not None else None
         refs = [(it.label, it.path) for it in items]
+        kinds = [it.kind for it in items]
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
         sent = self.sb.for_flow_keyframe(prompt, s)  # + dialogue staging; state keeps `prompt` (fingerprint)
         img = None
         # Images are free on Flow, so retrying them (or falling back) is safe.
         if refs:
             img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", sent, refs, project, kw, opts,
-                                        log_line="" if loc is not None else None)
+                                        log_line="" if loc is not None else None, kinds=kinds)
         chained = src is not None and img is not None
         if img is None:
             img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(sent, **kw), opts.max_retries)
@@ -794,33 +806,44 @@ class Pipeline:
         """Text-to-video, with the characters' reference images (r2v) when there are any."""
         refs = self.sb.scene_refs(s)  # location picture + characters; never the previous keyframe
         project = common["project"]
-        if refs and not self.state.data.get("r2v_unsupported"):
+        if refs:
             if self.sb.scene_location(s) is not None:
                 self._log_refs(s, self.sb.scene_ref_items(s))
             else:
                 self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
-            # Flow characters (or more references than the CLI accepts): attach them by name on the chat page,
-            # which has no --ref cap, instead of uploading each picture through `gflow video r2v`.
             cap = ref_caps.video_cap(common.get("model"))
-            if self._prefer_ui(refs, project, cap):
+            # Flow characters (or more references than the CLI accepts): attach them by name on the chat page,
+            # which has no --ref cap, instead of uploading each picture through `gflow video r2v`. This runs
+            # even when this account's `gflow video r2v` is unsupported (the chat page does not use it).
+            prefer_ui = self._prefer_ui(refs, project, cap)
+            if not prefer_ui and not self.state.data.get("r2v_unsupported"):
+                try:
+                    send = self._cap_cli_refs([p for _, p in refs], refs, cap, "video r2v")
+                    video, media_id = self._with_retries(
+                        "render video",
+                        lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), send, **common),
+                        opts.max_retries)
+                    return video, media_id, "r2v"
+                except GflowError as exc:
+                    if exc.exit_code != EXIT_NOT_PORTED:
+                        raise
+                    # Refused before submit, so no credits were spent.
+                    self.state.data["r2v_unsupported"] = True
+                    self.state.save()
+                    self._remember(r2v_unsupported=True)
+                    if self.g.ui_available():
+                        self.log("  ! gflow chưa hỗ trợ video theo ảnh tham chiếu trên tài khoản này (chưa trừ "
+                                 "credit); gắn nhân vật qua giao diện chat của Flow.")
+                        prefer_ui = True
+                    else:
+                        self.log("  ! Tài khoản Flow này chưa hỗ trợ video theo ảnh tham chiếu qua gflow (chưa trừ "
+                                 "credit). Dùng Chữ → Video thường.")
+            # Either the scene prefers the chat page, or `gflow video r2v` is unsupported but the chat page is up:
+            # attach every reference by name there rather than drop the characters to a plain Chữ → Video.
+            if prefer_ui or (self.state.data.get("r2v_unsupported") and self.g.ui_available()):
                 self.log("  → Tạo video có nhân vật tham chiếu qua giao diện chat của Flow (gắn nhân vật theo tên).")
                 video, media_id = self._ref_video_via_ui(s, prompt, self.ui_refs(refs, project), common)
                 return video, media_id, "flow-ui-r2v"
-            try:
-                send = self._cap_cli_refs([p for _, p in refs], refs, cap, "video r2v")
-                video, media_id = self._with_retries(
-                    "render video",
-                    lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), send, **common), opts.max_retries)
-                return video, media_id, "r2v"
-            except GflowError as exc:
-                if exc.exit_code != EXIT_NOT_PORTED:
-                    raise
-                # Refused before submit, so no credits were spent.
-                self.log("  ! Tài khoản Flow này chưa hỗ trợ video theo ảnh tham chiếu qua gflow (chưa trừ credit). "
-                         "Dùng Chữ → Video thường.")
-                self.state.data["r2v_unsupported"] = True
-                self.state.save()
-                self._remember(r2v_unsupported=True)
         video, media_id = self._with_retries("render video", lambda: self.g.text_to_video(self.sb.for_flow_video(prompt, s), **common),
                                              opts.max_retries)
         return video, media_id, "t2v"
@@ -872,7 +895,7 @@ class Pipeline:
         if ui:
             # Attach the scene's characters too (Flow characters by name, others as pictures) so their faces
             # stay identical even where the start frame does not show everyone.
-            char_refs = self.ui_refs(self.sb.scene_char_refs(s), project)
+            char_refs = self.ui_refs(self.sb.scene_ui_char_refs(s), project)
             return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
         call = lambda: self.g.image_to_video(start_image, self.sb.for_flow_video(prompt, s), end_image=s.end_image, **common)
         try:
@@ -890,7 +913,7 @@ class Pipeline:
             self._remember(i2v_unsupported=True, i2v_error=str(exc))
             if self.g.ui_available():
                 self.log("  → Làm Ảnh → Video qua giao diện chat của Flow (như bấm “+” rồi “Add to prompt” bằng tay).")
-                char_refs = self.ui_refs(self.sb.scene_char_refs(s), project)
+                char_refs = self.ui_refs(self.sb.scene_ui_char_refs(s), project)
                 return self._render_via_ui(s, start_image, prompt, common, refs=char_refs)
             if s.mode == "i2v":
                 raise GflowError(

@@ -720,8 +720,6 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/hoa.png',
                    '--ref',
                    '<tmp>/tuan.png',
-                   '--ref',
-                   '<tmp>/bao.png',
                    '--aspect',
                    '9:16',
                    '-o',

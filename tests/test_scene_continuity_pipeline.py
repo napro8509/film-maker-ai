@@ -323,7 +323,9 @@ def test_t2v_r2v_refs(env):
     assert report.ok, report
     r2v = [c for c in env.calls() if c[:2] == ["video", "r2v"]]
     assert len(r2v) == 1
-    assert refs(r2v[0]) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
+    # The chat page is off here (CLI), so gflow video r2v is trimmed to the Veo --ref cap (3); the uncapped
+    # list still shows in the log line below. With the chat page on, every reference is attached by name.
+    assert refs(r2v[0]) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png"]
     assert "Setting: long dark teak table, brass ceiling lamp." in r2v[0][2]
     assert env.lines.count("  ảnh tham chiếu: bối cảnh Phòng khách, Minh, Lan, Tuan") == 2
 

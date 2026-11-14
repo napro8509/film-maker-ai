@@ -1377,11 +1377,14 @@ function renderSceneMedia(sc, { kfHint = null, lazy = false, prog = [`kf:${sc.id
   const startImg = sc.mode === "i2v" ? (assetUrl(sc.image) || st.image_url) : null;
   const stale = st.status === "changed";
   if (st.clip_url) {
-    const poster = st.rendered_as === "t2v" || st.rendered_as === "r2v" ? null : (kf || startImg || null);
+    // t2v / r2v / flow-ui-r2v have no start frame or keyframe, so no poster (never the unused keyframe still).
+    const noPoster = st.rendered_as === "t2v" || st.rendered_as === "r2v" || st.rendered_as === "flow-ui-r2v";
+    const poster = noPoster ? null : (kf || startImg || null);
     box.append(lazy ? lazyVideo(st.clip_url, poster)
       : h("video", { src: st.clip_url, controls: true, preload: "metadata", poster, playsinline: true }));
     if (stale) box.append(h("span", { class: "tag warn" }, "Clip cũ · prompt đã đổi"));
     else if (st.rendered_as === "t2v" && sc.mode === "keyframe") box.append(h("span", { class: "tag" }, "Render bằng Chữ → Video"));
+    else if (st.rendered_as === "flow-ui-r2v") box.append(h("span", { class: "tag" }, "Có nhân vật · qua giao diện chat Flow"));
     else if (st.rendered_as === "flow-ui") box.append(h("span", { class: "tag" }, "Render qua giao diện chat Flow"));
     else if (st.rendered_as === "r2v") box.append(h("span", { class: "tag" }, sc.mode === "keyframe" ? "Render bằng Chữ → Video + ảnh nhân vật" : "Có ảnh nhân vật"));
   } else if (kf) {

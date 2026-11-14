@@ -887,8 +887,10 @@ class Storyboard(StoryboardDraft):
     def thumbnail_refs(self) -> list[tuple[str, Path]]:
         if not self.use_character_refs:
             return []
+        # No cap: on the Flow chat page every cover character is attached by name; the CLI path trims to the
+        # image model's --ref cap at send time (Pipeline._cap_cli_refs), as for scene keyframes.
         return [(c.name, Path(c.image)) for c in self._characters_in(self.thumbnail_prompt())
-                if c.image and Path(c.image).is_file()][:MAX_REFS]
+                if c.image and Path(c.image).is_file()]
 
     def scene_text(self, scene: Scene) -> str:
         """Text whose character names decide which references a scene gets (speakers count too)."""
@@ -989,15 +991,30 @@ class Storyboard(StoryboardDraft):
         return out
 
     def _char_ref_candidates(self, scene: Scene) -> list[tuple[str, Path]]:
-        if not self.use_character_refs or scene.mode == "i2v":
+        """(name, image) of characters with a reference picture on disk. For every mode."""
+        if not self.use_character_refs:
             return []
         return [(c.name, Path(c.image)) for c in self.scene_characters(scene)
                 if c.image and Path(c.image).is_file()]
 
     def scene_char_refs(self, scene: Scene) -> list[tuple[str, Path]]:
-        """(name, image) of every character picked for this scene that has a reference image on disk. All of
-        them are sent: characters are made as Flow characters and attached by name (the picked-on-Board flow),
-        not uploaded one picture at a time, so a scene is no longer capped at a few reference images."""
+        """(name, image) of every character picked for this scene that is part of the scene's references
+        (location-aware reference list, fingerprint, refs_signature). All of them are sent: characters are made
+        as Flow characters and attached by name (the picked-on-Board flow), not uploaded one picture at a time,
+        so a scene is no longer capped at a few reference images.
+
+        An i2v scene already starts from a provided frame, so its reference list / fingerprint keep NOT counting
+        the characters (that contract is unchanged). To still attach the picked characters when an i2v clip is
+        rendered through the Flow chat page, use `scene_ui_char_refs`."""
+        if scene.mode == "i2v":
+            return []
+        return self._char_ref_candidates(scene)
+
+    def scene_ui_char_refs(self, scene: Scene) -> list[tuple[str, Path]]:
+        """(name, image) of every character picked for this scene that has a reference picture — for EVERY mode,
+        i2v included. Used only when a clip is rendered on the Flow chat composer (the characters are attached
+        by name, with no 3-image cap). Never part of scene_refs / refs_signature / the scene fingerprint, so
+        attaching characters to an i2v clip does not change the i2v reference contract."""
         return self._char_ref_candidates(scene)
 
     def scene_ref_items(self, scene: Scene, prev: tuple[str, Path] | None = None) -> list[RefItem]:
