@@ -34,7 +34,11 @@ DIALOGUE_RULE = ("Spoken language: {lang}. Each line is said in {lang} only by t
                  "nobody else repeats it, mouths it or talks along.")
 # The sentence used before; prompts that still carry it get the new one instead.
 OLD_DIALOGUE_RULE = re.compile(r"All spoken dialogue is in [^;.]+; characters speak only [^.]+\.?")
-NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
+# No "music": every clip is generated alone, so Veo composed different music for each and the score jumped at every
+# cut. One background score is added for the whole film when editing (editor / CapCut).
+NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound and sound effects."
+# The sentence used before; prompts that still carry it get the new one instead.
+OLD_NO_DIALOGUE_RULE = "No spoken dialogue: characters do not talk; only ambient sound, sound effects and music."
 # A scene without lines in a film with dialogue. Sending the language rule there ("characters speak only Thai")
 # made Veo invent lines in half of such scenes (a mother saying "it's ok, I'm here" in a scene meant to be silent).
 SILENT_SCENE_RULE = ("Nobody speaks in this scene: no dialogue, no words, no voice-over; the characters stay silent "
@@ -809,6 +813,7 @@ class Storyboard(StoryboardDraft):
             return prompt
         if self.basic:  # one sound sentence, nothing from the drama flow
             rule = self.audio_rule()
+            prompt = prompt.replace(formats.OLD_SILENT_RULE, rule) if rule else prompt
             if not rule or rule.rstrip(".") in prompt:
                 return self.for_flow(prompt)
             base = prompt.rstrip()
@@ -825,7 +830,7 @@ class Storyboard(StoryboardDraft):
                     base += "."
                 prompt = f"{base} {cues}" if base else cues
         rule = self.dialogue_rule()
-        prompt = OLD_DIALOGUE_RULE.sub(lambda _: rule, prompt)
+        prompt = OLD_DIALOGUE_RULE.sub(lambda _: rule, prompt).replace(OLD_NO_DIALOGUE_RULE, NO_DIALOGUE_RULE)
         if (scene is not None and self.speaks() and rule and not scene.spoken_lines()
                 and rule.rstrip(".") not in prompt
                 and not self._speech_in_prompt(prompt.replace(SILENT_SCENE_RULE, ""))):

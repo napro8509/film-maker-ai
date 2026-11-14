@@ -44,6 +44,11 @@ FORMATS: dict[str, dict] = {
 }
 
 # key -> label, help, planner guide (English), rule added to every video prompt (English)
+# Said with what IS heard: "no music" made Veo add odd music (and each clip its own, so it jumped at every cut).
+# The music is added for the whole film when editing.
+SILENT_RULE = "Nobody speaks; the sound is only ambient sound and sound effects."
+OLD_SILENT_RULE = "No dialogue, no music."  # the sentence used before; saved prompts get the new one
+
 AUDIO: dict[str, dict] = {
     "dialogue": {
         "label": "Có thoại", "desc": "Kịch bản có lời nhân vật, cần lồng tiếng hoặc khớp môi",
@@ -57,7 +62,7 @@ AUDIO: dict[str, dict] = {
         "label": "Không thoại", "desc": "Kể bằng biểu cảm và hành động, nhạc nền giữ cảm xúc",
         "guide": ("Nobody speaks. Tell the story with faces, gestures and actions; `audio` has only ambient sound "
                   "and effects (music is added when editing). No `speaker`, leave `narration` empty."),
-        "rule": "No dialogue, no music.",
+        "rule": SILENT_RULE,
     },
     "voiceover": {
         "label": "Thuyết minh", "desc": "Một giọng kể dẫn dắt, nhân vật không cần nói",
@@ -71,14 +76,14 @@ AUDIO: dict[str, dict] = {
         "guide": ("The story must be understood with the sound off. Nobody speaks (no `speaker`); put a short "
                   "caption for the scene in `narration`, at most 12 words (added as text when editing, never "
                   "drawn by the video model)."),
-        "rule": "No dialogue, no music.",
+        "rule": SILENT_RULE,
     },
     "music": {
         "label": "Nhạc kể chuyện", "desc": "Câu chuyện đi theo một bài hát",
         "guide": ("The story follows one song: scenes are cut like a music video, each scene matches a part of "
                   "the song (intro, verse, chorus, bridge, final chorus); the song is added when editing. Nobody "
                   "talks (no `speaker`), leave `narration` empty."),
-        "rule": "No dialogue, no music.",
+        "rule": SILENT_RULE,
     },
 }
 

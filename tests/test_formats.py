@@ -46,7 +46,7 @@ def test_drama_is_unchanged_without_a_format_or_with_short_drama():
 def test_silent_basic_film_gets_the_short_no_speech_rule():
     sb = _sb(format="short_film", audio="silent", dialogue_language="none")
     s = sb.scenes[0]
-    assert sb.for_flow_video(sb.video_prompt(s), s).startswith("Lan stands up. No dialogue, no music.")  # hand-written scene
+    assert sb.for_flow_video(sb.video_prompt(s), s).startswith("Lan stands up. Nobody speaks; the sound is only ambient sound and sound effects.")  # hand-written scene
 
 
 def test_unknown_choices_are_rejected_and_genres_cleaned():
@@ -673,3 +673,12 @@ def test_center_partner_gaze_says_frame_center():
         "listeners": [{"position": "frame center", "visual_tag": "the toddler girl in the pink romper"}]})
     text = i2v_prompt.assemble(shot, audio_mode="dialogue", language="Vietnamese")
     assert "turns head toward frame left" in text and "pink romper on frame center" in text
+
+
+def test_basic_sound_rules_never_mention_music():
+    from filmmaker import formats
+    for key, a in formats.AUDIO.items():
+        assert "music" not in a["rule"].lower(), key
+    sb = _sb(format="short_film", audio="silent", dialogue_language="none")
+    out = sb.for_flow_video(f"Lan walks. {formats.OLD_SILENT_RULE}")  # a prompt saved with the old sentence
+    assert "no music" not in out and out.count(formats.SILENT_RULE) == 1

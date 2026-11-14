@@ -51,7 +51,7 @@ def test_message_with_dialogue_language():
     assert planner._user_message("ý", 3, "9:16", None, "Thai") == (
         base + "\nSpoken dialogue language: Thai (every character who speaks speaks only Thai)")
     assert planner._user_message("ý", 3, "9:16", "English", "none") == (
-        base + "\nSpoken dialogue: none (no character speaks; only ambient sound, sound effects and music)"
+        base + "\nSpoken dialogue: none (no character speaks; only ambient sound and sound effects)"
         "\nSubtitle (narration) language: English")
 
 
@@ -195,7 +195,7 @@ def test_cli_dialogue_lang_without_lang(dump, tmp_path):
 @pytest.mark.parametrize("value", ["None", "NONE", " none "])
 def test_message_none_any_case(value):
     msg = planner._user_message("ý", 3, "9:16", None, value)
-    assert msg.endswith("\nSpoken dialogue: none (no character speaks; only ambient sound, sound effects and music)")
+    assert msg.endswith("\nSpoken dialogue: none (no character speaks; only ambient sound and sound effects)")
 
 
 @pytest.mark.parametrize("opt", ["--dialogue-lang", "--lang"])
