@@ -56,8 +56,10 @@ def test_package_metadata_content():
         assert m.retires(a) == date(2026, 12, 5)
     for a in ("veo-lite", "veo-lite-lp", "omni-1.2-flash"):
         assert m.retires(a) is None
-    assert all(e["checked"] == date(2026, 11, 9) for e in m.models.values())
-    assert set(m.models) == {"veo-lite", "veo-lite-lp", "veo-fast", "veo-quality", "omni-flash", "omni-1.2-flash"}
+    flow = {a: e for a, e in m.models.items() if a != "muse"}  # Muse (Meta) was added later, on 2026-11-17
+    assert all(e["checked"] == date(2026, 11, 9) for e in flow.values())
+    assert set(m.models) == {"veo-lite", "veo-lite-lp", "veo-fast", "veo-quality", "omni-flash", "omni-1.2-flash", "muse"}
+    assert m.durations("muse") == [10]
     assert m.durations("veo-lite") == [4, 6, 8] and m.durations("veo-lite-lp") == [4, 6, 8]
     assert m.entry("veo-lite")["price"] == {"unit": "clip", "ultra": 5, "default": 10}
     assert m.entry("veo-fast")["price"] == {"unit": "clip", "ultra": 10, "default": 20}

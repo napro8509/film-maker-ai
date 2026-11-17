@@ -77,3 +77,11 @@ models:
     plan_required:
     checked: 2026-11-09
     note: "360p: 1 credit/giây; 11–15 giây cần gói trả phí"
+
+  muse:
+    retires:
+    durations: [10]
+    price:
+    plan_required:
+    checked: 2026-11-17
+    note: "Meta Muse (muse.ai), không phải Flow: điều khiển trang chat Muse, video 10 giây có tiếng, không tốn credit Flow. Đăng nhập một lần: filmmaker muse login"

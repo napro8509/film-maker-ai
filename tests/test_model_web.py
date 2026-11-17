@@ -114,7 +114,10 @@ def test_api_models_aliases_only_from_gflow(client, tmp_path, monkeypatch):
     f.write_text(json.dumps(data))
     monkeypatch.setenv("FAKE_GFLOW_MODELS", str(f))
     res = client.get("/api/models").json()
-    assert [m["alias"] for m in res["video"]] == ["veo-fast", "veo-lite"]  # no veo-quality although it is in metadata
+    # no veo-quality although it is in metadata; Muse is not a Flow model, so it is always added at the end
+    assert [m["alias"] for m in res["video"]] == ["veo-fast", "veo-lite", "muse"]
+    muse = res["video"][-1]
+    assert muse["max_duration"] == 10 and muse["info"]["durations"] == [10] and muse["status"] == "active"
 
 
 def test_api_models_reads_override(client):
@@ -147,8 +150,8 @@ def test_fallback_not_cached(client, monkeypatch):
     res = client.get("/api/models").json()
     assert res["source"] == "fallback"
     assert [m["alias"] for m in res["video"]] == ["veo-fast", "veo-quality", "veo-lite", "veo-lite-lp",
-                                                   "omni-flash", "omni-1.2-flash"]
-    assert [m["max_duration"] for m in res["video"]] == [8, 8, 8, 8, 10, 15]
+                                                   "omni-flash", "omni-1.2-flash", "muse"]
+    assert [m["max_duration"] for m in res["video"]] == [8, 8, 8, 8, 10, 15, 10]
     assert [m["alias"] for m in res["image"]] == ["nano2", "nano-pro", "imagen4", "nano2-lite"]
     assert video_by_alias(res)["veo-fast"]["status"] == "retiring"  # warnings still work without gflow
     res2 = client.get("/api/models").json()
@@ -161,7 +164,7 @@ def test_fallback_not_cached(client, monkeypatch):
 def test_fallback_when_gflow_missing(client, monkeypatch):
     monkeypatch.setenv("GFLOW_BIN", "/nonexistent/gflow-binary")
     res = client.get("/api/models").json()
-    assert res["source"] == "fallback" and len(res["video"]) == 6
+    assert res["source"] == "fallback" and len(res["video"]) == 7  # 6 fallback + muse
     assert not hasattr(server, "FALLBACK_MODELS")
 
 
@@ -180,7 +183,7 @@ def test_broken_package_metadata(client, tmp_path, monkeypatch):
     monkeypatch.setattr(model_meta, "PACKAGE_FILE", broken)
     write_override(client.override, "models:\n  veo-lite:\n    retires: 2026-11-01\n")  # ignored: package broken
     res = client.get("/api/models").json()
-    assert res["source"] == "gflow" and len(res["video"]) == 6
+    assert res["source"] == "gflow" and len(res["video"]) == 7  # 6 from gflow + muse
     assert all(m["info"] is None and m["status"] == "active" for m in res["video"])
     assert "broken-package.yaml" in res["metadata_error"]
 
@@ -190,6 +193,8 @@ def test_broken_package_metadata(client, tmp_path, monkeypatch):
     res = c2.get("/api/models").json()
     assert res["source"] == "fallback"
     assert res["video"] == [{"alias": "veo-lite", "max_duration": 8, "info": None, "status": "active",
+                             "retires_label": None},
+                            {"alias": "muse", "max_duration": 10, "info": None, "status": "active",
                              "retires_label": None}]
     assert res["image"] == [{"alias": "nano2", "label": "Nano Banana 2"}]
     assert "broken-package.yaml" in res["metadata_error"]

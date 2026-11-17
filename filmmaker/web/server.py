@@ -41,6 +41,7 @@ from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
 from ..settings import DEFAULT_BACKUP_REMOTE, settings_path
 from ..gflow import Gflow, GflowError, _extract_json, _split
+from .. import gflow as gflow_mod
 from ..pipeline import DONE, Pipeline, RunOptions, State
 from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, NO_SUBTITLES, Scene, Storyboard, clean_dialogue_language, clean_language,
                           load_storyboard, merge_subtitles_raw, save_storyboard)
@@ -1009,7 +1010,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         meta = model_meta.load()
         src = raw if raw is not None else meta.fallback
         video = []
-        for m in src.get("video") or []:
+        src_video = list(src.get("video") or [])
+        if not any(gflow_mod.is_muse(m.get("alias")) for m in src_video):  # not a Flow model: gflow never lists it
+            src_video.append({"alias": gflow_mod.MUSE_MODEL, "max_duration": 10})
+        for m in src_video:
             alias = m.get("alias")
             video.append({**m, "info": meta.info(alias), "status": meta.status(alias),
                           "retires_label": meta.retires_label(alias)})

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Collection
 from pathlib import Path
@@ -18,7 +19,7 @@ from . import model_meta, retirement
 from . import settings as user_settings
 from .assemble import AssembleError, assemble
 from .backup import AutoBackup, BackupError, Rclone, last_backup
-from .gflow import Gflow, GflowError
+from .gflow import Gflow, GflowError, _extract_json
 from .thumbnail import ThumbnailError
 from .pipeline import DONE, Pipeline, RunOptions, State, send_list
 from .storyboard import LANG_MAX, clean_dialogue_language, clean_language, load_storyboard, save_storyboard
@@ -1409,6 +1410,51 @@ def app(workspace: Path | None) -> None:
     from .desktop import main as desktop_main
 
     desktop_main(workspace)
+
+
+# --- muse: Meta's Muse agent as a video model ----------------------------------------------
+
+
+@main.group()
+def muse() -> None:
+    """Dùng Meta Muse (muse.ai) làm model video: đặt `model: muse` cho phim hoặc cảnh.
+
+    \b
+    Muse không phải Flow: Film Maker điều khiển trang chat muse.ai (video 10 giây, có tiếng,
+    không tốn credit Flow). Đăng nhập một lần:  filmmaker muse login
+    """
+
+
+def _muse_cmd(profile: str | None) -> list[str]:
+    cmd = Gflow(profile=profile).muse_command()
+    if not cmd:
+        raise click.ClickException("không tìm thấy Python có Playwright (của gflow-cli). Cài gflow-cli trước.")
+    return cmd
+
+
+@muse.command("login")
+@click.option("--profile", default=None, help="Profile gflow (để tìm Python của gflow-cli).")
+def muse_login(profile: str | None) -> None:
+    """Mở cửa sổ muse.ai để đăng nhập (một lần). Nhập xong mã 6 số, chờ tới trang chat, ĐỪNG đóng cửa sổ."""
+    proc = subprocess.run([*_muse_cmd(profile), "login"], stdout=subprocess.PIPE, text=True)
+    payload = _extract_json(proc.stdout or "") or {}
+    if proc.returncode != 0 or payload.get("status") != "ok":
+        raise click.ClickException(((payload.get("error") or {}).get("detail")) or "đăng nhập Muse chưa xong")
+    click.echo("✔ Đã đăng nhập Muse. Đặt `model: muse` trong storyboard (hoặc chọn Muse trên web) để render bằng Muse.")
+
+
+@muse.command("fetch")
+@click.argument("marker")
+@click.option("-o", "--out", type=click.Path(dir_okay=False, path_type=Path), required=True)
+@click.option("--profile", default=None)
+def muse_fetch(marker: str, out: Path, profile: str | None) -> None:
+    """Tải video Muse đã làm cho một yêu cầu trước (vd khi bị hết giờ chờ). MARKER: một đoạn chữ trong tin nhắn đó."""
+    proc = subprocess.run([*_muse_cmd(profile), "fetch", "--marker", marker, "-o", str(out)],
+                          stdout=subprocess.PIPE, text=True)
+    payload = _extract_json(proc.stdout or "") or {}
+    if proc.returncode != 0 or payload.get("status") != "ok":
+        raise click.ClickException(((payload.get("error") or {}).get("detail")) or "không lấy được video")
+    click.echo(f"✔ {payload.get('local_path')}")
 
 
 if __name__ == "__main__":

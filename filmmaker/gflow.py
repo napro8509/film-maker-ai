@@ -132,6 +132,17 @@ def _stream(args: list[str], timeout: float, on_line: Callable[[str], None],
 
 
 UI_SCRIPT = Path(__file__).with_name("flow_ui.py")
+MUSE_SCRIPT = Path(__file__).with_name("muse_ui.py")
+
+#: Video "models" that are not Flow: rendered by driving another site's chat page (see muse_ui.py).
+#: Every video method below sends these there instead of to gflow, so the pipeline and the clone flow
+#: need no change of their own.
+MUSE_MODEL = "muse"
+
+
+def is_muse(model: str | None) -> bool:
+    return (model or "").strip().lower() == MUSE_MODEL
+
 
 # Names the Flow chat agent understands for gflow's model aliases.
 MODEL_NAMES = {
@@ -377,10 +388,14 @@ class Gflow:
         return (Path(local) if local else out), payload.get("media_id")
 
     def text_to_video(self, prompt: str, **kw: Any) -> tuple[Path, str | None]:
+        if is_muse(kw.get("model")):
+            return self.muse_video(None, prompt, **kw)
         payload = self.run_json("video", "t2v", prompt, *self._video_opts(**kw))
         return self._video_result(payload, kw["out"])
 
     def image_to_video(self, image: Path, prompt: str, *, end_image: str | None = None, **kw: Any) -> tuple[Path, str | None]:
+        if is_muse(kw.get("model")):
+            return self.muse_video(image, prompt, **kw)
         args = ["video", "i2v", "--initial-frame", str(image)]
         if end_image:
             args += ["--end-frame", str(end_image)]
@@ -389,11 +404,53 @@ class Gflow:
 
     def reference_to_video(self, prompt: str, refs: list[Path], **kw: Any) -> tuple[Path, str | None]:
         """Text-to-video with reference images ("ingredients") for the characters."""
+        if is_muse(kw.get("model")):
+            return self.muse_video(None, prompt, refs=refs, **kw)
         args = ["video", "r2v", prompt]
         for r in refs:
             args += ["--ref", str(r)]
         payload = self.run_json(*args, *self._video_opts(**kw))
         return self._video_result(payload, kw["out"])
+
+    # --- video through Meta's Muse agent (see muse_ui.py) ----------------------
+
+    def muse_command(self) -> list[str] | None:
+        if os.environ.get("MUSE_UI_CMD"):
+            return _split(os.environ["MUSE_UI_CMD"])
+        py = os.environ.get("FLOW_UI_PYTHON") or _gflow_python(self.binary)
+        return [py, str(MUSE_SCRIPT)] if py else None
+
+    def muse_video(self, image: Path | None, prompt: str, *, refs: list[Path | str] | None = None,
+                   aspect: str, duration: int | None, out: Path, **_: Any) -> tuple[Path, None]:
+        """One clip from muse.ai. `image` is the start frame (or None), `refs` character pictures; Flow
+        characters given by name ("character:<name>") and Flow media ids cannot go to Muse and are left out.
+        Muse has no project, no media id and no credits, so the extra keyword arguments are ignored."""
+        cmd = self.muse_command()
+        if not cmd:
+            raise GflowError("không tìm thấy Python có Playwright (của gflow-cli) để điều khiển Muse", exit_code=2)
+        files = [Path(r) for r in refs or [] if not str(r).startswith("character:") and Path(r).is_file()]
+        skipped = len(refs or []) - len(files)
+        args = [*cmd, "i2v", "--prompt", prompt, "--aspect", aspect, "-o", str(out),
+                "--timeout", str(max(300, self.timeout - 60))]
+        if image is not None:
+            args += ["--image", str(image)]
+        for f in files:
+            args += ["--ref", str(f)]
+        if duration:
+            args += ["--duration", str(duration)]
+        if os.environ.get("MUSE_UI_PROFILE"):
+            args += ["--profile-dir", os.environ["MUSE_UI_PROFILE"]]
+        opts = ([*(["--image", str(image)] if image is not None else []),
+                 *(a for f in files for a in ("--ref", str(f))), "--aspect", aspect])
+        self.log(ui_log_line(cmd, "i2v", opts, prompt))
+        if skipped:
+            self.log(f"  (bỏ {skipped} nhân vật Flow/ảnh không có file: Muse chỉ nhận ảnh trên máy)")
+        if self.dry_run:
+            return out, None
+        payload = self._run_ui(args, "video có thể vẫn đang tạo trên Muse (lấy lại bằng muse_ui.py fetch)",
+                               spent=True, who="Muse")
+        local = payload.get("local_path")
+        return (Path(local) if local else out), None
 
     # --- image-to-video through the Flow chat page (see flow_ui.py) ------------
 
@@ -434,6 +491,8 @@ class Gflow:
                           model: str | None, duration: int | None, project: str | None, out: Path) -> tuple[Path, str | None]:
         """Video through the Flow chat page. `image` is the start frame for image-to-video, or None for
         reference-to-video (characters only, attached by name / picture). `refs` are the extra references."""
+        if is_muse(model):
+            return self.muse_video(image, prompt, refs=refs, aspect=aspect, duration=duration, out=out)
         cmd = self.ui_command()
         profile = self.ui_profile_dir()
         if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):
@@ -515,7 +574,7 @@ class Gflow:
         return {"local_path": payload.get("local_path") or str(out), "entity_id": payload.get("entity_id"),
                 "name": payload.get("name") or name, "media_id": payload.get("media_id")}
 
-    def _run_ui(self, args: list[str], timeout_note: str, *, spent: bool) -> dict:
+    def _run_ui(self, args: list[str], timeout_note: str, *, spent: bool, who: str = "Flow") -> dict:
         """Run the Flow chat driver (streams its log and "@@progress" lines) and return its ok payload."""
         token = object()
         err_lines: list[str] = []
@@ -539,12 +598,12 @@ class Gflow:
         finally:
             self._set_live(None)
         if timed_out:
-            raise GflowError(f"điều khiển Flow quá {self.timeout}s; {timeout_note}",
+            raise GflowError(f"điều khiển {who} quá {self.timeout}s; {timeout_note}",
                              exit_code=EXIT_TIMEOUT, payload={"error": {"spent": spent}})
         payload = _extract_json(stdout or "")
         if returncode != 0 or not payload or payload.get("status") != "ok":
             err = (payload or {}).get("error") or {}
             detail = err.get("detail") or "\n".join(err_lines[-5:]) or (stdout or "").strip()[-400:]
-            raise GflowError(f"Flow (giao diện chat): {detail}", exit_code=int(err.get("exit_code") or returncode or 1),
+            raise GflowError(f"{who} (giao diện chat): {detail}", exit_code=int(err.get("exit_code") or returncode or 1),
                              retryable=False, payload=payload)
         return payload

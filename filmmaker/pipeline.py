@@ -20,7 +20,7 @@ from typing import Any, Callable, Collection, Literal
 from . import durations as dur
 from . import flow_caps, manual_clip, model_meta, ref_caps
 from . import progress as prog
-from .gflow import EXIT_NOT_PORTED, Gflow, GflowError
+from .gflow import EXIT_NOT_PORTED, Gflow, GflowError, is_muse
 from .flow_ui import character_ref
 from .storyboard import MAX_REFS, Character, Location, RefItem, Scene, Storyboard, file_sha  # noqa: F401
 from .thumbnail import render_cover
@@ -434,6 +434,12 @@ class Pipeline:
             plan.append((s, self._plan_kind(s, force, retry_unknown, confirm)))
         return plan
 
+    def _muse_only(self, scenes: list[Scene]) -> bool:
+        """Every scene renders on Muse from a picture on disk or from text alone: Flow is not used at all."""
+        return bool(scenes) and all(
+            is_muse(s.model or self.sb.model) and s.mode in ("i2v", "t2v") and not self.sb.scene_refs(s)
+            for s in scenes)
+
     def ensure_project(self) -> str:
         pid = self.sb.project_id or self.state.data.get("project_id")
         if pid:
@@ -504,6 +510,14 @@ class Pipeline:
 
         for s in todo:
             self.rep.queued(f"vid:{s.id}")
+        if self._muse_only(todo):
+            # Nothing goes to Flow (no keyframe, no character to attach there): no Flow project needed.
+            project = self.sb.project_id or self.state.data.get("project_id") or ""
+            self.log("Tất cả cảnh dùng Muse (muse.ai): không cần project Flow.")
+            try:
+                return self._send_scenes(todo, resend, project, opts, report)
+            finally:
+                self.rep.settle()
         try:
             project = self.ensure_project()
         except GflowError as exc:
