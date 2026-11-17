@@ -1,30 +1,43 @@
 "use strict";
-/* Film Maker — tab "Bảng" (storyboard board: nhân vật → keyframe → video).
+/* Film Maker — tab "Bảng" (ComfyUI Node-Graph Workflow Studio:
+   FilmConfig / Character / Location → Keyframe (+ Continuity chain) → VideoSampler → SaveFilm).
    Loaded BEFORE app.js and runs nothing at load time: every reference to app.js globals
    (S, h, zone, changed, flushSave, runAction, …) only happens when a function is called. */
 
 const B = {
   pid: null,
   loading: false, loaded: false, loadError: null,
-  cards: {},             // last loaded/saved cards dict (serialized keys → {x, y}); fallback for lookups
+  cards: {},             // last loaded/saved cards dict (serialized keys → {x, y})
   pos: new WeakMap(),    // character object → {x, y} (survives renames)
-  spos: new Map(),       // "kf:<sid>" / "vid:<sid>" → {x, y}
-  videos: new Set(),     // keyframe scenes whose video card the user showed
+  lpos: new WeakMap(),   // location object → {x, y} (survives renames)
+  spos: new Map(),       // "cfg:film" / "kf:<sid>" / "vid:<sid>" / "out:final" → {x, y}
+  videos: new Set(),     // keyframe scenes whose video node is explicitly shown
+  collapsed: new Set(),  // collapsed node keys (UI state)
+  hideIdleVideos: false, // false = show full ComfyUI DAG end-to-end; true = hide unrendered keyframe video nodes
+  showGroups: true,      // ComfyUI scene group frames
+  showMinimap: true,     // ComfyUI bottom-right minimap
+  showModelLinks: false, // optional MODEL bus wires from FilmConfig
+  wireStyle: "spline",   // "spline" | "orthogonal" | "straight"
   view: null,            // {x, y, zoom} | null (null → "Vừa màn hình" on first draw)
-  h: {},                 // measured card heights by DOM key
+  h: {},                 // measured node heights by DOM key
+  slotY: {},             // measured socket Y offset inside each node: `${key}|${side}|${slot}` → number
   sel: null,             // selected link id
-  selChar: null,         // character object of a selected "c<i>>…" link: the index alone shifts when characters change
-  saveAfterMount: false, // bShowVideo: PUT once bAfterMount has placed the new card
-  drag: null,            // current pointer interaction
+  selChar: null,         // character object of a selected "c<i>>…" link
+  selLoc: null,          // location object of a selected "l<i>>…" link
+  saveAfterMount: false,
+  drag: null,            // current pointer interaction ("pan" | "card" | "link" | "minimap")
   sig: "",               // card keys of the rendered board (structure)
   savedJson: null, savedKeys: null, pending: null, timer: null, inflight: false,
-  mc: null,              // boardModel() cached for the current task (see bModel)
+  mc: null,              // boardModel() cached for the current microtask
   keyBound: false,
+  comfy: { checking: false, checked: false, online: false, url: "127.0.0.1:8188", checkpoints: [], devices: [], queue_running: 0, queue_pending: 0, comfyui_version: null, video_nodes: [], error: null },
+  paletteOpen: false,
+  prefsLoaded: false,
 };
 
 const BOARD_ZOOMS = [0.25, 0.33, 0.5, 0.67, 0.8, 1, 1.25, 1.5, 2];
-const BOARD_ORIGIN = 32, BOARD_GAP_COL = 120, BOARD_GAP_ROW = 24, BOARD_GRID = 8, BOARD_HEAD = 36;
-const BOARD_W_CHAR = 220;
+const BOARD_ORIGIN = 40, BOARD_GAP_COL = 112, BOARD_GAP_ROW = 28, BOARD_GRID = 8, BOARD_HEAD = 34;
+const BOARD_W_CHAR = 236, BOARD_W_CFG = 244, BOARD_W_OUT = 256;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 /* createElementNS helper: h() uses createElement, which cannot make SVG nodes. */
@@ -38,22 +51,33 @@ function svgEl(tag, attrs, ...kids) {
   return el;
 }
 
-/* ---------- small helpers ---------- */
+/* ---------- core pure helpers (shared with Node UI tests) ---------- */
 
 const bKey = (n) => String(n ?? "").trim().toLowerCase(); // same as app.js charKey
 function bScenePortrait() { return S.cur.storyboard.aspect === "9:16"; }
-function bSceneW() { return bScenePortrait() ? 192 : 256; }
-function bCardW(key) { return key.startsWith("char:") ? BOARD_W_CHAR : bSceneW(); }
-function bFallbackH(key) { return key.startsWith("char:") ? 300 : bScenePortrait() ? 430 : 260; }
-function bCardH(key) { return B.h[key] || bFallbackH(key); }
+function bSceneW() { return bScenePortrait() ? 228 : 268; }
+function bCardW(key) {
+  if (key.startsWith("char:") || key.startsWith("loc:")) return BOARD_W_CHAR;
+  if (key.startsWith("cfg:")) return BOARD_W_CFG;
+  if (key.startsWith("out:")) return BOARD_W_OUT;
+  return bSceneW();
+}
+function bFallbackH(key) {
+  if (B.collapsed.has(key)) return 68;
+  if (key.startsWith("cfg:")) return 236;
+  if (key.startsWith("char:")) return 316;
+  if (key.startsWith("loc:")) return 286;
+  if (key.startsWith("out:")) return 230;
+  return bScenePortrait() ? 450 : 310;
+}
+function bCardH(key) { return B.collapsed.has(key) ? (B.h[key] || 68) : (B.h[key] || bFallbackH(key)); }
 function bSnap(v) { return Math.round(v / BOARD_GRID) * BOARD_GRID; }
 function bClampZoom(z) { return Math.min(2, Math.max(0.25, z)); }
 function bChars() { return S.cur.storyboard.characters || []; }
 function bScenes() { return S.cur.storyboard.scenes || []; }
 function bMode(sc) { return sc.mode || "keyframe"; }
 function bCharIndex(name) { const k = bKey(name); return k ? bChars().findIndex((c) => bKey(c.name) === k) : -1; }
-/* Like bCharIndex, but a name renamed since the last save (still the old name in scenes[].characters until
-   app.js save() passes the new one on) resolves through S.charSaved, so arrows do not flicker to "unknown". */
+/* Like bCharIndex, but a name renamed since the last save resolves through S.charSaved. */
 function bResolve(name) {
   const i = bCharIndex(name);
   if (i >= 0) return i;
@@ -66,32 +90,6 @@ function bTyping() {
   const a = document.activeElement;
   return !!(a && a.matches && a.matches("input, textarea, select, [contenteditable], [contenteditable] *"));
 }
-
-/* Layout key used in ui.json: char:<tên>, or char:#<i> for empty/duplicate names (G5).
-   A name changed since the last successful save keeps its saved key, so ui.json matches storyboard.yaml until the save goes through. */
-function bSerialCharKey(c, i, problems) {
-  if (problems.has(i) || !String(c.name || "").trim()) return `char:#${i}`;
-  const saved = S.charSaved && typeof S.charSaved.get === "function" ? S.charSaved.get(c) : null;
-  const n = String(saved || "").trim() || c.name.trim();
-  return `char:${n}`;
-}
-
-function bCharPos(c, i, problems = charNameProblems(S.cur.storyboard)) {
-  if (B.pos.has(c)) return B.pos.get(c);
-  const p = B.cards[bSerialCharKey(c, i, problems)];
-  if (p) B.pos.set(c, { x: p.x, y: p.y });
-  return B.pos.get(c) || null;
-}
-function bPos(key) {
-  if (key.startsWith("char:#")) { const i = +key.slice(6), c = bChars()[i]; return c ? bCharPos(c, i) : null; }
-  return B.spos.get(key) || null;
-}
-function bSetPos(key, p) {
-  if (key.startsWith("char:#")) { const c = bChars()[+key.slice(6)]; if (c) B.pos.set(c, p); }
-  else B.spos.set(key, p);
-}
-
-/* ---------- model ---------- */
 
 /* Characters of a scene for the arrows. Explicit list wins; otherwise the server's auto set;
    storyboard invalid (scene_state empty) → only the raw explicit list, no auto arrows. */
@@ -126,12 +124,115 @@ function linkKind(name, sid, ci = bResolve(name)) {
 
 function bVideoShown(sc) {
   if (bMode(sc) !== "keyframe") return true;
+  if (!B.hideIdleVideos) return true;
   const st = S.cur.scene_state?.[sc.id] || {};
   return B.videos.has(sc.id) || !!st.clip_url || st.status === "interrupted" || bSceneRunning(sc, "vid");
 }
 
-/* With structured job progress (progress.js) the running state comes from `progress`; "queued" is not running.
-   Jobs without it keep the old guess from the log / job title. */
+/* Notes about the characters sent with a scene (kf card, or t2v video card). */
+function bSceneCharMsgs(sc) {
+  const kids = [];
+  if (bMode(sc) === "i2v") return kids;
+  const L = sceneLinks(sc), st = S.cur.scene_state?.[sc.id];
+  for (const n of L.unknown) kids.push(h("div", { class: "scene-msg err" }, h("div", {}, `Không có nhân vật “${n}”`),
+    h("div", { class: "row", style: { marginTop: "6px" } }, h("button", { class: "btn sm", onclick: () => bRemoveUnknown(sc, n) }, icon("x"), "Bỏ khỏi cảnh"))));
+  if (st && S.cur.storyboard.use_character_refs !== false) {
+    const linked = L.idx.map((i) => bChars()[i]).filter(Boolean);
+    for (const c of linked) if (!charImageUrl(c)) kids.push(h("div", { class: "scene-msg warn" }, `${c.name} chưa có ảnh tham chiếu — chỉ dùng mô tả`));
+  }
+  return kids;
+}
+
+/* ---------- locations & continuity helpers on the board ---------- */
+
+function bLocs() { return (S.cur.storyboard.locations || []); }
+function bLocIndex(name) {
+  const k = bKey(name);
+  if (!k) return -1;
+  const i = bLocs().findIndex((l) => l && !blankLocation(l) && bKey(l.name) === k);
+  if (i >= 0) return i;
+  const saved = S.locSaved;
+  if (!saved || typeof saved.get !== "function") return -1;
+  return bLocs().findIndex((l) => l && !blankLocation(l) && bKey(saved.get(l)) === k);
+}
+
+function bContinuityPrevSid(sceneIdx) {
+  const sb = S.cur.storyboard, scenes = bScenes();
+  if (sceneIdx <= 0 || sb.continuity === false) return null;
+  const sc = scenes[sceneIdx];
+  if (!sc || bMode(sc) !== "keyframe" || sc.continue_previous === false) return null;
+  const li = bLocIndex(sc.location);
+  if (li < 0) return null;
+  const prev = scenes[sceneIdx - 1];
+  if (!prev || bMode(prev) !== "keyframe") return null;
+  if (bLocIndex(prev.location) !== li) return null;
+  return prev.id;
+}
+
+function bEngine() {
+  const e = S.settings?.board_engine || S.env?.comfyui?.engine || localGet("boardEngine", "flow");
+  return e === "comfyui" ? "comfyui" : "flow";
+}
+
+function bLoadUiPrefsOnce() {
+  if (B.prefsLoaded) return;
+  B.prefsLoaded = true;
+  const ws = localGet("boardWireStyle");
+  if (ws === "spline" || ws === "orthogonal" || ws === "straight") B.wireStyle = ws;
+  const sg = localGet("boardGroups");
+  if (typeof sg === "boolean") B.showGroups = sg;
+  const sm = localGet("boardMinimap");
+  if (typeof sm === "boolean") B.showMinimap = sm;
+  const ml = localGet("boardModelLinks");
+  if (typeof ml === "boolean") B.showModelLinks = ml;
+  const hi = localGet("boardHideIdleVid");
+  if (typeof hi === "boolean") B.hideIdleVideos = hi;
+}
+
+/* ---------- layout keys & positions ---------- */
+
+function bSerialCharKey(c, i, problems) {
+  if (problems.has(i) || !String(c.name || "").trim()) return `char:#${i}`;
+  const saved = S.charSaved && typeof S.charSaved.get === "function" ? S.charSaved.get(c) : null;
+  const n = String(saved || "").trim() || c.name.trim();
+  return `char:${n}`;
+}
+
+function bSerialLocKey(l, i, problems) {
+  if (problems.has(i) || !String(l.name || "").trim()) return `loc:#${i}`;
+  const saved = S.locSaved && typeof S.locSaved.get === "function" ? S.locSaved.get(l) : null;
+  const n = String(saved || "").trim() || l.name.trim();
+  return `loc:${n}`;
+}
+
+function bCharPos(c, i, problems = charNameProblems(S.cur.storyboard)) {
+  if (B.pos.has(c)) return B.pos.get(c);
+  const p = B.cards[bSerialCharKey(c, i, problems)] || B.cards[`char:#${i}`];
+  if (p) B.pos.set(c, { x: p.x, y: p.y });
+  return B.pos.get(c) || null;
+}
+
+function bLocPos(l, i, problems = locNameProblems(S.cur.storyboard)) {
+  if (B.lpos.has(l)) return B.lpos.get(l);
+  const p = B.cards[bSerialLocKey(l, i, problems)] || B.cards[`loc:#${i}`];
+  if (p) B.lpos.set(l, { x: p.x, y: p.y });
+  return B.lpos.get(l) || null;
+}
+
+function bPos(key) {
+  if (key.startsWith("char:#")) { const i = +key.slice(6), c = bChars()[i]; return c ? bCharPos(c, i) : null; }
+  if (key.startsWith("loc:#")) { const i = +key.slice(5), l = bLocs()[i]; return l ? bLocPos(l, i) : null; }
+  return B.spos.get(key) || null;
+}
+
+function bSetPos(key, p) {
+  if (key.startsWith("char:#")) { const c = bChars()[+key.slice(6)]; if (c) B.pos.set(c, p); }
+  else if (key.startsWith("loc:#")) { const l = bLocs()[+key.slice(5)]; if (l) B.lpos.set(l, p); }
+  else B.spos.set(key, p);
+}
+
+/* ---------- running / failed state ---------- */
+
 function bSceneRunning(sc, type) {
   if (progOn()) return progRunning(`${type}:${sc.id}`);
   if (currentSceneInJob() !== sc.id) return false;
@@ -141,7 +242,6 @@ function bSceneRunning(sc, type) {
 
 const PROG_FAILED_MSG = "Tạo lỗi — xem nhật ký job";
 
-/* Names the running portraits job is drawing ("Tạo ảnh nhân vật (A, B)"); no list → every character without a picture. */
 function bCharRunning(c) {
   if (progOn()) return progRunning(progCharKey(c));
   const j = S.job;
@@ -157,73 +257,178 @@ function bCharFailed(c) {
   return j.result?.failed?.[c.name] || null;
 }
 
+function bLocRunning(l) {
+  if (progOn()) return progRunning(progLocKey(l));
+  const j = S.job;
+  if (!j || j.status !== "running" || j.kind !== "locations" || j.project !== S.cur.id) return false;
+  const m = /\(([^()]*)\)\s*$/.exec(j.title || "");
+  if (m) return m[1].split(", ").some((n) => n === l.name);
+  return !locImageUrl(l);
+}
+function bLocFailed(l) {
+  const j = S.job;
+  if (jobRunning() && progOn()) return progFailed(progLocKey(l)) ? (j.result?.failed?.[l.name] || PROG_FAILED_MSG) : null;
+  if (!j || j.kind !== "locations" || j.project !== S.cur.id || j.status === "running") return null;
+  return j.result?.failed?.[l.name] || null;
+}
+
+/* ---------- ComfyUI Node Graph Model ---------- */
+
 function boardModel() {
   const sb = S.cur.storyboard;
   const problems = charNameProblems(sb);
+  const locProblems = locNameProblems(sb);
   const cards = [], links = [];
-  bChars().forEach((c, i) => cards.push({ key: `char:#${i}`, type: "char", c, i, bad: problems.has(i) }));
+  let nid = 1;
+
+  cards.push({ key: "cfg:film", type: "cfg", nid: nid++ });
+  bChars().forEach((c, i) => cards.push({ key: `char:#${i}`, type: "char", c, i, bad: problems.has(i), nid: nid++ }));
+  bLocs().forEach((l, i) => {
+    if (!blankLocation(l)) cards.push({ key: `loc:#${i}`, type: "loc", l, i, bad: locProblems.has(i), nid: nid++ });
+  });
+
   bScenes().forEach((sc, row) => {
     const mode = bMode(sc);
-    if (mode === "keyframe") cards.push({ key: `kf:${sc.id}`, type: "kf", sc, row });
-    if (bVideoShown(sc)) cards.push({ key: `vid:${sc.id}`, type: "vid", sc, row });
+    if (mode === "keyframe") cards.push({ key: `kf:${sc.id}`, type: "kf", sc, row, nid: nid++ });
+    if (bVideoShown(sc)) cards.push({ key: `vid:${sc.id}`, type: "vid", sc, row, nid: nid++ });
   });
-  for (const sc of bScenes()) {
-    const mode = bMode(sc);
-    if (mode === "i2v") continue;
-    const L = sceneLinks(sc), to = mode === "keyframe" ? `kf:${sc.id}` : `vid:${sc.id}`;
-    for (const ci of L.idx) {
-      const c = bChars()[ci];
-      const k = linkKind(c.name, sc.id, ci);
-      links.push({ id: `c${ci}>${to}`, kind: "char", from: `char:#${ci}`, to, ci, sid: sc.id, name: c.name, explicit: L.explicit, ...k });
+
+  const hasScenes = bScenes().length > 0;
+  if (hasScenes) cards.push({ key: "out:final", type: "out", nid: nid++ });
+
+  bScenes().forEach((sc, row) => {
+    const mode = bMode(sc), vidShown = bVideoShown(sc);
+    const primaryTarget = mode === "keyframe" ? `kf:${sc.id}` : `vid:${sc.id}`;
+
+    if (B.showModelLinks) {
+      links.push({ id: `m>${primaryTarget}`, kind: "model", dtype: "MODEL", from: "cfg:film", fromSlot: "MODEL", to: primaryTarget, toSlot: "model", sid: sc.id });
     }
-    if (mode === "keyframe" && bVideoShown(sc)) links.push({ id: `k>${sc.id}`, kind: "kfvid", from: `kf:${sc.id}`, to: `vid:${sc.id}`, sid: sc.id });
-  }
-  return { cards, links, problems };
+
+    if (mode !== "i2v") {
+      const L = sceneLinks(sc);
+      for (const ci of L.idx) {
+        const c = bChars()[ci];
+        const k = linkKind(c.name, sc.id, ci);
+        links.push({
+          id: `c${ci}>${primaryTarget}`, kind: "char", dtype: "CHARACTER",
+          from: `char:#${ci}`, fromSlot: "CHARACTER", to: primaryTarget, toSlot: "characters",
+          ci, sid: sc.id, name: c.name, explicit: L.explicit, ...k,
+        });
+      }
+      const li = bLocIndex(sc.location);
+      if (li >= 0 && !blankLocation(bLocs()[li])) {
+        const loc = bLocs()[li];
+        links.push({
+          id: `l${li}>${primaryTarget}`, kind: "loc", dtype: "LOCATION",
+          from: `loc:#${li}`, fromSlot: "LOCATION", to: primaryTarget, toSlot: "location",
+          li, sid: sc.id, name: loc.name,
+        });
+      }
+    }
+
+    if (mode === "keyframe") {
+      const prevSid = bContinuityPrevSid(row);
+      if (prevSid) {
+        links.push({
+          id: `cont:${prevSid}>${sc.id}`, kind: "cont", dtype: "IMAGE",
+          from: `kf:${prevSid}`, fromSlot: "IMAGE", to: `kf:${sc.id}`, toSlot: "prev_image",
+          fromSid: prevSid, sid: sc.id,
+        });
+      }
+      if (vidShown) {
+        links.push({
+          id: `k>${sc.id}`, kind: "kfvid", dtype: "IMAGE",
+          from: `kf:${sc.id}`, fromSlot: "IMAGE", to: `vid:${sc.id}`, toSlot: "start_image",
+          sid: sc.id,
+        });
+      }
+    }
+
+    if (vidShown && hasScenes) {
+      const st = S.cur.scene_state?.[sc.id] || {};
+      links.push({
+        id: `v>${sc.id}`, kind: "vidout", dtype: "VIDEO",
+        from: `vid:${sc.id}`, fromSlot: "VIDEO", to: "out:final", toSlot: "clips",
+        sid: sc.id, done: st.status === "done" && !!st.clip_url,
+      });
+    }
+  });
+
+  return { cards, links, problems, locProblems };
 }
 
-/* boardModel() for the current task: zones of one refresh (ports, arrows, selection) share one computation.
-   Dropped at the end of the task and by bRefresh()/renderBoard() after an edit. */
 function bModel() {
   if (!B.mc) { B.mc = boardModel(); queueMicrotask(() => { B.mc = null; }); }
   return B.mc;
 }
 
-/* ---------- layout ---------- */
+/* ---------- DAG Auto-Layout ---------- */
 
-function bIntersects(a, b, m = 12) {
+function bIntersects(a, b, m = 14) {
   return a.x < b.x + b.w + m && a.x + a.w + m > b.x && a.y < b.y + b.h + m && a.y + a.h + m > b.y;
 }
-/* Pure: push rect down below whatever it overlaps (never moves the others). */
+
 function placeFree(rect, rects) {
   const r = { ...rect };
-  for (let guard = 0; guard < 500; guard++) {
+  for (let guard = 0; guard < 600; guard++) {
     const hit = rects.find((o) => bIntersects(r, o));
     if (!hit) return r;
-    r.y = hit.y + hit.h + BOARD_GAP_ROW;
+    r.y = bSnap(hit.y + hit.h + BOARD_GAP_ROW);
   }
   return r;
 }
 
-/* Default grid slots (ui-proposal §7): characters | keyframe | video, one row per scene. */
+/* ComfyUI DAG columns: Config & Locations | Characters | Keyframe | VideoSampler | SaveFilm */
 function bGridSlots(cards) {
   const slots = {};
-  const xKf = BOARD_ORIGIN + BOARD_W_CHAR + BOARD_GAP_COL, xVid = xKf + bSceneW() + BOARD_GAP_COL;
-  let y = BOARD_ORIGIN;
-  for (const cd of cards.filter((c) => c.type === "char")) { slots[cd.key] = { x: BOARD_ORIGIN, y }; y += bCardH(cd.key) + BOARD_GAP_ROW; }
-  y = BOARD_ORIGIN;
+  const cfgAndLocs = cards.filter((c) => c.type === "cfg" || c.type === "loc");
+  const charCards = cards.filter((c) => c.type === "char");
+  const splitSources = charCards.length > 0 && (cfgAndLocs.length + charCards.length > 2);
+
+  const xCol0 = BOARD_ORIGIN;
+  const xChar = splitSources ? (xCol0 + Math.max(BOARD_W_CFG, BOARD_W_CHAR) + 64) : xCol0;
+  const xKf = xChar + (charCards.length || !splitSources ? Math.max(BOARD_W_CHAR, BOARD_W_CFG) : 0) + BOARD_GAP_COL;
+  const xVid = xKf + bSceneW() + BOARD_GAP_COL;
+  const xOut = xVid + bSceneW() + BOARD_GAP_COL;
+
+  if (splitSources) {
+    let y0 = BOARD_ORIGIN;
+    for (const cd of cfgAndLocs) {
+      slots[cd.key] = { x: xCol0, y: bSnap(y0) };
+      y0 += bCardH(cd.key) + BOARD_GAP_ROW;
+    }
+    let y1 = BOARD_ORIGIN;
+    for (const cd of charCards) {
+      slots[cd.key] = { x: xChar, y: bSnap(y1) };
+      y1 += bCardH(cd.key) + BOARD_GAP_ROW;
+    }
+  } else {
+    let ySrc = BOARD_ORIGIN;
+    for (const cd of cards.filter((c) => c.type === "cfg" || c.type === "char" || c.type === "loc")) {
+      slots[cd.key] = { x: xCol0, y: bSnap(ySrc) };
+      ySrc += bCardH(cd.key) + BOARD_GAP_ROW;
+    }
+  }
+
+  let ySc = BOARD_ORIGIN + 16;
   for (const sc of bScenes()) {
     const kf = `kf:${sc.id}`, vid = `vid:${sc.id}`, isKf = bMode(sc) === "keyframe";
-    if (isKf) slots[kf] = { x: xKf, y };
-    slots[vid] = { x: xVid, y };
-    y += Math.max(isKf ? bCardH(kf) : 0, B.h[vid] || (isKf ? bCardH(kf) : bCardH(vid))) + BOARD_GAP_ROW;
+    if (isKf) slots[kf] = { x: xKf, y: bSnap(ySc) };
+    slots[vid] = { x: isKf ? xVid : xKf, y: bSnap(ySc) };
+    const rowH = Math.max(isKf ? bCardH(kf) : 0, bCardH(vid));
+    ySc += rowH + BOARD_GAP_ROW + (B.showGroups ? 36 : 0);
+  }
+
+  if (cards.some((c) => c.type === "out")) {
+    const midY = bScenes().length ? Math.max(BOARD_ORIGIN, (ySc - BOARD_GAP_ROW - bCardH("out:final")) / 2) : BOARD_ORIGIN;
+    slots["out:final"] = { x: xOut, y: bSnap(midY) };
   }
   return slots;
 }
 
-/* Give a position to every card that has none (all=true: to every card). Returns true if anything moved. */
 function autoLayout(all = false) {
   const { cards } = boardModel();
-  if (all) { B.spos.clear(); B.pos = new WeakMap(); B.cards = {}; }
+  if (all) { B.spos.clear(); B.pos = new WeakMap(); B.lpos = new WeakMap(); B.cards = {}; }
   const slots = bGridSlots(cards);
   const rect = (key, p) => ({ x: p.x, y: p.y, w: bCardW(key), h: bCardH(key) });
   const placed = [];
@@ -232,9 +437,9 @@ function autoLayout(all = false) {
   for (const cd of cards) {
     if (bPos(cd.key)) continue;
     let slot = slots[cd.key];
-    if (cd.type === "vid" && bMode(cd.sc) === "keyframe") { // next to its keyframe when that one was moved
+    if (cd.type === "vid" && bMode(cd.sc) === "keyframe") {
       const kp = bPos(`kf:${cd.sc.id}`);
-      if (kp) slot = { x: kp.x + bSceneW() + BOARD_GAP_COL, y: kp.y };
+      if (kp) slot = { x: bSnap(kp.x + bSceneW() + BOARD_GAP_COL), y: kp.y };
     }
     const r = placeFree(rect(cd.key, slot || { x: BOARD_ORIGIN, y: BOARD_ORIGIN }), placed);
     bSetPos(cd.key, { x: r.x, y: r.y });
@@ -247,25 +452,32 @@ function autoLayout(all = false) {
 /* ---------- saving the layout (PUT /board) ---------- */
 
 function bSerialize() {
-  const sb = S.cur.storyboard, problems = charNameProblems(sb);
+  const sb = S.cur.storyboard, problems = charNameProblems(sb), locProbs = locNameProblems(sb);
   const cards = {};
+  const pCfg = B.spos.get("cfg:film");
+  if (pCfg) cards["cfg:film"] = { x: pCfg.x, y: pCfg.y };
   bChars().forEach((c, i) => { const p = bCharPos(c, i, problems); if (p) cards[bSerialCharKey(c, i, problems)] = { x: p.x, y: p.y }; });
+  bLocs().forEach((l, i) => {
+    if (blankLocation(l)) return;
+    const p = bLocPos(l, i, locProbs);
+    if (p) cards[bSerialLocKey(l, i, locProbs)] = { x: p.x, y: p.y };
+  });
   const kfIds = new Set();
   for (const sc of bScenes()) {
     if (bMode(sc) === "keyframe") { kfIds.add(sc.id); const p = B.spos.get(`kf:${sc.id}`); if (p) cards[`kf:${sc.id}`] = { x: p.x, y: p.y }; }
     if (bVideoShown(sc)) { const p = B.spos.get(`vid:${sc.id}`); if (p) cards[`vid:${sc.id}`] = { x: p.x, y: p.y }; }
   }
+  const pOut = B.spos.get("out:final");
+  if (pOut && bScenes().length) cards["out:final"] = { x: pOut.x, y: pOut.y };
   const videos = [...B.videos].filter((id) => kfIds.has(id));
   const view = B.view ? { x: Math.round(B.view.x), y: Math.round(B.view.y), zoom: Math.round(B.view.zoom * 1000) / 1000 } : null;
   return { cards, videos, view };
 }
 const bKeysOf = (body) => Object.keys(body.cards).sort().join("\n") + "|" + body.videos.join(",");
 
-/* Debounced (400 ms) after a drop, zoom, re-layout, show/hide video. The body is taken now, so a project switch
-   during the delay still saves the right project. */
 function saveBoard(delay = 400) {
   if (!S.cur || B.pid !== S.cur.id || !B.loaded) return;
-  if (B.loadError) { // never overwrite the saved layout we could not read (code-review #2)
+  if (B.loadError) {
     if (!B.loadErrorToast) { B.loadErrorToast = true; toast("Chưa tải được bố cục — tạm không lưu vị trí. Bấm “Thử lại” trên bảng.", "error", 6000); }
     return;
   }
@@ -273,9 +485,9 @@ function saveBoard(delay = 400) {
   clearTimeout(B.timer);
   B.timer = setTimeout(() => { B.timer = null; bFlushBoard(); }, delay);
 }
-/* One PUT at a time: a later layout waits in B.pending, so an old, slow request can never land after a newer one. */
+
 async function bFlushBoard() {
-  if (B.inflight) return; // sent when the running request ends
+  if (B.inflight) return;
   const p = B.pending;
   B.pending = null;
   if (!p) return;
@@ -293,8 +505,6 @@ async function bFlushBoard() {
   }
 }
 
-/* Hook called by app.js after every successful storyboard save: renamed characters / new or removed scenes
-   change the layout keys, so save them (positions follow the objects). */
 function boardAfterSave() {
   if (!S.cur || B.pid !== S.cur.id || !B.loaded) return;
   if (bKeysOf(bSerialize()) !== B.savedKeys) saveBoard();
@@ -305,12 +515,13 @@ async function bLoad(pid) {
   try { lay = await api("GET", `/api/projects/${encodeURIComponent(pid)}/board`); }
   catch (e) { err = e.message || "lỗi mạng"; }
   if (B.pid !== pid) return;
-  // Failed: draw the default layout but keep B.loadError set, so saveBoard() never PUTs it over the saved one.
   B.loadError = err; B.loadErrorToast = false;
   if (err) toast("Không tải được bố cục bảng — tạm dùng bố cục mặc định, chưa lưu vị trí", "error");
   lay = lay && typeof lay === "object" ? lay : {};
   B.cards = lay.cards && typeof lay.cards === "object" ? lay.cards : {};
-  for (const [k, p] of Object.entries(B.cards)) if (!k.startsWith("char:") && p) B.spos.set(k, { x: +p.x, y: +p.y });
+  for (const [k, p] of Object.entries(B.cards)) {
+    if (!k.startsWith("char:") && !k.startsWith("loc:") && p) B.spos.set(k, { x: +p.x, y: +p.y });
+  }
   B.videos = new Set(Array.isArray(lay.videos) ? lay.videos : []);
   B.view = lay.view && typeof lay.view === "object" ? { x: +lay.view.x || 0, y: +lay.view.y || 0, zoom: bClampZoom(+lay.view.zoom || 1) } : null;
   B.savedKeys = Object.keys(B.cards).sort().join("\n") + "|" + [...B.videos].join(",");
@@ -318,42 +529,310 @@ async function bLoad(pid) {
   if (S.cur && S.cur.id === pid && S.tab === "board") rerenderBoard();
 }
 
-/* "Thử lại" on the load-error banner: read the layout again (positions moved meanwhile are replaced by the saved ones). */
 function bRetryLoad() {
   if (!S.cur || B.pid !== S.cur.id) return;
-  B.pid = null; // renderBoard() resets the board state and calls bLoad again
+  B.pid = null;
   rerenderBoard();
 }
 
-/* ---------- arrows: edit scenes[].characters ---------- */
+/* ---------- ComfyUI server status & job execution ---------- */
 
-/* add/remove: a character name. Writes the scene's explicit list (storyboard order); [] stays [] (AC28). */
+async function bProbeComfy(force = false) {
+  if (B.comfy.checking || (B.comfy.checked && !force)) return B.comfy;
+  B.comfy.checking = true;
+  refreshZone("board-comfy-pill");
+  try {
+    const r = await api("GET", "/api/comfy/status");
+    Object.assign(B.comfy, r, { checking: false, checked: true });
+  } catch (e) {
+    Object.assign(B.comfy, { checking: false, checked: true, online: false, error: e.message });
+  }
+  refreshZone("board-comfy-pill");
+  return B.comfy;
+}
+
+async function bSetEngine(eng) {
+  const next = eng === "comfyui" ? "comfyui" : "flow";
+  localSet("boardEngine", next);
+  if (S.settings) S.settings.board_engine = next;
+  if (S.env?.comfyui) S.env.comfyui.engine = next;
+  try { S.settings = await api("PUT", "/api/settings", { board_engine: next }); } catch { /* keep local */ }
+  if (next === "comfyui") bProbeComfy(true);
+  rerenderBoard();
+}
+
+async function bRunComfy(action, extra = {}) {
+  if (!S.cur) return;
+  if (jobRunning()) { toast("Đang có việc chạy — đợi xong hoặc bấm Dừng.", "error"); return; }
+  await flushSave();
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
+  try {
+    const j = await api("POST", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/run`, { action, ...extra });
+    startJob(j);
+  } catch (e) {
+    toast(e.message, "error", 6000);
+    if (/Không kết nối được ComfyUI|checkpoint/i.test(e.message || "")) bOpenComfyModal();
+  }
+}
+
+async function bQueueMain() {
+  if (jobRunning()) { toast("Đang có việc chạy", "error"); return; }
+  if (bEngine() === "comfyui") {
+    await bRunComfy("pipeline");
+    return;
+  }
+  const sb = S.cur.storyboard;
+  const missingChars = bChars().filter((c) => c.name && c.description && !charImageUrl(c));
+  if (missingChars.length) { makePortraits([]); return; }
+  const missingLocs = bLocs().filter((l) => !blankLocation(l) && locCanMake(l) && !locImageUrl(l));
+  if (missingLocs.length) { makeLocationImages([]); return; }
+  const missingKf = bScenes().filter((sc) => bMode(sc) === "keyframe" && !S.cur.scene_state?.[sc.id]?.keyframe_url);
+  if (missingKf.length) { runAction("keyframes"); return; }
+  runAction("video");
+}
+
+function bOpenComfyModal() {
+  const cfg = S.env?.comfyui || {};
+  const curUrl = S.settings?.comfyui_url || cfg.url || B.comfy.url || "127.0.0.1:8188";
+  const urlInp = h("input", { type: "text", value: curUrl, placeholder: "127.0.0.1:8188" });
+  const ckptInp = h("input", { type: "text", value: S.settings?.comfyui_checkpoint || cfg.checkpoint || "", placeholder: "Tự chọn checkpoint đầu tiên trên máy chủ" });
+  const ckptList = h("datalist", { id: "cf-ckpt-list" }, (B.comfy.checkpoints || []).map((c) => h("option", { value: c })));
+  ckptInp.setAttribute("list", "cf-ckpt-list");
+  const stepsInp = h("input", { type: "number", min: 1, max: 150, value: S.settings?.comfyui_steps || cfg.steps || 20 });
+  const cfgInp = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: S.settings?.comfyui_cfg || cfg.cfg || 7 });
+  const engSel = h("select", { value: bEngine() },
+    h("option", { value: "flow" }, "Google Flow (mặc định)"),
+    h("option", { value: "comfyui" }, "ComfyUI (chạy qua máy chủ ComfyUI)"));
+  const statusBox = h("div", { class: "stack tight" });
+
+  const drawStatus = () => {
+    const st = B.comfy;
+    if (st.checking) {
+      put(statusBox, h("div", { class: "row small muted" }, h("span", { class: "spinner" }), "Đang kiểm tra máy chủ ComfyUI…"));
+      return;
+    }
+    if (!st.checked) {
+      put(statusBox, h("div", { class: "small muted" }, "Bấm “Kiểm tra kết nối” để đọc danh sách GPU/MPS và model từ ComfyUI."));
+      return;
+    }
+    if (st.online) {
+      const devText = (st.devices || []).map((d) => d.name || d.type).filter(Boolean).join(", ") || "CPU/MPS";
+      put(statusBox,
+        h("div", { class: "banner info flush" }, icon("check"),
+          h("div", { class: "b-body" },
+            h("div", {}, h("b", {}, `Đã kết nối ComfyUI ${st.comfyui_version ? "v" + st.comfyui_version : ""}`), ` · Thiết bị: ${devText}`),
+            h("div", { class: "small muted" }, `Checkpoints: ${(st.checkpoints || []).length} · Hàng đợi: ${st.queue_running} đang chạy, ${st.queue_pending} chờ` + (st.video_nodes?.length ? ` · Video nodes: ${st.video_nodes.join(", ")}` : "")))));
+      put(ckptList, (st.checkpoints || []).map((c) => h("option", { value: c })));
+    } else {
+      put(statusBox,
+        h("div", { class: "banner warn flush" }, icon("alert"),
+          h("div", { class: "b-body" },
+            h("div", {}, h("b", {}, "Chưa kết nối được máy chủ ComfyUI")),
+            h("div", { class: "small" }, st.error || "Hãy chạy ComfyUI (mặc định cổng 8188) rồi bấm Kiểm tra kết nối. Khi chưa bật ComfyUI, bạn vẫn thiết kế flow trên Bảng, xuất/nhập file workflow.json và chạy qua Google Flow bình thường."))));
+    }
+  };
+
+  const testNow = async () => {
+    B.comfy.checking = true;
+    drawStatus();
+    try {
+      const r = await api("GET", `/api/comfy/status?url=${encodeURIComponent(urlInp.value.trim())}`);
+      Object.assign(B.comfy, r, { checking: false, checked: true });
+    } catch (e) {
+      Object.assign(B.comfy, { checking: false, checked: true, online: false, error: e.message });
+    }
+    drawStatus();
+  };
+
+  const tmplRow = S.cur?.has_comfy_template
+    ? h("div", { class: "banner info flush" }, icon("code"),
+      h("div", { class: "b-body" }, "Dự án đang gắn API Workflow ComfyUI tuỳ chỉnh (`comfy_template`)."),
+      h("button", { class: "btn sm ghost", onclick: async () => {
+        try {
+          const r = await api("DELETE", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/template`);
+          if (r.project) applyMeta(r.project);
+          toast("Đã gỡ API Workflow tuỳ chỉnh", "ok");
+        } catch (e) { toast(e.message, "error"); }
+      } }, "Gỡ template"))
+    : null;
+
+  drawStatus();
+  modal({
+    title: "Cấu hình ComfyUI & Flow Bảng",
+    wide: true,
+    body: h("div", { class: "stack" },
+      statusBox,
+      h("div", { class: "row", style: { alignItems: "flex-end" } },
+        h("div", { style: { flex: "1" } }, field("Địa chỉ máy chủ ComfyUI", urlInp, "mặc định 127.0.0.1:8188")),
+        h("button", { class: "btn sm", onclick: testNow }, icon("refresh"), "Kiểm tra kết nối"),
+        B.comfy.online ? h("button", { class: "btn sm ghost", onclick: async () => {
+          try { await api("POST", "/api/comfy/interrupt", { url: urlInp.value.trim() }); toast("Đã gửi lệnh Interrupt tới ComfyUI", "ok"); }
+          catch (e) { toast(e.message, "error"); }
+        } }, icon("stop"), "Interrupt") : null),
+      h("div", { class: "grid2" },
+        field("Engine thực thi trên Bảng", engSel),
+        field("Checkpoint ưu tiên", h("div", {}, ckptInp, ckptList), "trống = tự nhận")),
+      h("div", { class: "grid2" },
+        field("Số bước lấy mẫu (Steps)", stepsInp, "1–150"),
+        field("CFG Scale", cfgInp, "1–30")),
+      tmplRow,
+      h("p", { class: "help" }, "Mẹo: Bạn có thể bấm “Workflow JSON → Xuất ComfyUI Workflow” để tải file workflow.json kéo thẳng vào giao diện ComfyUI, hoặc nhập một file workflow_api.json (Save API Format từ ComfyUI, hỗ trợ biến {{prompt}}, {{seed}}, {{width}}, {{height}}, {{image}}) để chạy custom workflow của riêng bạn.")),
+    buttons: [
+      { label: "Huỷ" },
+      { label: "Lưu cấu hình", cls: "primary", onclick: async (close) => {
+        try {
+          S.settings = await api("PUT", "/api/settings", {
+            comfyui_url: urlInp.value.trim(),
+            comfyui_checkpoint: ckptInp.value.trim(),
+            comfyui_steps: +stepsInp.value || 20,
+            comfyui_cfg: +cfgInp.value || 7,
+            board_engine: engSel.value,
+          });
+          localSet("boardEngine", S.settings.board_engine);
+          S.env = await api("GET", "/api/env");
+          B.comfy.checked = false;
+          close();
+          rerenderBoard();
+          toast("Đã lưu cấu hình ComfyUI", "ok");
+        } catch (e) { toast(e.message, "error"); }
+      } },
+    ],
+  });
+  if (!B.comfy.checked) testNow();
+}
+
+async function bExportWorkflow(fmt = "ui") {
+  if (!S.cur) return;
+  await flushSave();
+  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
+  await bFlushBoard();
+  try {
+    const data = await api("GET", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/workflow?format=${fmt}`);
+    const text = JSON.stringify(data, null, 2);
+    const suffix = fmt === "api" ? "comfy-api.json" : "comfy-workflow.json";
+    const fname = `${S.cur.id}-${suffix}`;
+    const blob = new Blob([text], { type: "application/json" });
+    const u = URL.createObjectURL(blob);
+    const a = h("a", { href: u, download: fname });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 2000);
+    toast(fmt === "api" ? "Đã xuất ComfyUI API Prompt (.json)" : "Đã xuất ComfyUI Workflow (.json)", "ok");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function bImportWorkflow() {
+  if (!S.cur) return;
+  const inp = h("input", { type: "file", accept: ".json,application/json", class: "hidden", onchange: async (e) => {
+    const f = e.target.files?.[0];
+    inp.remove();
+    if (!f) return;
+    try {
+      await flushSave();
+      const text = await f.text();
+      const wf = JSON.parse(text);
+      const r = await api("POST", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/workflow`, { workflow: wf, apply_storyboard: true });
+      if (r.kind === "api_template") {
+        if (r.project) applyMeta(r.project);
+        rerenderBoard();
+        toast("Đã lưu ComfyUI API Workflow Template cho dự án này!", "ok", 6000);
+      } else {
+        B.pid = null;
+        if (r.project) reloadProject(r.project);
+        else await refreshCurrent();
+        rerenderBoard();
+        toast("Đã nhập ComfyUI Workflow lên Bảng", "ok");
+      }
+    } catch (err) {
+      toast("Không nhập được workflow: " + err.message, "error", 6000);
+    }
+  } });
+  document.body.append(inp);
+  inp.click();
+}
+
+/* ---------- Graph Editing Actions (Characters, Locations, Continuity, Scenes) ---------- */
+
 async function editSceneChars(sc, add, remove) {
   const sb = S.cur.storyboard, pid = S.cur.id;
   if (charsLocked(sb)) { toast("Đổi tên nhân vật trống/trùng trước khi nối"); return false; }
-  if (add && S.cur.errors?.length) { toast("Storyboard đang lỗi — chỉ xoá được mũi tên. Sửa lỗi ở khung phía trên trước.", "error"); return false; }
+  if (add && S.cur.errors?.length) { toast("Storyboard đang lỗi — chỉ xoá được dây nối. Sửa lỗi ở khung phía trên trước.", "error"); return false; }
   if (bMode(sc) === "i2v") { toast(`Cảnh ${sc.id} kiểu “${bModeLabel("i2v")}” không dùng ảnh nhân vật`); return false; }
   let base;
   if (Array.isArray(sc.characters)) base = sc.characters;
   else {
-    // First edit on this scene: start from the server's auto set, which must be fresh (design-review #2).
     await flushSave();
     if (!S.cur || S.cur.id !== pid || S.cur.storyboard !== sb || !sb.scenes.includes(sc)) return false;
     if (saveFailed()) { toast("Chưa lưu được storyboard nên chưa biết nhân vật tự động của cảnh: " + (S.saveError || "thử lại sau"), "error"); return false; }
-    if (S.cur.errors?.length) { toast("Storyboard đang lỗi — sửa lỗi trước khi nối mũi tên", "error"); return false; }
+    if (S.cur.errors?.length) { toast("Storyboard đang lỗi — sửa lỗi trước khi nối dây", "error"); return false; }
     const st = S.cur.scene_state?.[sc.id];
     if (!st || !Array.isArray(st.characters)) { toast(`Chưa có danh sách nhân vật của cảnh ${sc.id} từ máy chủ — thử lại sau giây lát`, "error"); return false; }
-    if (Array.isArray(sc.characters)) base = sc.characters; // set meanwhile (another edit)
+    if (Array.isArray(sc.characters)) base = sc.characters;
     else base = st.characters.filter((n) => String(n || "").trim());
   }
   const cur = (n) => { const i = bResolve(n); return i >= 0 ? bKey(sb.characters[i].name) : bKey(n); };
   const set = new Set(base.map(cur));
   if (add) set.add(bKey(add));
   if (remove) set.delete(bKey(remove));
-  const unknown = base.filter((n) => bKey(n) && bResolve(n) < 0); // kept; the user removes them with "Bỏ khỏi cảnh"
+  const unknown = base.filter((n) => bKey(n) && bResolve(n) < 0);
   sc.characters = [...sb.characters.map((c) => c.name).filter((n) => set.has(bKey(n))), ...unknown];
   changed();
   bRefresh();
+  return true;
+}
+
+async function editSceneLocation(sc, locName) {
+  const sb = S.cur.storyboard;
+  if (locsLocked(sb)) { toast("Đổi tên bối cảnh trống/trùng trước khi nối"); return false; }
+  if (bMode(sc) === "i2v") { toast(`Cảnh ${sc.id} kiểu “${bModeLabel("i2v")}” không dùng bối cảnh`); return false; }
+  const nextVal = locName ? String(locName).trim() : "";
+  const nImpact = locationImpact(sb, S.cur.scene_state, { scene: sc, to: nextVal, kind: "assign" });
+  if (!(await confirmLocImpact(nImpact, nextVal ? `Gán bối cảnh “${nextVal}” cho cảnh ${sc.id}` : `Bỏ bối cảnh khỏi cảnh ${sc.id}`))) return false;
+  if (nextVal) sc.location = nextVal;
+  else delete sc.location;
+  changed();
+  bRefresh();
+  return true;
+}
+
+async function editSceneContinuity(fromSid, toSid, enable) {
+  const sb = S.cur.storyboard, scenes = bScenes();
+  const toIdx = scenes.findIndex((s) => s.id === toSid);
+  if (toIdx <= 0 || scenes[toIdx - 1].id !== fromSid) {
+    toast("Chỉ nối tiếp keyframe giữa 2 cảnh liền kề nhau theo thứ tự kịch bản");
+    return false;
+  }
+  const prev = scenes[toIdx - 1], cur = scenes[toIdx];
+  if (bMode(prev) !== "keyframe" || bMode(cur) !== "keyframe") {
+    toast("Cả 2 cảnh liền kề phải ở chế độ Ảnh → Video (Keyframe) để nối tiếp");
+    return false;
+  }
+  if (!enable) {
+    cur.continue_previous = false;
+    changed();
+    bRefresh();
+    return true;
+  }
+  const prevLoc = bLocIndex(prev.location), curLoc = bLocIndex(cur.location);
+  if (prevLoc < 0 && curLoc < 0) {
+    toast(`Gán cùng một Bối cảnh (Location) cho ${prev.id} và ${cur.id} trước khi nối tiếp keyframe`);
+    return false;
+  }
+  if (prevLoc >= 0 && curLoc < 0) {
+    if (!(await editSceneLocation(cur, bLocs()[prevLoc].name))) return false;
+  } else if (curLoc >= 0 && prevLoc < 0) {
+    if (!(await editSceneLocation(prev, bLocs()[curLoc].name))) return false;
+  } else if (prevLoc !== curLoc) {
+    toast(`${prev.id} và ${cur.id} đang ở 2 bối cảnh khác nhau — đổi về cùng bối cảnh để nối keyframe`);
+    return false;
+  }
+  if (sb.continuity === false) delete sb.continuity;
+  delete cur.continue_previous;
+  changed();
+  bRefresh();
+  toast(`Đã bật nối tiếp keyframe ${fromSid} → ${toSid}`, "ok");
   return true;
 }
 
@@ -364,16 +843,23 @@ function bRemoveUnknown(sc, name) {
   bRefresh();
 }
 
-/* ---------- render ---------- */
+/* ---------- Render ComfyUI Canvas ---------- */
 
 function renderBoard() {
-  if (!B.keyBound) { document.addEventListener("keydown", bOnKey); B.keyBound = true; } // once (design-review #4)
+  bLoadUiPrefsOnce();
+  if (!B.keyBound) { document.addEventListener("keydown", bOnKey); B.keyBound = true; }
   if (B.pid !== S.cur.id) {
     clearTimeout(B.timer); B.timer = null;
     if (B.pending) bFlushBoard();
-    Object.assign(B, { pid: S.cur.id, loading: true, loaded: false, loadError: null, cards: {}, pos: new WeakMap(), spos: new Map(),
-      videos: new Set(), view: null, h: {}, sel: null, selChar: null, saveAfterMount: false, drag: null, sig: "", savedJson: null, savedKeys: null });
+    Object.assign(B, {
+      pid: S.cur.id, loading: true, loaded: false, loadError: null,
+      cards: {}, pos: new WeakMap(), lpos: new WeakMap(), spos: new Map(),
+      videos: new Set(), collapsed: new Set(), view: null, h: {}, slotY: {},
+      sel: null, selChar: null, selLoc: null, saveAfterMount: false, drag: null,
+      sig: "", savedJson: null, savedKeys: null, paletteOpen: false,
+    });
     bLoad(S.cur.id);
+    bProbeComfy(false);
   }
   const sb = S.cur.storyboard;
   sb.characters = sb.characters || [];
@@ -381,18 +867,18 @@ function renderBoard() {
   const root = h("section", { class: "board" + (bScenePortrait() ? " portrait" : "") },
     bToolbar(),
     zone("board-notes", bNotes));
-  // Custom properties: Object.assign(el.style, …) in h() ignores them (QA bug #1).
   root.style.setProperty("--bc-w-char", BOARD_W_CHAR + "px");
   root.style.setProperty("--bc-w-scene", bSceneW() + "px");
   const vp = h("div", { class: "board-viewport", tabindex: "-1" });
   root.append(vp);
   if (B.loading) {
-    vp.append(h("div", { class: "loading" }, h("span", { class: "spinner" }), "Đang tải bảng…"));
+    vp.append(h("div", { class: "loading" }, h("span", { class: "spinner" }), "Đang tải ComfyUI flow…"));
     return root;
   }
   const model = boardModel();
   B.sig = model.cards.map((c) => c.key).join(",");
   const world = h("div", { class: "board-world" });
+  world.append(zone("board-groups", () => bGroupsLayer(model)));
   world.append(zone("board-links", () => bLinksSvg()));
   const unplaced = [];
   for (const cd of model.cards) {
@@ -405,6 +891,10 @@ function renderBoard() {
   bEmpties(world, model);
   world.append(svgEl("svg", { class: "board-draft", "aria-hidden": "true" }, svgEl("path", { class: "board-link draft", d: "" })));
   vp.append(world);
+  if (B.showMinimap) vp.append(bMinimapEl(model));
+  vp.append(h("div", { class: "cf-hud-hint" }, "Kéo nền: di chuyển · Ctrl+Cuộn: thu phóng · Nháy đúp: thêm/tìm Node · Del: xoá dây"));
+  if (B.paletteOpen) vp.append(bPaletteEl(model));
+
   bApplyView(vp);
   vp.addEventListener("pointerdown", bOnPointerDown);
   vp.addEventListener("pointermove", bOnPointerMove);
@@ -412,54 +902,278 @@ function renderBoard() {
   vp.addEventListener("pointercancel", bOnPointerUp);
   vp.addEventListener("wheel", bOnWheel, { passive: false });
   vp.addEventListener("click", bOnClick);
+  vp.addEventListener("dblclick", bOnDblClick);
+  vp.addEventListener("contextmenu", bOnContextMenu);
   vp.addEventListener("keydown", bOnLinkKey);
   requestAnimationFrame(() => bAfterMount(root, unplaced));
   return root;
 }
 
-/* Re-draw only the board (structure changed: a card appeared/disappeared). Keeps view and positions. */
 function rerenderBoard() {
   const old = document.querySelector("#main .board");
   if (!old || S.tab !== "board") return;
   old.replaceWith(renderBoard());
 }
 
-/* Measure real heights (cards are attached but hidden), place the cards without a position, then fit if needed. */
+function bMeasureSlots(root = document.querySelector("#main .board")) {
+  if (!root) return;
+  const zoom = B.view?.zoom || 1;
+  B.slotY = {};
+  root.querySelectorAll(".board-card").forEach((cardEl) => {
+    const key = cardEl.dataset.key;
+    if (cardEl.offsetHeight) B.h[key] = cardEl.offsetHeight;
+    const cr = cardEl.getBoundingClientRect();
+    cardEl.querySelectorAll(".board-port[data-slot]").forEach((portEl) => {
+      const pr = portEl.getBoundingClientRect();
+      const side = portEl.dataset.port;
+      const slot = portEl.dataset.slot;
+      if (cr.height > 0 && pr.height > 0) {
+        B.slotY[`${key}|${side}|${slot}`] = (pr.top + pr.height / 2 - cr.top) / zoom;
+      }
+    });
+  });
+}
+
 function bAfterMount(root, unplaced) {
   if (!root.isConnected) return;
-  root.querySelectorAll(".board-card").forEach((el) => { if (el.offsetHeight) B.h[el.dataset.key] = el.offsetHeight; });
+  bMeasureSlots(root);
   if (unplaced.length && autoLayout(false)) {
     for (const key of unplaced) {
       const el = root.querySelector(`.board-card[data-key="${CSS.escape(key)}"]`), p = bPos(key);
       if (el && p) { el.style.left = p.x + "px"; el.style.top = p.y + "px"; el.style.visibility = ""; }
     }
-    refreshZone("board-links");
   }
+  bMeasureSlots(root);
+  refreshZone("board-groups");
+  refreshZone("board-links");
   bPlaceEmpties(root);
   if (!B.view) bFit(false);
+  else bUpdateMinimap();
   if (B.saveAfterMount) { B.saveAfterMount = false; saveBoard(); }
-  refreshZones(); // zone functions also sync the card frame flags (running/failed/invalid) now that cards are attached
+  refreshZones();
 }
 
 function bApplyView(vp = document.querySelector(".board-viewport")) {
   if (!vp) return;
   const v = B.view || { x: 0, y: 0, zoom: 1 };
-  // Set the values directly, not as inherited custom properties: changing a variable on the viewport makes
-  // WebKit (the desktop app) restyle every card on each wheel/pan event (~230 ms with 20 scenes).
   const world = vp.querySelector(".board-world");
   if (world) world.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.zoom})`;
-  vp.style.backgroundSize = `${16 * v.zoom}px ${16 * v.zoom}px`;
-  vp.style.backgroundPosition = `${v.x}px ${v.y}px`;
+  const major = 100 * v.zoom, minor = 20 * v.zoom;
+  vp.style.backgroundSize = `${major}px ${major}px, ${major}px ${major}px, ${minor}px ${minor}px, ${minor}px ${minor}px`;
+  vp.style.backgroundPosition = `${v.x}px ${v.y}px, ${v.x}px ${v.y}px, ${v.x}px ${v.y}px, ${v.x}px ${v.y}px`;
   const lbl = document.querySelector(".board-zoom-val");
   if (lbl) lbl.textContent = Math.round(v.zoom * 100) + "%";
+  bUpdateMinimap(vp);
 }
+
+/* ---------- ComfyUI Scene Groups & Minimap & Search Palette ---------- */
+
+function bGroupsLayer(model) {
+  const wrap = h("div", { class: "cf-groups", "aria-hidden": "true" });
+  if (!B.showGroups) return wrap;
+  for (const sc of bScenes()) {
+    const keys = [];
+    if (bMode(sc) === "keyframe" && model.cards.some((c) => c.key === `kf:${sc.id}`)) keys.push(`kf:${sc.id}`);
+    if (model.cards.some((c) => c.key === `vid:${sc.id}`)) keys.push(`vid:${sc.id}`);
+    const rects = keys.map((k) => { const p = bPos(k); return p ? { x: p.x, y: p.y, w: bCardW(k), h: bCardH(k) } : null; }).filter(Boolean);
+    if (!rects.length) continue;
+    const padX = 16, padTop = 34, padBot = 14;
+    const minX = Math.min(...rects.map((r) => r.x)) - padX;
+    const minY = Math.min(...rects.map((r) => r.y)) - padTop;
+    const maxX = Math.max(...rects.map((r) => r.x + r.w)) + padX;
+    const maxY = Math.max(...rects.map((r) => r.y + r.h)) + padBot;
+    const li = bLocIndex(sc.location);
+    const locTxt = li >= 0 ? ` · ${bLocs()[li].name}` : ` · ${bModeLabel(bMode(sc))}`;
+    const grp = h("div", { class: "cf-group", "data-sid": sc.id, style: { left: minX + "px", top: minY + "px", width: (maxX - minX) + "px", height: (maxY - minY) + "px" } },
+      h("div", { class: "cf-group-head" }, `Cảnh ${sc.id}${locTxt}`));
+    wrap.append(grp);
+  }
+  return wrap;
+}
+
+function bNodeColor(type) {
+  return { cfg: "#6366f1", char: "#a855f7", loc: "#10b981", kf: "#38bdf8", vid: "#f97316", out: "#22c55e" }[type] || "#94a3b8";
+}
+
+function bMinimapBounds(cards) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const cd of cards) {
+    const p = bPos(cd.key);
+    if (!p) continue;
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + bCardW(cd.key)); maxY = Math.max(maxY, p.y + bCardH(cd.key));
+  }
+  if (!Number.isFinite(minX)) return { x: 0, y: 0, w: 1200, h: 800 };
+  const pad = 120;
+  return { x: minX - pad, y: minY - pad, w: Math.max(600, maxX - minX + 2 * pad), h: Math.max(400, maxY - minY + 2 * pad) };
+}
+
+function bMinimapEl(model) {
+  const b = bMinimapBounds(model.cards);
+  const svg = svgEl("svg", { viewBox: `${b.x} ${b.y} ${b.w} ${b.h}`, preserveAspectRatio: "xMidYMid meet", "aria-hidden": "true" });
+  for (const cd of model.cards) {
+    const p = bPos(cd.key);
+    if (!p) continue;
+    svg.append(svgEl("rect", {
+      "data-mm-key": cd.key, x: p.x, y: p.y, width: bCardW(cd.key), height: bCardH(cd.key), rx: 14,
+      fill: bNodeColor(cd.type), "fill-opacity": "0.75",
+    }));
+  }
+  svg.append(svgEl("rect", { class: "mm-lens", x: b.x, y: b.y, width: 200, height: 150, rx: 10 }));
+  const wrap = h("div", { class: "cf-minimap", title: "Bản đồ node ComfyUI — bấm hoặc kéo để di chuyển khung nhìn" }, svg);
+  return wrap;
+}
+
+function bUpdateMinimap(vp = bViewport()) {
+  if (!vp || !B.showMinimap) return;
+  const mm = vp.querySelector(".cf-minimap svg");
+  if (!mm) return;
+  const cards = bModel().cards;
+  const b = bMinimapBounds(cards);
+  mm.setAttribute("viewBox", `${b.x} ${b.y} ${b.w} ${b.h}`);
+  const lens = mm.querySelector(".mm-lens");
+  const seen = new Set();
+  for (const cd of cards) {
+    const p = bPos(cd.key);
+    if (!p) continue;
+    seen.add(cd.key);
+    let r = mm.querySelector(`rect[data-mm-key="${CSS.escape(cd.key)}"]`);
+    if (!r) {
+      r = svgEl("rect", {
+        "data-mm-key": cd.key, rx: 14,
+        fill: bNodeColor(cd.type), "fill-opacity": "0.82",
+      });
+      if (lens) mm.insertBefore(r, lens);
+      else mm.append(r);
+    }
+    r.setAttribute("x", p.x);
+    r.setAttribute("y", p.y);
+    r.setAttribute("width", bCardW(cd.key));
+    r.setAttribute("height", bCardH(cd.key));
+  }
+  mm.querySelectorAll("rect[data-mm-key]").forEach((el) => {
+    if (!seen.has(el.getAttribute("data-mm-key"))) el.remove();
+  });
+  if (lens && vp.clientWidth) {
+    const v = B.view || { x: 0, y: 0, zoom: 1 };
+    const lx = -v.x / v.zoom, ly = -v.y / v.zoom, lw = vp.clientWidth / v.zoom, lh = vp.clientHeight / v.zoom;
+    lens.setAttribute("x", lx); lens.setAttribute("y", ly);
+    lens.setAttribute("width", Math.max(40, lw)); lens.setAttribute("height", Math.max(30, lh));
+  }
+}
+
+function bPanFromMinimap(e, mmEl) {
+  const vp = bViewport(), svg = mmEl.querySelector("svg");
+  if (!vp || !svg) return;
+  const vb = (svg.getAttribute("viewBox") || "0 0 1200 800").split(" ").map(Number);
+  const r = mmEl.getBoundingClientRect();
+  const scale = Math.min(r.width / vb[2], r.height / vb[3]);
+  const offX = (r.width - vb[2] * scale) / 2, offY = (r.height - vb[3] * scale) / 2;
+  const wx = vb[0] + (e.clientX - r.left - offX) / scale;
+  const wy = vb[1] + (e.clientY - r.top - offY) / scale;
+  const z = B.view?.zoom || 1;
+  B.view = { x: vp.clientWidth / 2 - wx * z, y: vp.clientHeight / 2 - wy * z, zoom: z };
+  bApplyView(vp);
+}
+
+function bTogglePalette(open) {
+  B.paletteOpen = open ?? !B.paletteOpen;
+  const vp = bViewport();
+  if (!vp) return;
+  vp.querySelector(".cf-palette")?.remove();
+  if (B.paletteOpen) {
+    const pal = bPaletteEl(bModel());
+    vp.append(pal);
+    setTimeout(() => pal.querySelector("input")?.focus(), 10);
+  }
+}
+
+function bPaletteEl(model) {
+  let q = "";
+  const list = h("div", { class: "cf-palette-list" });
+  const actions = [
+    { label: "Thêm nhân vật (CharacterLoader)", tag: "+ CHARACTER", run: () => { bTogglePalette(false); bAddCharacter(); } },
+    { label: "Thêm bối cảnh (LocationLoader)", tag: "+ LOCATION", run: () => { bTogglePalette(false); bAddLocation(); } },
+    { label: "Thêm cảnh Ảnh → Video (Keyframe + Sampler)", tag: "+ SCENE KF", run: () => { bTogglePalette(false); bAddScene("keyframe"); } },
+    { label: "Thêm cảnh Chữ → Video (T2V Sampler)", tag: "+ SCENE T2V", run: () => { bTogglePalette(false); bAddScene("t2v"); } },
+    { label: "Xuất ComfyUI Workflow (.json)", tag: "EXPORT", run: () => { bTogglePalette(false); bExportWorkflow("ui"); } },
+    { label: "Cấu hình máy chủ ComfyUI", tag: "SERVER", run: () => { bTogglePalette(false); bOpenComfyModal(); } },
+  ];
+  for (const cd of model.cards) {
+    const title = cd.type === "cfg" ? "FilmConfig · Cấu hình phim"
+      : cd.type === "char" ? `Nhân vật · ${cd.c.name || "(chưa đặt tên)"}`
+      : cd.type === "loc" ? `Bối cảnh · ${cd.l.name || "(chưa đặt tên)"}`
+      : cd.type === "kf" ? `Keyframe · ${cd.sc.id}`
+      : cd.type === "vid" ? `VideoSampler · ${cd.sc.id}`
+      : "SaveFilm · Ghép phim";
+    actions.push({ label: `Đi tới: ${title}`, tag: `#${cd.nid}`, run: () => { bTogglePalette(false); bFocusNode(cd.key); } });
+  }
+  const draw = () => {
+    const k = q.trim().toLowerCase();
+    const hits = actions.filter((a) => !k || a.label.toLowerCase().includes(k) || a.tag.toLowerCase().includes(k)).slice(0, 14);
+    put(list, hits.length ? hits.map((a, idx) => h("button", {
+      class: "cf-palette-item" + (idx === 0 ? " active" : ""),
+      onclick: a.run,
+    }, h("span", {}, a.label), h("span", { class: "cf-palette-tag" }, a.tag)))
+      : h("div", { class: "small muted", style: { padding: "10px" } }, "Không tìm thấy node phù hợp."));
+  };
+  const inp = h("input", {
+    type: "text", placeholder: "Tìm hoặc thêm node ComfyUI (Nhân vật, Bối cảnh, Cảnh, s01…)",
+    oninput: (e) => { q = e.target.value; draw(); },
+    onkeydown: (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); bTogglePalette(false); }
+      else if (e.key === "Enter") { e.preventDefault(); list.querySelector(".cf-palette-item")?.click(); }
+    },
+  });
+  draw();
+  return h("div", { class: "cf-palette", onpointerdown: (e) => e.stopPropagation() },
+    h("div", { class: "cf-palette-head" }, icon("plus"), inp,
+      h("button", { class: "btn sm ghost icon", title: "Đóng", onclick: () => bTogglePalette(false) }, icon("x"))),
+    list);
+}
+
+function bFocusNode(key) {
+  bScrollTo(key);
+  const el = document.querySelector(`.board-card[data-key="${CSS.escape(key)}"]`);
+  if (el) el.focus({ preventScroll: true });
+}
+
+/* ---------- ComfyUI Toolbar & Legend ---------- */
 
 function bToolbar() {
   const zoomPct = Math.round((B.view?.zoom || 1) * 100) + "%";
-  return h("div", { class: "board-toolbar", role: "toolbar", "aria-label": "Công cụ bảng" },
-    h("button", { class: "btn sm board-add", title: "Thêm nhân vật", "aria-label": "Thêm nhân vật", onclick: bAddCharacter }, icon("plus"), h("span", { class: "lbl-text" }, "Nhân vật")),
-    h("button", { class: "btn sm ghost", title: "Tự xếp lại", "aria-label": "Tự xếp lại", onclick: bRelayout }, icon("layout"), h("span", { class: "lbl-text" }, "Tự xếp lại")),
+  const eng = bEngine();
+  const wireLabels = { spline: "Dây: Cong", orthogonal: "Dây: Vuông", straight: "Dây: Thẳng" };
+  return h("div", { class: "board-toolbar", role: "toolbar", "aria-label": "Công cụ ComfyUI Flow" },
+    h("div", { class: "cf-engine-seg", role: "group", "aria-label": "Engine thực thi" },
+      h("button", { class: eng === "flow" ? "on" : "", title: "Thực thi qua Google Flow (gflow)", onclick: () => bSetEngine("flow") }, "Google Flow"),
+      h("button", { class: "comfy" + (eng === "comfyui" ? " on" : ""), title: "Thực thi qua máy chủ ComfyUI", onclick: () => bSetEngine("comfyui") }, "ComfyUI")),
+    zone("board-comfy-pill", bComfyPill),
+    h("div", { class: "cf-queue-group" },
+      h("button", { class: "cf-queue-btn", disabled: jobRunning(), title: eng === "comfyui" ? "Queue toàn bộ workflow trên máy chủ ComfyUI" : "Chạy bước tiếp theo trên Google Flow", onclick: bQueueMain },
+        icon("play"), eng === "comfyui" ? "Queue ComfyUI" : "Chạy Flow"),
+      h("button", { class: "cf-queue-more", "aria-label": "Tuỳ chọn chạy Flow", onclick: (e) => popMenu(e.currentTarget, bQueueMenuItems()) }, icon("down"))),
     h("span", { class: "board-sep", "aria-hidden": "true" }),
+    h("button", { class: "btn sm board-add", title: "Thêm hoặc tìm Node (nháy đúp nền canvas)", onclick: () => bTogglePalette() },
+      icon("plus"), h("span", { class: "lbl-text" }, "Thêm Node")),
+    h("button", { class: "btn sm ghost", title: "Xuất / Nhập ComfyUI Workflow JSON", onclick: (e) => popMenu(e.currentTarget, [
+      { label: "Xuất ComfyUI Workflow (.json)", icon: "download", onclick: () => bExportWorkflow("ui") },
+      { label: "Xuất ComfyUI API Prompt (.json)", icon: "code", onclick: () => bExportWorkflow("api") },
+      { label: "Nhập ComfyUI Workflow (.json)…", icon: "upload", onclick: bImportWorkflow },
+      "-",
+      { label: "Cấu hình máy chủ ComfyUI…", icon: "settings", onclick: bOpenComfyModal },
+    ], "ComfyUI Workflow") }, icon("code"), h("span", { class: "lbl-text" }, "Workflow JSON")),
+    h("button", { class: "btn sm ghost", title: "Tuỳ chọn hiển thị ComfyUI canvas", onclick: (e) => popMenu(e.currentTarget, [
+      { label: wireLabels[B.wireStyle] + " (đổi kiểu dây)", icon: "board", onclick: bCycleWireStyle },
+      { label: (B.showGroups ? "✓ " : "") + "Hiện khung nhóm từng cảnh", onclick: () => { B.showGroups = !B.showGroups; localSet("boardGroups", B.showGroups); rerenderBoard(); } },
+      { label: (B.showMinimap ? "✓ " : "") + "Hiện bản đồ thu nhỏ (Minimap)", onclick: () => { B.showMinimap = !B.showMinimap; localSet("boardMinimap", B.showMinimap); rerenderBoard(); } },
+      { label: (B.showModelLinks ? "✓ " : "") + "Hiện dây nối MODEL từ FilmConfig", onclick: () => { B.showModelLinks = !B.showModelLinks; localSet("boardModelLinks", B.showModelLinks); refreshZone("board-links"); } },
+      { label: (B.hideIdleVideos ? "✓ " : "") + "Ẩn node Video chưa tạo", onclick: () => { B.hideIdleVideos = !B.hideIdleVideos; localSet("boardHideIdleVid", B.hideIdleVideos); rerenderBoard(); } },
+      "-",
+      { label: "Thu gọn mọi node", onclick: () => bCollapseAll(true) },
+      { label: "Mở rộng mọi node", onclick: () => bCollapseAll(false) },
+      { label: "Tự xếp lại DAG", icon: "layout", onclick: bRelayout },
+    ], "Hiển thị Canvas") }, icon("layout"), h("span", { class: "lbl-text" }, "Bố cục")),
     h("div", { class: "board-zoom", role: "group", "aria-label": "Thu phóng" },
       h("button", { class: "btn sm ghost icon", title: "Thu nhỏ", "aria-label": "Thu nhỏ", onclick: () => bZoomStep(-1) }, icon("minus")),
       h("button", { class: "board-zoom-val mono", "aria-live": "polite", title: "Về 100%", onclick: () => bZoomTo(1) }, zoomPct),
@@ -467,20 +1181,75 @@ function bToolbar() {
       h("button", { class: "btn sm ghost", title: "Vừa màn hình", "aria-label": "Vừa màn hình", onclick: () => bFit(true) }, icon("fit"), h("span", { class: "lbl-text" }, "Vừa màn hình"))),
     h("span", { class: "spacer" }),
     zone("board-sel", bSelSlot),
-    h("div", { class: "board-legend", "aria-label": "Chú thích" }, bLegendItems().map(([cls, label]) => h("span", { class: "board-legend-item" }, bLegendSample(cls), label))),
+    h("div", { class: "board-legend", "aria-label": "Chú thích cổng ComfyUI" },
+      bLegendItems().map(([color, label]) => h("span", { class: "board-legend-item" }, h("i", { class: "cf-legend-dot", style: { background: color } }), label))),
     h("button", { class: "btn sm ghost board-legend-btn", "aria-haspopup": "menu", title: "Chú thích", onclick: (e) => popMenu(e.currentTarget,
-      bLegendItems().map(([cls, label]) => ({ label, extra: bLegendSample(cls) }))) }, icon("info"), h("span", { class: "lbl-text" }, "Chú thích")));
+      bLegendItems().map(([color, label]) => ({ label, extra: h("i", { class: "cf-legend-dot", style: { background: color, marginLeft: "auto" } }) }))) },
+      icon("info"), h("span", { class: "lbl-text" }, "Chú thích")));
+}
+
+function bComfyPill() {
+  const st = B.comfy;
+  const dotCls = st.checking ? "checking" : st.online ? "online" : "offline";
+  const text = st.checking ? "ComfyUI…" : st.online ? `ComfyUI${st.queue_running ? ` (${st.queue_running})` : ""}` : "ComfyUI · cấu hình";
+  const tip = st.online
+    ? `Đã kết nối ComfyUI (${st.url}) · ${(st.checkpoints || []).length} checkpoint`
+    : "Bấm để cấu hình kết nối máy chủ ComfyUI hoặc nhập API Workflow";
+  return h("button", { class: "cf-status-btn", title: tip, onclick: bOpenComfyModal },
+    h("span", { class: "cf-dot " + dotCls }),
+    h("span", {}, text));
+}
+
+function bQueueMenuItems() {
+  const busy = jobRunning(), eng = bEngine();
+  if (eng === "comfyui") {
+    return [
+      { label: "Queue toàn bộ Flow (ComfyUI)", icon: "play", disabled: busy, onclick: () => bRunComfy("pipeline") },
+      { label: "Queue ảnh Nhân vật (ComfyUI)", icon: "users", disabled: busy, onclick: () => bRunComfy("portraits", { force: false }) },
+      { label: "Queue ảnh Bối cảnh (ComfyUI)", icon: "image", disabled: busy, onclick: () => bRunComfy("locations", { force: false }) },
+      { label: "Queue tất cả Keyframe (ComfyUI)", icon: "image", disabled: busy, onclick: () => bRunComfy("keyframes", { force: false }) },
+      { label: "Queue tất cả Video clip (ComfyUI)", icon: "video", disabled: busy, onclick: () => bRunComfy("video", { force: false }) },
+      "-",
+      { label: "Ghép phim hoàn chỉnh (ffmpeg)", icon: "stitch", disabled: busy, onclick: () => runAction("stitch") },
+      { label: "Dừng hàng đợi ComfyUI (Interrupt)", icon: "stop", danger: true, onclick: async () => {
+        try { await api("POST", "/api/comfy/interrupt", {}); toast("Đã gửi Interrupt tới ComfyUI", "ok"); }
+        catch (e) { toast(e.message, "error"); }
+      } },
+    ];
+  }
+  return [
+    { label: "Tạo ảnh nhân vật chưa có (miễn phí)", icon: "users", disabled: busy, onclick: () => makePortraits([]) },
+    { label: "Tạo ảnh bối cảnh chưa có (miễn phí)", icon: "image", disabled: busy, onclick: () => makeLocationImages([]) },
+    { label: "Tạo tất cả Keyframe chưa có (miễn phí)", icon: "image", disabled: busy, onclick: () => runAction("keyframes") },
+    { label: "Render tất cả Video clip (credit)", icon: "video", disabled: busy, onclick: () => runAction("video") },
+    "-",
+    { label: "Ghép phim hoàn chỉnh (final.mp4)", icon: "stitch", disabled: busy, onclick: () => runAction("stitch") },
+  ];
 }
 
 function bLegendItems() {
-  return [["explicit", "Đã chọn nhân vật"], ["auto", "Tự động theo tên trong prompt"], ["explicit desc", "Chỉ thêm mô tả, không gửi ảnh"], ["kfvid", "Keyframe → video"]];
+  return [
+    ["#a855f7", "Nhân vật"],
+    ["#10b981", "Bối cảnh"],
+    ["#38bdf8", "Ảnh / Nối KF"],
+    ["#22c55e", "Video clip"],
+  ];
 }
-function bLegendSample(cls) {
-  const desc = cls.includes("desc");
-  return svgEl("svg", { class: "board-legend-sample", viewBox: "0 0 28 10", width: 28, height: 10, "aria-hidden": "true" },
-    svgEl("g", { class: "board-link " + cls },
-      svgEl("path", { class: "line", d: desc ? "M1 5H19" : "M1 5H21" }),
-      desc ? svgEl("path", { class: "head-open", d: "M19 1.5L26 5L19 8.5z" }) : svgEl("path", { class: "head", d: "M20 1L27 5L20 9z" })));
+
+function bCycleWireStyle() {
+  const order = ["spline", "orthogonal", "straight"];
+  B.wireStyle = order[(order.indexOf(B.wireStyle) + 1) % order.length];
+  localSet("boardWireStyle", B.wireStyle);
+  refreshZone("board-links");
+}
+
+function bCollapseAll(collapse) {
+  if (collapse) {
+    for (const cd of bModel().cards) B.collapsed.add(cd.key);
+  } else {
+    B.collapsed.clear();
+  }
+  rerenderBoard();
 }
 
 function bNotes() {
@@ -489,43 +1258,49 @@ function bNotes() {
   if (B.loadError && !B.loading) notes.push(h("div", { class: "banner err flush", role: "alert" }, icon("alert"),
     h("div", { class: "b-body" }, `Không tải được bố cục bảng (${B.loadError}) — đang dùng bố cục mặc định, vị trí chưa được lưu.`),
     h("button", { class: "btn sm", onclick: bRetryLoad }, icon("refresh"), "Thử lại")));
-  if (charsLocked(sb)) notes.push(h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, "Có nhân vật tên trống/trùng — đổi tên trước khi nối mũi tên.")));
-  if (S.cur.errors?.length) notes.push(h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, "Storyboard đang lỗi — chỉ xoá được mũi tên, nút tạo bị tắt.")));
+  if (charsLocked(sb)) notes.push(h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, "Có nhân vật tên trống/trùng — đổi tên trước khi nối dây.")));
+  if (locsLocked(sb)) notes.push(h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, "Có bối cảnh tên trống/trùng — đổi tên trước khi nối dây.")));
+  if (S.cur.errors?.length) notes.push(h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, "Storyboard đang lỗi — chỉ xoá được dây nối, nút tạo bị tắt.")));
   if (sb.use_character_refs === false) notes.push(h("div", { class: "banner info flush" }, icon("info"),
-    h("div", { class: "b-body" }, "Đang tắt gửi ảnh nhân vật — mũi tên chỉ thêm mô tả."),
-    h("button", { class: "btn sm ghost", onclick: () => switchTab("story") }, "Bật lại")));
-  const touch = (window.matchMedia && matchMedia("(pointer: coarse)").matches) || innerWidth <= 720;
-  if (touch && !localGet("boardTouchHint")) notes.push(h("div", { class: "banner info flush" }, icon("info"),
-    h("div", { class: "b-body" }, "Kéo nối cần chuột/trackpad. Trên màn hình cảm ứng hãy sửa nhân vật của cảnh ở tab Cảnh."),
-    h("button", { class: "btn sm ghost icon", title: "Ẩn", "aria-label": "Ẩn gợi ý", onclick: () => { localSet("boardTouchHint", 1); refreshZone("board-notes"); } }, icon("x"))));
+    h("div", { class: "b-body" }, "Đang tắt gửi ảnh nhân vật — dây CHARACTER chuyển màu vàng (chỉ gửi mô tả)."),
+    h("button", { class: "btn sm ghost", onclick: () => { delete sb.use_character_refs; changed(); bRefresh(); } }, "Bật lại")));
   return h("div", { class: "board-notes" }, notes);
 }
 
-/* The selected link, or null. A character link stays selected only while index ci still holds the same character
-   object: deleting/adding/reordering characters shifts the indexes, and the selection must never jump (QA r2 #2). */
+/* ---------- Selection & Wire Deletion ---------- */
+
 function bSelLink(links) {
   if (!B.sel) return null;
   const L = links.find((l) => l.id === B.sel);
-  if (L && (L.kind !== "char" || (B.selChar && bChars()[L.ci] === B.selChar))) return L;
-  B.sel = null; B.selChar = null;
-  return null;
+  if (!L) { B.sel = null; B.selChar = null; B.selLoc = null; return null; }
+  if (L.kind === "char" && (!B.selChar || bChars()[L.ci] !== B.selChar)) { B.sel = null; B.selChar = null; return null; }
+  if (L.kind === "loc" && (!B.selLoc || bLocs()[L.li] !== B.selLoc)) { B.sel = null; B.selLoc = null; return null; }
+  return L;
 }
 
 function bSelSlot() {
   const L = bSelLink(bModel().links);
-  if (!L) { return h("div", { class: "board-sel hidden" }); }
+  if (!L) return h("div", { class: "board-sel hidden" });
   const why = bDeleteBlocked(L);
+  const descText = L.kind === "char" ? `${L.name} → ${L.sid}`
+    : L.kind === "loc" ? `${L.name} → ${L.sid}`
+    : L.kind === "cont" ? `Nối KF ${L.fromSid} → ${L.sid}`
+    : L.kind === "kfvid" ? `Keyframe ${L.sid} → Video`
+    : `${L.sid} → Ghép phim`;
   return h("div", { class: "board-sel" },
-    h("span", { class: "muted small" }, L.kind === "char" ? `${L.name} → ${L.sid}` : `Keyframe ${L.sid} → video`),
-    h("button", { class: "btn sm danger", disabled: !!why, title: why || "Xoá mũi tên (Delete)", onclick: () => bDeleteSelected() }, icon("trash"), "Xoá mũi tên"));
+    h("span", { class: "muted small" }, descText),
+    h("button", { class: "btn sm danger", disabled: !!why, title: why || "Ngắt dây nối (Delete)", onclick: () => bDeleteSelected() }, icon("trash"), "Ngắt dây"));
 }
 
 function bDeleteBlocked(L) {
-  if (L.kind === "char") return charsLocked(S.cur.storyboard) ? "Đổi tên nhân vật trống/trùng trước khi sửa mũi tên" : "";
+  if (L.kind === "char") return charsLocked(S.cur.storyboard) ? "Đổi tên nhân vật trống/trùng trước khi sửa dây" : "";
+  if (L.kind === "loc") return locsLocked(S.cur.storyboard) ? "Đổi tên bối cảnh trống/trùng trước khi sửa dây" : "";
+  if (L.kind === "cont") return "";
+  if (L.kind === "vidout" || L.kind === "model") return "Dây hệ thống cố định trong luồng dựng phim";
   const sc = bScenes().find((s) => s.id === L.sid), st = S.cur.scene_state?.[L.sid] || {};
-  if (st.clip_url) return "Cảnh đã có clip — không ẩn được card video";
-  if (sc && bSceneRunning(sc, "vid")) return "Cảnh đang render — không ẩn được card video";
-  if (st.status === "interrupted") return "Cảnh bị ngắt khi render — không ẩn được card video";
+  if (st.clip_url) return "Cảnh đã có clip — không ẩn được node video";
+  if (sc && bSceneRunning(sc, "vid")) return "Cảnh đang render — không ẩn được node video";
+  if (st.status === "interrupted") return "Cảnh bị ngắt khi render — không ẩn được node video";
   return "";
 }
 
@@ -538,7 +1313,13 @@ async function bDeleteSelected() {
   if (!sc) return;
   if (L.kind === "char") {
     if (await editSceneChars(sc, null, L.name)) { B.sel = null; B.selChar = null; bRefresh(); }
-  } else {
+  } else if (L.kind === "loc") {
+    if (await editSceneLocation(sc, "")) { B.sel = null; B.selLoc = null; bRefresh(); }
+  } else if (L.kind === "cont") {
+    if (await editSceneContinuity(L.fromSid, L.sid, false)) { B.sel = null; bRefresh(); }
+  } else if (L.kind === "kfvid") {
+    B.hideIdleVideos = true;
+    localSet("boardHideIdleVid", true);
     B.videos.delete(sc.id);
     B.sel = null;
     rerenderBoard();
@@ -547,77 +1328,133 @@ async function bDeleteSelected() {
 }
 
 function bSelect(id) {
-  const m = /^c(\d+)>/.exec(id || "");
+  const mc = /^c(\d+)>/.exec(id || ""), ml = /^l(\d+)>/.exec(id || "");
   B.sel = id || null;
-  B.selChar = m ? bChars()[+m[1]] || null : null;
+  B.selChar = mc ? bChars()[+mc[1]] || null : null;
+  B.selLoc = ml ? bLocs()[+ml[1]] || null : null;
   document.querySelectorAll(".board-links .board-link").forEach((g) => {
     const on = g.dataset.id === id;
     g.classList.toggle("selected", on);
     const line = g.querySelector(".line");
-    if (line) line.setAttribute("marker-end", `url(#${bMarker(g.classList.contains("desc"), on)})`);
+    if (line) line.setAttribute("marker-end", `url(#${bMarker(g.dataset.dtype, g.classList.contains("desc"), on)})`);
   });
   refreshZone("board-sel");
 }
 
-/* ---------- SVG arrows ---------- */
+/* ---------- ComfyUI Socket-to-Socket SVG Noodles ---------- */
 
-function bMarker(desc, selected) { return selected ? "bm-arrow-sel" : desc ? "bm-open" : "bm-arrow"; }
+function bMarker(dtype, desc, selected) {
+  if (selected) return "bm-sel";
+  if (desc) return "bm-open";
+  return {
+    CHARACTER: "bm-char",
+    LOCATION: "bm-loc",
+    IMAGE: "bm-image",
+    VIDEO: "bm-video",
+    MODEL: "bm-model",
+  }[dtype] || "bm-arrow";
+}
 
-function bAnchor(key, side) {
+function bDefaultSlotY(key, side, slot) {
+  if (B.collapsed.has(key)) return BOARD_HEAD / 2;
+  const orderIn = { model: 0, start_image: 0, image: 0, characters: 0, location: 1, prev_image: 2, clips: 0 };
+  if (key.startsWith("kf:")) {
+    const idx = { characters: 0, location: 1, prev_image: 2, model: 3 }[slot] ?? 0;
+    return BOARD_HEAD + 15 + idx * 22;
+  }
+  if (key.startsWith("vid:")) {
+    const idx = { start_image: 0, image: 0, characters: 0, location: 1, model: 2 }[slot] ?? 0;
+    return BOARD_HEAD + 15 + idx * 22;
+  }
+  const idx = (side === "in" ? orderIn[slot] : 0) ?? 0;
+  return BOARD_HEAD + 15 + idx * 22;
+}
+
+function bAnchor(key, side, slot = "") {
   const p = bPos(key);
   if (!p) return null;
-  return side === "out" ? { x: p.x + bCardW(key) + 1, y: p.y + BOARD_HEAD / 2 } : { x: p.x - 8, y: p.y + BOARD_HEAD / 2 };
+  const measured = slot ? B.slotY[`${key}|${side}|${slot}`] : undefined;
+  const dy = measured !== undefined ? measured : bDefaultSlotY(key, side, slot);
+  return side === "out" ? { x: p.x + bCardW(key) + 1, y: p.y + dy } : { x: p.x - 3, y: p.y + dy };
 }
+
 function bCurve(a, b) {
-  const dx = Math.max(48, Math.abs(b.x - a.x) / 2);
+  if (B.wireStyle === "straight") {
+    return `M${a.x} ${a.y}L${b.x} ${b.y}`;
+  }
+  if (B.wireStyle === "orthogonal") {
+    const midX = a.x + (b.x - a.x) / 2;
+    return `M${a.x} ${a.y}L${midX} ${a.y}L${midX} ${b.y}L${b.x} ${b.y}`;
+  }
+  const span = Math.abs(b.x - a.x);
+  const dx = Math.max(54, span * 0.48);
   return `M${a.x} ${a.y}C${a.x + dx} ${a.y} ${b.x - dx} ${b.y} ${b.x} ${b.y}`;
 }
 
 function bLinksSvg() {
   const model = bModel();
-  // A card appeared/disappeared because of a job or a save (e.g. a render started): redraw the board once.
   const sig = model.cards.map((c) => c.key).join(",");
   if (B.sig && sig !== B.sig && !bTyping() && !B.drag && !B.requeued) {
     B.requeued = true;
     setTimeout(() => { B.requeued = false; rerenderBoard(); }, 0);
   }
-  let minX = 0, minY = 0, maxX = 800, maxY = 600;
+  let minX = 0, minY = 0, maxX = 1200, maxY = 800;
   for (const cd of model.cards) {
     const p = bPos(cd.key);
     if (!p) continue;
     minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
     maxX = Math.max(maxX, p.x + bCardW(cd.key)); maxY = Math.max(maxY, p.y + bCardH(cd.key));
   }
-  const M = 1500, x0 = Math.floor(minX - M), y0 = Math.floor(minY - M), w = Math.ceil(maxX - minX + 2 * M), hgt = Math.ceil(maxY - minY + 2 * M);
-  const marker = (id, d, cls) => svgEl("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 10, markerHeight: 10, markerUnits: "userSpaceOnUse", orient: "auto" },
+  const M = 1600, x0 = Math.floor(minX - M), y0 = Math.floor(minY - M), w = Math.ceil(maxX - minX + 2 * M), hgt = Math.ceil(maxY - minY + 2 * M);
+  const marker = (id, d, cls) => svgEl("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 9, markerHeight: 9, markerUnits: "userSpaceOnUse", orient: "auto" },
     svgEl("path", { d, class: cls }));
-  const svg = svgEl("svg", { class: "board-links", "aria-label": "Mũi tên nối", viewBox: `${x0} ${y0} ${w} ${hgt}`, width: w, height: hgt,
-    style: `left:${x0}px;top:${y0}px` },
+  const svg = svgEl("svg", {
+    class: "board-links", "aria-label": "Dây nối ComfyUI", viewBox: `${x0} ${y0} ${w} ${hgt}`, width: w, height: hgt,
+    style: `left:${x0}px;top:${y0}px`,
+  },
     svgEl("defs", {},
-      marker("bm-arrow", "M0 0L10 5L0 10z", "mk-arrow"),
-      marker("bm-arrow-sel", "M0 0L10 5L0 10z", "mk-sel"),
-      marker("bm-open", "M1 1L9 5L1 9z", "mk-open")));
+      marker("bm-arrow", "M0 1L10 5L0 9z", "mk-arrow"),
+      marker("bm-char", "M0 1L10 5L0 9z", "mk-char"),
+      marker("bm-loc", "M0 1L10 5L0 9z", "mk-loc"),
+      marker("bm-image", "M0 1L10 5L0 9z", "mk-image"),
+      marker("bm-video", "M0 1L10 5L0 9z", "mk-video"),
+      marker("bm-model", "M0 1L10 5L0 9z", "mk-model"),
+      marker("bm-sel", "M0 1L10 5L0 9z", "mk-sel"),
+      marker("bm-open", "M1 1.5L9 5L1 8.5z", "mk-open")));
   bSelLink(model.links);
   for (const L of model.links) {
-    const a = bAnchor(L.from, "out"), b = bAnchor(L.to, "in");
+    const a = bAnchor(L.from, "out", L.fromSlot), b = bAnchor(L.to, "in", L.toSlot);
     if (!a || !b) continue;
     const d = bCurve(a, b), sel = B.sel === L.id;
-    const cls = ["board-link", L.kind === "kfvid" ? "kfvid" : L.explicit ? "explicit" : "auto", L.desc ? "desc" : "", sel ? "selected" : ""].filter(Boolean).join(" ");
-    const tip = L.kind === "kfvid" ? "Video tạo từ keyframe"
-      : [`${L.name} → ${L.sid}`, L.explicit ? null : "Tự động theo tên trong prompt", L.desc ? `Chỉ thêm mô tả — ${L.reason}` : null].filter(Boolean).join("\n");
-    const label = L.kind === "kfvid" ? `Mũi tên keyframe ${L.sid} → video` : `Mũi tên ${L.name} → ${L.sid}, ${L.explicit ? "đã chọn" : "tự động"}${L.desc ? ", chỉ mô tả" : ""}`;
-    svg.append(svgEl("g", { class: cls, "data-id": L.id, "data-from": L.from, "data-to": L.to, tabindex: "0", role: "button", "aria-label": label },
+    const cls = [
+      "board-link",
+      `dtype-${L.dtype}`,
+      L.kind,
+      L.kind === "char" ? (L.explicit ? "explicit" : "auto") : "",
+      L.desc ? "desc" : "",
+      L.kind === "vidout" && !L.done ? "vid-todo" : "",
+      sel ? "selected" : "",
+    ].filter(Boolean).join(" ");
+    const tip = L.kind === "char"
+      ? [`[CHARACTER] ${L.name} → ${L.sid}`, L.explicit ? "Đã nối thủ công" : "Tự động theo tên trong prompt", L.desc ? `Chỉ gửi mô tả (${L.reason})` : "Gửi kèm ảnh tham chiếu"].join("\n")
+      : L.kind === "loc" ? `[LOCATION] Bối cảnh “${L.name}” → ${L.sid}`
+      : L.kind === "cont" ? `[IMAGE] Nối tiếp keyframe ${L.fromSid} → ${L.sid} (cùng bối cảnh)`
+      : L.kind === "kfvid" ? `[IMAGE] Keyframe ${L.sid} → VideoSampler ${L.sid}`
+      : L.kind === "vidout" ? `[VIDEO] Clip ${L.sid} → SaveFilm (${L.done ? "đã có clip" : "chưa render"})`
+      : `[MODEL] Cấu hình phim → ${L.sid}`;
+    svg.append(svgEl("g", {
+      class: cls, "data-id": L.id, "data-from": L.from, "data-from-slot": L.fromSlot || "",
+      "data-to": L.to, "data-to-slot": L.toSlot || "", "data-dtype": L.dtype || "",
+      tabindex: "0", role: "button", "aria-label": tip.replace(/\n/g, " · "),
+    },
       svgEl("title", {}, tip),
       svgEl("path", { class: "halo", d }),
       svgEl("path", { class: "hit", d }),
-      svgEl("path", { class: "line", d, "marker-end": `url(#${bMarker(L.desc, sel)})` })));
+      svgEl("path", { class: "line", d, "marker-end": `url(#${bMarker(L.dtype, L.desc, sel)})` })));
   }
   return svg;
 }
 
-/* Card drag starts: move the arrows touching it into a small SVG of their own, so the big one stays untouched.
-   Changing any path in the big SVG makes WebKit (the desktop app) repaint every arrow (~200 ms a frame
-   with 20 scenes when they were dashed). The drop rebuilds "board-links" and removes this one. */
 function bLiftLinks(key) {
   const base = document.getElementById("board-links");
   if (!base) return;
@@ -630,28 +1467,69 @@ function bLiftLinks(key) {
   base.after(live);
 }
 
-/* While dragging a card: update only the paths touching it (no re-render). */
 function bUpdateLinksFor(key) {
   document.querySelectorAll(`.board-links .board-link[data-from="${CSS.escape(key)}"], .board-links .board-link[data-to="${CSS.escape(key)}"]`).forEach((g) => {
-    const a = bAnchor(g.dataset.from, "out"), b = bAnchor(g.dataset.to, "in");
+    const a = bAnchor(g.dataset.from, "out", g.dataset.fromSlot), b = bAnchor(g.dataset.to, "in", g.dataset.toSlot);
     if (!a || !b) return;
     const d = bCurve(a, b);
     g.querySelectorAll("path").forEach((p) => p.setAttribute("d", d));
   });
 }
 
-/* ---------- cards ---------- */
+/* ---------- ComfyUI Node Shells & Cards ---------- */
 
-function bCardShell(cd, label, headKids, bodyKids, ports) {
-  const el = h("article", { class: `card board-card ${cd.type}`, "data-key": cd.key, tabindex: "0", role: "group", "aria-label": label },
-    ports.in ? zone(`bc-pin-${cd.key}`, ports.in) : null,
-    h("header", { class: "board-card-head", title: "Kéo để di chuyển" }, headKids),
-    h("div", { class: "board-card-body stack tight" }, bodyKids),
-    ports.out ? zone(`bc-pout-${cd.key}`, ports.out) : null);
+function bSlotRowIn({ slot, dtype, label, valText, linked, title, onClear }) {
+  return h("div", { class: "cf-slot-row" },
+    h("span", {
+      class: "board-port in" + (linked ? " linked" : ""),
+      "data-port": "in", "data-slot": slot, "data-dtype": dtype,
+      title: title || label,
+    }),
+    h("span", { class: "cf-slot-name" }, label),
+    valText ? h("span", { class: "cf-slot-val", title: valText }, valText) : null,
+    onClear ? h("button", { class: "cf-slot-clear", title: "Ngắt kết nối này", onclick: (e) => { e.stopPropagation(); onClear(); } }, "×") : null);
+}
+
+function bSlotRowOut({ slot, dtype, label, linked, disabledWhy, title }) {
+  return h("div", { class: "cf-slot-row" },
+    h("span", { class: "cf-slot-name" }, label),
+    h("span", {
+      class: "board-port out" + (linked ? " linked" : "") + (disabledWhy ? " disabled" : ""),
+      "data-port": "out", "data-slot": slot, "data-dtype": dtype,
+      title: disabledWhy || title || `Kéo cổng ${label} để nối`,
+    }));
+}
+
+function bToggleCollapse(key) {
+  if (B.collapsed.has(key)) B.collapsed.delete(key);
+  else B.collapsed.add(key);
+  const el = document.querySelector(`.board-card[data-key="${CSS.escape(key)}"]`);
+  if (el) {
+    el.classList.toggle("is-collapsed", B.collapsed.has(key));
+    const btn = el.querySelector(".cf-collapse");
+    if (btn) btn.textContent = B.collapsed.has(key) ? "▸" : "▾";
+  }
+  bMeasureSlots();
+  refreshZone("board-groups");
+  refreshZone("board-links");
+  bUpdateMinimap();
+}
+
+function bCardShell(cd, label, headKids, slotsZoneFn, bodyKids) {
+  const isCol = B.collapsed.has(cd.key);
+  const el = h("article", {
+    class: `card board-card ${cd.type}` + (isCol ? " is-collapsed" : ""),
+    "data-key": cd.key, tabindex: "0", role: "group", "aria-label": label,
+  },
+    h("header", { class: "board-card-head", title: "Kéo tiêu đề để di chuyển node" },
+      h("button", { class: "cf-collapse", title: "Thu gọn / Mở rộng node", onclick: (e) => { e.stopPropagation(); bToggleCollapse(cd.key); } }, isCol ? "▸" : "▾"),
+      headKids,
+      h("span", { class: "cf-nid" }, `#${cd.nid}`)),
+    slotsZoneFn ? zone(`bc-slots-${cd.key}`, slotsZoneFn) : null,
+    h("div", { class: "board-card-body stack tight" }, bodyKids));
   return el;
 }
 
-/* Card frame classes live outside the zones (the frame holds inputs): the badge zone keeps them in sync. */
 function bFlags(key, flags) {
   const el = document.querySelector(`.board-card[data-key="${CSS.escape(key)}"]`);
   if (!el) return;
@@ -659,22 +1537,72 @@ function bFlags(key, flags) {
 }
 
 function bMoreBtn(items, label) {
-  return h("button", { class: "btn sm ghost icon", title: "Thêm thao tác", "aria-label": label, "aria-haspopup": "menu",
-    onclick: (e) => popMenu(e.currentTarget, items()) }, icon("more"));
+  return h("button", {
+    class: "btn sm ghost icon", title: "Thêm thao tác", "aria-label": label, "aria-haspopup": "menu",
+    onclick: (e) => popMenu(e.currentTarget, items()),
+  }, icon("more"));
 }
 
-function bLinkedIn(key) { return bModel().links.some((l) => l.to === key); }
+function bLinkedOut(key, slot) {
+  return bModel().links.some((l) => l.from === key && (!slot || l.fromSlot === slot));
+}
 
 function bCard(cd) {
-  return cd.type === "char" ? bCharCard(cd) : cd.type === "kf" ? bKfCard(cd) : bVidCard(cd);
+  if (cd.type === "cfg") return bCfgCard(cd);
+  if (cd.type === "char") return bCharCard(cd);
+  if (cd.type === "loc") return bLocCard(cd);
+  if (cd.type === "kf") return bKfCard(cd);
+  if (cd.type === "out") return bOutCard(cd);
+  return bVidCard(cd);
 }
 
+/* 1. FilmConfig Node */
+function bCfgCard(cd) {
+  const sb = S.cur.storyboard;
+  const imageModels = (S.models.image || []).length ? S.models.image : [{ alias: "nano2", label: "Nano Banana 2" }];
+  const vidOpts = videoModelOptions(sb.model);
+  return bCardShell(cd, "Cấu hình phim (FilmConfig)",
+    [icon("settings"), h("span", { class: "cf-node-title" }, "FilmConfig"), h("span", { class: "spacer" }),
+      bMoreBtn(() => [
+        { label: "Mở tab Phong cách & nhân vật", icon: "users", onclick: () => switchTab("story") },
+        { label: "Cấu hình ComfyUI Server…", icon: "settings", onclick: bOpenComfyModal },
+      ], "Thao tác FilmConfig")],
+    () => h("div", { class: "cf-slots" },
+      h("div", { class: "cf-slots-col in" }, h("span", { class: "cf-slot-val" }, bEngine() === "comfyui" ? "Engine: ComfyUI" : "Engine: Google Flow")),
+      h("div", { class: "cf-slots-col out" },
+        bSlotRowOut({ slot: "MODEL", dtype: "MODEL", label: "MODEL", linked: bLinkedOut(cd.key, "MODEL"), title: "Cấu hình model & phong cách chung" }))),
+    [
+      h("div", { class: "cf-widgets" },
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "aspect"),
+          h("select", { value: sb.aspect || "16:9", onchange: (e) => { sb.aspect = e.target.value; changed(); rerenderBoard(); } },
+            h("option", { value: "16:9" }, "16:9 (Ngang)"), h("option", { value: "9:16" }, "9:16 (Dọc)"))),
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "video_model"),
+          h("select", { value: sb.model || "", onchange: (e) => { sb.model = e.target.value || undefined; changed(); bRefresh(); } },
+            h("option", { value: "" }, "Mặc định"),
+            vidOpts.map((m) => h("option", { value: m.alias }, m.alias)))),
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "image_model"),
+          h("select", { value: sb.image_model || "nano2", onchange: (e) => { sb.image_model = e.target.value; changed(); } },
+            imageModels.map((m) => h("option", { value: m.alias }, m.alias)))),
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "continuity"),
+          h("select", { value: sb.continuity === false ? "off" : "on", onchange: (e) => { sb.continuity = e.target.value === "off" ? false : undefined; changed(); bRefresh(); } },
+            h("option", { value: "on" }, "Nối KF liên tiếp"), h("option", { value: "off" }, "Tắt nối KF")))),
+      h("textarea", {
+        class: "board-desc", rows: 2, value: sb.style || "", "aria-label": "Phong cách hình ảnh",
+        placeholder: "style: cinematic, warm morning light, 35mm film grain…",
+        oninput: (e) => { sb.style = e.target.value; changed(); },
+      }),
+    ]);
+}
+
+/* 2. CharacterLoader Node */
 function bCharCard(cd) {
   const sb = S.cur.storyboard, c = cd.c, i = cd.i, key = cd.key;
   const z = (part) => `bc-${part}-${key}`;
-  const nameInput = h("input", { type: "text", class: "board-name", value: c.name || "", placeholder: "Tên, ví dụ: Lan", "aria-label": "Tên nhân vật",
+  const nameInput = h("input", {
+    type: "text", class: "board-name", value: c.name || "", placeholder: "Tên, vd: Lan", "aria-label": "Tên nhân vật",
     "aria-invalid": cd.bad ? "true" : null,
-    oninput: (e) => { c.name = e.target.value; changed(); bRefreshNames(); } });
+    oninput: (e) => { c.name = e.target.value; changed(); bRefreshNames(); },
+  });
   const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", class: "hidden", onchange: async (e) => {
     const f = e.target.files[0]; if (!f) return;
     const fd = new FormData(); fd.append("file", f); fd.append("kind", "character");
@@ -684,6 +1612,7 @@ function bCharCard(cd) {
       c.image = r.path; changed(); bRefresh();
     } catch (err) { toast(err.message, "error"); }
   } });
+
   const el = bCardShell(cd, `Nhân vật ${c.name || "chưa đặt tên"}`,
     [icon("users"), nameInput,
       zone(z("badge"), () => {
@@ -693,89 +1622,164 @@ function bCharCard(cd) {
         const running = bCharRunning(c), failed = bCharFailed(c);
         bFlags(key, { "is-invalid": bad, "is-running": running, "is-failed": !!failed && !running });
         return running ? h("span", { class: "badge mini running" }, "Đang tạo…") : failed ? h("span", { class: "badge mini failed" }, "Lỗi")
-          : progQueued(progCharKey(c)) ? h("span", { class: "badge mini queued" }, "Đang chờ…") : h("span");
+          : progQueued(progCharKey(c)) ? h("span", { class: "badge mini queued" }, "Chờ…") : h("span");
       }),
-      h("span", { class: "spacer" }),
       bMoreBtn(() => [
         { label: "Mở trong tab Nhân vật", icon: "users", onclick: () => switchTab("story") },
         { label: "Chọn ảnh có sẵn…", icon: "image", onclick: () => bPickImage(c) },
         "-",
         { label: "Xoá nhân vật", icon: "trash", danger: true, onclick: async () => { if (await removeCharacter(i)) renderMain(); } },
       ], `Thao tác nhân vật ${c.name || ""}`)],
-    [zone(z("media"), () => {
-      const url = charImageUrl(c), cs = S.cur.characters_state?.[i];
-      const missing = !!(c.image && cs && cs.name === c.name && cs.image_missing);
-      const box = h("div", { class: "media board-char-media" });
-      if (bCharRunning(c) && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo ảnh…")));
-      else if (url) box.append(h("img", { src: url, alt: c.name || "", decoding: "async", onclick: () => lightbox(url) }));
-      else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có ảnh")));
-      if (missing) box.append(h("span", { class: "tag warn" }, "Không thấy file ảnh"));
-      return progAttach(box, [progCharKey(c)]);
-    }),
-    h("textarea", { class: "board-desc", rows: 2, value: c.description || "", "aria-label": "Mô tả ngoại hình",
-      placeholder: "a Vietnamese woman in her late 20s, shoulder-length black hair, cream linen shirt…",
-      oninput: (e) => { c.description = e.target.value; changed(); refreshZone(z("actions")); } }),
-    zone(z("msg"), () => {
-      const cs = S.cur.characters_state?.[i], kids = [];
-      if (charNameProblems(sb).has(i)) kids.push(h("div", { class: "scene-msg warn" }, "Tên trống/trùng — đổi tên trước khi nối"));
-      if (c.image && cs && cs.name === c.name && cs.image_missing) kids.push(h("div", { class: "scene-msg warn" }, "Không thấy file ảnh nhân vật — tạo lại hoặc tải ảnh lên."));
-      const failed = !bCharRunning(c) && bCharFailed(c);
-      if (failed) kids.push(h("div", { class: "scene-msg err" }, failed));
-      return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids);
-    }),
-    zone(z("actions"), () => {
-      const busy = jobRunning(), url = charImageUrl(c), canMake = !!(String(c.name || "").trim() && String(c.description || "").trim());
-      const failed = !bCharRunning(c) && bCharFailed(c);
-      const errs = S.cur.errors?.length;
-      const title = busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : canMake ? "Ảnh trên Flow miễn phí" : "Cần nhập tên và mô tả trước";
-      return h("div", { class: "board-card-actions row" },
-        h("button", { class: "btn sm", disabled: busy || !canMake || !!errs, title, onclick: () => makePortraits([c.name], !!url) },
-          icon(url || failed ? "refresh" : "image"), failed ? "Thử lại" : url ? "Tạo lại" : "Tạo ảnh", FREE()),
-        h("button", { class: "btn sm ghost icon", title: "Tải ảnh lên", "aria-label": "Tải ảnh lên", onclick: () => fileInput.click() }, icon("upload")),
-        fileInput);
-    })],
-    { out: () => {
+    () => {
       const locked = charsLocked(sb), errs = S.cur.errors?.length;
       const why = charNameProblems(sb).has(i) ? "Tên trống/trùng — đổi tên trước khi nối" : locked ? "Đổi tên nhân vật trống/trùng trước khi nối"
-        : errs ? "Storyboard đang lỗi — chỉ xoá được mũi tên" : "";
-      return h("span", { class: "board-port out" + (why ? " disabled" : ""), "data-port": "out", title: why || "Kéo để nối vào keyframe của cảnh" });
-    } });
+        : errs ? "Storyboard đang lỗi — chỉ xoá được dây nối" : "";
+      const nScenes = bModel().links.filter((l) => l.from === key).length;
+      return h("div", { class: "cf-slots" },
+        h("div", { class: "cf-slots-col in" }, h("span", { class: "cf-slot-val" }, nScenes ? `Đang nối ${nScenes} cảnh` : "Chưa nối cảnh")),
+        h("div", { class: "cf-slots-col out" },
+          bSlotRowOut({ slot: "CHARACTER", dtype: "CHARACTER", label: "CHARACTER", linked: nScenes > 0, disabledWhy: why, title: "Kéo vào cổng characters của cảnh" })));
+    },
+    [
+      zone(z("media"), () => {
+        const url = charImageUrl(c), cs = S.cur.characters_state?.[i];
+        const missing = !!(c.image && cs && cs.name === c.name && cs.image_missing);
+        const box = h("div", { class: "media board-char-media" });
+        if (bCharRunning(c) && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo ảnh…")));
+        else if (url) box.append(h("img", { src: url, alt: c.name || "", decoding: "async", onclick: () => lightbox(url) }));
+        else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có ảnh nhân vật")));
+        if (missing) box.append(h("span", { class: "tag warn" }, "Thiếu file ảnh"));
+        return progAttach(box, [progCharKey(c)]);
+      }),
+      h("textarea", {
+        class: "board-desc", rows: 2, value: c.description || "", "aria-label": "Mô tả ngoại hình",
+        placeholder: "Vietnamese woman, late 20s, shoulder-length black hair…",
+        oninput: (e) => { c.description = e.target.value; changed(); refreshZone(z("actions")); },
+      }),
+      zone(z("msg"), () => {
+        const cs = S.cur.characters_state?.[i], kids = [];
+        if (charNameProblems(sb).has(i)) kids.push(h("div", { class: "scene-msg warn" }, "Tên trống/trùng — đổi tên trước khi nối"));
+        if (c.image && cs && cs.name === c.name && cs.image_missing) kids.push(h("div", { class: "scene-msg warn" }, "Không thấy file ảnh — tạo lại hoặc tải lên."));
+        const failed = !bCharRunning(c) && bCharFailed(c);
+        if (failed) kids.push(h("div", { class: "scene-msg err" }, failed));
+        return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids);
+      }),
+      zone(z("actions"), () => {
+        const busy = jobRunning(), url = charImageUrl(c), canMake = !!(String(c.name || "").trim() && String(c.description || "").trim());
+        const failed = !bCharRunning(c) && bCharFailed(c);
+        const errs = S.cur.errors?.length, isComfy = bEngine() === "comfyui";
+        return h("div", { class: "board-card-actions row" },
+          h("button", {
+            class: "btn sm", disabled: busy || !canMake || !!errs,
+            title: !canMake ? "Cần nhập tên và mô tả trước" : isComfy ? "Tạo ảnh qua máy chủ ComfyUI" : "Ảnh trên Flow miễn phí",
+            onclick: () => isComfy ? bRunComfy("portraits", { names: [c.name], force: true }) : makePortraits([c.name], !!url),
+          }, icon(url || failed ? "refresh" : "image"), failed ? "Thử lại" : url ? "Tạo lại" : "Tạo ảnh", FREE()),
+          h("button", { class: "btn sm ghost icon", title: "Tải ảnh lên", "aria-label": "Tải ảnh lên", onclick: () => fileInput.click() }, icon("upload")),
+          fileInput);
+      }),
+    ]);
   if (cd.bad) el.classList.add("is-invalid");
   return el;
 }
 
-function bPickImage(c) {
-  const imgs = otherImageAssets(); // app.js: leaves out the location images (assets/locations/)
-  const isAsset = !c.image || imgs.some((a) => a.path === c.image);
-  const sel = h("select", { value: c.image || "", "aria-label": "Ảnh nhân vật" },
-    h("option", { value: "" }, "— không dùng ảnh —"),
-    isAsset ? null : h("option", { value: c.image }, c.image),
-    imgs.map((a) => h("option", { value: a.path }, a.path.replace("assets/", ""))));
-  modal({ title: `Ảnh của ${c.name || "nhân vật"}`, body: h("div", { class: "stack" }, field("Ảnh có sẵn trong dự án", sel),
-    imgs.length ? null : h("p", { class: "help" }, "Dự án chưa có ảnh nào. Dùng nút Tải ảnh lên trên card.")),
-    buttons: [{ label: "Huỷ" }, { label: "Dùng ảnh này", cls: "primary", onclick: (close) => { c.image = sel.value || undefined; changed(); close(); bRefresh(); } }] });
+/* 3. LocationLoader Node */
+function bLocCard(cd) {
+  const sb = S.cur.storyboard, l = cd.l, i = cd.i, key = cd.key;
+  const z = (part) => `bc-${part}-${key}`;
+  const nameInput = h("input", {
+    type: "text", class: "board-name", value: l.name || "", placeholder: "Bối cảnh, vd: Phòng khách", "aria-label": "Tên bối cảnh",
+    "aria-invalid": cd.bad ? "true" : null,
+    oninput: (e) => { l.name = e.target.value; changed(); bRefreshNames(); },
+  });
+  const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", class: "hidden", onchange: async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append("file", f); fd.append("kind", "location");
+    try {
+      const r = await api("POST", `/api/projects/${S.cur.id}/upload`, fd, true);
+      S.assets = await api("GET", `/api/projects/${S.cur.id}/assets`);
+      const imp = locationImpact(sb, S.cur.scene_state, { location: l, kind: "image" });
+      if (!(await confirmLocImpact(imp, "Dùng ảnh bối cảnh vừa tải lên"))) return;
+      l.image = r.path; changed(); bRefresh();
+    } catch (err) { toast(err.message, "error"); }
+  } });
+
+  const el = bCardShell(cd, `Bối cảnh ${l.name || "chưa đặt tên"}`,
+    [icon("image"), nameInput,
+      zone(z("badge"), () => {
+        const bad = locNameProblems(sb).has(i);
+        const inp = document.querySelector(`.board-card[data-key="${CSS.escape(key)}"] .board-name`);
+        if (inp) { if (bad) inp.setAttribute("aria-invalid", "true"); else inp.removeAttribute("aria-invalid"); }
+        const running = bLocRunning(l), failed = bLocFailed(l);
+        bFlags(key, { "is-invalid": bad, "is-running": running, "is-failed": !!failed && !running });
+        return running ? h("span", { class: "badge mini running" }, "Đang tạo…") : failed ? h("span", { class: "badge mini failed" }, "Lỗi")
+          : progQueued(progLocKey(l)) ? h("span", { class: "badge mini queued" }, "Chờ…") : h("span");
+      }),
+      bMoreBtn(() => [
+        { label: "Mở trong tab Bối cảnh", icon: "image", onclick: () => switchTab("story") },
+        "-",
+        { label: "Xoá bối cảnh", icon: "trash", danger: true, onclick: async () => {
+          const n = locationImpact(sb, S.cur.scene_state, { location: l, kind: "delete" });
+          if (!(await confirmModal("Xoá bối cảnh?", `Xoá “${l.name || "bối cảnh"}” khỏi storyboard?` + (n ? ` (${n} cảnh đã có clip sẽ chuyển Đã đổi)` : ""), "Xoá", true))) return;
+          removeLocation(sb, i); changed(); renderMain();
+        } },
+      ], `Thao tác bối cảnh ${l.name || ""}`)],
+    () => {
+      const locked = locsLocked(sb), errs = S.cur.errors?.length;
+      const why = locNameProblems(sb).has(i) ? "Tên trống/trùng — đổi tên trước khi nối" : locked ? "Đổi tên bối cảnh trống/trùng trước khi nối"
+        : errs ? "Storyboard đang lỗi — chỉ xoá được dây nối" : "";
+      const nScenes = bModel().links.filter((lk) => lk.from === key).length;
+      return h("div", { class: "cf-slots" },
+        h("div", { class: "cf-slots-col in" }, h("span", { class: "cf-slot-val" }, nScenes ? `Đang gắn ${nScenes} cảnh` : "Chưa gắn cảnh")),
+        h("div", { class: "cf-slots-col out" },
+          bSlotRowOut({ slot: "LOCATION", dtype: "LOCATION", label: "LOCATION", linked: nScenes > 0, disabledWhy: why, title: "Kéo vào cổng location của cảnh" })));
+    },
+    [
+      zone(z("media"), () => {
+        const url = locImageUrl(l), ls = S.cur.locations_state?.[i];
+        const missing = !!(l.image && ls && ls.name === l.name && ls.image_missing);
+        const box = h("div", { class: "media board-loc-media" });
+        if (bLocRunning(l) && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo bối cảnh…")));
+        else if (url) box.append(h("img", { src: url, alt: l.name || "", decoding: "async", onclick: () => lightbox(url) }));
+        else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có ảnh bối cảnh")));
+        if (missing) box.append(h("span", { class: "tag warn" }, "Thiếu file ảnh"));
+        return progAttach(box, [progLocKey(l)]);
+      }),
+      h("textarea", {
+        class: "board-desc", rows: 2, value: l.description || "", "aria-label": "Mô tả bối cảnh",
+        placeholder: "dim family living room, teak table, warm lamp light…",
+        oninput: (e) => { l.description = e.target.value; changed(); refreshZone(z("actions")); },
+      }),
+      zone(z("msg"), () => {
+        const failed = !bLocRunning(l) && bLocFailed(l);
+        return h("div", { class: "stack tight" + (failed ? "" : " hidden") }, failed ? h("div", { class: "scene-msg err" }, failed) : null);
+      }),
+      zone(z("actions"), () => {
+        const busy = jobRunning(), url = locImageUrl(l), canMake = locCanMake(l);
+        const errs = S.cur.errors?.length, isComfy = bEngine() === "comfyui";
+        return h("div", { class: "board-card-actions row" },
+          h("button", {
+            class: "btn sm", disabled: busy || !canMake || !!errs,
+            title: !canMake ? "Cần nhập tên và mô tả trước" : isComfy ? "Tạo bối cảnh qua ComfyUI" : "Ảnh trên Flow miễn phí",
+            onclick: async () => {
+              const imp = locationImpact(sb, S.cur.scene_state, { location: l, kind: "image" });
+              if (!(await confirmLocImpact(imp, url ? "Tạo lại ảnh bối cảnh" : "Tạo ảnh bối cảnh"))) return;
+              if (isComfy) bRunComfy("locations", { names: [l.name], force: true });
+              else makeLocationImages([l.name], true);
+            },
+          }, icon(url ? "refresh" : "image"), url ? "Tạo lại" : "Tạo ảnh", FREE()),
+          h("button", { class: "btn sm ghost icon", title: "Tải ảnh bối cảnh lên", "aria-label": "Tải ảnh lên", onclick: () => fileInput.click() }, icon("upload")),
+          fileInput);
+      }),
+    ]);
+  if (cd.bad) el.classList.add("is-invalid");
+  return el;
 }
 
-/* Notes about the characters sent with a scene (kf card, or t2v video card). */
-function bSceneCharMsgs(sc) {
-  const kids = [];
-  if (bMode(sc) === "i2v") return kids;
-  const L = sceneLinks(sc), st = S.cur.scene_state?.[sc.id];
-  for (const n of L.unknown) kids.push(h("div", { class: "scene-msg err" }, h("div", {}, `Không có nhân vật “${n}”`),
-    h("div", { class: "row", style: { marginTop: "6px" } }, h("button", { class: "btn sm", onclick: () => bRemoveUnknown(sc, n) }, icon("x"), "Bỏ khỏi cảnh"))));
-  if (st && S.cur.storyboard.use_character_refs !== false) {
-    const linked = L.idx.map((i) => bChars()[i]).filter(Boolean);
-    for (const c of linked) if (!charImageUrl(c)) kids.push(h("div", { class: "scene-msg warn" }, `${c.name} chưa có ảnh tham chiếu — chỉ dùng mô tả`));
-  }
-  return kids;
-}
-
+/* 4. KeyframeSampler Node */
 function bKfCard(cd) {
-  const sc = cd.sc, key = cd.key, sid = sc.id;
+  const sc = cd.sc, key = cd.key, sid = sc.id, row = cd.row;
   const z = (part) => `bc-${part}-${key}`;
   const st = () => S.cur.scene_state?.[sc.id] || {};
-  // Keyframe errors live in the last keyframes job result (failed[sid]); scene_state.error is for video renders,
-  // shown on the keyframe card only when the scene still has no usable keyframe.
   const failedKf = () => {
     const j = S.job;
     if (jobRunning() && progOn() && progFailed(`kf:${sid}`)) return j.result?.failed?.[sid] || PROG_FAILED_MSG;
@@ -783,153 +1787,326 @@ function bKfCard(cd) {
     const s = st();
     return s.status === "failed" && s.error && (!s.keyframe_url || s.keyframe_stale) ? s.error : null;
   };
+  const shots = S.env?.camera_presets?.shot || [];
+
   return bCardShell(cd, `Keyframe cảnh ${sid}`,
-    [icon("image"), h("b", { class: "mono" }, sid), h("span", { class: "muted small" }, "Keyframe"),
+    [icon("image"), h("span", { class: "cf-node-title mono" }, sid), h("span", { class: "cf-node-sub" }, "Keyframe"),
       zone(z("badge"), () => {
         const s = st(), running = bSceneRunning(sc, "kf"), failed = !running && !!failedKf();
         bFlags(key, { "is-running": running, "is-failed": failed });
-        const b = running ? badge("running", "Đang tạo…") : failed ? badge("failed", "Lỗi") : progQueued(`kf:${sid}`) ? badge("queued", "Đang chờ…")
-          : !s.keyframe_url ? badge("todo", "Chưa có ảnh")
-          : s.keyframe_stale ? badge("changed", "Ảnh cũ — cần tạo lại") : badge("done", "Xong");
+        const b = running ? badge("running", "Đang tạo…") : failed ? badge("failed", "Lỗi") : progQueued(`kf:${sid}`) ? badge("queued", "Chờ…")
+          : !s.keyframe_url ? badge("todo", "Chưa có")
+          : s.keyframe_stale ? badge("changed", "Ảnh cũ") : badge("done", "Xong");
         b.classList.add("mini");
         return b;
       }),
       h("span", { class: "spacer" }),
       bMoreBtn(() => [
-        { label: "Sửa prompt…", icon: "edit", onclick: () => bEditPrompt(sc, key) },
+        { label: "Sửa prompt & phụ đề…", icon: "edit", onclick: () => bEditPrompt(sc, key) },
         { label: "Xem ảnh lớn", icon: "eye", disabled: !st().keyframe_url, onclick: () => st().keyframe_url && lightbox(st().keyframe_url) },
         { label: "Mở trong tab Cảnh", icon: "video", onclick: () => switchTab("scenes") },
       ], `Thao tác keyframe ${sid}`)],
-    [zone(z("media"), () => {
-      const s = st(), box = h("div", { class: "media" + (bScenePortrait() ? " portrait" : "") });
-      if (bSceneRunning(sc, "kf") && !s.keyframe_url && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo keyframe…")));
-      else if (s.keyframe_url) {
-        box.append(h("img", { src: s.keyframe_url, alt: "keyframe " + sid, decoding: "async", onclick: () => lightbox(s.keyframe_url) }));
-        if (s.keyframe_stale) box.append(h("span", { class: "tag warn", title: "Prompt, nhân vật nối vào hoặc ảnh nhân vật đã đổi từ khi tạo ảnh này" }, "Ảnh cũ · cần tạo lại"));
-      } else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Bấm “Tạo keyframe” để xem trước (miễn phí)")));
-      return progAttach(box, [`kf:${sid}`]);
-    }),
-    zone(z("sum"), () => { const t = sc.image_prompt || sc.prompt || ""; return h("p", { class: "board-sum", title: t }, t || h("span", { class: "muted" }, "(chưa có prompt)")); }),
-    zone(z("msg"), () => {
-      const kids = bSceneCharMsgs(sc);
-      if (failedKf() && !bSceneRunning(sc, "kf")) kids.unshift(h("div", { class: "scene-msg err" }, failedKf()));
-      return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids);
-    }),
-    zone(z("actions"), () => {
-      const s = st(), busy = jobRunning(), errs = S.cur.errors?.length, hasKf = !!s.keyframe_url;
-      const failed = !!failedKf() && !bSceneRunning(sc, "kf");
-      return h("div", { class: "board-card-actions row" },
-        h("button", { class: "btn sm", disabled: busy || !!errs, title: busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : "Ảnh trên Flow miễn phí",
-          onclick: () => runAction("keyframes", { only: [sid], force_keyframes: hasKf ? [sid] : [] }) },
-          icon(hasKf || failed ? "refresh" : "image"), failed ? "Thử lại" : hasKf ? "Tạo lại" : "Tạo keyframe", FREE()),
-        bVideoShown(sc) ? null : h("button", { class: "btn sm ghost", disabled: !!errs, title: errs ? "Storyboard đang lỗi — sửa lỗi trước" : "Hiện card video của cảnh này",
-          onclick: () => bShowVideo(sc) }, icon("arrowRight"), "Video"));
-    })],
-    {
-      in: () => h("span", { class: "board-port in" + (bLinkedIn(key) ? " linked" : ""), "data-port": "in", title: "Nhân vật nối vào cảnh này" }),
-      out: () => {
-        const why = S.cur.errors?.length && !bVideoShown(sc) ? "Storyboard đang lỗi — sửa lỗi trước khi tạo card video" : "";
-        return h("span", { class: "board-port out" + (why ? " disabled" : ""), "data-port": "out", title: why || "Kéo ra chỗ trống để tạo card video" });
-      },
-    });
+    () => {
+      const L = sceneLinks(sc);
+      const li = bLocIndex(sc.location);
+      const locObj = li >= 0 ? bLocs()[li] : null;
+      const prevSid = bContinuityPrevSid(row);
+      const whyOut = S.cur.errors?.length && !bVideoShown(sc) ? "Storyboard đang lỗi — sửa lỗi trước" : "";
+      return h("div", { class: "cf-slots" },
+        h("div", { class: "cf-slots-col in" },
+          bSlotRowIn({
+            slot: "characters", dtype: "CHARACTER", label: "characters",
+            valText: L.names.length ? `(${L.names.length})` : "",
+            linked: L.idx.length > 0, title: L.names.length ? `Nhân vật: ${L.names.join(", ")}` : "Kéo cổng CHARACTER của nhân vật vào đây",
+          }),
+          bSlotRowIn({
+            slot: "location", dtype: "LOCATION", label: "location",
+            valText: locObj ? locObj.name : "",
+            linked: !!locObj, title: locObj ? `Bối cảnh: ${locObj.name}` : "Kéo cổng LOCATION của bối cảnh vào đây",
+            onClear: locObj ? () => editSceneLocation(sc, "") : null,
+          }),
+          bSlotRowIn({
+            slot: "prev_image", dtype: "IMAGE", label: "prev_image",
+            valText: prevSid ? `← ${prevSid}` : "",
+            linked: !!prevSid, title: prevSid ? `Đang nối tiếp keyframe từ cảnh ${prevSid}` : "Kéo IMAGE từ Keyframe cảnh liền trước để nối tiếp",
+            onClear: prevSid ? () => editSceneContinuity(prevSid, sid, false) : null,
+          })),
+        h("div", { class: "cf-slots-col out" },
+          bSlotRowOut({
+            slot: "IMAGE", dtype: "IMAGE", label: "IMAGE",
+            linked: bLinkedOut(key, "IMAGE"), disabledWhy: whyOut,
+            title: "Đầu ra Keyframe — kéo sang cảnh kế để nối tiếp hoặc hiện VideoSampler",
+          })));
+    },
+    [
+      zone(z("media"), () => {
+        const s = st(), box = h("div", { class: "media" + (bScenePortrait() ? " portrait" : "") });
+        if (bSceneRunning(sc, "kf") && !s.keyframe_url && !progOn()) box.append(h("div", { class: "ph" }, h("span", { class: "spinner" }), h("span", {}, "Đang tạo keyframe…")));
+        else if (s.keyframe_url) {
+          box.append(h("img", { src: s.keyframe_url, alt: "keyframe " + sid, decoding: "async", onclick: () => lightbox(s.keyframe_url) }));
+          if (s.keyframe_stale) box.append(h("span", { class: "tag warn", title: "Prompt, nhân vật hoặc bối cảnh đã đổi" }, "Ảnh cũ · tạo lại"));
+        } else box.append(h("div", { class: "ph" }, icon("image"), h("span", {}, "Chưa có keyframe")));
+        return progAttach(box, [`kf:${sid}`]);
+      }),
+      h("div", { class: "cf-widgets" },
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "shot"),
+          h("select", {
+            value: sc.camera?.shot || "",
+            onchange: (e) => {
+              sc.camera = sc.camera || {};
+              if (e.target.value) sc.camera.shot = e.target.value; else delete sc.camera.shot;
+              if (!Object.keys(sc.camera).length) delete sc.camera;
+              changed();
+            },
+          },
+            h("option", { value: "" }, "Tự động"),
+            shots.map((o) => h("option", { value: o.value }, o.value))))),
+      zone(z("sum"), () => {
+        const t = sc.image_prompt || sc.prompt || "";
+        return h("p", { class: "board-sum", title: "Bấm để sửa prompt mở đầu & hành động", onclick: () => bEditPrompt(sc, key) },
+          t || h("span", { class: "muted" }, "(bấm để nhập image_prompt…)"));
+      }),
+      zone(z("msg"), () => {
+        const kids = bSceneCharMsgs(sc);
+        if (failedKf() && !bSceneRunning(sc, "kf")) kids.unshift(h("div", { class: "scene-msg err" }, failedKf()));
+        return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids);
+      }),
+      zone(z("actions"), () => {
+        const s = st(), busy = jobRunning(), errs = S.cur.errors?.length, hasKf = !!s.keyframe_url;
+        const failed = !!failedKf() && !bSceneRunning(sc, "kf"), isComfy = bEngine() === "comfyui";
+        return h("div", { class: "board-card-actions row" },
+          h("button", {
+            class: "btn sm", disabled: busy || !!errs,
+            title: isComfy ? "Tạo keyframe qua ComfyUI" : busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : "Ảnh trên Flow miễn phí",
+            onclick: () => isComfy ? bRunComfy("keyframes", { only: [sid], force: hasKf }) : runAction("keyframes", { only: [sid], force_keyframes: hasKf ? [sid] : [] }),
+          }, icon(hasKf || failed ? "refresh" : "image"), failed ? "Thử lại" : hasKf ? "Tạo lại" : "Tạo KF", FREE()),
+          bVideoShown(sc) ? null : h("button", { class: "btn sm ghost", disabled: !!errs, onclick: () => bShowVideo(sc) }, icon("arrowRight"), "Video"));
+      }),
+    ]);
 }
 
+/* 5. VideoSampler Node */
 function bVidCard(cd) {
   const sc = cd.sc, key = cd.key, sid = sc.id, mode = bMode(sc);
   const z = (part) => `bc-${part}-${key}`;
   const st = () => S.cur.scene_state?.[sc.id] || {};
-  return bCardShell(cd, `Video cảnh ${sid}`,
-    [icon("video"), h("b", { class: "mono" }, sid), h("span", { class: "muted small" }, "Video"),
+  const moves = S.env?.camera_presets?.movement || [];
+
+  return bCardShell(cd, `VideoSampler cảnh ${sid}`,
+    [icon("video"), h("span", { class: "cf-node-title mono" }, sid), h("span", { class: "cf-node-sub" }, "VideoSampler"),
       zone(z("badge"), () => {
         const k = sceneStatusKey(sc), s = st();
         bFlags(key, { "is-running": k === "running", "is-failed": k === "failed" || (s.status === "failed" && !!s.error) });
-        const b = k === "queued" ? badge("queued", "Đang chờ…") : badge(STATUS[k] ? k : "todo");
+        const b = k === "queued" ? badge("queued", "Chờ…") : badge(STATUS[k] ? k : "todo");
         b.classList.add("mini");
         return b;
       }),
       h("span", { class: "spacer" }),
       bMoreBtn(() => {
-        const why = mode !== "keyframe" ? "Cảnh này luôn có card video" : bDeleteBlocked({ kind: "kfvid", sid });
+        const why = mode !== "keyframe" ? "Cảnh này luôn hiện node VideoSampler" : bDeleteBlocked({ kind: "kfvid", sid });
         return [
+          { label: "Sửa prompt & phụ đề…", icon: "edit", onclick: () => bEditPrompt(sc, key) },
           { label: "Mở trong tab Cảnh", icon: "video", onclick: () => switchTab("scenes") },
-          { label: "Ẩn card video", icon: "eye", disabled: !!why, extra: why ? h("span", { class: "board-menu-why" }, why.replace(/ — .*$/, "")) : null,
-            onclick: () => { B.videos.delete(sid); if (B.sel === `k>${sid}`) B.sel = null; rerenderBoard(); saveBoard(); } },
+          {
+            label: "Ẩn node Video này", icon: "eye", disabled: !!why,
+            extra: why ? h("span", { class: "board-menu-why" }, why.replace(/ — .*$/, "")) : null,
+            onclick: () => { B.hideIdleVideos = true; localSet("boardHideIdleVid", true); B.videos.delete(sid); if (B.sel === `k>${sid}`) B.sel = null; rerenderBoard(); saveBoard(); },
+          },
         ];
       }, `Thao tác video ${sid}`)],
-    [zone(z("meta"), () => {
-      const s = st(), model = s.model || sc.model || S.cur.storyboard.model;
-      const parts = [model ? modelLabel(model) : "Model mặc định", sceneDur(sc) + "s"];
-      if (mode === "t2v") parts.push(bModeLabel("t2v"));
-      if (mode === "i2v") parts.push("Ảnh của bạn");
-      return h("div", { class: "small muted board-meta" }, parts.join(" · "));
-    }),
-    zone(z("media"), () => {
-      const el = renderSceneMedia(sc, { kfHint: "Bấm “Tạo keyframe” trên card keyframe để xem trước (miễn phí)", lazy: true, prog: [`vid:${sid}`] });
-      if (!st().clip_url) el.classList.add("board-vid-pending");
-      return el;
-    }),
-    mode === "i2v" ? h("div", { class: "small muted" }, "Cảnh i2v không dùng ảnh nhân vật") : null,
-    zone(z("msg"), () => { const kids = mode === "t2v" ? bSceneCharMsgs(sc) : []; return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids); }),
-    zone(z("actions"), () => h("div", { class: "board-card-actions" },
-      renderSceneActions(sc, { keyframe: false, retry: true, blocked: S.cur.errors?.length ? "Storyboard đang lỗi — sửa lỗi ở khung phía trên trước" : "" })))],
-    { in: mode === "i2v" ? null : () => h("span", { class: "board-port in" + (bLinkedIn(key) ? " linked" : ""), "data-port": "in",
-      title: mode === "keyframe" ? "Video tạo từ keyframe của cảnh" : "Nhân vật nối vào cảnh này" }) });
+    () => {
+      const inRows = [];
+      if (mode === "keyframe") {
+        inRows.push(bSlotRowIn({ slot: "start_image", dtype: "IMAGE", label: "start_image", valText: `kf:${sid}`, linked: true, title: "Ảnh mở đầu từ KeyframeSampler" }));
+      } else if (mode === "t2v") {
+        const L = sceneLinks(sc), li = bLocIndex(sc.location), locObj = li >= 0 ? bLocs()[li] : null;
+        inRows.push(bSlotRowIn({ slot: "characters", dtype: "CHARACTER", label: "characters", valText: L.names.length ? `(${L.names.length})` : "", linked: L.idx.length > 0 }));
+        inRows.push(bSlotRowIn({ slot: "location", dtype: "LOCATION", label: "location", valText: locObj ? locObj.name : "", linked: !!locObj, onClear: locObj ? () => editSceneLocation(sc, "") : null }));
+      } else {
+        inRows.push(bSlotRowIn({ slot: "image", dtype: "IMAGE", label: "image", valText: sc.image ? sc.image.split("/").pop() : "chưa chọn", linked: !!sc.image }));
+      }
+      return h("div", { class: "cf-slots" },
+        h("div", { class: "cf-slots-col in" }, inRows),
+        h("div", { class: "cf-slots-col out" },
+          bSlotRowOut({ slot: "VIDEO", dtype: "VIDEO", label: "VIDEO", linked: true, title: "Clip đầu ra nối tới SaveFilm" })));
+    },
+    [
+      h("div", { class: "cf-widgets" },
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "mode"),
+          h("select", { value: mode, onchange: (e) => { sc.mode = e.target.value; changed(); rerenderBoard(); } },
+            MODES.map(([v, l]) => h("option", { value: v }, l)))),
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "duration"),
+          h("select", { value: String(sc.duration || 8), onchange: (e) => { sc.duration = +e.target.value; changed(); bRefresh(); } },
+            [4, 6, 8].map((d) => h("option", { value: String(d) }, `${d} giây`)))),
+        h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "motion"),
+          h("select", {
+            value: sc.camera?.movement || "",
+            onchange: (e) => {
+              sc.camera = sc.camera || {};
+              if (e.target.value) sc.camera.movement = e.target.value; else delete sc.camera.movement;
+              if (!Object.keys(sc.camera).length) delete sc.camera;
+              changed();
+            },
+          },
+            h("option", { value: "" }, "Mặc định"),
+            moves.map((o) => h("option", { value: o.value }, o.value))))),
+      zone(z("media"), () => {
+        const el = renderSceneMedia(sc, { kfHint: "Tạo keyframe ở node bên trái để xem trước", lazy: true, prog: [`vid:${sid}`] });
+        if (!st().clip_url) el.classList.add("board-vid-pending");
+        return el;
+      }),
+      zone(z("sum"), () => {
+        const t = sc.prompt || "";
+        return h("p", { class: "board-sum", title: "Bấm để sửa prompt chuyển động", onclick: () => bEditPrompt(sc, key) },
+          t || h("span", { class: "muted" }, "(bấm để nhập prompt hành động…)"));
+      }),
+      zone(z("msg"), () => { const kids = mode === "t2v" ? bSceneCharMsgs(sc) : []; return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids); }),
+      zone(z("actions"), () => {
+        if (bEngine() === "comfyui") {
+          const busy = jobRunning(), errs = S.cur.errors?.length, hasClip = !!st().clip_url;
+          return h("div", { class: "board-card-actions row" },
+            h("button", {
+              class: "btn sm primary", disabled: busy || !!errs,
+              title: "Render clip cảnh này qua máy chủ ComfyUI (không tốn credit Flow)",
+              onclick: () => bRunComfy("video", { only: [sid], force: hasClip }),
+            }, icon(hasClip ? "refresh" : "video"), hasClip ? "Queue lại (Comfy)" : "Queue Video", FREE()));
+        }
+        return h("div", { class: "board-card-actions" },
+          renderSceneActions(sc, { keyframe: false, retry: true, blocked: S.cur.errors?.length ? "Storyboard đang lỗi — sửa lỗi ở khung phía trên trước" : "" }));
+      }),
+    ]);
+}
+
+/* 6. SaveFilm (Final Stitch Output) Node */
+function bOutCard(cd) {
+  const key = cd.key;
+  const z = (part) => `bc-${part}-${key}`;
+  return bCardShell(cd, "SaveFilm · Ghép phim hoàn chỉnh",
+    [icon("stitch"), h("span", { class: "cf-node-title" }, "SaveFilm"),
+      zone(z("badge"), () => {
+        const hasFinal = !!S.cur.final_url;
+        return hasFinal ? h("span", { class: "badge mini done" }, "Có phim") : h("span", { class: "badge mini todo" }, "Chờ clip");
+      }),
+      h("span", { class: "spacer" }),
+      bMoreBtn(() => [
+        { label: "Mở tab Ghép phim & ảnh bìa", icon: "stitch", onclick: () => switchTab("final") },
+      ], "Thao tác SaveFilm")],
+    () => {
+      const total = bScenes().length;
+      const done = bScenes().filter((s) => S.cur.scene_state?.[s.id]?.status === "done" && S.cur.scene_state?.[s.id]?.clip_url).length;
+      return h("div", { class: "cf-slots" },
+        h("div", { class: "cf-slots-col in" },
+          bSlotRowIn({ slot: "clips", dtype: "VIDEO", label: "clips", valText: `${done}/${total} xong`, linked: total > 0, title: "Nhận clip từ tất cả các cảnh" })),
+        h("div", { class: "cf-slots-col out" }));
+    },
+    [
+      zone(z("progress"), () => {
+        const total = Math.max(1, bScenes().length);
+        const done = bScenes().filter((s) => S.cur.scene_state?.[s.id]?.status === "done" && S.cur.scene_state?.[s.id]?.clip_url).length;
+        const pct = Math.round((done / total) * 100);
+        return h("div", { class: "stack tight" },
+          h("div", { class: "cf-widget" }, h("span", { class: "cf-w-key" }, "ready"), h("span", { class: "cf-w-val" }, `${done}/${bScenes().length} cảnh (${pct}%)`)),
+          h("div", { class: "cf-film-meter" }, h("i", { style: { width: pct + "%" } })));
+      }),
+      zone(z("media"), () => {
+        if (S.cur.final_url) {
+          return h("div", { class: "media" + (bScenePortrait() ? " portrait" : "") },
+            h("video", { src: S.cur.final_url, controls: true, preload: "metadata" }));
+        }
+        return h("div", { class: "media board-loc-media" },
+          h("div", { class: "ph" }, icon("film"), h("span", {}, "Ghép tất cả clip thành final.mp4")));
+      }),
+      zone(z("actions"), () => {
+        const busy = jobRunning();
+        const ready = bScenes().some((s) => S.cur.scene_state?.[s.id]?.clip_url);
+        return h("div", { class: "board-card-actions row" },
+          h("button", { class: "btn sm primary", disabled: busy || !ready, title: ready ? "Ghép các clip đã xong thành final.mp4" : "Cần ít nhất 1 clip đã render", onclick: () => runAction("stitch") },
+            icon("stitch"), "Ghép phim", FREE()),
+          S.env?.capcut ? h("button", { class: "btn sm", disabled: busy || !ready, onclick: () => runAction("capcut") }, "CapCut") : null,
+          h("button", { class: "btn sm ghost", onclick: () => switchTab("final") }, "Chi tiết"));
+      }),
+    ]);
+}
+
+function bPickImage(c) {
+  const imgs = otherImageAssets();
+  const isAsset = !c.image || imgs.some((a) => a.path === c.image);
+  const sel = h("select", { value: c.image || "", "aria-label": "Ảnh nhân vật" },
+    h("option", { value: "" }, "— không dùng ảnh —"),
+    isAsset ? null : h("option", { value: c.image }, c.image),
+    imgs.map((a) => h("option", { value: a.path }, a.path.replace("assets/", ""))));
+  modal({
+    title: `Ảnh của ${c.name || "nhân vật"}`,
+    body: h("div", { class: "stack" }, field("Ảnh có sẵn trong dự án", sel),
+      imgs.length ? null : h("p", { class: "help" }, "Dự án chưa có ảnh nào. Dùng nút Tải ảnh lên trên node.")),
+    buttons: [{ label: "Huỷ" }, { label: "Dùng ảnh này", cls: "primary", onclick: (close) => { c.image = sel.value || undefined; changed(); close(); bRefresh(); } }],
+  });
 }
 
 function bEditPrompt(sc, key) {
   const z = `bc-sum-${key}`;
-  const ta = (k, label, ph, rows = 3) => field(label, h("textarea", { rows, value: sc[k] || "", placeholder: ph,
-    oninput: (e) => { sc[k] = e.target.value; changed(); refreshZone(z); } }), "nên viết tiếng Anh");
-  modal({ title: `Cảnh ${sc.id}`, wide: true,
+  const ta = (k, label, ph, rows = 3) => field(label, h("textarea", {
+    rows, value: sc[k] || "", placeholder: ph,
+    oninput: (e) => { sc[k] = e.target.value; changed(); refreshZone(z); },
+  }), "nên viết tiếng Anh");
+  modal({
+    title: `Node Cảnh ${sc.id}`, wide: true,
     body: h("div", { class: "stack" },
-      ta("image_prompt", "Ảnh mở đầu", "Mô tả khung hình đầu tiên như một bức ảnh: chủ thể, ai đứng đâu, bối cảnh…"),
-      ta("prompt", "Hành động", "Một hành động, ví dụ: Lan lifts the glass and smiles…"),
+      bMode(sc) === "keyframe" ? ta("image_prompt", "Ảnh mở đầu (image_prompt)", "Mô tả khung hình đầu tiên: chủ thể, vị trí đứng, bối cảnh, ánh sáng…") : null,
+      ta("prompt", "Hành động / Chuyển động (prompt)", "Một hành động rõ ràng, ví dụ: Lan lifts the glass and smiles…"),
       subtitleFields(S.cur.storyboard, sc, changed),
-      h("p", { class: "help" }, "Tự lưu khi bạn gõ. Sửa prompt có thể làm keyframe đã có thành “Ảnh cũ”.")),
-    buttons: [{ label: "Xong", cls: "primary" }] });
+      h("p", { class: "help" }, "Tự lưu khi bạn gõ. Sửa prompt có thể đánh dấu keyframe/clip đã có thành “Đã sửa”.")),
+    buttons: [{ label: "Xong", cls: "primary" }],
+  });
 }
 
-/* Empty columns: "add a character" / "no scenes yet" placeholders. */
-function bEmpties(world, model) {
-  if (!model.cards.some((c) => c.type === "char")) world.append(h("div", { class: "board-empty empty-inline", "data-empty": "char" },
-    icon("users"), "Thêm nhân vật để nối vào cảnh", h("button", { class: "btn sm", onclick: bAddCharacter }, icon("plus"), "Nhân vật")));
-  if (!bScenes().length) world.append(h("div", { class: "board-empty empty-inline", "data-empty": "scene" },
-    icon("video"), "Chưa có cảnh — thêm ở tab Cảnh", h("button", { class: "btn sm", onclick: () => switchTab("scenes") }, "Mở tab Cảnh")));
+/* Empty placeholders when project has no scenes yet */
+function bEmpties(world) {
+  if (!bScenes().length) {
+    world.append(h("div", { class: "board-empty empty-inline", "data-empty": "scene" },
+      icon("video"), "Chưa có cảnh nào trên bảng",
+      h("button", { class: "btn sm primary", onclick: () => bAddScene("keyframe") }, icon("plus"), "Thêm cảnh đầu tiên")));
+  }
 }
 function bPlaceEmpties(root) {
-  const xKf = BOARD_ORIGIN + BOARD_W_CHAR + BOARD_GAP_COL;
+  const xKf = BOARD_ORIGIN + BOARD_W_CFG + BOARD_GAP_COL;
   root.querySelectorAll(".board-empty").forEach((el) => {
-    el.style.left = (el.dataset.empty === "char" ? BOARD_ORIGIN : xKf) + "px";
+    el.style.left = xKf + "px";
     el.style.top = BOARD_ORIGIN + "px";
   });
 }
 
-/* Re-render status parts (zones) and resync the frame flags. */
-function bRefresh() { B.mc = null; refreshZones(); }
+function bRefresh() {
+  B.mc = null;
+  refreshZones();
+  requestAnimationFrame(() => {
+    bMeasureSlots();
+    refreshZone("board-groups");
+    refreshZone("board-links");
+    bUpdateMinimap();
+  });
+}
 
-/* Typing a character name: only what depends on names (character cards' badge/msg/actions/port, arrows, notes,
-   selection). Scene cards catch up on the next save (applyMeta → refreshZones). */
 function bRefreshNames() {
   B.mc = null;
   for (const id of [...S.zones.keys()]) {
-    if (/^bc-(badge|msg|actions|pout)-char:/.test(id) || id === "board-links" || id === "board-notes" || id === "board-sel") refreshZone(id);
+    if (/^bc-(badge|msg|actions|slots)-(char|loc):/.test(id) || id === "board-links" || id === "board-notes" || id === "board-sel") refreshZone(id);
   }
 }
 
-/* ---------- toolbar actions ---------- */
+/* ---------- Node Creation Modals (Character, Location, Scene) ---------- */
 
 async function bRelayout() {
-  if (!(await confirmModal("Tự xếp lại bảng?", "Mọi card về lưới mặc định. Vị trí bạn đã kéo sẽ mất.", "Xếp lại"))) return;
+  if (!(await confirmModal("Tự xếp lại bố cục DAG?", "Sắp xếp lại mọi node theo luồng ComfyUI từ trái sang phải (Sources → Keyframe → VideoSampler → SaveFilm).", "Xếp lại"))) return;
   autoLayout(true);
   B.view = null;
   rerenderBoard();
-  // bAfterMount fits the view; save once the measured layout is known
   setTimeout(() => saveBoard(0), 60);
 }
 
 function bShowVideo(sc) {
   B.videos.add(sc.id);
-  B.saveAfterMount = true; // the new card gets its position in bAfterMount (next frame): save after that (QA r2 #3)
+  B.saveAfterMount = true;
   rerenderBoard();
 }
 
@@ -941,7 +2118,7 @@ function bAddCharacter() {
   const msg = h("div", { class: "scene-msg err hidden", role: "alert" });
   const check = () => {
     const v = name.value.trim();
-    const err = !v ? "Nhập tên nhân vật." : sb.characters.some((c) => bKey(c.name) === bKey(v)) ? `Đã có nhân vật “${v}” (tên không phân biệt hoa thường).` : "";
+    const err = !v ? "Nhập tên nhân vật." : sb.characters.some((c) => bKey(c.name) === bKey(v)) ? `Đã có nhân vật “${v}”.` : "";
     msg.textContent = err; msg.classList.toggle("hidden", !err);
     if (err) name.setAttribute("aria-invalid", "true"); else name.removeAttribute("aria-invalid");
     return !err;
@@ -949,11 +2126,16 @@ function bAddCharacter() {
   const go = (close) => {
     if (!check()) { name.focus(); return; }
     const c = { name: name.value.trim(), description: desc.value.trim() };
-    const problems = charNameProblems(sb);
-    let bottom = BOARD_ORIGIN - BOARD_GAP_ROW, placed = [];
-    sb.characters.forEach((o, i) => { const p = bCharPos(o, i, problems); if (p) { bottom = Math.max(bottom, p.y + bCardH(`char:#${i}`)); } });
-    for (const cd of boardModel().cards) { const p = bPos(cd.key); if (p) placed.push({ x: p.x, y: p.y, w: bCardW(cd.key), h: bCardH(cd.key) }); }
-    const r = placeFree({ x: BOARD_ORIGIN, y: bottom + BOARD_GAP_ROW, w: BOARD_W_CHAR, h: bFallbackH("char:") }, placed);
+    const placed = [];
+    let bottom = BOARD_ORIGIN;
+    for (const cd of boardModel().cards) {
+      const p = bPos(cd.key);
+      if (p) {
+        placed.push({ x: p.x, y: p.y, w: bCardW(cd.key), h: bCardH(cd.key) });
+        if (cd.type === "cfg" || cd.type === "char") bottom = Math.max(bottom, p.y + bCardH(cd.key));
+      }
+    }
+    const r = placeFree({ x: BOARD_ORIGIN, y: bSnap(bottom + BOARD_GAP_ROW), w: BOARD_W_CHAR, h: bFallbackH("char:") }, placed);
     sb.characters.push(c);
     B.pos.set(c, { x: r.x, y: r.y });
     changed();
@@ -961,16 +2143,86 @@ function bAddCharacter() {
     rerenderBoard();
     bScrollTo(`char:#${sb.characters.length - 1}`);
     saveBoard();
-    setTimeout(() => document.querySelector(`.board-card[data-key="char:#${sb.characters.length - 1}"] .board-desc`)?.focus(), 30);
   };
   name.addEventListener("input", () => { if (!msg.classList.contains("hidden")) check(); });
   name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); desc.focus(); } });
-  modal({ title: "Thêm nhân vật", body: h("div", { class: "stack" }, field("Tên", name, "bắt buộc, không trùng"), field("Mô tả ngoại hình", desc, "tiếng Anh"), msg,
-    h("p", { class: "help" }, "Mô tả một lần, rồi tạo hoặc tải ảnh lên trên card. Kéo chấm tròn bên phải card vào keyframe để dùng nhân vật cho cảnh đó.")),
-    buttons: [{ label: "Huỷ" }, { label: "Thêm", cls: "primary", onclick: go }] });
+  modal({
+    title: "Thêm Node Nhân vật (CharacterLoader)",
+    body: h("div", { class: "stack" }, field("Tên nhân vật", name, "bắt buộc, không trùng"), field("Mô tả ngoại hình", desc, "tiếng Anh"), msg,
+      h("p", { class: "help" }, "Kéo cổng CHARACTER (màu tím) bên phải node vào cổng characters của cảnh để gắn nhân vật.")),
+    buttons: [{ label: "Huỷ" }, { label: "Thêm Node", cls: "primary", onclick: go }],
+  });
 }
 
-/* ---------- view: pan / zoom / fit ---------- */
+function bAddLocation() {
+  const sb = S.cur.storyboard;
+  sb.locations = sb.locations || [];
+  const name = h("input", { type: "text", placeholder: "Ví dụ: Quán cà phê phố cổ", "aria-label": "Tên bối cảnh" });
+  const desc = h("textarea", { rows: 3, placeholder: "cozy Hanoi street-side cafe, low wooden stools, warm morning sunlight…", "aria-label": "Mô tả bối cảnh" });
+  const msg = h("div", { class: "scene-msg err hidden", role: "alert" });
+  const check = () => {
+    const v = name.value.trim();
+    const err = !v ? "Nhập tên bối cảnh." : sb.locations.some((l) => !blankLocation(l) && bKey(l.name) === bKey(v)) ? `Đã có bối cảnh “${v}”.` : "";
+    msg.textContent = err; msg.classList.toggle("hidden", !err);
+    return !err;
+  };
+  const go = (close) => {
+    if (!check()) { name.focus(); return; }
+    const loc = { name: name.value.trim(), description: desc.value.trim() };
+    const placed = [];
+    let bottom = BOARD_ORIGIN;
+    for (const cd of boardModel().cards) {
+      const p = bPos(cd.key);
+      if (p) {
+        placed.push({ x: p.x, y: p.y, w: bCardW(cd.key), h: bCardH(cd.key) });
+        if (cd.type === "cfg" || cd.type === "char" || cd.type === "loc") bottom = Math.max(bottom, p.y + bCardH(cd.key));
+      }
+    }
+    const r = placeFree({ x: BOARD_ORIGIN, y: bSnap(bottom + BOARD_GAP_ROW), w: BOARD_W_CHAR, h: bFallbackH("loc:") }, placed);
+    sb.locations.push(loc);
+    B.lpos.set(loc, { x: r.x, y: r.y });
+    changed();
+    close();
+    rerenderBoard();
+    bScrollTo(`loc:#${sb.locations.length - 1}`);
+    saveBoard();
+  };
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); desc.focus(); } });
+  modal({
+    title: "Thêm Node Bối cảnh (LocationLoader)",
+    body: h("div", { class: "stack" }, field("Tên bối cảnh", name, "bắt buộc, không trùng"), field("Mô tả không gian cố định", desc, "tiếng Anh"), msg,
+      h("p", { class: "help" }, "Kéo cổng LOCATION (màu xanh ngọc) vào cảnh để cố định không gian & ánh sáng giữa nhiều cảnh.")),
+    buttons: [{ label: "Huỷ" }, { label: "Thêm Node", cls: "primary", onclick: go }],
+  });
+}
+
+function bNextSceneId() {
+  const used = new Set(bScenes().map((s) => s.id));
+  for (let n = bScenes().length + 1; n < 999; n++) {
+    const id = "s" + String(n).padStart(2, "0");
+    if (!used.has(id)) return id;
+  }
+  return "s" + Date.now().toString().slice(-4);
+}
+
+function bAddScene(mode = "keyframe") {
+  const sb = S.cur.storyboard;
+  sb.scenes = sb.scenes || [];
+  const sid = bNextSceneId();
+  const prev = sb.scenes[sb.scenes.length - 1];
+  const sc = mode === "keyframe"
+    ? { id: sid, mode: "keyframe", image_prompt: "", prompt: "", duration: 8, ...(prev?.location ? { location: prev.location } : {}) }
+    : { id: sid, mode: "t2v", prompt: "", duration: 8, ...(prev?.location ? { location: prev.location } : {}) };
+  sb.scenes.push(sc);
+  B.videos.add(sid);
+  B.saveAfterMount = true;
+  changed();
+  rerenderBoard();
+  setTimeout(() => bScrollTo(mode === "keyframe" ? `kf:${sid}` : `vid:${sid}`), 40);
+  toast(`Đã thêm cảnh ${sid} lên Bảng`, "ok");
+}
+
+/* ---------- View: Pan / Zoom / Fit ---------- */
 
 function bViewport() { return document.querySelector("#main .board-viewport"); }
 
@@ -991,18 +2243,18 @@ function bZoomStep(dir) {
   bZoomTo(next ?? (dir > 0 ? 2 : 0.25));
 }
 
-/* Zoom so every card fits with a 32px margin, at most 100%. */
 function bFit(save = true) {
   const vp = bViewport();
   if (!vp || !vp.clientWidth) return;
   const rects = [...vp.querySelectorAll(".board-card, .board-empty")].filter((el) => el.style.visibility !== "hidden").map((el) => ({
-    x: parseFloat(el.style.left) || 0, y: parseFloat(el.style.top) || 0, w: el.offsetWidth, h: el.offsetHeight }));
+    x: parseFloat(el.style.left) || 0, y: parseFloat(el.style.top) || 0, w: el.offsetWidth, h: el.offsetHeight,
+  }));
   if (!rects.length) { B.view = { x: 0, y: 0, zoom: 1 }; bApplyView(vp); return; }
   const minX = Math.min(...rects.map((r) => r.x)), minY = Math.min(...rects.map((r) => r.y));
   const maxX = Math.max(...rects.map((r) => r.x + r.w)), maxY = Math.max(...rects.map((r) => r.y + r.h));
   const bw = maxX - minX, bh = maxY - minY, vw = vp.clientWidth, vh = vp.clientHeight;
-  const z = bClampZoom(Math.min(1, (vw - 64) / bw, (vh - 64) / bh));
-  B.view = { x: (vw - bw * z) / 2 - minX * z, y: Math.max(32, (vh - bh * z) / 2) - minY * z, zoom: z };
+  const z = bClampZoom(Math.min(1, (vw - 72) / bw, (vh - 72) / bh));
+  B.view = { x: (vw - bw * z) / 2 - minX * z, y: Math.max(28, (vh - bh * z) / 2) - minY * z, zoom: z };
   bApplyView(vp);
   if (save) saveBoard();
 }
@@ -1013,7 +2265,7 @@ function bScrollTo(key) {
   const v = B.view || { x: 0, y: 0, zoom: 1 };
   const sx = p.x * v.zoom + v.x, sy = p.y * v.zoom + v.y, w = bCardW(key) * v.zoom, hh = bCardH(key) * v.zoom;
   if (sx >= 0 && sy >= 0 && sx + w <= vp.clientWidth && sy + hh <= vp.clientHeight) return;
-  B.view = { ...v, x: vp.clientWidth / 2 - (p.x + bCardW(key) / 2) * v.zoom, y: Math.min(32, vp.clientHeight / 2 - (p.y + bCardH(key) / 2) * v.zoom) };
+  B.view = { ...v, x: vp.clientWidth / 2 - (p.x + bCardW(key) / 2) * v.zoom, y: Math.min(36, vp.clientHeight / 2 - (p.y + bCardH(key) / 2) * v.zoom) };
   bApplyView(vp);
 }
 
@@ -1023,6 +2275,7 @@ function bWorldPoint(e) {
 }
 
 function bOnWheel(e) {
+  if (e.target.closest?.(".cf-palette")) return;
   e.preventDefault();
   const vp = e.currentTarget, r = vp.getBoundingClientRect(), v = B.view || { x: 0, y: 0, zoom: 1 };
   if (e.ctrlKey || e.metaKey) {
@@ -1036,38 +2289,69 @@ function bOnWheel(e) {
   saveBoard();
 }
 
-/* ---------- pointer: pan, drag card, drag arrow ---------- */
+/* ---------- Pointer: Pan, Drag Node, Drag Wire, Minimap ---------- */
+
+function bHighlightCompatiblePorts(fromKey, dtype, on) {
+  document.querySelectorAll(".board-port.slot-compatible").forEach((el) => el.classList.remove("slot-compatible"));
+  if (!on || !dtype) return;
+  document.querySelectorAll(`.board-port.in[data-dtype="${CSS.escape(dtype)}"]`).forEach((portEl) => {
+    const card = portEl.closest(".board-card");
+    if (card && card.dataset.key !== fromKey && !bDropProblem(fromKey, card.dataset.key, portEl.dataset.slot)) {
+      portEl.classList.add("slot-compatible");
+    }
+  });
+}
 
 function bOnPointerDown(e) {
   if (e.button !== 0 || B.drag) return;
   const vp = e.currentTarget, t = e.target;
+  if (t.closest(".cf-palette")) return;
+
+  const mm = t.closest(".cf-minimap");
+  if (mm) {
+    e.preventDefault();
+    B.drag = { kind: "minimap", id: e.pointerId, mm };
+    vp.setPointerCapture(e.pointerId);
+    bPanFromMinimap(e, mm);
+    return;
+  }
+
   const port = t.closest(".board-port");
   if (port) {
     e.preventDefault();
     const card = port.closest(".board-card");
     if (port.classList.contains("disabled")) { toast(port.title); return; }
     if (!port.classList.contains("out") || !card) return;
-    B.drag = { kind: "link", from: card.dataset.key, id: e.pointerId, target: null, ok: false };
+    bMeasureSlots();
+    B.drag = {
+      kind: "link", from: card.dataset.key, fromSlot: port.dataset.slot || "",
+      dtype: port.dataset.dtype || "", id: e.pointerId, target: null, ok: false,
+    };
     vp.setPointerCapture(e.pointerId);
     vp.classList.add("is-dragging");
     port.classList.add("active");
+    bHighlightCompatiblePorts(card.dataset.key, port.dataset.dtype, true);
     bDraftTo(bWorldPoint(e));
     return;
   }
-  if (t.closest(".board-link")) return; // click selects
+
+  if (t.closest(".board-link")) return;
+
   const head = t.closest(".board-card-head");
   if (head) {
-    // The name input fills most of a character header: an unfocused one also drags; a click without moving focuses it.
     const nameInput = t.matches("input.board-name") && document.activeElement !== t ? t : null;
     if (!nameInput && t.closest("input, textarea, select, button, a")) return;
     const card = head.closest(".board-card"), p = bPos(card.dataset.key);
     if (!p) return;
     if (nameInput) e.preventDefault();
+    bMeasureSlots();
     B.drag = { kind: "card", key: card.dataset.key, el: card, id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: p.x, oy: p.y, moved: false, focus: nameInput };
     vp.setPointerCapture(e.pointerId);
     return;
   }
+
   if (t.closest(".board-card, .board-empty")) return;
+  if (B.paletteOpen) bTogglePalette(false);
   const v = B.view || { x: 0, y: 0, zoom: 1 };
   B.drag = { kind: "pan", id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: v.x, oy: v.y, moved: false };
   vp.setPointerCapture(e.pointerId);
@@ -1076,7 +2360,9 @@ function bOnPointerDown(e) {
 function bOnPointerMove(e) {
   const d = B.drag;
   if (!d || d.id !== e.pointerId) return;
-  if (d.kind === "pan") {
+  if (d.kind === "minimap") {
+    bPanFromMinimap(e, d.mm);
+  } else if (d.kind === "pan") {
     const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
     if (!d.moved && Math.hypot(dx, dy) < 4) return;
     if (!d.moved) { d.moved = true; e.currentTarget.classList.add("is-panning"); }
@@ -1092,16 +2378,23 @@ function bOnPointerMove(e) {
       d.el.style.left = d.nx + "px"; d.el.style.top = d.ny + "px";
       bSetPos(d.key, { x: d.nx, y: d.ny });
       bUpdateLinksFor(d.key);
+      refreshZone("board-groups");
+      bUpdateMinimap();
     });
   } else if (d.kind === "link") {
     bDraftTo(bWorldPoint(e));
     const under = document.elementFromPoint(e.clientX, e.clientY);
-    const card = under && under.closest && under.closest(".board-card");
+    const card = under?.closest?.(".board-card");
+    const slotEl = under?.closest?.(".board-port.in");
     const key = card && card.dataset.key !== d.from ? card.dataset.key : null;
-    if (key !== d.target) {
+    const toSlot = slotEl?.dataset?.slot || "";
+    const sig = `${key || ""}|${toSlot}`;
+    if (sig !== d.targetSig) {
       document.querySelectorAll(".board-card.drop-ok, .board-card.drop-no").forEach((el) => el.classList.remove("drop-ok", "drop-no"));
+      d.targetSig = sig;
       d.target = key;
-      if (card && key) { d.ok = !bDropProblem(d.from, key); card.classList.add(d.ok ? "drop-ok" : "drop-no"); }
+      d.toSlot = toSlot;
+      if (card && key) { d.ok = !bDropProblem(d.from, key, toSlot); card.classList.add(d.ok ? "drop-ok" : "drop-no"); }
     }
   }
 }
@@ -1112,8 +2405,10 @@ function bOnPointerUp(e) {
   const vp = e.currentTarget;
   B.drag = null;
   vp.classList.remove("is-dragging", "is-panning");
-  try { vp.releasePointerCapture(e.pointerId); } catch { /* already released */ }
-  if (d.kind === "pan") {
+  try { vp.releasePointerCapture(e.pointerId); } catch { /* released */ }
+  if (d.kind === "minimap") {
+    saveBoard();
+  } else if (d.kind === "pan") {
     if (d.moved) saveBoard();
     else if (B.sel) bSelect(null);
   } else if (d.kind === "card") {
@@ -1122,41 +2417,65 @@ function bOnPointerUp(e) {
       d.el.classList.remove("dragging");
       bSetPos(d.key, { x: d.nx, y: d.ny });
       d.el.style.left = d.nx + "px"; d.el.style.top = d.ny + "px";
+      bMeasureSlots();
+      refreshZone("board-groups");
       refreshZone("board-links");
+      bUpdateMinimap();
       document.querySelectorAll("#main svg.board-links.live").forEach((el) => el.remove());
-      saveBoard(); // once, after the drop (AC22)
-    } else if (d.focus) { d.focus.focus(); const n = d.focus.value.length; try { d.focus.setSelectionRange(n, n); } catch { /* ignore */ } }
+      saveBoard();
+    } else if (d.focus) {
+      d.focus.focus();
+      const n = d.focus.value.length;
+      try { d.focus.setSelectionRange(n, n); } catch { /* ignore */ }
+    }
   } else if (d.kind === "link") {
-    document.querySelectorAll(".board-port.active").forEach((el) => el.classList.remove("active"));
+    document.querySelectorAll(".board-port.active, .board-port.slot-compatible").forEach((el) => el.classList.remove("active", "slot-compatible"));
     document.querySelectorAll(".board-card.drop-ok, .board-card.drop-no").forEach((el) => el.classList.remove("drop-ok", "drop-no"));
     bDraftTo(null);
     if (e.type === "pointercancel") return;
     const under = document.elementFromPoint(e.clientX, e.clientY);
-    const card = under && under.closest && under.closest(".board-card");
-    if (card && card.dataset.key === d.from) return; // back onto its own card: cancel, no toast
-    bDrop(d.from, card ? card.dataset.key : null, bWorldPoint(e), !!(under && under.closest && under.closest(".board-viewport")));
+    const card = under?.closest?.(".board-card");
+    const slotEl = under?.closest?.(".board-port.in");
+    if (card && card.dataset.key === d.from) return;
+    bDrop(d.from, card ? card.dataset.key : null, slotEl?.dataset?.slot || "", bWorldPoint(e), !!under?.closest?.(".board-viewport"));
   }
 }
 
 function bOnClick(e) {
-  const g = e.target.closest && e.target.closest(".board-link");
+  const g = e.target.closest?.(".board-link");
   if (g && g.dataset.id) { bSelect(B.sel === g.dataset.id ? null : g.dataset.id); g.focus({ preventScroll: true }); }
 }
+
+function bOnDblClick(e) {
+  if (e.target.closest?.(".board-card, .board-link, .cf-minimap, .cf-palette")) return;
+  e.preventDefault();
+  bTogglePalette(true);
+}
+
+function bOnContextMenu(e) {
+  if (e.target.closest?.("input, textarea, select")) return;
+  if (e.target.closest?.(".board-card, .cf-palette, .cf-minimap")) return;
+  e.preventDefault();
+  bTogglePalette(true);
+}
+
 function bOnLinkKey(e) {
-  const g = e.target.closest && e.target.closest(".board-link");
+  const g = e.target.closest?.(".board-link");
   if (g && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); bSelect(g.dataset.id); }
 }
 
-/* Document-level keys (bound once): Delete/Backspace deletes the selected arrow, Esc deselects / cancels a draft. */
 function bOnKey(e) {
   if (S.tab !== "board" || !S.cur) return;
   if (document.querySelector("#modal-root .overlay")) return;
   if (bTyping()) return;
   if ((e.key === "Delete" || e.key === "Backspace") && B.sel) { e.preventDefault(); bDeleteSelected(); }
+  else if (e.key === "/" || (e.key === " " && !B.drag)) { e.preventDefault(); bTogglePalette(true); }
+  else if (e.key === "f" || e.key === "F") { e.preventDefault(); bFit(true); }
   else if (e.key === "Escape") {
+    if (B.paletteOpen) { bTogglePalette(false); return; }
     if (B.drag && B.drag.kind === "link") {
       B.drag = null; bDraftTo(null);
-      document.querySelectorAll(".board-port.active").forEach((el) => el.classList.remove("active"));
+      document.querySelectorAll(".board-port.active, .board-port.slot-compatible").forEach((el) => el.classList.remove("active", "slot-compatible"));
       document.querySelectorAll(".board-card.drop-ok, .board-card.drop-no").forEach((el) => el.classList.remove("drop-ok", "drop-no"));
     } else if (B.sel) bSelect(null);
   }
@@ -1167,49 +2486,112 @@ function bDraftTo(pt) {
   if (!path) return;
   const d = B.drag;
   if (!pt || !d || d.kind !== "link") { path.setAttribute("d", ""); path.removeAttribute("marker-end"); return; }
-  const a = bAnchor(d.from, "out");
+  const a = bAnchor(d.from, "out", d.fromSlot);
   if (!a) return;
   path.setAttribute("d", bCurve(a, pt));
-  path.setAttribute("marker-end", "url(#bm-arrow-sel)");
+  path.setAttribute("marker-end", "url(#bm-sel)");
 }
 
-/* Why dropping an arrow from `from` onto card `to` is refused ("" = allowed). */
+/* ---------- Wire Drop Validation & Connection Execution ---------- */
+
 function bDropProblem(from, to) {
   const toType = to.split(":")[0], sid = to.slice(to.indexOf(":") + 1);
-  const sc = toType === "char" ? null : bScenes().find((s) => s.id === sid);
+  const sc = (toType === "kf" || toType === "vid") ? bScenes().find((s) => s.id === sid) : null;
+
   if (from.startsWith("char:#")) {
     const c = bChars()[+from.slice(6)];
     if (!c) return "Không thấy nhân vật";
-    if (toType === "char") return "Chỉ nối nhân vật vào keyframe hoặc video của cảnh";
+    if (toType !== "kf" && toType !== "vid") return "Chỉ nối nhân vật vào node Keyframe hoặc VideoSampler của cảnh";
     if (!sc) return "Không thấy cảnh";
     if (bMode(sc) === "i2v") return `Cảnh ${sc.id} kiểu “${bModeLabel("i2v")}” không dùng ảnh nhân vật`;
     if (sceneLinks(sc).idx.includes(+from.slice(6))) return `${c.name} đã nối vào cảnh ${sc.id}`;
     return "";
   }
-  const fromSid = from.slice(3);
-  if (toType === "vid" && sid === fromSid) return "Keyframe đã nối với video của cảnh này";
-  return "Keyframe chỉ nối với video của cùng cảnh";
+
+  if (from.startsWith("loc:#")) {
+    const l = bLocs()[+from.slice(5)];
+    if (!l) return "Không thấy bối cảnh";
+    if (toType !== "kf" && toType !== "vid") return "Chỉ nối bối cảnh vào node Keyframe hoặc VideoSampler của cảnh";
+    if (!sc) return "Không thấy cảnh";
+    if (bMode(sc) === "i2v") return `Cảnh ${sc.id} kiểu “${bModeLabel("i2v")}” không dùng bối cảnh`;
+    if (bLocIndex(sc.location) === +from.slice(5)) return `Cảnh ${sc.id} đã gắn bối cảnh “${l.name}”`;
+    return "";
+  }
+
+  if (from.startsWith("cfg:")) {
+    if (toType === "kf" || toType === "vid") return "";
+    return "Cổng MODEL chỉ nối vào các node cảnh";
+  }
+
+  if (from.startsWith("kf:")) {
+    const fromSid = from.slice(3);
+    if (toType === "kf") {
+      const scenes = bScenes();
+      const iFrom = scenes.findIndex((s) => s.id === fromSid), iTo = scenes.findIndex((s) => s.id === sid);
+      if (iTo !== iFrom + 1) return "Chỉ nối tiếp Keyframe vào cảnh liền kề ngay sau đó";
+      if (bContinuityPrevSid(iTo) === fromSid) return `Keyframe ${fromSid} đã nối tiếp sang ${sid}`;
+      return "";
+    }
+    if (toType === "vid" && sid === fromSid) return bVideoShown(sc) ? "Keyframe đã nối với VideoSampler của cảnh này" : "";
+    return "Keyframe chỉ nối sang VideoSampler cùng cảnh hoặc prev_image của cảnh kế tiếp";
+  }
+
+  if (from.startsWith("vid:")) {
+    if (to === "out:final") return "Clip của cảnh đã tự nối vào SaveFilm";
+    return "Cổng VIDEO đầu ra đã nối tới SaveFilm";
+  }
+
+  return "Không thể nối hai cổng này";
 }
 
-async function bDrop(from, to, pt, inViewport) {
+async function bDrop(from, to, _toSlot, pt, inViewport) {
   if (from.startsWith("char:#")) {
-    if (!to) return; // dropped on empty space: nothing to do
+    if (!to) return;
     const why = bDropProblem(from, to);
     if (why) { toast(why); return; }
     const c = bChars()[+from.slice(6)], sid = to.slice(to.indexOf(":") + 1), sc = bScenes().find((s) => s.id === sid);
     const viaVideo = to.startsWith("vid:") && bMode(sc) === "keyframe";
-    if (await editSceneChars(sc, c.name) && viaVideo) toast(`Đã nối vào keyframe của cảnh ${sid} — video tạo từ keyframe`);
+    if (await editSceneChars(sc, c.name) && viaVideo) toast(`Đã nối nhân vật vào Keyframe của cảnh ${sid}`);
     return;
   }
-  // from a keyframe
-  const sid = from.slice(3), sc = bScenes().find((s) => s.id === sid);
-  if (!sc) return;
-  if (to) { const why = bDropProblem(from, to); if (why) toast(why); return; }
-  if (!inViewport) return;
-  if (S.cur.errors?.length) { toast("Storyboard đang lỗi — sửa lỗi trước khi tạo card video", "error"); return; }
-  if (bVideoShown(sc)) { toast(`Card video của cảnh ${sid} đã có trên bảng`); return; }
-  B.videos.add(sid);
-  bSetPos(`vid:${sid}`, { x: bSnap(pt.x + 8), y: bSnap(pt.y - BOARD_HEAD / 2) });
-  rerenderBoard();
-  saveBoard();
+
+  if (from.startsWith("loc:#")) {
+    if (!to) return;
+    const why = bDropProblem(from, to);
+    if (why) { toast(why); return; }
+    const l = bLocs()[+from.slice(5)], sid = to.slice(to.indexOf(":") + 1), sc = bScenes().find((s) => s.id === sid);
+    await editSceneLocation(sc, l.name);
+    return;
+  }
+
+  if (from.startsWith("cfg:")) {
+    if (!to) return;
+    const why = bDropProblem(from, to);
+    if (why) { toast(why); return; }
+    B.showModelLinks = true;
+    localSet("boardModelLinks", true);
+    refreshZone("board-links");
+    toast("Đã bật hiển thị dây nối MODEL cho toàn bộ cảnh", "ok");
+    return;
+  }
+
+  if (from.startsWith("kf:")) {
+    const sid = from.slice(3), sc = bScenes().find((s) => s.id === sid);
+    if (!sc) return;
+    if (to) {
+      const why = bDropProblem(from, to);
+      if (why) { toast(why); return; }
+      if (to.startsWith("kf:")) {
+        await editSceneContinuity(sid, to.slice(3), true);
+        return;
+      }
+    }
+    if (!inViewport) return;
+    if (S.cur.errors?.length) { toast("Storyboard đang lỗi — sửa lỗi trước khi hiện node VideoSampler", "error"); return; }
+    if (bVideoShown(sc)) { toast(`Node VideoSampler của cảnh ${sid} đã có trên bảng`); return; }
+    B.videos.add(sid);
+    bSetPos(`vid:${sid}`, { x: bSnap(pt.x + 8), y: bSnap(pt.y - BOARD_HEAD / 2) });
+    rerenderBoard();
+    saveBoard();
+  }
 }

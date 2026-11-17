@@ -24,7 +24,7 @@ EMPTY_BOARD: dict[str, Any] = {"cards": {}, "videos": [], "view": None}
 MAX_CARDS = 1000
 MAX_VIDEOS = 1000
 MIN_ZOOM, MAX_ZOOM = 0.25, 2.0
-CARD_KEY = re.compile(r"^(char|kf|vid):.+$", re.S)
+CARD_KEY = re.compile(r"^(char|loc|cfg|kf|vid|out):.+$", re.S)
 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
