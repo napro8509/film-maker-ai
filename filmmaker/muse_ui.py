@@ -205,34 +205,60 @@ SEND_NAMES = ("Send", "Send message", "Submit")
 #: (our request). Old clips higher up in the chat load lazily and get a fresh blob: URL on every page load, so
 #: "a src we had not seen" is not enough: only a video below our own message is the answer to it. Muse's avatar
 #: (header, status panel) is a looping video too; it is told apart by size / position.
-VIDEOS_JS = """(marker) => {
-  let anchor = null;
+VIDEOS_JS = """([marker, head]) => {
+  // the deepest nodes holding a text (a bubble's own text node container, not its ancestors)
+  const deepest = (t) => [...document.querySelectorAll('div, p, span')].filter(e =>
+      (e.innerText || '').includes(t) && ![...e.children].some(c => (c.innerText || '').includes(t)));
+  const FOLLOWS = Node.DOCUMENT_POSITION_FOLLOWING;
+  let anchor = null, bound = null;
   if (marker) {
-    const hits = [...document.querySelectorAll('div, p, span')].filter(e => (e.innerText || '').includes(marker));
-    anchor = hits.length ? hits[hits.length - 1] : null;  // document order: the deepest node of the last bubble
+    const hits = deepest(marker);
+    anchor = hits.length ? hits[hits.length - 1] : null;
+    // the next request we sent after this one: a video below THAT belongs to the later request
+    if (anchor && head) bound = deepest(head).find(e => anchor.compareDocumentPosition(e) & FOLLOWS) || null;
   }
   return [...document.querySelectorAll('video')].map(v => {
     const r = v.getBoundingClientRect();
+    const after = marker ? !!(anchor && (anchor.compareDocumentPosition(v) & FOLLOWS)) : true;
+    const before = !bound || !!(v.compareDocumentPosition(bound) & FOLLOWS);
     return {src: v.currentSrc || v.src || (v.querySelector('source') || {}).src || '', w: Math.round(r.width),
-            h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y),
-            after: marker ? !!(anchor && (anchor.compareDocumentPosition(v) & Node.DOCUMENT_POSITION_FOLLOWING)) : true};
+            h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y), after: after && before};
   });
 }"""
 
-LAST_REPLY_JS = """() => {
-  const texts = [...document.querySelectorAll('[aria-label="Copy response"]')].map(b => {
-    let el = b; for (let i = 0; i < 8 && el; i++) { el = el.parentElement; if (el && el.innerText && el.innerText.length > 20) break; }
-    return el ? el.innerText : '';
-  });
-  const mine = texts.filter(t => !/^\\s*You:/.test(t));  // the user's own bubbles also carry a copy button
-  return mine.length ? mine[mine.length - 1].slice(0, 1500) : '';
+#: How many "Failed to create …" task rows Muse's activity panel shows (a render that failed on Muse's side).
+FAILED_JS = """() => (document.body.innerText.match(/Failed to (create|generate)/gi) || []).length"""
+
+#: Muse's chat text below our request (its answer when it writes instead of sending a video). Only the chat
+#: column (left of the status panel), only text that comes after the bubble holding `marker`.
+REPLY_AFTER_JS = """(marker) => {
+  const deepest = [...document.querySelectorAll('div, p, span')].filter(e =>
+      (e.innerText || '').includes(marker) && ![...e.children].some(c => (c.innerText || '').includes(marker)));
+  const anchor = deepest.length ? deepest[deepest.length - 1] : null;
+  if (!anchor) return '';
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const out = [];
+  let n;
+  while ((n = walker.nextNode())) {
+    if (!(anchor.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING) || anchor.contains(n)) continue;
+    const el = n.parentElement;
+    if (!el) continue;
+    const r = el.getBoundingClientRect();
+    if (!r.width || r.x > 1000) continue;
+    const t = n.textContent.trim();
+    if (t) out.push(t);
+  }
+  return out.join(' ').slice(0, 1500);
 }"""
 
 DECLINE_RE = r"can't|cannot|can not|unable|not able|won't|not allowed|policy|sorry|limit reached|out of credits|try again later"
 
 
+REQUEST_HEAD = "Make exactly 1 video now with your video generation tool"
+
+
 def build_prompt(motion: str, *, image: bool, aspect: str, duration: int | None, refs: int = 0) -> str:
-    parts = ["Make exactly 1 video now with your video generation tool (Muse Video), with sound. "
+    parts = [REQUEST_HEAD + " (Muse Video), with sound. "
              "Do not ask me any questions, do not plan or write a script, just generate it and send me the video."]
     if image:
         parts.append(("The first attached image" if refs else "Use the attached image") +
@@ -254,9 +280,33 @@ def _marker(prompt: str) -> str:
     return prompt.strip()[-80:]
 
 
+#: Seconds Muse's written answer must stay unchanged (and no video) before it counts as its final answer.
+REPLY_SETTLE = 60
+
+
+def _asks_or_declines(text: str) -> bool:
+    import re
+    t = text.strip()
+    if re.search(r"generating|creating|working on|rendering|in progress|on it", t, re.I) and "?" not in t:
+        return False
+    return t.endswith("?") or bool(re.search(DECLINE_RE, t, re.I))
+
+
+def _wait_for(fn, seconds: float) -> bool:
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            if fn():
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def _new_videos(page, before: set[str], marker: str = "") -> list[dict]:
     out = []
-    for v in page.evaluate(VIDEOS_JS, marker):
+    for v in page.evaluate(VIDEOS_JS, [marker, REQUEST_HEAD if marker else ""]):
         if not v.get("after", True):
             continue
         if not v["src"] or v["src"] in before or "/videos/avatars/" in v["src"]:
@@ -316,7 +366,11 @@ def run_i2v(args) -> dict:
                 raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
             time.sleep(3)
             marker = _marker(prompt)
-            before = {v["src"] for v in page.evaluate(VIDEOS_JS, "") if v["src"]}
+            before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", ""]) if v["src"]}
+            # Muse's activity panel (with older "Failed to create" rows) loads a moment after the chat: count
+            # those rows only once it is there, or an old row would look like a new failure.
+            _wait_for(lambda: page.get_by_text("Today", exact=True).count() > 0, 15)
+            failed_before = page.evaluate(FAILED_JS)
             files = [str(f) for f in ([image] if image else []) + refs]
             if files:
                 try:
@@ -346,7 +400,7 @@ def run_i2v(args) -> dict:
             log("  đã gửi yêu cầu lên Muse, chờ video…")
             time.sleep(5)
             _shot(page, debug, "2-sent")
-            last_reply, n = "", 0
+            last_reply, n, reply_at = "", 0, time.time()
             while time.time() < end:
                 vids = _new_videos(page, before, marker)
                 if vids:
@@ -358,11 +412,20 @@ def run_i2v(args) -> dict:
                     _download(page, ctx, src, out)
                     if out.stat().st_size < 10_000:
                         raise Fail(EXIT_GENERATION_FAILED, "File video Muse tải về quá nhỏ", spent=True)
-                    return {"status": "ok", "local_path": str(out), "reply": page.evaluate(LAST_REPLY_JS)[:400]}
-                reply = page.evaluate(LAST_REPLY_JS)
+                    return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
+                if page.evaluate(FAILED_JS) > failed_before:
+                    _shot(page, debug, "9-failed")
+                    raise Fail(EXIT_GENERATION_FAILED, "Muse báo không tạo được video này (Failed to create…). "
+                               "Gửi lại cảnh hoặc sửa prompt.", spent=False)
+                reply = page.evaluate(REPLY_AFTER_JS, marker)
                 if reply != last_reply:
-                    last_reply = reply
-                    log("  Muse: " + reply.replace("\n", " ")[:200])
+                    last_reply, reply_at = reply, time.time()
+                    if reply:
+                        log("  Muse: " + reply.replace("\n", " ")[:200])
+                elif reply and time.time() - reply_at > REPLY_SETTLE and _asks_or_declines(reply):
+                    # Muse wrote back (a question / a refusal) and nothing has been generating since
+                    _shot(page, debug, "9-declined")
+                    raise Fail(EXIT_AGENT_DECLINED, "Muse không tạo video, trả lời: " + reply[:600], spent=False)
                 n += 1
                 if debug and n % 6 == 0:
                     _shot(page, debug, f"wait-{n:03d}")

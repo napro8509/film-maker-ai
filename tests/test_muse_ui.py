@@ -106,3 +106,21 @@ def test_missing_image_fails_before_opening_a_browser(tmp_path, capsys):
     assert code == muse_ui.EXIT_USAGE
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "fail" and out["error"]["spent"] is False
+
+
+def test_prompt_starts_with_the_request_head_used_to_bound_fetch():
+    """fetch stops at the next request bubble, found by this fixed opening of every prompt."""
+    p = muse_ui.build_prompt("x", image=False, aspect="9:16", duration=10)
+    assert p.startswith(muse_ui.REQUEST_HEAD)
+
+
+def test_videos_js_and_failed_js_are_valid_js_strings():
+    assert "([marker, head])" in muse_ui.VIDEOS_JS
+    assert "\n" not in muse_ui.FAILED_JS  # a real newline inside a JS regex literal breaks it
+
+
+def test_asks_or_declines():
+    assert muse_ui._asks_or_declines("I still can't make that exact podium take. Want me to do that one?")
+    assert muse_ui._asks_or_declines("Sorry, that request goes against our policy.")
+    assert not muse_ui._asks_or_declines("Generating your 10-second video now.")
+    assert not muse_ui._asks_or_declines("Here it is.")
