@@ -60,3 +60,48 @@ def test_upload_names_are_unique():
 
     names = {flow_ui.upload_name(Path("/k/s07.png")) for _ in range(50)}
     assert len(names) == 50 and all(n.startswith("fm-s07-") and n.endswith(".png") for n in names)
+
+
+def _run_i2v(monkeypatch, tmp_path, refs):
+    """run_i2v with the browser faked out; returns how often the start-frame check ran."""
+    import sys
+    import types
+    from argparse import Namespace
+
+    image = tmp_path / "s01.png"
+    image.write_bytes(b"png")
+    fake = types.ModuleType("playwright.sync_api")
+
+    class _PW:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake.sync_playwright = lambda: _PW()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake)
+
+    class _Ctx:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(flow_ui, "_session", lambda *a, **k: (_Ctx(), object()))
+    monkeypatch.setattr(flow_ui, "_i2v_on_page", lambda *a, **k: {"status": "ok"})
+    calls = []
+    monkeypatch.setattr(flow_ui, "check_start_frame", lambda img, out: calls.append(img))
+    args = Namespace(timeout=600, image=str(image), ref=refs, out=str(tmp_path / "s01.mp4"), prompt="walks",
+                     aspect="9:16", model=None, duration=None, headless=True, window="headless",
+                     profile_dir=str(tmp_path), channel=None, project="p")
+    flow_ui.run_i2v(args)
+    return calls
+
+
+def test_first_frame_i2v_is_checked_against_the_start_picture(monkeypatch, tmp_path):
+    assert len(_run_i2v(monkeypatch, tmp_path, None)) == 1
+
+
+def test_reference_to_video_is_not_checked_on_its_first_frame(monkeypatch, tmp_path):
+    """Character refs make Flow render Reference-to-Video, which reframes the shot: right clips scored
+    -0.16..0.65, so the first-frame check would discard good, paid-for clips."""
+    assert _run_i2v(monkeypatch, tmp_path, ["character:Ong Hai"]) == []

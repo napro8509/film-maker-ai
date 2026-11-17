@@ -372,3 +372,17 @@ def test_a_line_cried_over_rain_gets_a_listen_without_the_detector(film, fake_cl
     res = qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
     assert calls == [(None, True), (qc.FAINT_VAD, True), (None, False)]
     assert "FAINT" in fake_claude[0]["user"] and "con ơi" in fake_claude[0]["user"] and res["transcript"] == "con ơi"
+
+
+@needs_ffmpeg
+def test_reference_to_video_clip_is_not_failed_for_its_framing(film, fake_claude, no_whisper, monkeypatch):
+    """With character refs next to the start picture Flow renders Reference-to-Video, which reframes the shot:
+    a low first-frame match there is not "another picture" and must not force FAIL."""
+    d, out = film
+    kf, clip = _media(out, "s01", same=False)
+    sb = load_storyboard(d / "storyboard.yaml")
+    monkeypatch.setattr(type(sb), "start_frame_char_refs", lambda self, s, limit=2: [("Phet", kf)])
+    r = qc.check_scene(sb, sb.scenes[0], clip, kf, out / "qcw")
+    assert r["verdict"] == "PASS" and r["match"] < qc.WRONG_START
+    assert not any("nhầm ảnh" in x for x in r["issues"])
+    assert "Reference-to-Video" in fake_claude[0]["user"]

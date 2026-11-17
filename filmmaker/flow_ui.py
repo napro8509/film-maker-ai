@@ -98,6 +98,57 @@ def build_prompt(motion: str, *, refs: int, aspect: str, model: str | None, dura
     return " ".join(parts)
 
 
+def build_v2v_prompt(instructions: str, *, refs: int, aspect: str, model: str | None, duration: int | None) -> str:
+    """Prompt for editing an uploaded video (Omni): the FIRST attachment is the video, the rest are the new cast."""
+    parts = ["Edit the attached video (the first attachment) and make exactly 1 new video from it; do not ask "
+             "questions and do not make it from scratch."]
+    if refs:
+        parts.append(f"The other {refs} attached image(s) are the NEW characters: give the people in the video "
+                     "exactly these faces, hair, skin and clothes.")
+    parts.append("Keep EVERYTHING else identical to the attached video: every movement, gesture, head turn, "
+                 "facial expression, mouth movement, eye line and timing, frame by frame; the same camera framing "
+                 "and camera movement; the same room, furniture, props, food, lighting and colours; the same "
+                 "length. Do not add, remove or reorder any action, and do not add text or music.")
+    spec = [f"aspect ratio {aspect}"]
+    if model:
+        spec.append(f"model {model}")
+    if duration:
+        spec.append(f"{duration} seconds")
+    parts.append("Use " + ", ".join(spec) + ".")
+    parts.append("Changes: " + instructions.strip())
+    return " ".join(parts)
+
+
+def run_v2v(args) -> dict:
+    """Video-to-video edit (Flow's Omni models): upload the source clip + the new cast, ask for the swap."""
+    dl = Deadline(args.timeout)
+    video = Path(args.video).expanduser()
+    refs = list(args.ref or [])
+    if not video.is_file():
+        raise Fail(EXIT_USAGE, f"không thấy video {video}")
+    for kind, value in split_refs(refs):
+        if kind == "file" and not Path(value).expanduser().is_file():
+            raise Fail(EXIT_USAGE, f"không thấy ảnh {value}")
+    out = Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    prompt = build_v2v_prompt(args.prompt, refs=len(refs), aspect=args.aspect, model=args.model,
+                              duration=args.duration)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise Fail(EXIT_USAGE, f"Python này chưa có Playwright ({sys.executable}). Hãy dùng Python của gflow-cli.") from exc
+    with sync_playwright() as pw:
+        window = "headless" if args.headless else args.window
+        ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project, deadline=dl)
+        try:
+            return _i2v_on_page(page, args, prompt, [str(video)] + refs, out, dl)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 OFFSCREEN = (-4000, -4000)
 
 
@@ -250,7 +301,9 @@ ACTIVE = "asset-item-active"  # Flow's class for a selected upload
 # In the open add menu: is our upload listed, selected (active), still processing, and is anything else selected?
 _SELECTION_JS = """(menu, name) => {
   const items = Array.from(menu.querySelectorAll('button[role=option].asset-item'));
-  const isMine = e => ((e.querySelector('.asset-title') || {}).innerText || '').trim() === name;
+  const stem = name.replace(/[.][A-Za-z0-9]+$/, '');  // Flow shows videos without their extension
+  const isMine = e => { const t = ((e.querySelector('.asset-title') || {}).innerText || '').trim();
+                        return t === name || t === stem; };
   const on = e => e.classList.contains('asset-item-active') || e.getAttribute('aria-selected') === 'true';
   const mine = items.find(isMine);
   return {mine: !!mine, active: !!mine && on(mine),
@@ -281,6 +334,24 @@ def _attach(page, image: Path, deadline: Deadline | None = None) -> None:
         _attach_named(page, copy, image.name, deadline)
 
 
+VIDEO_SUFFIXES = (".mp4", ".m4v", ".mov", ".3gp", ".avi")
+RIGHTS = {"agreed": False}  # set by --agree-video-rights: the USER confirmed they hold the rights to the upload
+
+
+def _video_rights(page, deadline: Deadline | None) -> None:
+    """Flow asks "Rights to use this video" for every uploaded video (seen 2026-11-17). Only the user can make
+    that promise: it is answered "I agree" only with --agree-video-rights, otherwise cancelled (nothing spent)."""
+    dialog = page.locator("mat-dialog-container, [role=dialog]").filter(has_text="Rights to use this video")
+    if not _wait(lambda: dialog.count() > 0, _cap(deadline, 20), 0.5):
+        return
+    if not RIGHTS["agreed"]:
+        dialog.first.locator("button", has_text="Cancel").first.click()
+        raise Fail(EXIT_USAGE, "Flow yêu cầu xác nhận bạn có quyền dùng video tải lên (“Rights to use this video”). "
+                   "Chỉ chạy lại với --agree-video-rights khi video là của bạn hoặc bạn được phép dùng.")
+    dialog.first.locator("button", has_text=re.compile(r"^\s*I agree\s*$")).first.click()
+    log("  đã xác nhận quyền dùng video (theo --agree-video-rights)")
+
+
 def _attach_named(page, image: Path, shown: str, deadline: Deadline | None) -> None:
     name = image.name
     before = page.locator(CHIP).count()
@@ -295,7 +366,9 @@ def _attach_named(page, image: Path, shown: str, deadline: Deadline | None) -> N
         menu.locator("button", has_text="Upload media").first.click()
     fc.value.set_files(str(image))
     log(f"  đang tải ảnh lên Flow: {shown}")
-    mine = menu.locator(ASSET_ITEM).filter(has=page.locator(ASSET_TITLE, has_text=name)).first
+    if image.suffix.lower() in VIDEO_SUFFIXES:
+        _video_rights(page, deadline)
+    mine = menu.locator(ASSET_ITEM).filter(has=page.locator(ASSET_TITLE, has_text=image.stem)).first
     add = menu.locator("button", has_text="Add to prompt").first
 
     def give_up(msg: str) -> Fail:
@@ -867,8 +940,11 @@ def run_i2v(args) -> dict:
                 ctx.close()
             except Exception:
                 pass
-    if result.get("status") == "ok" and not result.get("dry_run") and image is not None:
-        check_start_frame(image, out)  # only image-to-video must start on the attached frame
+    if result.get("status") == "ok" and not result.get("dry_run") and image is not None and not refs:
+        # Only first-frame image-to-video must start on the attached picture. With character refs the prompt asks
+        # for Reference-to-Video, which keeps the scene but reframes it (right clips scored -0.16..0.65 on
+        # 2026-11-15), so a first-frame check there throws away good, paid-for clips.
+        check_start_frame(image, out)
     return result
 
 
@@ -1229,9 +1305,18 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--info", help="Character info (personality) shown to the Flow agent")
     c.add_argument("--retire-id", help="rename this older character of the project first")
     c.add_argument("--retire-name", default="")
+    v = sub.add_parser("v2v", help="edit an uploaded video (Omni): swap the people, keep the rest")
+    common(v, 2400)
+    v.add_argument("--video", required=True, help="the source clip to edit (Omni takes up to ~10 s)")
+    v.add_argument("--ref", action="append", help="new character picture (or character:<name>), repeatable")
+    v.add_argument("--duration", type=int)
+    v.add_argument("--max-credits", type=int, default=0, help="reject Flow's offer above this many credits (0 = no limit)")
+    v.add_argument("--agree-video-rights", action="store_true",
+                   help="answer Flow's 'Rights to use this video' with I agree (only if you own / may use the video)")
     args = ap.parse_args(argv)
+    RIGHTS["agreed"] = bool(getattr(args, "agree_video_rights", False))
     try:
-        result = {"i2i": run_i2i, "char": run_char}.get(args.cmd, run_i2v)(args)
+        result = {"i2i": run_i2i, "char": run_char, "v2v": run_v2v}.get(args.cmd, run_i2v)(args)
         code = 0
     except Fail as f:
         result = {"status": "fail", "error": {"exit_code": f.code, "detail": f.detail, "retryable": False, "spent": f.spent}}

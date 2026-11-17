@@ -54,6 +54,9 @@ SILENT_SCENE_RULE = ("Nobody speaks in this scene: no dialogue, no words, no voi
                      "are an indistinct murmur; "
                      "only ambient sound and sound effects.")
 
+# The same for the structured I2V prompts of the new flow, said positively (those templates avoid negatives).
+I2V_SILENT_RULE = ("Everyone in the frame keeps lips closed and stays wordless the whole time; the only human sounds "
+                   "are breathing, sighs or soft crying.")
 
 def clean_language(value: object) -> str | None:
     """A language name as stored: None / "" / blanks -> None, inner whitespace collapsed.
@@ -825,12 +828,27 @@ class Storyboard(StoryboardDraft):
         names = [re.escape(c.name.strip()) for c in self.characters if c.name.strip()]
         return bool(names) and bool(re.search(rf"\b(?:{'|'.join(names)})\b(?:\s*\([^)]*\))?\s*:", prompt))
 
+    def _silent_shot(self, prompt: str, scene: Scene | None) -> str:
+        """A structured I2V prompt of a scene without a line in a film with dialogue gets I2V_SILENT_RULE (before
+        its Audio line). Without it the prompt said nothing about speech and Veo made the people talk, in English,
+        in about half of such scenes of Thai films (2026-11-15). Not part of the fingerprint: nothing re-renders."""
+        shot = scene.video_shot if scene is not None else None
+        if (shot is None or self.audio != "dialogue" or not self.spoken_language() or I2V_SILENT_RULE in prompt
+                or (shot.speaker is not None and i2v_prompt.clean_line(shot.speaker.line))):
+            return prompt
+        for mark in ("Audio:", i2v_prompt.CLOSING):
+            at = prompt.find(mark)
+            if at >= 0:
+                head = prompt[:at].rstrip()
+                return f"{head} {I2V_SILENT_RULE} {prompt[at:]}" if head else f"{I2V_SILENT_RULE} {prompt[at:]}"
+        return f"{prompt.rstrip()} {I2V_SILENT_RULE}"
+
     def for_flow_video(self, prompt: str, scene: Scene | None = None) -> str:
         """A video prompt as actually sent to Flow: who-is-who for the dialogue (`speaker_cues`, when the scene is
         given), the spoken-language sentence, then `for_flow` (NO_TEXT).
         None of these are part of the fingerprints, so adding them re-renders nothing."""
-        if self.basic and i2v_prompt.CLOSING in prompt:  # a structured I2V prompt is complete as it is
-            return prompt
+        if self.basic and i2v_prompt.CLOSING in prompt:  # a structured I2V prompt is complete but for silence
+            return self._silent_shot(prompt, scene)
         if self.basic:  # one sound sentence, nothing from the drama flow
             rule = self.audio_rule()
             prompt = prompt.replace(formats.OLD_SILENT_RULE, rule) if rule else prompt

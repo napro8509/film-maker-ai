@@ -299,11 +299,21 @@ def expected_dialogue(sb: Storyboard, s: Scene) -> str:
     return f"Expected dialogue, in {lang}, in this order, each line once:\n{rows}"
 
 
+def uses_reference_video(sb: Storyboard, s: Scene) -> bool:
+    """True when the clip was rendered with character refs next to the start picture: Flow then makes it as
+    Reference-to-Video, which reframes the shot, so a low first-frame match does not mean another picture."""
+    try:
+        return bool(sb.start_frame_char_refs(s))
+    except Exception:
+        return False
+
+
 def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, work: Path, **ai_kw) -> dict[str, Any]:
     """QC of one clip. Returns the stored result (verdict, score, issues, measurements)."""
     from .flow_ui import frame_match
 
     raw_match = frame_match(keyframe, clip) if keyframe and keyframe.is_file() else None
+    reframed = keyframe is not None and uses_reference_video(sb, s)
     match = round(raw_match, 3) if raw_match is not None and raw_match == raw_match else None  # None or NaN: unknown
     sound = audio_stats(clip)
     speech = transcribe(clip)
@@ -328,7 +338,9 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     if talk:
         images.append((f"scene {s.id}: {SPEAK_FRAMES} frames while the line is heard (at "
                        + ", ".join(f"{x}s" for x in talk[1]) + "): whose mouth moves?", talk[0]))
-    facts = [f"Start-frame match with the keyframe: {match if match is not None else 'unknown'}",
+    facts = [(f"Start-frame match with the keyframe: not meaningful ({match}): rendered as Reference-to-Video with "
+              "character references, which keeps the scene but reframes the shot; judge the content, not the framing"
+              if reframed else f"Start-frame match with the keyframe: {match if match is not None else 'unknown'}"),
              f"Audio: {json.dumps(sound)}"]
     if speech is None:
         facts.append("Transcript: not available (speech-to-text is not set up): judge the sound from the audio "
@@ -352,7 +364,7 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         ai_kw = {"ai_model": sb.ai_model, **ai_kw}
     ans = ai.ask(SYSTEM, user, QCAnswer, images=images, **ai_kw)
     verdict, issues = ans.verdict, list(ans.issues)
-    if match is not None and match < WRONG_START and verdict != "FAIL":  # never trust a clip of another picture
+    if match is not None and match < WRONG_START and not reframed and verdict != "FAIL":  # never trust a clip of another picture
         verdict = "FAIL"
         issues.insert(0, f"Clip không bắt đầu từ keyframe của cảnh (độ khớp {match:.2f}): Flow đã dùng nhầm ảnh.")
     return {"verdict": verdict, "score": ans.score, "issues": issues, "picture": ans.picture, "sound": ans.sound,
