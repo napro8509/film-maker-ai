@@ -115,7 +115,7 @@ def test_prompt_starts_with_the_request_head_used_to_bound_fetch():
 
 
 def test_videos_js_and_failed_js_are_valid_js_strings():
-    assert "([marker, head])" in muse_ui.VIDEOS_JS
+    assert "([marker, head, sel])" in muse_ui.VIDEOS_JS
     assert "\n" not in muse_ui.FAILED_JS  # a real newline inside a JS regex literal breaks it
 
 

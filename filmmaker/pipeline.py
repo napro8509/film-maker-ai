@@ -204,6 +204,10 @@ class Pipeline:
             return f"the {pos} is {name} (keep {name}'s face, hair and clothes exactly)"
 
         ui_prompt = "Reference images: " + "; ".join(_slot(i, n) for i, (n, _) in enumerate(refs)) + ". " + prompt
+        if is_muse(kw.get("model")):  # Muse takes the local pictures as they are, with the labelled prompt
+            return self._with_retries(what, lambda: self.g.muse_image(self.sb.for_flow(ui_prompt), files,
+                                                                      out=kw["out"], aspect=kw["aspect"]),
+                                      opts.max_retries)
         # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
         cap = ref_caps.image_cap(kw.get("model"))
         if (self.state.data.get("i2i_ui") or self._prefer_ui(refs, project, cap)) and self.g.ui_available():
@@ -248,6 +252,8 @@ class Pipeline:
         """References for the Flow chat page: a character made on Flow's Characters page is attached by its
         name (Flow keeps its face itself); anything else is uploaded as a picture."""
         out: list[Path | str] = []
+        if is_muse(self.sb.model):  # the video goes to Muse, which takes local pictures only (no Flow names)
+            return [p for _, p in refs]
         for name, p in refs:
             fc = self.flow_character(name, project, p)
             if fc:
@@ -436,14 +442,22 @@ class Pipeline:
 
     def _muse_only(self, scenes: list[Scene]) -> bool:
         """Every scene renders on Muse from a picture on disk or from text alone: Flow is not used at all."""
+        if scenes and self.flow_free():
+            return True
         return bool(scenes) and all(
             is_muse(s.model or self.sb.model) and s.mode in ("i2v", "t2v") and not self.sb.scene_refs(s)
             for s in scenes)
+
+    def flow_free(self) -> bool:
+        """Pictures and every scene's video are made on Muse: nothing of this film goes to Flow."""
+        return is_muse(self.sb.image_model) and all(is_muse(s.model or self.sb.model) for s in self.sb.scenes)
 
     def ensure_project(self) -> str:
         pid = self.sb.project_id or self.state.data.get("project_id")
         if pid:
             return pid
+        if self.flow_free():
+            return ""  # no Flow project is ever needed
         self.log(f"Tạo project Flow mới: {self.sb.title}")
         pid = self.g.create_project(self.sb.title)
         if not self.g.dry_run:
@@ -739,6 +753,8 @@ class Pipeline:
         """Character pictures are made on Flow's Characters page (a reusable Flow character) rather than as a
         plain text-to-image picture: needs the Flow page driver (gflow's own `character create` uses a labs route
         that accounts moved to flow.google.com no longer have)."""
+        if is_muse(self.sb.image_model):  # pictures come from Muse: a Flow character would never be used
+            return False
         return bool(self.g.flow_characters and not self._no_flow_chars and self.g.ui_available())
 
     def _flow_character_image(self, c: Character, prompt: str, dest: Path, project: str) -> Path | None:

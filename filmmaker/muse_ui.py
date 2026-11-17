@@ -205,7 +205,7 @@ SEND_NAMES = ("Send", "Send message", "Submit")
 #: (our request). Old clips higher up in the chat load lazily and get a fresh blob: URL on every page load, so
 #: "a src we had not seen" is not enough: only a video below our own message is the answer to it. Muse's avatar
 #: (header, status panel) is a looping video too; it is told apart by size / position.
-VIDEOS_JS = """([marker, head]) => {
+VIDEOS_JS = """([marker, head, sel]) => {
   // the deepest nodes holding a text (a bubble's own text node container, not its ancestors)
   const deepest = (t) => [...document.querySelectorAll('div, p, span')].filter(e =>
       (e.innerText || '').includes(t) && ![...e.children].some(c => (c.innerText || '').includes(t)));
@@ -217,7 +217,7 @@ VIDEOS_JS = """([marker, head]) => {
     // the next request we sent after this one: a video below THAT belongs to the later request
     if (anchor && head) bound = deepest(head).find(e => anchor.compareDocumentPosition(e) & FOLLOWS) || null;
   }
-  return [...document.querySelectorAll('video')].map(v => {
+  return [...document.querySelectorAll(sel || 'video')].map(v => {
     const r = v.getBoundingClientRect();
     const after = marker ? !!(anchor && (anchor.compareDocumentPosition(v) & FOLLOWS)) : true;
     const before = !bound || !!(v.compareDocumentPosition(bound) & FOLLOWS);
@@ -236,11 +236,16 @@ REPLY_AFTER_JS = """(marker) => {
       (e.innerText || '').includes(marker) && ![...e.children].some(c => (c.innerText || '').includes(marker)));
   const anchor = deepest.length ? deepest[deepest.length - 1] : null;
   if (!anchor) return '';
+  // the composer (its "Message Muse" placeholder, the "Still sending" note) is not part of Muse's answer
+  const comp = document.querySelector('textarea[aria-label="Message"]');
+  let box = comp ? (comp.closest('form') || comp.parentElement) : null;
+  for (let i = 0; box && !comp.closest('form') && i < 3 && box.parentElement; i++) box = box.parentElement;
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const out = [];
   let n;
   while ((n = walker.nextNode())) {
     if (!(anchor.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING) || anchor.contains(n)) continue;
+    if (box && box.contains(n)) continue;
     const el = n.parentElement;
     if (!el) continue;
     const r = el.getBoundingClientRect();
@@ -254,11 +259,23 @@ REPLY_AFTER_JS = """(marker) => {
 DECLINE_RE = r"can't|cannot|can not|unable|not able|won't|not allowed|policy|sorry|limit reached|out of credits|try again later"
 
 
-REQUEST_HEAD = "Make exactly 1 video now with your video generation tool"
+#: Every request starts with this, so the next request bubble bounds where an answer can be (fetch, i2v, image).
+REQUEST_HEAD = "Make exactly 1 "
+
+
+def build_image_prompt(description: str, *, refs: int, aspect: str) -> str:
+    parts = [REQUEST_HEAD + "image now with your image generation tool (Muse Image). "
+             "Do not ask me any questions and do not describe it, just generate it and send me the image."]
+    if refs:
+        parts.append(f"The {refs} attached image(s) are references, in the order they are attached: keep the "
+                     "characters' faces, hair and clothes and the places exactly as in them.")
+    parts.append(f"Image: aspect ratio {aspect}, one single frame (no collage, no text, no watermark).")
+    parts.append("Description: " + description.strip())
+    return " ".join(parts)
 
 
 def build_prompt(motion: str, *, image: bool, aspect: str, duration: int | None, refs: int = 0) -> str:
-    parts = [REQUEST_HEAD + " (Muse Video), with sound. "
+    parts = [REQUEST_HEAD + "video now with your video generation tool (Muse Video), with sound. "
              "Do not ask me any questions, do not plan or write a script, just generate it and send me the video."]
     if image:
         parts.append(("The first attached image" if refs else "Use the attached image") +
@@ -304,21 +321,25 @@ def _wait_for(fn, seconds: float) -> bool:
     return False
 
 
-def _new_videos(page, before: set[str], marker: str = "") -> list[dict]:
+def _new_videos(page, before: set[str], marker: str = "", sel: str = "video") -> list[dict]:
+    """New videos (or, with sel="img", pictures) Muse sent as the answer to the request holding `marker`."""
     out = []
-    for v in page.evaluate(VIDEOS_JS, [marker, REQUEST_HEAD if marker else ""]):
+    for v in page.evaluate(VIDEOS_JS, [marker, REQUEST_HEAD if marker else "", sel]):
         if not v.get("after", True):
             continue
         if not v["src"] or v["src"] in before or "/videos/avatars/" in v["src"]:
             continue
-        if v["w"] < 120 or v["h"] < 120 or v["x"] > 1000:  # avatar in the header / status panel
+        if v["w"] < 120 or v["h"] < 120 or v["x"] > 1000:  # avatar / icons in the header / status panel
             continue
         out.append(v)
     return out
 
 
 def _download(page, ctx, src: str, out: Path) -> None:
-    if src.startswith("blob:"):
+    if src.startswith("data:"):
+        import base64
+        out.write_bytes(base64.b64decode(src.split(",", 1)[1]))
+    elif src.startswith("blob:"):
         data = page.evaluate("""async (u) => { const b = await (await fetch(u)).blob();
             return await new Promise(r => { const f = new FileReader(); f.onload = () => r(f.result.split(',')[1]);
             f.readAsDataURL(b); }); }""", src)
@@ -327,8 +348,28 @@ def _download(page, ctx, src: str, out: Path) -> None:
     else:
         resp = ctx.request.get(src, timeout=180_000)
         if not resp.ok:
-            raise Fail(EXIT_GENERATION_FAILED, f"Tải video Muse lỗi HTTP {resp.status}", spent=True)
+            raise Fail(EXIT_GENERATION_FAILED, f"Tải file Muse lỗi HTTP {resp.status}", spent=True)
         out.write_bytes(resp.body())
+
+
+def _to_png_if_needed(out: Path) -> None:
+    """Muse sends WebP; the pipeline's keyframes are PNG/JPEG. Convert in place with ffmpeg when the name asks
+    for .png/.jpg (kept as WebP if ffmpeg is missing: most tools still read it)."""
+    head = out.read_bytes()[:12]
+    if not (head[:4] == b"RIFF" and head[8:12] == b"WEBP") or out.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+        return
+    import shutil
+    import subprocess
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return
+    tmp = out.with_name(out.stem + ".muse.webp")
+    out.replace(tmp)
+    r = subprocess.run([ff, "-loglevel", "error", "-y", "-i", str(tmp), str(out)], capture_output=True)
+    if r.returncode == 0 and out.is_file():
+        tmp.unlink()
+    else:
+        tmp.replace(out)
 
 
 def _shot(page, debug: Path | None, name: str) -> None:
@@ -340,8 +381,18 @@ def _shot(page, debug: Path | None, name: str) -> None:
 
 
 def run_i2v(args) -> dict:
+    return _generate(args, "video")
+
+
+def run_image(args) -> dict:
+    args.image, args.duration = None, None
+    return _generate(args, "image")
+
+
+def _generate(args, kind: str) -> dict:
+    """One video (kind "video") or one picture (kind "image") from the Muse chat, saved at args.out."""
     end = time.time() + args.timeout
-    image = Path(args.image).expanduser() if args.image else None
+    image = Path(args.image).expanduser() if getattr(args, "image", None) else None
     refs = [Path(r).expanduser() for r in args.ref or []]
     for f in ([image] if image else []) + refs:
         if not f.is_file():
@@ -351,8 +402,12 @@ def run_i2v(args) -> dict:
     debug = Path(args.debug_dir).expanduser() if args.debug_dir else None
     if debug:
         debug.mkdir(parents=True, exist_ok=True)
-    prompt = build_prompt(args.prompt, image=image is not None, aspect=args.aspect, duration=args.duration,
-                          refs=len(refs))
+    if kind == "image":
+        prompt, sel, word, min_size = build_image_prompt(args.prompt, refs=len(refs), aspect=args.aspect), "img", "ảnh", 5_000
+    else:
+        prompt = build_prompt(args.prompt, image=image is not None, aspect=args.aspect, duration=args.duration,
+                              refs=len(refs))
+        sel, word, min_size = "video", "video", 10_000
     with _playwright()() as pw:
         ctx, page = _open(pw, Path(args.profile_dir).expanduser(), args.channel, headless=args.window == "headless")
         try:
@@ -366,7 +421,7 @@ def run_i2v(args) -> dict:
                 raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
             time.sleep(3)
             marker = _marker(prompt)
-            before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", ""]) if v["src"]}
+            before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", "", sel]) if v["src"]}
             # Muse's activity panel (with older "Failed to create" rows) loads a moment after the chat: count
             # those rows only once it is there, or an old row would look like a new failure.
             _wait_for(lambda: page.get_by_text("Today", exact=True).count() > 0, 15)
@@ -397,25 +452,27 @@ def run_i2v(args) -> dict:
             if not sent:
                 box.press("Enter")
             SPENT["sent"] = True
-            log("  đã gửi yêu cầu lên Muse, chờ video…")
+            log(f"  đã gửi yêu cầu lên Muse, chờ {word}…")
             time.sleep(5)
             _shot(page, debug, "2-sent")
             last_reply, n, reply_at = "", 0, time.time()
             while time.time() < end:
-                vids = _new_videos(page, before, marker)
+                vids = _new_videos(page, before, marker, sel)
                 if vids:
-                    time.sleep(3)  # the player sometimes swaps in the final src right after it appears
-                    vids = _new_videos(page, before, marker) or vids
-                    src = vids[-1]["src"]
-                    log(f"  có video: {src[:100]}")
-                    _shot(page, debug, "3-video")
+                    time.sleep(3 if kind == "video" else 8)  # the player / a progressive image swaps in the final src
+                    vids = _new_videos(page, before, marker, sel) or vids
+                    src = vids[-1]["src"] if kind == "video" else vids[0]["src"]
+                    log(f"  có {word}: {src[:100]}")
+                    _shot(page, debug, "3-result")
                     _download(page, ctx, src, out)
-                    if out.stat().st_size < 10_000:
-                        raise Fail(EXIT_GENERATION_FAILED, "File video Muse tải về quá nhỏ", spent=True)
+                    if kind == "image":
+                        _to_png_if_needed(out)
+                    if out.stat().st_size < min_size:
+                        raise Fail(EXIT_GENERATION_FAILED, f"File {word} Muse tải về quá nhỏ", spent=True)
                     return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
                 if page.evaluate(FAILED_JS) > failed_before:
                     _shot(page, debug, "9-failed")
-                    raise Fail(EXIT_GENERATION_FAILED, "Muse báo không tạo được video này (Failed to create…). "
+                    raise Fail(EXIT_GENERATION_FAILED, f"Muse báo không tạo được {word} này (Failed to create…). "
                                "Gửi lại cảnh hoặc sửa prompt.", spent=False)
                 reply = page.evaluate(REPLY_AFTER_JS, marker)
                 if reply != last_reply:
@@ -425,7 +482,7 @@ def run_i2v(args) -> dict:
                 elif reply and time.time() - reply_at > REPLY_SETTLE and _asks_or_declines(reply):
                     # Muse wrote back (a question / a refusal) and nothing has been generating since
                     _shot(page, debug, "9-declined")
-                    raise Fail(EXIT_AGENT_DECLINED, "Muse không tạo video, trả lời: " + reply[:600], spent=False)
+                    raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}, trả lời: " + reply[:600], spent=False)
                 n += 1
                 if debug and n % 6 == 0:
                     _shot(page, debug, f"wait-{n:03d}")
@@ -433,8 +490,8 @@ def run_i2v(args) -> dict:
             _shot(page, debug, "9-timeout")
             import re
             if last_reply and re.search(DECLINE_RE, last_reply, re.I):
-                raise Fail(EXIT_AGENT_DECLINED, "Muse không tạo video: " + last_reply[:500], spent=False)
-            raise Fail(EXIT_TIMEOUT, "Hết thời gian chờ video từ Muse. Trả lời cuối: " + last_reply[:300], spent=True)
+                raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}: " + last_reply[:500], spent=False)
+            raise Fail(EXIT_TIMEOUT, f"Hết thời gian chờ {word} từ Muse. Trả lời cuối: " + last_reply[:300], spent=True)
         finally:
             ctx.close()
 
@@ -497,6 +554,16 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--timeout", type=int, default=900)
     v.add_argument("--debug-dir", help="save screenshots of each step here")
     v.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
+    im = sub.add_parser("image", help="one picture from a prompt (+ reference pictures)")
+    common(im)
+    im.add_argument("--prompt", required=True)
+    im.add_argument("--ref", action="append", help="reference picture (character / place), repeatable")
+    im.add_argument("--aspect", default="9:16")
+    im.add_argument("-o", "--out", required=True)
+    im.add_argument("--window", choices=["show", "headless"], default="headless")
+    im.add_argument("--timeout", type=int, default=600)
+    im.add_argument("--debug-dir", help="save screenshots of each step here")
+    im.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
     f = sub.add_parser("fetch", help="download the clip Muse made for an earlier message (sends nothing)")
     common(f)
     f.add_argument("--marker", required=True, help="text from that message (e.g. the end of the scene prompt)")
@@ -504,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args(argv)
     try:
-        result = {"login": run_login, "probe": run_probe, "i2v": run_i2v, "fetch": run_fetch}[args.cmd](args)
+        result = {"login": run_login, "probe": run_probe, "i2v": run_i2v, "image": run_image, "fetch": run_fetch}[args.cmd](args)
         code = 0
     except Fail as f:
         result = {"status": "fail", "error": {"exit_code": f.code, "detail": f.detail, "retryable": False, "spent": f.spent}}

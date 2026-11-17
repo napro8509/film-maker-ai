@@ -329,6 +329,29 @@ class NewProject(BaseModel):
     title: str = "Phim mới"
     source: str = "blank"  # blank | template
     ai_model: str | None = None  # None / claude (default) | gemini-pro
+    engine: Literal["flow", "muse"] = "flow"  # who makes the pictures and the videos
+
+
+#: A Muse clip is always this long; scenes of a Muse film ask for it so the duration check never blocks them.
+MUSE_SECONDS = 10
+
+
+def apply_engine(data: Any, engine: str) -> None:
+    """Make a new film's pictures and videos on `engine`: "muse" = Meta Muse for both (video model and image
+    model "muse", every scene 10 s); "flow" leaves the Flow defaults. `data` is a storyboard dict or object."""
+    if engine != "muse":
+        return
+    def put(obj: Any, key: str, value: Any) -> None:
+        if isinstance(obj, dict):
+            obj[key] = value
+        else:
+            setattr(obj, key, value)
+    put(data, "model", gflow_mod.MUSE_MODEL)
+    put(data, "image_model", gflow_mod.MUSE_MODEL)
+    scenes = data.get("scenes") if isinstance(data, dict) else getattr(data, "scenes", None)
+    for sc in scenes or []:
+        put(sc, "model", None)
+        put(sc, "duration", MUSE_SECONDS)
 
 
 class AnalyzeBody(BaseModel):
@@ -380,6 +403,7 @@ class PlanBody(BaseModel):
     custom_style: str = ""
     genres: list[str] = []
     ai_model: str | None = None  # None / claude (default) | gemini-pro
+    engine: Literal["flow", "muse"] = "flow"  # who makes the pictures and the videos
 
 
 def _credits(out: Path) -> str | None:
@@ -1013,13 +1037,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         src_video = list(src.get("video") or [])
         if not any(gflow_mod.is_muse(m.get("alias")) for m in src_video):  # not a Flow model: gflow never lists it
             src_video.append({"alias": gflow_mod.MUSE_MODEL, "max_duration": 10})
+        src_image = [dict(m) for m in src.get("image") or []]
+        if not any(gflow_mod.is_muse(m.get("alias")) for m in src_image):
+            src_image.append({"alias": gflow_mod.MUSE_MODEL, "label": "Muse Image (Meta)"})
         for m in src_video:
             alias = m.get("alias")
             video.append({**m, "info": meta.info(alias), "status": meta.status(alias),
                           "retires_label": meta.retires_label(alias)})
         return {
             "video": video,
-            "image": [dict(m) for m in src.get("image") or []],
+            "image": src_image,
             "source": "gflow" if raw is not None else "fallback",
             "today": meta.today.isoformat(),
             "plan": meta.plan,
@@ -1150,6 +1177,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if chosen_model == ai_mod.GEMINI_PRO:
             data["ai_model"] = ai_mod.GEMINI_PRO
         data["model"] = model_meta.load().default_video_model  # new projects never start on a retiring model
+        apply_engine(data, body.engine)
         (d / "storyboard.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return {"id": pid}
 
@@ -1282,6 +1310,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                                   aspect=body.aspect, language_hint=language, dialogue_language=dialogue, **extra_ai)
                 if body.format:
                     sb.format = body.format
+            apply_engine(sb, body.engine)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
@@ -2851,6 +2880,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                                   aspect=body.aspect, language_hint=language, dialogue_language=dialogue, **extra_ai)
                 if body.format:
                     sb.format = body.format
+            apply_engine(sb, body.engine)
             pid, d = new_project_dir(sb.title)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)

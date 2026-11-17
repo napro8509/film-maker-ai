@@ -25,7 +25,7 @@ if fail:
                                                   "retryable": False, "spent": spent == "true"}}))
     sys.exit(int(code))
 out = Path(argv[argv.index("-o") + 1]); out.parent.mkdir(parents=True, exist_ok=True)
-if argv[0] in ("i2i", "char"):  # one image
+if argv[0] in ("i2i", "char", "image"):  # one image (muse_ui `image` too)
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=64x36",
                     "-frames:v", "1", str(out)], check=True)
 else:

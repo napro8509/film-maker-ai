@@ -326,6 +326,8 @@ class Gflow:
         return payload.get("project_id") or "DRY-RUN-PROJECT"
 
     def text_to_image(self, prompt: str, *, out: Path, aspect: str, model: str, project: str | None) -> Path:
+        if is_muse(model):
+            return self.muse_image(prompt, [], out=out, aspect=aspect)
         args = ["image", "t2i", prompt, "--aspect", aspect, "--model", model, "-o", str(out)]
         if project:
             args += ["--project", project]
@@ -361,6 +363,8 @@ class Gflow:
         """Text-to-image guided by reference images (keeps characters' faces the same).
 
         A ref is a local file (gflow uploads it into the project) or the media id of an image already in it."""
+        if is_muse(model):
+            return self.muse_image(prompt, refs, out=out, aspect=aspect)
         args = ["image", "i2i", prompt]
         for r in refs:
             args += ["--ref", str(r)]
@@ -452,6 +456,30 @@ class Gflow:
         local = payload.get("local_path")
         return (Path(local) if local else out), None
 
+    def muse_image(self, prompt: str, refs: list[Path | str] | None, *, out: Path, aspect: str) -> Path:
+        """One picture from muse.ai (Muse Image), guided by local reference pictures (characters, places).
+        Flow media ids and Flow characters by name cannot go to Muse and are left out."""
+        cmd = self.muse_command()
+        if not cmd:
+            raise GflowError("không tìm thấy Python có Playwright (của gflow-cli) để điều khiển Muse", exit_code=2)
+        files = [Path(r) for r in refs or [] if not str(r).startswith("character:") and Path(r).is_file()]
+        skipped = len(refs or []) - len(files)
+        args = [*cmd, "image", "--prompt", prompt, "--aspect", aspect, "-o", str(out),
+                "--timeout", str(max(300, min(900, self.timeout - 60)))]
+        for f in files:
+            args += ["--ref", str(f)]
+        if os.environ.get("MUSE_UI_PROFILE"):
+            args += ["--profile-dir", os.environ["MUSE_UI_PROFILE"]]
+        self.log(ui_log_line(cmd, "image", [*(a for f in files for a in ("--ref", str(f))), "--aspect", aspect],
+                             prompt))
+        if skipped:
+            self.log(f"  (bỏ {skipped} ảnh tham chiếu không có file trên máy: Muse chỉ nhận ảnh trên máy)")
+        if self.dry_run:
+            return out
+        payload = self._run_ui(args, "ảnh có thể vẫn đang tạo trên Muse", spent=False, who="Muse")
+        local = payload.get("local_path")
+        return Path(local) if local else out
+
     # --- image-to-video through the Flow chat page (see flow_ui.py) ------------
 
     def ui_command(self) -> list[str] | None:
@@ -528,6 +556,8 @@ class Gflow:
                           project: str | None) -> Path:
         """Image guided by the characters' pictures through the Flow chat page (free), for accounts where
         gflow refuses i2i (agent-only composer, gflow #799)."""
+        if is_muse(model):
+            return self.muse_image(prompt, refs, out=out, aspect=aspect)
         cmd = self.ui_command()
         profile = self.ui_profile_dir()
         if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):

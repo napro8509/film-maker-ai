@@ -3489,9 +3489,23 @@ async function stopJob() {
 
 /* ---------- new project ---------- */
 
+/* Who makes a new film's pictures and videos: Google Flow (Veo / Nano Banana) or Meta Muse (muse.ai). */
+const ENGINES = [["flow", "Google Flow", "Veo + Nano Banana · tốn credit Flow"], ["muse", "Meta Muse", "muse.ai · video 10 giây có tiếng, không tốn credit Flow"]];
+function engineField(get, set) {
+  const box = h("div");
+  const draw = () => put(box, h("div", { class: "seg", role: "radiogroup", "aria-label": "Tạo ảnh & video bằng" }, ENGINES.map(([k, label]) =>
+    h("button", { type: "button", class: get() === k ? "on" : "", role: "radio", "aria-checked": String(get() === k),
+      onclick: () => { set(k); localSet("filmEngine", k); draw(); } }, label))),
+    h("p", { class: "help", style: { margin: "6px 0 0" } }, ENGINES.find(([k]) => k === get())[2] + (get() === "muse" ? ". Đăng nhập một lần: filmmaker muse login" : "")));
+  draw();
+  return h("div", { class: "field" }, h("span", { class: "lbl" }, "Tạo ảnh & video bằng"), box);
+}
+
 function openNewProject() {
   let mode = (S.env.planner || S.env.gemini_backend) ? "ai" : "template";
   let aiModel = "claude";
+  let engine = localGet("filmEngine") === "muse" ? "muse" : "flow";
+  const engineRow = () => engineField(() => engine, (v) => { engine = v; });
   const body = h("div");
   const render = () => {
     const choices = [["ai", "sparkle", "Từ ý tưởng", "AI viết storyboard cho bạn"], ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
@@ -3505,19 +3519,20 @@ function openNewProject() {
     const inp = h("input", { type: "text", value: def, placeholder: "Tên phim" });
     setTimeout(() => inp.focus(), 30);
     const go = async () => {
-      try { const r = await api("POST", "/api/projects", { title: inp.value, source: mode, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) }); close(); await loadProjects(); await openProject(r.id); }
+      try { const r = await api("POST", "/api/projects", { title: inp.value, source: mode, engine, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) }); close(); await loadProjects(); await openProject(r.id); }
       catch (e) { toast(e.message, "error"); }
     };
     inp.onkeydown = (e) => { if (e.key === "Enter") go(); };
     return h("div", { class: "stack" }, field("Tên phim", inp),
       field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; }), "xử lý các tác vụ AI của dự án; mặc định là Claude"),
+      engineRow(),
       h("div", { class: "row" }, h("span", { class: "spacer" }), h("button", { class: "btn primary", onclick: go }, "Tạo dự án")));
   };
   const aiForm = () => {
     const modelRow = field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; render(); }), "xử lý viết kịch bản và các tác vụ AI của dự án; mặc định là Claude");
     if (!aiModelReady(aiModel)) return h("div", { class: "stack" }, modelRow, aiModelBanner(aiModel, () => { close(); openSettings(); }));
     const F = S.env.formats;
-    if (!F) return h("div", { class: "stack" }, modelRow, dramaForm(null));
+    if (!F) return h("div", { class: "stack" }, modelRow, engineRow(), dramaForm(null));
     const box = h("div", { class: "stack" });
     // The old short drama flow is deprecated: a new film never starts on it (not even when it was the last pick).
     const saved = F.formats.find((f) => f.key === localGet("filmFormat") && !f.deprecated);
@@ -3532,7 +3547,7 @@ function openNewProject() {
         info.basic ? basicForm(info) : dramaForm(fmt));
     };
     draw();
-    return h("div", { class: "stack" }, modelRow, box);
+    return h("div", { class: "stack" }, modelRow, engineRow(), box);
   };
   /* Formats other than the drama: text -> image -> video, without the drama's direction, camera or dialogue rows. */
   const basicForm = (info) => {
@@ -3577,7 +3592,7 @@ function openNewProject() {
       if (!l.ok) { toast("Ngôn ngữ: " + l.msg, "error"); lang.input.focus(); return null; }
       localSet("filmLang", l.value);
       return { idea: idea.value, scenes: Math.max(1, Math.min(80, +n.value || info.scenes)), aspect: aspect.value, language: l.value,
-        format: info.key, audio, visual_style: visual, custom_style: visual === "other" ? custom.value : "", genres: [...genres],
+        format: info.key, audio, visual_style: visual, custom_style: visual === "other" ? custom.value : "", genres: [...genres], engine,
         ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) };
     };
     const planOnly = async (e) => {
@@ -3631,7 +3646,7 @@ function openNewProject() {
       btn.disabled = true;
       try {
         const j = await api("POST", "/api/projects/autopilot", { idea: idea.value, scenes, aspect: aspect.value, language: b.value,
-          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
+          dialogue_language: a.value, review: autoReview.checked, burn_subtitles: autoSubs.checked, engine, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
         close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động — thường mất 40–90 phút cho 10 cảnh. Bạn có thể làm việc khác.", "", 8000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -3644,7 +3659,7 @@ function openNewProject() {
       localSet("dialogueLang", a.value); localSet("subtitleLang", b.value); // remembered even if the plan job fails
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
+        const j = await api("POST", "/api/projects/plan", { idea: idea.value, scenes: +n.value || 6, aspect: aspect.value, language: b.value, dialogue_language: a.value, engine, ...(fmt ? { format: fmt } : {}), ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) });
         close(); localSet("draftIdea", ""); startJob(j); toast(`${aiModelLabel(aiModel)} đang viết storyboard, thường mất 1–3 phút…`, "", 6000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };

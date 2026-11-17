@@ -97,7 +97,7 @@ def test_api_models_info_status_today(client, tmp_path, monkeypatch):
     assert v["veo-fast"]["info"]["retires"] == "2026-12-05" and v["veo-fast"]["info"]["credits"] == 10
     assert v["brand-new"] == {"alias": "brand-new", "max_duration": 12, "info": None, "status": "active",
                               "retires_label": None}
-    assert res["image"] == [{"alias": "nano2", "label": "Nano Banana 2"}]
+    assert res["image"] == [{"alias": "nano2", "label": "Nano Banana 2"}, {"alias": "muse", "label": "Muse Image (Meta)"}]  # Muse: not Flow, always listed
 
 
 def test_api_models_status_after_retirement(client, monkeypatch):
@@ -152,10 +152,10 @@ def test_fallback_not_cached(client, monkeypatch):
     assert [m["alias"] for m in res["video"]] == ["veo-fast", "veo-quality", "veo-lite", "veo-lite-lp",
                                                    "omni-flash", "omni-1.2-flash", "muse"]
     assert [m["max_duration"] for m in res["video"]] == [8, 8, 8, 8, 10, 15, 10]
-    assert [m["alias"] for m in res["image"]] == ["nano2", "nano-pro", "imagen4", "nano2-lite"]
+    assert [m["alias"] for m in res["image"]] == ["nano2", "nano-pro", "imagen4", "nano2-lite", "muse"]
     assert video_by_alias(res)["veo-fast"]["status"] == "retiring"  # warnings still work without gflow
     res2 = client.get("/api/models").json()
-    assert res2["source"] == "gflow" and [m["alias"] for m in res2["image"]] == ["nano2", "nano-pro"]
+    assert res2["source"] == "gflow" and [m["alias"] for m in res2["image"]] == ["nano2", "nano-pro", "muse"]
     assert len(model_calls(client)) == 2
     client.get("/api/models")
     assert len(model_calls(client)) == 2  # the gflow answer is cached
@@ -196,7 +196,7 @@ def test_broken_package_metadata(client, tmp_path, monkeypatch):
                              "retires_label": None},
                             {"alias": "muse", "max_duration": 10, "info": None, "status": "active",
                              "retires_label": None}]
-    assert res["image"] == [{"alias": "nano2", "label": "Nano Banana 2"}]
+    assert res["image"] == [{"alias": "nano2", "label": "Nano Banana 2"}, {"alias": "muse", "label": "Muse Image (Meta)"}]  # Muse: not Flow, always listed
     assert "broken-package.yaml" in res["metadata_error"]
 
     # Still no 500 elsewhere, new projects still on veo-lite, nothing is blocked.
