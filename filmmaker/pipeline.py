@@ -302,7 +302,7 @@ class Pipeline:
     def has_keyframe(self, s: Scene) -> bool:
         st = self.state.scene(s.id)
         return (
-            st.get("keyframe_prompt") == self.sb.image_prompt(s)
+            st.get("keyframe_prompt") == self.sb.stored_image_prompt(s)
             and (st.get("keyframe_refs") or []) == self.sb.refs_signature(s)
             and self.keyframe_path(s).is_file()
         )
@@ -625,7 +625,7 @@ class Pipeline:
 
     def _make_keyframe(self, s: Scene, project: str, opts: RunOptions) -> Path:
         kf = self.keyframe_path(s)
-        prompt = self.sb.image_prompt(s)
+        prompt = self.sb.stored_image_prompt(s)  # kept in the state: default prompt rules (see Storyboard.rule)
         loc = self.sb.scene_location(s)
         items, src, why = self.keyframe_ref_items(s, self._dry_kf if self.g.dry_run else ())
         if loc is not None:
@@ -642,7 +642,8 @@ class Pipeline:
         refs = [(it.label, it.path) for it in items]
         kinds = [it.kind for it in items]
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
-        sent = self.sb.for_flow_keyframe(prompt, s)  # + dialogue staging; state keeps `prompt` (fingerprint)
+        # + the film's image rules and dialogue staging; the state keeps `prompt` (default rules, fingerprint)
+        sent = self.sb.for_flow_keyframe(self.sb.image_prompt(s), s)
         img = None
         # Images are free on Flow, so retrying them (or falling back) is safe.
         if refs:

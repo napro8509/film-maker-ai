@@ -14,7 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from . import ai
+from . import ai, rules
 from .storyboard import NO_DIALOGUE, Camera, Storyboard
 
 Verdict = Literal["PASS", "REVISE"]
@@ -120,13 +120,7 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
   blood, weapons, and above all children in distress (hurt, crying hard, mocked, fighting). Rewrite such scenes
   mildly, keeping the story beat: dialogue without insults, calm/soft `delivery` instead of fierce or raised,
   action and image_prompt without pain or violence (feelings through faces and small gestures).
-- Children in `characters`, `prompt` and `image_prompt` (Google's child-safety filter blocks many pictures of minors and the credits are lost): never an
-  exact age ("4 years old", "age 8", "10 months old") nor body details (chubby, round or rosy cheeks, plump): write
-  "a toddler girl", "a schoolgirl", "a baby boy" and describe them by hair, clothes and what they do. Keep children
-  fully and casually dressed in everyday activities, usually in medium or wide shots together with an adult; never
-  a child in a bath, swimwear, undressing, in bed up close, asleep or limp, alone and frightened, crying hard, or an
-  adult kissing, feeding or holding a child's face up close. Fear or shock in a child is played as surprise or
-  playful worry. Give close-ups and the main spoken lines to adults or teens when the story allows.
+- Children in `characters`, `prompt` and `image_prompt` (Google's child-safety filter blocks many pictures of minors and the credits are lost): """ + rules.CHILDREN_GUIDE + """
 - Real, identifiable people (Flow refuses "prominent people"): in a film based on a true event, prompts and
   content directions must not point to the real persons — no real names, ranks, units or famous roles ("the
   retired Navy SEAL", "the Australian doctor"), no "true story". Describe characters by look and action only.

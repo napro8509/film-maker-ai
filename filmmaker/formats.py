@@ -7,6 +7,10 @@ small helpers: no I/O, imported by the storyboard, the planner and the web serve
 
 from __future__ import annotations
 
+from .rules import (  # noqa: F401  (re-exported as formats.<NAME>)
+    AUDIO_DIALOGUE_RULE, OLD_SILENT_RULE, SILENT_RULE, VOICEOVER_RULE,
+)
+
 DRAMA = "short_drama"
 # The drama flow is deprecated: kept so old projects (empty `format`) still open and finish, but new films use
 # the basic flow. DEFAULT_FORMAT is what a new film gets when no format is chosen.
@@ -43,11 +47,7 @@ FORMATS: dict[str, dict] = {
     },
 }
 
-# key -> label, help, planner guide (English), rule added to every video prompt (English)
-# Said with what IS heard: "no music" made Veo add odd music (and each clip its own, so it jumped at every cut).
-# The music is added for the whole film when editing.
-SILENT_RULE = "Nobody speaks; the sound is only ambient sound and sound effects."
-OLD_SILENT_RULE = "No dialogue, no music."  # the sentence used before; saved prompts get the new one
+# key -> label, help, planner guide (English), rule added to every video prompt (English, from rules.py)
 
 AUDIO: dict[str, dict] = {
     "dialogue": {
@@ -56,7 +56,7 @@ AUDIO: dict[str, dict] = {
                   "words) and every other visible person in `listeners`; `narration` = exactly that line (the subtitle). "
                   "Scenes without words leave both `speaker` and `narration` empty: never a `narration` without "
                   "a `speaker`."),
-        "rule": "Spoken language: {lang}. Only one person speaks; everyone else keeps lips closed.",
+        "rule": AUDIO_DIALOGUE_RULE,
     },
     "silent": {
         "label": "Không thoại", "desc": "Kể bằng biểu cảm và hành động, nhạc nền giữ cảm xúc",
@@ -68,8 +68,7 @@ AUDIO: dict[str, dict] = {
         "label": "Thuyết minh", "desc": "Một giọng kể dẫn dắt, nhân vật không cần nói",
         "guide": ("One narrator tells the story; characters on screen do not talk (no `speaker`). Put the "
                   "narrator's sentence for the scene in `narration`, at most 12 words, no quotation marks."),
-        "rule": ("Voice-over: one calm narrator's voice speaks in {lang}; the characters on screen do not talk "
-                 "and their lips do not move."),
+        "rule": VOICEOVER_RULE,
     },
     "onscreen_text": {
         "label": "Chữ trên màn hình", "desc": "Lời hiện thành chữ, xem tắt tiếng vẫn hiểu",

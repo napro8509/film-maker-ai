@@ -25,7 +25,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from . import ai, reviewer
+from . import ai, reviewer, rules
 from .storyboard import NO_DIALOGUE, Scene, Storyboard
 
 QC_FILE = "qc.json"
@@ -37,7 +37,7 @@ VAD_NAME = "ggml-silero-v5.1.2.bin"
 VAD_URL = f"https://huggingface.co/ggml-org/whisper-vad/resolve/main/{VAD_NAME}"
 QC_VERSION = 2  # 2: transcripts with voice-activity detection, who-speaks frames; older MINOR/FAIL are checked again
 FRAMES = 6
-WRONG_START = 0.75  # first frame vs keyframe below this: the clip was made from another picture
+WRONG_START = rules.START_MATCH_MIN  # first frame vs keyframe below this: the clip was made from another picture
 
 Verdict = Literal["PASS", "MINOR", "FAIL"]
 

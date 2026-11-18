@@ -21,14 +21,10 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
-MAX_WORDS = 12
-SILENT_BINDING = "remaining completely silent with lips closed, nodding slightly"  # eyeline guide, token map
-NO_TEXT_SHORT = "(no subtitles, no captions, no on-screen text)"
-# Still pictures of the basic formats: the short form of storyboard.NO_TEXT (no long negative, no "dialogue").
-NO_TEXT_IMAGE = "No on-screen text, letters or watermarks."
-CLOSING = "Single continuous shot, no scene cuts."
-# Review 2: no "no dialogue, no music" (negatives made Veo add murmurs / odd music): silence is said with real sounds.
-DEFAULT_SOUND = "quiet ambient room tone"
+from .rules import (  # noqa: F401  (re-exported as i2v_prompt.<NAME>)
+    CLOSING, DEFAULT_SOUND, MAX_WORDS, NO_TEXT_IMAGE, NO_TEXT_SHORT, SILENT_BINDING,
+)
+
 # Review 2: the start frame already holds the place and the light; "... matching the starting frame" only dilutes.
 _FRAME_MATCH = re.compile(r"(?i),?\s*(?:\b(?:under|in|with)\b[^,.;]*?)?\bmatching the (?:starting|opening|previous|first|start) (?:frame|image|shot)")
 # Sentence-start position anchors: two of them in `action` = two people acting at once (review 2: 1 active, 1 passive).
@@ -163,10 +159,14 @@ _OPEN_SMILE = [(re.compile(r"(?i)\bgrinning(?:\s+\w+ly)?\b"), "smiling with clos
                (re.compile(r"(?i)\blaughs?(?:\s+\w+ly)?\b"), "smiles with closed lips")]
 
 
-def _silent(action: str) -> str:
+def _silent(action: str, lock: bool = True, smile: bool = True) -> str:
+    """A listener's silent action with the lip lock (`lock`) and open-mouth smiles closed (`smile`)."""
     a = _frame_words(clean_text(action).rstrip(" ."))
-    for pat, rep in _OPEN_SMILE:
-        a = pat.sub(rep, a)
+    if smile:
+        for pat, rep in _OPEN_SMILE:
+            a = pat.sub(rep, a)
+    if not lock:
+        return a
     # an older wording of the lock is replaced by the eyeline guide's one
     a = re.sub(r"(?i),?\s*(?:keeps (?:her|his|their)? ?lips completely closed|listening silently|without speaking)", "", a).strip(" ,")
     if re.search(r"(?i)silent with lips closed", a):
@@ -305,15 +305,19 @@ BODY_RELATIVE = re.compile(r"(?i)\b(?:to|toward|towards|at|on)\s+(?:his|her|thei
                            r"\b(?:his|her|their)\s+(?:left|right)(?!\s+(?:hand|arm|leg|foot|shoulder|side|cheek|ear|eye))\b")
 
 
-def first_frame_staging(shot: VideoShot) -> str:
+def first_frame_staging(shot: VideoShot, facing: str = "profile") -> str:
     """Eyeline guide, I2V first frame: the speaker already turned in profile toward the partner, every mouth closed
-    ('' when the scene has no speaker)."""
+    ('' when the scene has no speaker). facing="camera": the speaker is the main face, turned toward the viewpoint."""
     sp = shot.speaker
     if not sp or not clean_line(sp.line):
         return ""
     side = frame_side(sp.position)
     d, _ = _gaze(sp, shot, side)
     where = f"positioned on frame {side} " if side in ("left", "right", "center") else ""
+    if facing == "camera":
+        return (f"Staging for the dialogue: {_tag(sp.visual_tag)} {where}is the main subject with the largest face, "
+                "turned toward the viewpoint (front or three-quarter view), face and mouth clearly visible; everyone "
+                "else in the frame with neutral closed lips.")
     return (f"Staging for the dialogue: {_tag(sp.visual_tag)} {where}in {_head(sp.head_angle)}, head turned toward "
             f"frame {d}, gaze held there {_level(sp.gaze_level)}; everyone in the frame with neutral closed lips.")
 
@@ -342,8 +346,21 @@ def _with_env(act: str, env: str) -> str:
     return f"{act}. {_cap(env)}" if re.search(r"(?i)\bwhile\b", act) else f"{act}, while {_lower_first(env)}"
 
 
-def _audio_line(sound: str) -> str:
-    return f"Audio: {_cap(sound or DEFAULT_SOUND)}. {CLOSING}"
+def _audio_line(sound: str, opts: dict | None = None) -> str:
+    o = _opts(opts)
+    sound = sound or (DEFAULT_SOUND if o["default_sound"] else "")
+    parts = [f"Audio: {_cap(sound)}." if sound else "", CLOSING if o["closing"] else ""]
+    return " ".join(p for p in parts if p)
+
+
+# What `assemble` adds, all on by default (the house guide); Storyboard.shot_options() passes the video rules.
+SHOT_DEFAULTS: dict[str, bool | str] = {"no_text": "short", "facing": "profile", "locked_camera": True,
+                                        "lens_words": True, "listener_silent": True, "closed_smile": True,
+                                        "lip_lock": True, "default_sound": True, "closing": True}
+
+
+def _opts(opts: dict | None) -> dict:
+    return {**SHOT_DEFAULTS, **(opts or {})}
 
 
 def environment(text: str | None) -> str:
@@ -466,36 +483,48 @@ def _lower_first(t: str) -> str:
     return t[0].lower() + t[1:] if t and not t[:2].isupper() else t
 
 
-def assemble(shot: VideoShot, *, audio_mode: str | None, language: str | None, narration: str | None = None) -> str:
+def assemble(shot: VideoShot, *, audio_mode: str | None, language: str | None, narration: str | None = None,
+             opts: dict | None = None) -> str:
     """The prompt sent to Flow, from the guide's templates.
 
     audio_mode "dialogue" with a speaker -> template 2 (one speaker, silent binding for the others);
     "voiceover" with narration -> template 2 with a narrator and everyone on screen silent;
-    anything else -> template 1 (the silence said by real sounds, no negatives)."""
+    anything else -> template 1 (the silence said by real sounds, no negatives).
+    `opts` turns parts of the guide off (SHOT_DEFAULTS: all on), from the film's video rules."""
+    o = _opts(opts)
+    safe = veo_safe if o["lens_words"] else (lambda t: t)
+    no_text = f" {NO_TEXT_SHORT}" if o["no_text"] != "off" else ""
     camera = _sentence(shot.camera)
     env = environment(shot.environment)
     sound = clean_text(shot.audio).rstrip(" .")
     lang = f" in {language}" if language else ""
     sp = shot.speaker
     if audio_mode == "dialogue" and sp and clean_line(sp.line):
-        return veo_safe(_dialogue(shot, sp, language=language, env=env, sound=sound))
+        return safe(_dialogue(shot, sp, language=language, env=env, sound=sound, opts=o))
     if audio_mode == "voiceover" and clean_line(narration):
         voice_style = clean_text(sp.voice_style).rstrip(" .") if sp else ""
         head = (f"A narrator voice-over speaks{lang} in {_a(voice_style or 'calm, warm storytelling')} voice: "
-                f"{_end(clean_line(narration))} {NO_TEXT_SHORT}")
+                f"{_end(clean_line(narration))}{no_text}")
         act = clean_text(shot.action).rstrip(" .")
         body = _with_env(act, env)
         parts = [p for p in (camera, _sentence(body), "Everyone in the frame keeps lips closed.") if p]
-        return veo_safe(f"{head}\nVisual: {' '.join(parts)}\n{_audio_line(sound)}")
+        return safe(f"{head}\nVisual: {' '.join(parts)}\n{_audio_line(sound, o)}".rstrip())
     act = clean_text(shot.action).rstrip(" .")
     body = _with_env(act, env)
-    return veo_safe(" ".join(p for p in (camera, _sentence(body), _audio_line(sound)) if p))
+    return safe(" ".join(p for p in (camera, _sentence(body), _audio_line(sound, o)) if p))
 
 
-def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, sound: str) -> str:
+def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, sound: str,
+              opts: dict | None = None) -> str:
     """The eyeline guide's 5 blocks: [1 locked-off viewpoint + focal length] [2 identity + frame position]
     [3 head angle + screen-space gaze anchor] [4 speech verb, tone, line] [5 lip lock + listeners]."""
+    o = _opts(opts)
     block1, kind = _shot_block(shot)
+    if not o["locked_camera"]:  # the scene's own camera sentence instead of the locked-off viewpoint
+        block1 = _sentence(shot.camera)
+    camera_face = o["facing"] == "camera"
+    no_text = f" {NO_TEXT_SHORT}" if o["no_text"] != "off" else ""
+    lip_lock = o["lip_lock"]
     side = frame_side(sp.position)
     tag = _tag(sp.visual_tag)
     d, gaze = _gaze(sp, shot, side)
@@ -506,23 +535,38 @@ def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, s
     gesture = _gesture(sp.action)
     listeners = [x for x in shot.listeners or [] if clean_text(x.visual_tag)]
     out: list[str] = []
-    if kind == "ots":
+    if camera_face:  # the speaker faces the viewpoint, mouth visible; listeners turn to the speaker
+        pos = f"Positioned on frame {side}, " if side else ""
+        if block1:
+            out.append(block1)
+        out.append(f"{pos}{tag} {gesture + ', then ' if gesture else ''}faces the viewpoint with face and mouth clearly "
+                   f"visible, {speech}: {line}{no_text}")
+        if lip_lock:
+            out.append(f"After finishing the line, {tag} closes mouth.")
+        for lst in listeners:
+            lside = frame_side(lst.position)
+            where = f"On frame {lside}, " if lside else ""
+            out.append(_sentence(f"{where}{_tag(lst.visual_tag)} turns toward {tag}, "
+                                 f"{_silent(lst.silent_action, o['listener_silent'], o['closed_smile'])}"))
+    elif kind == "ots":
         lst = listeners[0]
         lside = frame_side(lst.position) or _other(side) or "left"
-        out.append(f"{block1} Softly out-of-focus in foreground {lside} is the shoulder of {_tag(lst.visual_tag)} seen "
-                   "from behind; exactly two people present in the scene.")
+        out.append(f"{block1 + ' ' if block1 else ''}Softly out-of-focus in foreground {lside} is the shoulder of "
+                   f"{_tag(lst.visual_tag)} seen from behind; exactly two people present in the scene.")
         pos = f"Positioned on frame {side or _other(lside)} facing forward-{lside}"
         out.append(f"{pos}, {tag} {gesture + ', then ' if gesture else ''}tilts head {_level(sp.gaze_level)} and locks gaze "
-                   f"onto the position of {_tag(lst.visual_tag)} at foreground {lside}, {speech}: {line} {NO_TEXT_SHORT}")
-        out.append(f"After finishing the line, {tag} closes mouth while maintaining that exact eyeline.")
+                   f"onto the position of {_tag(lst.visual_tag)} at foreground {lside}, {speech}: {line}{no_text}")
+        if lip_lock:
+            out.append(f"After finishing the line, {tag} closes mouth while maintaining that exact eyeline.")
     else:
         if kind == "two":
             out.append("Characters face and look only at each other throughout the scene.")
         out.append(block1)
         pos = f"Positioned on frame {side} in {_head(sp.head_angle)}, " if side else f"In {_head(sp.head_angle)}, "
         out.append(f"{pos}{tag} {gesture + ', then ' if gesture else ''}turns head toward frame {d} and {gaze}, "
-                   f"{speech}: {line} {NO_TEXT_SHORT}")
-        out.append(f"After finishing the line, {tag} closes mouth while maintaining that exact eyeline.")
+                   f"{speech}: {line}{no_text}")
+        if lip_lock:
+            out.append(f"After finishing the line, {tag} closes mouth while maintaining that exact eyeline.")
         for lst in listeners:
             lside = frame_side(lst.position)
             where = f"On frame {lside}, " if lside else ""
@@ -536,10 +580,11 @@ def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, s
             many = re.search(r"(?i)\b(?:two|three|four|both|children|kids|people|family|girls|boys|twins|sisters|brothers)\b",
                              clean_text(lst.visual_tag))
             faces = f" face{'' if many else 's'} frame {toward}," if toward else ""
-            out.append(_sentence(f"{where}{_tag(lst.visual_tag)}{faces} {_silent(lst.silent_action)}"))
+            out.append(_sentence(f"{where}{_tag(lst.visual_tag)}{faces} "
+                                 f"{_silent(lst.silent_action, o['listener_silent'], o['closed_smile'])}"))
     if env:
         out.append(_sentence(env))
-    out.append(_audio_line(sound))
+    out.append(_audio_line(sound, o))
     return " ".join(p for p in out if p)
 
 

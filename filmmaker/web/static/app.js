@@ -1789,10 +1789,9 @@ function renderStory() {
             oninput: (e) => set("edit_style", e.target.value) }), "agent dựng phim làm theo; không gửi Flow") : null,
         isBasic(sb) ? formatSummary(sb) : renderDialogueLang(sb, set),
         h("div", { class: "stack tight" },
-          h("label", { class: "check" },
-            h("input", { type: "checkbox", checked: sb.no_text !== false,
-              onchange: (e) => { sb.no_text = e.target.checked ? undefined : false; changed(); } }),
-            h("span", {}, "Không cho Flow chèn chữ, phụ đề, watermark vào ảnh và video", h("span", { class: "sub" }, "Phụ đề sẽ được thêm khi ghép phim."))),
+          h("div", { class: "row" },
+            h("button", { class: "btn sm", onclick: () => openPromptRules(sb) }, icon("settings"), "Quy tắc prompt ảnh & video"),
+            h("span", { class: "help" }, rulesSummary(sb))),
           h("label", { class: "check" },
             h("input", { type: "checkbox", checked: !!sb.fallback_t2v,
               onchange: (e) => { sb.fallback_t2v = e.target.checked ? true : undefined; changed(); renderMain(); } }),
@@ -1803,6 +1802,88 @@ function renderStory() {
               oninput: (e) => set("project_id", e.target.value || undefined) }))))),
     renderCharacters(sb),
     renderLocations(sb));
+}
+
+/* ---------- prompt rules popup ----------
+   Two rule sets (image / video) from /api/prompt-rules: rules that never clash are checkboxes (on by default),
+   rules that cannot all hold are one radio group ("auto" = what the film's format did before). Saved in
+   sb.prompt_rules, only values that differ from the default. Applies to what is made next (no re-render). */
+let RULES_SCHEMA = null;
+const RULE_KINDS = [["image", "Hình ảnh"], ["video", "Video"]];
+function rulesFlow(sb) { return isBasic(sb) ? "basic" : "drama"; }
+function rulesSummary(sb) {
+  const n = Object.values(sb.prompt_rules || {}).reduce((a, v) => a + Object.keys(v || {}).length, 0);
+  if (sb.no_text === false) return n ? `Đã đổi ${n} quy tắc; đang tắt câu chặn chữ trên hình` : "Đang tắt câu chặn chữ trên hình";
+  return n ? `Đã đổi ${n} quy tắc so với mặc định` : "Đang dùng bộ quy tắc mặc định";
+}
+async function openPromptRules(sb) {
+  if (!RULES_SCHEMA) {
+    try { RULES_SCHEMA = await api("GET", "/api/prompt-rules"); } catch (e) { toast(e.message, "error"); return; }
+  }
+  const flow = rulesFlow(sb);
+  // the older "Không cho Flow chèn chữ" checkbox becomes the "Không thêm" choice of both sets
+  const draft = JSON.parse(JSON.stringify(sb.prompt_rules || {}));
+  if (sb.no_text === false) for (const [k] of RULE_KINDS) { draft[k] = draft[k] || {}; if (!("no_text" in draft[k])) draft[k].no_text = "off"; }
+  let tab = "image";
+  const val = (kind, r) => (draft[kind] && r.id in draft[kind]) ? draft[kind][r.id] : r.default;
+  const put = (kind, r, v) => {
+    draft[kind] = draft[kind] || {};
+    if (v === r.default) delete draft[kind][r.id]; else draft[kind][r.id] = v;
+    if (!Object.keys(draft[kind]).length) delete draft[kind];
+    previewOut.replaceChildren();
+  };
+  const body = h("div", { class: "stack rules-pop" });
+  const previewOut = h("div", { class: "stack tight" });
+  const tabs = h("div", { class: "seg", role: "tablist", "aria-label": "Bộ quy tắc" });
+  const list = h("div", { class: "stack" });
+  const draw = () => {
+    tabs.replaceChildren(...RULE_KINDS.map(([k, label]) => h("button", { role: "tab", class: tab === k ? "on" : "", "aria-selected": String(tab === k),
+      onclick: () => { tab = k; draw(); } }, label)));
+    const rs = RULES_SCHEMA[tab].filter((r) => r.flows.includes(flow));
+    const choices = rs.filter((r) => r.type === "choice"), toggles = rs.filter((r) => r.type === "toggle");
+    list.replaceChildren(
+      h("div", { class: "rules-group" }, h("h3", {}, "Chọn một (các quy tắc loại trừ nhau)"),
+        choices.map((r) => h("fieldset", { class: "rule-choice" },
+          h("legend", {}, r.label), h("p", { class: "help" }, r.help),
+          r.options.map((o) => h("label", { class: "check" },
+            h("input", { type: "radio", name: `rule-${tab}-${r.id}`, value: o.value, checked: val(tab, r) === o.value,
+              onchange: () => put(tab, r, o.value) }),
+            h("span", {}, o.label + (o.value === r.default ? " (mặc định)" : ""), h("span", { class: "sub" }, o.help))))))),
+      h("div", { class: "rules-group" }, h("h3", {}, "Bật / tắt (không đụng nhau)"),
+        toggles.map((r) => h("label", { class: "check" },
+          h("input", { type: "checkbox", checked: !!val(tab, r), onchange: (e) => put(tab, r, e.target.checked) }),
+          h("span", {}, r.label, h("span", { class: "sub" }, r.help))))));
+  };
+  const preview = async () => {
+    previewOut.replaceChildren(h("p", { class: "help" }, "Đang ghép prompt…"));
+    try {
+      const r = await api("POST", `/api/projects/${S.cur.id}/prompt-rules/preview`, { prompt_rules: draft });
+      previewOut.replaceChildren(
+        h("p", { class: "help" }, `Cảnh ${r.scene} (prompt sẽ gửi đi, chưa lưu):`),
+        r.image ? h("div", {}, h("span", { class: "lbl" }, "Ảnh mở đầu"), h("pre", { class: "box" }, r.image)) : null,
+        h("div", {}, h("span", { class: "lbl" }, "Video"), h("pre", { class: "box" }, r.video)));
+    } catch (e) { previewOut.replaceChildren(h("p", { class: "help warn-text" }, e.message)); }
+  };
+  draw();
+  body.append(
+    h("p", { class: "help" }, `Phim ${flow === "basic" ? "định dạng mới" : "short drama"}: chỉ hiện quy tắc dùng cho định dạng này. `
+      + "Áp dụng cho lần tạo ảnh / video tiếp theo; cảnh đã xong không bị làm lại."),
+    tabs, list,
+    h("details", { class: "rules-preview" }, h("summary", { onclick: () => { if (!previewOut.childElementCount) preview(); } }, "Xem thử prompt"),
+      h("div", { class: "stack tight" }, h("button", { class: "btn sm", onclick: preview }, icon("refresh"), "Ghép lại"), previewOut)));
+  modal({
+    title: "Quy tắc prompt", wide: true, body,
+    buttons: [
+      { label: "Về mặc định", cls: "ghost", onclick: () => { delete draft[tab]; previewOut.replaceChildren(); draw(); } },
+      { label: "Huỷ" },
+      { label: "Lưu", cls: "primary", onclick: (close) => {
+        sb.prompt_rules = Object.keys(draft).length ? draft : undefined;
+        if (sb.no_text === false) sb.no_text = undefined;  // now said by the no_text choices
+        changed(); renderMain(); close();
+        toast("Đã lưu quy tắc prompt");
+      } },
+    ],
+  });
 }
 
 /* Basic formats: the image-to-video prompt in parts (scene.video_shot), joined on the server with the house I2V

@@ -36,6 +36,7 @@ from .. import ai as ai_mod
 from .. import durations as dur
 from .. import autopilot, film_chat, flow_caps, formats, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
+from .. import rules as rules_mod
 from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
 from ..settings import DEFAULT_BACKUP_REMOTE, settings_path
@@ -293,6 +294,11 @@ def _validation_errors(exc: ValidationError) -> list[str]:
 
 class SaveBody(BaseModel):
     storyboard: dict[str, Any]
+
+
+class RulesPreviewBody(BaseModel):
+    prompt_rules: dict[str, Any] | None = None
+    scene_id: str | None = None
 
 
 class YamlBody(BaseModel):
@@ -1517,6 +1523,35 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise RuntimeError(f"{label} không trả về tiêu đề nào.")
         ui_prefs.update(pdir(pid), lambda p: p.__setitem__("thumbnail_titles", titles))
         return titles
+
+    @app.get("/api/prompt-rules")
+    def prompt_rules_schema() -> dict[str, Any]:
+        """The image and video rule sets of the "Quy tắc prompt" popup (rules.IMAGE_RULES / VIDEO_RULES)."""
+        return rules_mod.rule_schema()
+
+    @app.post("/api/projects/{pid}/prompt-rules/preview")
+    def prompt_rules_preview(pid: str, body: RulesPreviewBody) -> dict[str, Any]:
+        """The prompts one scene would send with these rules (nothing saved, nothing sent to Flow). Without a
+        scene id: the first scene with dialogue, else the first scene."""
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        try:
+            sb.prompt_rules = rules_mod.clean_prompt_rules(body.prompt_rules)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        scenes = {s.id: s for s in sb.scenes}
+        if body.scene_id is not None and body.scene_id not in scenes:
+            raise HTTPException(404, f"Không có cảnh {body.scene_id}")
+        talking = [s for s in sb.scenes if s.spoken_lines() or (s.video_shot and s.video_shot.speaker)]
+        s = scenes[body.scene_id] if body.scene_id else (talking or sb.scenes)[0]
+        return {
+            "scene": s.id,
+            "image": sb.for_flow_keyframe(sb.image_prompt(s), s) if s.mode == "keyframe" else None,
+            "video": sb.for_flow_video(sb.video_prompt(s), s),
+        }
 
     @app.post("/api/projects/{pid}/thumbnail/titles")
     def thumbnail_titles(pid: str) -> dict[str, Any]:

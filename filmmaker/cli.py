@@ -422,6 +422,14 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
     return sb, out_dir, report
 
 
+@main.command("rules")
+def rules_cmd() -> None:
+    """Liệt kê các quy tắc làm phim (giới hạn, câu tự chèn vào prompt) trong filmmaker/rules.py."""
+    from . import rules
+
+    click.echo(rules.catalogue(), nl=False)
+
+
 @main.command()
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @_run_options
