@@ -400,6 +400,8 @@ async function init() {
     if (id === "crawl") { if (!S.crawlView || S.crawl) openCrawler(null); return; }
     if (id.startsWith("crawl/")) { const cid = id.slice(6); if (!S.crawlView || !S.crawl || S.crawl.id !== cid) openCrawler(cid); return; }
     if (id.startsWith("analysis/")) { const aid = id.slice(9); if (!S.ana || S.ana.id !== aid) openAnalysis(aid); return; }
+    if (id === "clone") { if (!S.cloneView || S.clone) openCloner(null); return; }
+    if (id.startsWith("clone/")) { const kid = id.slice(6); if (!S.cloneView || S.clone?.id !== kid) openCloner(kid); return; }
     if (id && (!S.cur || S.cur.id !== id) && S.projects.some((p) => p.id === id)) openProject(id).then((ok) => {
       if (ok === false && S.cur) history.replaceState(null, "", "#" + S.cur.id); // user chose to stay
     });
@@ -420,8 +422,9 @@ async function init() {
   if (want === "crawl") { await openCrawler(null); loadModels(null); }
   else if (want.startsWith("crawl/")) { await openCrawler(want.slice(6)); loadModels(null); }
   else if (want.startsWith("analysis/")) { await openAnalysis(want.slice(9)); loadModels(null); }
+  else if (want === "clone" || want.startsWith("clone/")) { await openCloner(want.slice(6) || null); loadModels(null); }
   const pick = S.projects.some((p) => p.id === want) ? want : S.projects[0]?.id;
-  if (S.ana || S.crawlView) { /* an analysis or crawl view is open */ } else if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
+  if (S.ana || S.crawlView || S.cloneView) { /* an analysis, crawl or clone view is open */ } else if (pick) await openProject(pick); else { renderMain(); loadModels(null); } // openProject loads /api/models itself
   const j = await api("GET", "/api/jobs/current").catch(() => null);
   if (j) {
     S.job = { ...j, lines: [] }; S.jobSince = 0; S.jobOpen = j.status === "running"; renderJobbar();
@@ -471,7 +474,7 @@ async function openProject(id) {
   loadModels(id); // in the background, not awaited
   try {
     const [d, a] = await Promise.all([api("GET", `/api/projects/${id}`), api("GET", `/api/projects/${id}/assets`)]);
-    S.cur = d; S.assets = a; S.playIdx = 0; S.ana = null; S.crawlView = false; S.crawl = null; S.lastCrawlId = null;
+    S.cur = d; S.assets = a; S.playIdx = 0; S.ana = null; S.crawlView = false; S.cloneView = false; S.crawl = null; S.lastCrawlId = null;
     S.dlChanged = null; // the "N clips keep the old language" warning belongs to this visit only
   } catch (e) { toast(e.message, "error"); return false; }
   rememberCharNames(); rememberLocNames();
@@ -903,6 +906,7 @@ function renderSidebar() {
     h("button", { class: "btn primary block", onclick: openNewProject, title: "Phim mới", "aria-label": "Phim mới" }, icon("plus"), h("span", { class: "new-label" }, "Phim mới")),
     h("button", { class: "btn block" + (S.ana ? " on" : ""), style: { marginTop: "8px" }, onclick: openAnalyzeVideo, "aria-label": "Phân tích video", title: "Dán link một video trên mạng: Film Maker phân tích cách dựng, màu, âm thanh… rồi làm phim mới cùng phong cách" }, icon("scan"), h("span", { class: "new-label" }, "Phân tích video")),
     h("button", { class: "btn block" + (S.crawlView ? " on" : ""), style: { marginTop: "4px" }, onclick: () => openCrawler(S.crawl?.id || S.lastCrawlId || null), "aria-label": "Crawl video", title: "Nhập link trang Facebook, kênh TikTok, YouTube để lấy top video nhiều view nhất rồi đưa sang Phân tích video" }, icon("trend"), h("span", { class: "new-label" }, "Crawl video")),
+    h("button", { class: "btn block" + (S.cloneView ? " on" : ""), style: { marginTop: "4px" }, onclick: () => openCloner(S.clone?.id || null), "aria-label": "Clone video", title: "Làm lại một clip giống hệt (âm thanh, cử chỉ, biểu cảm, góc máy) nhưng với nhân vật mới" }, icon("copy"), h("span", { class: "new-label" }, "Clone video")),
     h("div", { class: "side-title" }, h("span", { class: "spacer" }, "Dự án"), h("span", {}, S.projects.length || "")),
     S.projects.length ? null : h("p", { class: "muted small", style: { padding: "0 8px" } }, "Chưa có dự án nào."),
     S.projects.map((p) => {
@@ -930,6 +934,7 @@ function renderSidebar() {
 function renderMain() {
   const m = $("#main");
   S.zones.clear();
+  if (S.cloneView) { put(m, renderCloner()); return; }
   if (S.crawlView) { put(m, renderCrawler()); return; }
   if (S.ana) { put(m, renderAnalysis()); return; }
   if (!S.cur) { put(m, renderEmpty()); return; }
@@ -3284,6 +3289,10 @@ async function onJobDone() {
   await loadProjects();
   if (j.kind === "plan" && j.result?.project) { await openProject(j.result.project); return; }
   if (j.kind === "analyze" && j.status === "done" && j.result?.analysis) { await openAnalysis(j.result.analysis); return; }
+  if (String(j.kind).startsWith("clone")) {
+    const kid = j.result?.clone || String(j.project || "").replace(/^clone:/, "");
+    if (kid && (S.cloneView || (j.kind === "clone_init" && j.status === "done"))) { await openCloner(kid); return; }
+  }
   if (j.kind === "crawl" && j.status === "done" && j.result?.crawl) { await openCrawler(j.result.crawl); return; }
   if (j.kind === "crawl_analyze" && j.status === "done") {
     if (j.result?.open_single && j.result?.analyses?.length === 1) { await openAnalysis(j.result.analyses[0], j.result.crawl || S.crawl?.id || null); return; }
@@ -3763,7 +3772,7 @@ async function openAnalysis(id, fromCrawlId) {
   catch (e) { toast(e.message, "error"); return; }
   await flushSave();
   if (fromCrawlId !== undefined) S.lastCrawlId = fromCrawlId;
-  S.cur = null; S.crawlView = false; S.crawl = null;
+  S.cur = null; S.crawlView = false; S.crawl = null; S.cloneView = false;
   if (document.body.classList.contains("side-open")) toggleSidebar(false);
   if (location.hash.slice(1) !== "analysis/" + id) history.replaceState(null, "", "#analysis/" + id);
   renderSidebar(); renderMain();
@@ -3977,6 +3986,7 @@ async function openCrawler(id) {
   S.crawl = detail;
   S.crawlView = true;
   S.ana = null;
+  S.cloneView = false;
   S.cur = null;
   if (document.body.classList.contains("side-open")) toggleSidebar(false);
   const hash = detail ? "crawl/" + encodeURIComponent(detail.id) : "crawl";

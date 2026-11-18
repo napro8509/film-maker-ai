@@ -48,6 +48,7 @@ from ..storyboard import (CAMERA_PRESETS, NO_DIALOGUE, NO_SUBTITLES, Scene, Stor
 from ..thumbnail import ThumbnailError
 from .. import crawler as cr
 from .. import video_analysis as va
+from .. import clone as cl
 from . import ui_prefs
 
 STATIC = Path(__file__).parent / "static"
@@ -352,6 +353,32 @@ def apply_engine(data: Any, engine: str) -> None:
     for sc in scenes or []:
         put(sc, "model", None)
         put(sc, "duration", MUSE_SECONDS)
+
+
+class CloneStartBody(BaseModel):
+    url: str
+    mode: Literal["regen", "edit"] = "regen"
+    model: str | None = None
+
+
+class CloneSaveBody(BaseModel):
+    cast: list[dict[str, Any]] | None = None
+    extra: str | None = None
+    segments: list[dict[str, Any]] | None = None
+
+
+class CloneRunBody(BaseModel):
+    only: list[str] | None = None
+    agree_rights: bool = False
+
+
+class CloneRedoBody(BaseModel):
+    segment: str
+    keyframe: bool = False
+
+
+class CloneStitchBody(BaseModel):
+    allow_missing: bool = False
 
 
 class AnalyzeBody(BaseModel):
@@ -3274,6 +3301,247 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         label = "Phân tích video từ crawl" if len(targets) == 1 else f"Phân tích {len(targets)} video từ crawl"
         return jobs.start("crawl_analyze", label, None, work).public()
+
+    # ---- clone video (Clone video: same clip, new cast) ----
+
+    clones_root = workspace / ".clones"
+    CLONE_MODELS = {"regen": ("veo-lite", "omni-1.2-flash", cl.MUSE_MODEL), "edit": ("omni-flash",)}
+    CAST_KEYS = ("name", "role_vi", "replaces", "new_look")
+    PLAN_KEYS = ("setting", "camera", "first_frame", "sounds")
+    STILL_KEYS = ("setting", "camera", "first_frame")  # what the start frame is drawn from
+
+    def kdir(kid: str) -> Path:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", kid) or not (clones_root / kid / cl.STATE).is_file():
+            raise HTTPException(404, "không có bản clone này")
+        return clones_root / kid
+
+    def clone_url(kid: str, folder: Path, rel: str | None) -> str | None:
+        if not rel:
+            return None
+        f = folder / rel
+        return f"/api/clones/{kid}/file/{rel}?v={int(f.stat().st_mtime)}" if f.is_file() else None
+
+    def clone_busy(kid: str) -> bool:
+        j = jobs.current
+        return bool(j and j.status == "running" and j.kind.startswith("clone") and j.project == "clone:" + kid)
+
+    def clone_summary(kid: str, folder: Path, data: dict[str, Any]) -> dict[str, Any]:
+        segs = data.get("segments") or []
+        thumb = next((r for r in ("keyframes/seg01.png", "segments/seg01.jpg") if (folder / r).is_file()), None)
+        return {"id": kid, "title": data.get("title") or kid, "mode": data.get("mode") or "edit",
+                "model": data.get("model"), "duration": data.get("duration"), "aspect": data.get("aspect"),
+                "segments": len(segs), "done": sum(1 for x in segs if x.get("status") == "done"),
+                "has_final": (folder / "final.mp4").is_file(), "thumb": clone_url(kid, folder, thumb),
+                "created": (folder / cl.STATE).stat().st_ctime}
+
+    @app.get("/api/clones")
+    def clones() -> list[dict[str, Any]]:
+        out = []
+        if clones_root.is_dir():
+            for d in clones_root.iterdir():
+                try:
+                    out.append(clone_summary(d.name, d, cl.load(d)))
+                except Exception:
+                    continue
+        return sorted(out, key=lambda x: -x["created"])
+
+    @app.post("/api/clones")
+    def start_clone(body: CloneStartBody) -> dict[str, Any]:
+        url = body.url.strip()
+        if not va.is_url(url):
+            raise HTTPException(400, "Hãy dán một link http(s) tới video.")
+        model = body.model or CLONE_MODELS[body.mode][0]
+        if model not in CLONE_MODELS[body.mode]:
+            raise HTTPException(400, f"Model {model} không dùng được cho chế độ này.")
+        backend = _ai_backend_or_400(ai_mod.DEFAULT_AI_MODEL)
+        kid = va.new_id(re.sub(r"^https?://(www\.)?", "", url).split("/")[0])
+        folder = clones_root / kid
+
+        def work(job: Job) -> dict[str, Any]:
+            job.log(f"Clone video: {url}")
+            try:
+                cl.init(url, folder, durations=cl.MODEL_DURATIONS[model], model=model, mode=body.mode,
+                        backend=backend, log=job.log)
+            except Exception:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
+            job.log("✔ Xong. Kiểm tra nhân vật mới rồi bấm “Tạo nhân vật” (miễn phí).")
+            return {"clone": kid}
+
+        return jobs.start("clone_init", "Clone video: tải & chia đoạn", None, work).public()
+
+    @app.get("/api/clones/{kid}")
+    def get_clone(kid: str) -> dict[str, Any]:
+        folder = kdir(kid)
+        data = cl.load(folder)
+        data["id"] = kid
+        data["folder"] = str(folder)
+        data["video_url"] = clone_url(kid, folder, data.get("file"))
+        data["final_url"] = clone_url(kid, folder, "final.mp4")
+        data["compare_url"] = clone_url(kid, folder, "compare.mp4")
+        data["models"] = list(CLONE_MODELS.get(data.get("mode") or "edit", ()))
+        for c in data.get("cast") or []:
+            c["picture_url"] = clone_url(kid, folder, c.get("picture"))
+        for x in data.get("segments") or []:
+            x["thumb_url"] = clone_url(kid, folder, f"segments/{x['id']}.jpg")
+            x["piece_url"] = clone_url(kid, folder, f"segments/{x['id']}.mp4")
+            x["keyframe_url"] = clone_url(kid, folder, f"keyframes/{x['id']}.png")
+            x["render_url"] = clone_url(kid, folder, x.get("render"))
+            x["chained"] = data.get("mode") == "regen" and cl._previous(data, x) is not None
+        return data
+
+    @app.put("/api/clones/{kid}")
+    def save_clone(kid: str, body: CloneSaveBody) -> dict[str, Any]:
+        folder = kdir(kid)
+        if clone_busy(kid):
+            raise HTTPException(409, detail={"message": "Bản clone này đang chạy; chờ xong rồi sửa.", "reason": "job_running"})
+        data = cl.load(folder)
+        if body.cast is not None:
+            old = {c.get("name"): c for c in data.get("cast") or []}
+            cast = []
+            for c in body.cast:
+                name = str(c.get("name") or "").strip()
+                if not name:
+                    raise HTTPException(400, "Mỗi nhân vật cần một tên.")
+                if any(x["name"] == name for x in cast):
+                    raise HTTPException(400, f"Trùng tên nhân vật: {name}")
+                prev = old.get(c.get("old_name") or name) or {}
+                item = {**prev, **{k: str(c.get(k) or "").strip() for k in CAST_KEYS}}
+                if prev and (item["new_look"] != prev.get("new_look") or item["name"] != prev.get("name")):
+                    item["ref"] = ""  # a new look needs a new Flow character
+                    item.pop("picture", None)
+                item.setdefault("ref", "")
+                cast.append(item)
+            data["cast"] = cast
+        if body.extra is not None:
+            data["extra"] = body.extra.strip()
+        if body.segments is not None:
+            by_id = {x["id"]: x for x in data.get("segments") or []}
+            for upd in body.segments:
+                seg = by_id.get(str(upd.get("id")))
+                if not seg or not isinstance(upd.get("plan"), dict):
+                    continue
+                plan = dict(seg.get("plan") or {})
+                new = upd["plan"]
+                changed_still = any(str(new.get(k, plan.get(k)) or "") != str(plan.get(k) or "") for k in STILL_KEYS)
+                for k in PLAN_KEYS:
+                    if k in new:
+                        plan[k] = str(new[k] or "").strip()
+                if isinstance(new.get("beats"), list):
+                    beats = []
+                    for b in new["beats"]:
+                        try:
+                            beats.append({"start": float(b["start"]), "end": float(b["end"]),
+                                          "action": str(b.get("action") or "").strip()})
+                        except (KeyError, TypeError, ValueError):
+                            raise HTTPException(400, f"{seg['id']}: nhịp hành động sai định dạng") from None
+                    plan["beats"] = [b for b in beats if b["action"]]
+                seg["plan"] = plan
+                kf = folder / "keyframes" / f"{seg['id']}.png"
+                if changed_still and seg.get("status") != "done" and not cl._previous(data, seg):
+                    cl._archive(kf)  # the start frame no longer matches the description
+        cl.save(folder, data)
+        return get_clone(kid)
+
+    def clone_job(kid: str, kind: str, title: str, fn: Callable[[Job, Path], dict[str, Any] | None]) -> dict[str, Any]:
+        folder = kdir(kid)
+
+        def work(job: Job) -> dict[str, Any]:
+            try:
+                res = fn(job, folder) or {}
+            except cl.CloneError as exc:
+                raise RuntimeError(str(exc)) from None
+            return {"clone": kid, **res}
+
+        return jobs.start(kind, title, "clone:" + kid, work).public()
+
+    @app.post("/api/clones/{kid}/describe")
+    def clone_describe(kid: str) -> dict[str, Any]:
+        backend = _ai_backend_or_400(ai_mod.DEFAULT_AI_MODEL)
+
+        def fn(job: Job, folder: Path) -> None:
+            data = cl.load(folder)
+            if data.get("mode") != "regen":
+                raise cl.CloneError("chỉ chế độ “Tạo lại bằng AI” mới cần mô tả hành động")
+            for seg in data["segments"]:
+                if seg.get("plan"):
+                    continue
+                if job.stop_requested:
+                    raise Stopped()
+                job.log(f"{seg['id']} ({seg['start']:.1f}-{seg['end']:.1f}s): AI đang xem từng nửa giây…")
+                seg["plan"] = cl.describe_segment(folder, data, seg, backend=backend)
+                cl.save(folder, data)
+            job.log("✔ Đã mô tả xong. Đọc lại, sửa chỗ cần đổi rồi bấm Render.")
+
+        return clone_job(kid, "clone_describe", "Clone: mô tả hành động", fn)
+
+    @app.post("/api/clones/{kid}/cast")
+    def clone_cast(kid: str) -> dict[str, Any]:
+        return clone_job(kid, "clone_cast", "Clone: tạo nhân vật Flow",
+                         lambda job, folder: (cl.make_cast(folder, gflow(log=job.log), log=job.log), None)[1])
+
+    @app.post("/api/clones/{kid}/run")
+    def clone_run(kid: str, body: CloneRunBody) -> dict[str, Any]:
+        data = cl.load(kdir(kid))
+        if data.get("mode") != "regen" and not body.agree_rights:
+            raise HTTPException(400, "Chế độ sửa video gốc cần xác nhận bạn có quyền dùng video này.")
+        ids = [x["id"] for x in data["segments"]]
+        only = [i for i in (body.only or ids) if i in ids]
+
+        def fn(job: Job, folder: Path) -> dict[str, Any]:
+            g = gflow(log=job.log)
+            for sid in only:
+                if job.stop_requested:
+                    raise Stopped()
+                d = cl.render(folder, g, only={sid}, agree_rights=body.agree_rights, log=job.log)
+                seg = next(x for x in d["segments"] if x["id"] == sid)
+                if seg.get("status") == "failed":
+                    job.log(f"✘ {sid}: {(seg.get('note') or '')[:300]}")
+            d = cl.load(folder)
+            bad = [x["id"] for x in d["segments"] if x["id"] in only and x.get("status") != "done"]
+            if bad:
+                return {"error": "chưa xong: " + ", ".join(bad)}
+            job.log("✔ Các đoạn đã render xong. Bấm “Ghép” để lồng âm thanh gốc.")
+            return {}
+
+        return clone_job(kid, "clone_run", "Clone: render", fn)
+
+    @app.post("/api/clones/{kid}/redo")
+    def clone_redo(kid: str, body: CloneRedoBody) -> dict[str, Any]:
+        folder = kdir(kid)
+        if clone_busy(kid):
+            raise HTTPException(409, detail={"message": "Bản clone này đang chạy; chờ xong rồi làm lại.", "reason": "job_running"})
+        try:
+            cl.redo(folder, body.segment, keyframe=body.keyframe)
+        except cl.CloneError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return get_clone(kid)
+
+    @app.post("/api/clones/{kid}/stitch")
+    def clone_stitch(kid: str, body: CloneStitchBody) -> dict[str, Any]:
+        def fn(job: Job, folder: Path) -> None:
+            out = cl.stitch(folder, allow_missing=body.allow_missing, log=job.log)
+            job.log("Đang làm bản so sánh gốc | clone…")
+            cl.compare(folder, out)
+            job.log("✔ Xong final.mp4 và compare.mp4.")
+
+        return clone_job(kid, "clone_stitch", "Clone: ghép với âm thanh gốc", fn)
+
+    @app.get("/api/clones/{kid}/file/{rel:path}")
+    def clone_file(kid: str, rel: str):
+        base = kdir(kid).resolve()
+        p = (base / rel).resolve()
+        if base not in p.parents or not p.is_file():
+            raise HTTPException(404)
+        return FileResponse(p)
+
+    @app.delete("/api/clones/{kid}")
+    def delete_clone(kid: str) -> dict[str, Any]:
+        folder = kdir(kid)
+        if clone_busy(kid):
+            raise HTTPException(409, detail={"message": "Bản clone này đang chạy; chờ xong rồi xoá.", "reason": "job_running"})
+        shutil.rmtree(folder)
+        return {"ok": True}
 
     # ---- jobs ----
 

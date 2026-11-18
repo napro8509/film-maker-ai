@@ -143,7 +143,6 @@ MUSE_MODEL = "muse"
 def is_muse(model: str | None) -> bool:
     return (model or "").strip().lower() == MUSE_MODEL
 
-
 # Names the Flow chat agent understands for gflow's model aliases.
 MODEL_NAMES = {
     "veo-fast": "Veo 3.1 Fast", "veo-quality": "Veo 3.1 Quality", "veo-lite": "Veo 3.1 Lite",
@@ -546,6 +545,42 @@ class Gflow:
         if duration:
             opts += ["--duration", str(duration)]
         self.log(ui_log_line(cmd, "i2v", opts, prompt))
+        if self.dry_run:
+            return out, None
+        payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)
+        local = payload.get("local_path")
+        return (Path(local) if local else out), payload.get("media_id")
+
+    def ui_video_to_video(self, video: Path, prompt: str, *, refs: list[str] | None = None, aspect: str,
+                          model: str | None, duration: int | None, project: str | None,
+                          out: Path, agree_rights: bool = False) -> tuple[Path, str | None]:
+        """Edit an uploaded clip through the Flow chat page (Omni): swap the people for `refs` (picture paths
+        or `character:<name>`), keep motion, expressions, camera and set. Costs credits."""
+        cmd = self.ui_command()
+        profile = self.ui_profile_dir()
+        if not cmd or not (profile or os.environ.get("FLOW_UI_CMD")):
+            raise GflowError("không tìm thấy Python/profile trình duyệt của gflow-cli để điều khiển Flow", exit_code=2)
+        if not project:
+            raise GflowError("cần project Flow để sửa video qua giao diện chat", exit_code=2)
+        args = [*cmd, "v2v", "--project", project, "--video", str(video), "--prompt", prompt, "--aspect", aspect,
+                "-o", str(out), "--profile-dir", str(profile or "none"), "--timeout", str(max(600, self.timeout - 120))]
+        opts = ["--video", str(video)]
+        for r in refs or []:
+            args += ["--ref", str(r)]
+            opts += ["--ref", str(r)]
+        if model:
+            args += ["--model", MODEL_NAMES.get(model, model)]
+            opts += ["--model", MODEL_NAMES.get(model, model)]
+        if duration:
+            args += ["--duration", str(duration)]
+            opts += ["--duration", str(duration)]
+        if self.ui_max_credits:
+            args += ["--max-credits", str(self.ui_max_credits)]
+        if agree_rights:  # the user confirmed they own / may use the uploaded video
+            args.append("--agree-video-rights")
+        if self.ui_window in ("show", "hidden", "headless"):
+            args += ["--window", self.ui_window]
+        self.log(ui_log_line(cmd, "v2v", opts, prompt))
         if self.dry_run:
             return out, None
         payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)

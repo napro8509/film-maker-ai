@@ -1388,30 +1388,6 @@ def crawl(sources: tuple[str, ...], from_file: Path | None, top_n: int, per_sour
     click.echo(f"✔ Danh sách link: {folder / 'urls.txt'}")
 
 
-@main.command()
-@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
-              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
-@click.option("--port", default=8765, show_default=True)
-@click.option("--no-browser", is_flag=True, help="Không tự mở trình duyệt.")
-def ui(workspace: Path | None, port: int, no_browser: bool) -> None:
-    """Mở giao diện web trên máy (http://127.0.0.1:8765)."""
-    try:
-        from .web.server import serve
-    except ImportError as exc:
-        raise click.ClickException("cần cài thêm: pip install -e '.[ui]'") from exc
-    serve(workspace or Path.home() / "FilmMaker", port=port, open_browser=not no_browser)
-
-
-@main.command()
-@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
-              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
-def app(workspace: Path | None) -> None:
-    """Mở Film Maker dạng cửa sổ app macOS (không cần trình duyệt)."""
-    from .desktop import main as desktop_main
-
-    desktop_main(workspace)
-
-
 # --- muse: Meta's Muse agent as a video model ----------------------------------------------
 
 
@@ -1455,6 +1431,193 @@ def muse_fetch(marker: str, out: Path, profile: str | None) -> None:
     if proc.returncode != 0 or payload.get("status") != "ok":
         raise click.ClickException(((payload.get("error") or {}).get("detail")) or "không lấy được video")
     click.echo(f"✔ {payload.get('local_path')}")
+
+
+# --- clone: remake a clip with new people ------------------------------------------------
+
+
+@main.group()
+def clone() -> None:
+    """Clone một clip: giữ nguyên âm thanh, cử chỉ, biểu cảm, góc máy, bối cảnh — chỉ thay nhân vật.
+
+    \b
+    Quy trình:  clone init LINK THƯ_MỤC   (tải video, chia đoạn ≤10s, AI liệt kê nhân vật -> clone.json)
+                clone cast THƯ_MỤC        (tạo nhân vật Flow mới từ mô tả new_look, miễn phí)
+                clone run THƯ_MỤC         (Omni trên Flow sửa từng đoạn: thay người, tốn credit)
+                clone stitch THƯ_MỤC      (ghép, khớp thời lượng, lồng ÂM THANH GỐC -> final.mp4)
+                clone make LINK THƯ_MỤC   (tất cả các bước trên)
+    """
+
+
+def _clone_gflow(profile: str | None, dry_run: bool = False) -> Gflow:
+    cfg = user_settings.load()
+    g = Gflow(profile=profile or (cfg.get("profile") or None), dry_run=dry_run, log=click.echo)
+    if cfg.get("flow_ui_window") in ("show", "hidden", "headless"):
+        g.ui_window = cfg["flow_ui_window"]
+    if cfg.get("flow_ui_max_credits"):
+        g.ui_max_credits = int(cfg["flow_ui_max_credits"])
+    return g
+
+
+def _durations_opt(value: str) -> list[int]:
+    try:
+        out = sorted({int(x) for x in value.replace(" ", "").split(",") if x})
+    except ValueError as exc:
+        raise click.BadParameter("vd 4,6,8,10") from exc
+    if not out:
+        raise click.BadParameter("cần ít nhất một độ dài")
+    return out
+
+
+def _mode_defaults(mode: str, model: str, durations: str) -> tuple[str, str, str]:
+    """regen renders whole takes on Omni 1.2 (3-15 s) unless the user picked a model / lengths.
+    --model muse (Meta Muse) is always regen with 10 s clips. Returns (mode, model, durations)."""
+    from . import clone as cl
+
+    if model.strip().lower() == cl.MUSE_MODEL:
+        return "regen", cl.MUSE_MODEL, "10" if durations == "4,6,8,10" else durations
+    if mode != "regen":
+        return mode, model, durations
+    return (mode, cl.REGEN_MODEL if model == "omni-flash" else model,
+            ",".join(map(str, cl.REGEN_DURATIONS)) if durations == "4,6,8,10" else durations)
+
+
+@clone.command("init")
+@click.argument("source")
+@click.argument("folder", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--model", default="omni-flash", show_default=True,
+              help="Model video: omni-flash (sửa video gốc), veo-lite / omni-1.2-flash (tạo lại), "
+                   "muse (Meta Muse: tạo lại, ảnh + video trên muse.ai, đoạn 10s).")
+@click.option("--durations", default="4,6,8,10", show_default=True, help="Độ dài clip model nhận (giây).")
+@click.option("--no-describe", is_flag=True, help="Không nhờ AI liệt kê nhân vật (tự điền cast).")
+@click.option("--mode", type=click.Choice(["edit", "regen"]), default="edit", show_default=True,
+              help="edit: Omni sửa thẳng video gốc (khớp từng khung hình); regen: AI tạo lại từ mô tả hành động "
+                   "theo từng nửa giây (dùng khi Flow không cho sửa video gốc, vd có trẻ em).")
+def clone_init(source: str, folder: Path, model: str, durations: str, no_describe: bool, mode: str) -> None:
+    """Tải video gốc, chia đoạn, liệt kê nhân vật -> FOLDER/clone.json."""
+    from . import clone as cl
+
+    mode, model, durations = _mode_defaults(mode, model, durations)
+    try:
+        cl.init(source, folder, durations=_durations_opt(durations), model=model, describe=not no_describe,
+                mode=mode, log=click.echo)
+    except (cl.CloneError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@clone.command("cast")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+def clone_cast(folder: Path, profile: str | None) -> None:
+    """Tạo nhân vật Flow (miễn phí) cho mỗi người trong cast chưa có ref."""
+    from . import clone as cl
+
+    try:
+        cl.make_cast(folder, _clone_gflow(profile), log=click.echo)
+    except (cl.CloneError, GflowError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@clone.command("run")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--only", multiple=True, help="Chỉ đoạn này (vd seg02), lặp lại được.")
+@click.option("--force", is_flag=True, help="Render lại cả đoạn đã xong (tốn credit).")
+@click.option("--dry-run", is_flag=True, help="Chỉ in lệnh, không gửi lên Flow.")
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--agree-video-rights", is_flag=True,
+              help="Trả lời “I agree” hộp thoại quyền dùng video của Flow — CHỈ khi video là của bạn/được phép dùng.")
+def clone_run(folder: Path, only, force: bool, dry_run: bool, profile: str | None, agree_video_rights: bool) -> None:
+    """Omni sửa từng đoạn: thay nhân vật, giữ nguyên mọi thứ khác (tốn credit)."""
+    from . import clone as cl
+
+    try:
+        data = cl.render(folder, _clone_gflow(profile, dry_run), only=set(only) or None, force=force,
+                         agree_rights=agree_video_rights, log=click.echo)
+    except (cl.CloneError, GflowError) as exc:
+        raise click.ClickException(str(exc)) from None
+    bad = [s["id"] for s in data["segments"] if s.get("status") == "failed"]
+    if bad:
+        raise click.ClickException("đoạn lỗi: " + ", ".join(bad) + " (xem note trong clone.json, chạy lại với --only)")
+
+
+@clone.command("stitch")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--allow-missing", is_flag=True, help="Đoạn chưa render thì tạm dùng cảnh gốc.")
+@click.option("--audio", type=click.Choice(["original", "none"]), default=None, help="Mặc định: âm thanh gốc.")
+@click.option("--compare/--no-compare", default=True, show_default=True, help="Xuất thêm compare.mp4 (gốc | clone).")
+def clone_stitch(folder: Path, output, allow_missing: bool, audio, compare: bool) -> None:
+    """Ghép các đoạn đã thay nhân vật + âm thanh gốc -> final.mp4."""
+    from . import clone as cl
+
+    try:
+        out = cl.stitch(folder, output, allow_missing=allow_missing, audio=audio, log=click.echo)
+        if compare:
+            click.echo(f"So sánh: {cl.compare(folder, out)}")
+    except cl.CloneError as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@clone.command("make")
+@click.argument("source")
+@click.argument("folder", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--cast", "cast_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="JSON/YAML danh sách nhân vật [{name, replaces, new_look | ref}] thay cho AI tự liệt kê.")
+@click.option("--model", default="omni-flash", show_default=True, help="Như `clone init --model`; muse = Meta Muse.")
+@click.option("--durations", default="4,6,8,10", show_default=True)
+@click.option("--mode", type=click.Choice(["edit", "regen"]), default="edit", show_default=True)
+@click.option("--profile", help="gflow profile (tài khoản Google).")
+@click.option("--agree-video-rights", is_flag=True,
+              help="Trả lời “I agree” hộp thoại quyền dùng video của Flow — CHỈ khi video là của bạn/được phép dùng.")
+def clone_make(source: str, folder: Path, cast_file, model: str, durations: str, mode: str, profile: str | None,
+               agree_video_rights: bool) -> None:
+    """Tất cả các bước: init -> cast -> run -> stitch."""
+    from . import clone as cl
+
+    g = _clone_gflow(profile)
+    mode, model, durations = _mode_defaults(mode, model, durations)
+    try:
+        if not (folder / cl.STATE).is_file():
+            cl.init(source, folder, durations=_durations_opt(durations), model=model, describe=not cast_file,
+                    mode=mode, log=click.echo)
+        if cast_file:
+            data = cl.load(folder)
+            data["cast"] = yaml.safe_load(cast_file.read_text(encoding="utf-8"))
+            cl.save(folder, data)
+        cl.make_cast(folder, g, log=click.echo)
+        data = cl.render(folder, g, agree_rights=agree_video_rights, log=click.echo)
+        bad = [s["id"] for s in data["segments"] if s.get("status") == "failed"]
+        out = cl.stitch(folder, allow_missing=bool(bad), log=click.echo)
+        click.echo(f"So sánh: {cl.compare(folder, out)}")
+        if bad:
+            raise click.ClickException("đoạn lỗi (đang dùng cảnh gốc): " + ", ".join(bad)
+                                       + " — chạy `filmmaker clone run --only ...` rồi `clone stitch`")
+    except (cl.CloneError, GflowError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
+@click.option("--port", default=8765, show_default=True)
+@click.option("--no-browser", is_flag=True, help="Không tự mở trình duyệt.")
+def ui(workspace: Path | None, port: int, no_browser: bool) -> None:
+    """Mở giao diện web trên máy (http://127.0.0.1:8765)."""
+    try:
+        from .web.server import serve
+    except ImportError as exc:
+        raise click.ClickException("cần cài thêm: pip install -e '.[ui]'") from exc
+    serve(workspace or Path.home() / "FilmMaker", port=port, open_browser=not no_browser)
+
+
+@main.command()
+@click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Thư mục chứa các dự án phim (mặc định ~/FilmMaker).")
+def app(workspace: Path | None) -> None:
+    """Mở Film Maker dạng cửa sổ app macOS (không cần trình duyệt)."""
+    from .desktop import main as desktop_main
+
+    desktop_main(workspace)
 
 
 if __name__ == "__main__":
