@@ -11,6 +11,7 @@ const S = {
   charSaved: new WeakMap(), // character object → the name scenes[].characters use for it (last save)
   locSaved: new WeakMap(), // location object → the name scenes[].location use for it (last save)
   locDescBase: new WeakMap(), // location object → { desc, n } before the first edit of its description (warning)
+  xlate: new WeakMap(), // scene object → { open, loading, engine, items:[{label,vi}], error } for the quick "Dịch" panel
 };
 const MODES = [
   ["keyframe", "Ảnh → Video", "Tạo ảnh mở đầu trước (miễn phí), duyệt rồi mới render. Giữ nhân vật đồng nhất nhất."],
@@ -69,6 +70,7 @@ const ICONS = {
   scan: '<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M9.5 9v6l5-3z"/>',
   filter: '<path d="M4 5h16l-6 7v6l-4 2v-8z"/>',
   trend: '<path d="m3 17 6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+  translate: '<path d="M4 5h7M8 5v1.6c0 3-1.9 5.6-4 6.6M5 9.2c0 1.9 2 3.7 4.4 4.3"/><path d="m12.5 20 3.5-8 3.5 8M13.7 17.3h4.6"/>',
 };
 function icon(name, cls = "") {
   const t = document.createElement("template");
@@ -1262,6 +1264,7 @@ function renderScene(sc, i) {
         onclick: () => { sc.mode = k; changed(); renderMain(); } }, l))),
       zone(`badge-${i}`, () => badge(STATUS[sceneStatusKey(sc)] ? sceneStatusKey(sc) : "todo")),
       h("div", { class: "scene-tools" },
+      h("button", { class: "btn ghost icon sm", title: "Dịch nội dung cảnh sang tiếng Việt", "aria-label": "Dịch sang tiếng Việt", onclick: () => translateScene(sc, i) }, icon("translate")),
       h("button", { class: "btn ghost icon sm", title: "Chuyển lên", "aria-label": "Chuyển lên", disabled: i === 0, onclick: () => move(-1) }, icon("up")),
       h("button", { class: "btn ghost icon sm", title: "Chuyển xuống", "aria-label": "Chuyển xuống", disabled: i === sb.scenes.length - 1, onclick: () => move(1) }, icon("down")),
       h("button", { class: "btn ghost icon sm", title: "Nhân bản cảnh", "aria-label": "Nhân bản cảnh", onclick: () => { sb.scenes.splice(i + 1, 0, { ...sc, camera: sc.camera ? { ...sc.camera } : undefined, dialogue: Array.isArray(sc.dialogue) ? sc.dialogue.map((d) => ({ ...d })) : undefined, characters: Array.isArray(sc.characters) ? [...sc.characters] : undefined, id: nextSceneId() }); changed(); renderMain(); } }, icon("copy")),
@@ -1271,6 +1274,7 @@ function renderScene(sc, i) {
         if (hasWork && !(await confirmModal("Xoá cảnh?", `Cảnh ${sc.id} đã có clip. Clip vẫn nằm trong thư mục output nhưng sẽ không được ghép vào phim.`, "Xoá", true))) return;
         sb.scenes.splice(i, 1); changed(); renderMain();
       } }, icon("trash")))),
+    zone(`xlate-${i}`, () => renderSceneXlate(sc, i)),
     h("div", { class: "scene-body" },
       h("div", { class: "media-col" }, zone(`media-${i}`, () => renderSceneMedia(sc)), zone(`sactions-${i}`, () => renderSceneActions(sc))),
       h("div", { class: "scene-fields" },
@@ -1312,6 +1316,80 @@ function renderScene(sc, i) {
             h("div", { class: "small muted" }, "Video"), h("pre", {}, st.video_prompt));
         }),
       )));
+}
+
+/* ---------- quick scene translation (EN → VI, no AI) ---------- */
+
+/* The scene's writable text fields that are worth translating, each with a Vietnamese label.
+   Covers both the classic layout (prompt / content_direction / camera notes / dialogue) and
+   the default film format's shot parts (sc.video_shot: camera, action, environment, audio,
+   the one speaker's line / action / look, and each listener). */
+function sceneTranslatableFields(sc) {
+  const out = [];
+  const add = (label, text) => { const t = (text || "").trim(); if (t) out.push({ label, text: t }); };
+  if (sc.mode === "keyframe") add("Ảnh mở đầu", sc.image_prompt);
+  const v = sc.video_shot && typeof sc.video_shot === "object" ? sc.video_shot : null;
+  if (v) {
+    add("Máy quay", v.camera);
+    add("Hành động", v.action);
+    add("Chuyển động phụ & ánh sáng", v.environment);
+    add("Âm thanh", v.audio);
+    const sp = v.speaker;
+    if (sp) {
+      add("Câu thoại", sp.line);
+      add("Cử chỉ khi nói", sp.action);
+      add("Đặc điểm người nói", sp.visual_tag);
+    }
+    (Array.isArray(v.listeners) ? v.listeners : []).forEach((l, j) =>
+      add(`Người nghe ${j + 1}`, l && (l.silent_action || l.visual_tag)));
+  } else {
+    add(sc.mode === "t2v" ? "Nội dung video" : "Hành động", sc.prompt);
+    add("Chỉ đạo nội dung", sc.content_direction);
+    if (sc.camera && sc.camera.notes) add("Ghi chú đạo diễn", sc.camera.notes);
+    (Array.isArray(sc.dialogue) ? sc.dialogue : []).forEach((d, j) =>
+      add(`Thoại ${j + 1}${d.character ? " · " + d.character : ""}`, d.line));
+  }
+  return out;
+}
+
+/* Translate this scene's text into Vietnamese and show it in an inline panel. Uses the local
+   machine-translation endpoint (no AI, no Flow credits); keeps nothing on the server. The
+   panel state lives in a WeakMap keyed by the scene object, so it never leaks between projects
+   or scenes that happen to share an id ("s01", "s02", …) and is dropped with the scene itself. */
+async function translateScene(sc, i) {
+  const fields = sceneTranslatableFields(sc);
+  if (!fields.length) { toast("Cảnh này chưa có nội dung để dịch", ""); return; }
+  S.xlate.set(sc, { open: true, loading: true, items: null, error: null });
+  refreshZone(`xlate-${i}`);
+  try {
+    const res = await api("POST", "/api/translate", { texts: fields.map((f) => f.text), target: "vi", source: "auto" });
+    const tr = res.translations || [];
+    S.xlate.set(sc, { open: true, loading: false, engine: res.engine,
+      items: fields.map((f, j) => ({ label: f.label, vi: (tr[j] && tr[j].text) || "" })) });
+  } catch (err) {
+    S.xlate.set(sc, { open: true, loading: false, error: err.message });
+  }
+  refreshZone(`xlate-${i}`);
+}
+
+function renderSceneXlate(sc, i) {
+  const st = S.xlate.get(sc);
+  if (!st || !st.open) return h("div");
+  const close = () => { st.open = false; refreshZone(`xlate-${i}`); };
+  let body;
+  if (st.loading) body = h("div", { class: "xlate-loading small muted" }, h("span", { class: "spinner" }), "Đang dịch sang tiếng Việt…");
+  else if (st.error) body = h("div", { class: "small warn-text" }, "Không dịch được: " + st.error);
+  else body = h("div", { class: "xlate-items" }, (st.items || []).map((it) =>
+    h("div", { class: "xlate-item" },
+      h("div", { class: "xlate-label small muted" }, it.label),
+      h("div", { class: "xlate-vi" }, it.vi || "—"))));
+  const note = st.engine === "glossary" ? " · ngoại tuyến, dịch thô bằng từ điển"
+    : st.engine === "mixed" ? " · một phần dịch thô (ngoại tuyến)" : "";
+  return h("div", { class: "xlate-panel" },
+    h("div", { class: "xlate-head" },
+      h("span", { class: "small muted" }, "Bản dịch tiếng Việt" + note),
+      h("button", { class: "btn ghost icon sm", title: "Đóng bản dịch", "aria-label": "Đóng bản dịch", onclick: close }, icon("x"))),
+    body);
 }
 
 /* "Bối cảnh" of a scene: picker (warns when a scene with a clip would turn "Đã đổi"), the per-scene chaining

@@ -320,6 +320,12 @@ class AskBody(BaseModel):
     pictures: bool = True  # send portraits, cover and a contact sheet of the film along
 
 
+class TranslateBody(BaseModel):
+    texts: list[str] = []
+    target: str = "vi"
+    source: str = "auto"
+
+
 class NewProject(BaseModel):
     title: str = "Phim mới"
     source: str = "blank"  # blank | template
@@ -1061,6 +1067,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "default_video_model": meta.default_video_model,
             "metadata_error": meta.error_text,
         }
+
+    @app.post("/api/translate")
+    async def translate(body: TranslateBody) -> dict[str, Any]:
+        """Quick machine translation for the per-scene "Dịch sang tiếng Việt" button.
+
+        Uses a free, key-less machine-translation endpoint (no AI / LLM, no Flow credits),
+        with an offline glossary fallback. Runs in a worker thread so the blocking HTTP call
+        does not stall the event loop."""
+        from .. import translate as tr_mod
+
+        texts = [str(t or "") for t in (body.texts or [])][:80]
+        if not any(t.strip() for t in texts):
+            return {"translations": [], "engine": "none"}
+        target = (body.target or "vi").strip()[:8] or "vi"
+        source = (body.source or "auto").strip()[:8] or "auto"
+        return await run_in_threadpool(tr_mod.translate_texts, texts, target, source)
 
     @app.get("/api/settings")
     def get_settings() -> dict[str, Any]:

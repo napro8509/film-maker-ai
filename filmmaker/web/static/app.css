@@ -308,6 +308,14 @@ details > :not(summary) { margin-top: var(--sp-2); }
 .scene-num { font-weight: var(--fw-bold); font-size: var(--fs-2); min-width: 24px; text-align: center; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 input.scene-id { width: 72px; min-height: var(--ctl-sm); padding: 2px var(--sp-2); font-family: var(--mono); font-size: var(--fs-1); border-radius: var(--r-1); }
 .scene-tools { display: flex; gap: 2px; margin-left: auto; }
+.xlate-panel { border-bottom: 1px solid var(--border); background: var(--surface-2); padding: var(--sp-2) var(--sp-3) var(--sp-3); }
+.xlate-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.xlate-loading { display: flex; align-items: center; gap: var(--sp-2); }
+.xlate-items { display: flex; flex-direction: column; gap: var(--sp-2); }
+.xlate-item { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: var(--sp-3); align-items: baseline; }
+.xlate-label { padding-top: 1px; }
+.xlate-vi { white-space: pre-wrap; min-width: 0; }
+@media (max-width: 640px) { .xlate-item { grid-template-columns: 1fr; gap: 1px; } }
 .scene-body { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: var(--sp-4); padding: var(--sp-4); }
 .scene-fields { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
 .media-col { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
