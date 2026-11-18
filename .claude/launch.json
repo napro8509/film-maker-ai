@@ -4,8 +4,22 @@
     {
       "name": "filmmaker-ui",
       "runtimeExecutable": ".venv/bin/filmmaker",
-      "runtimeArgs": ["ui", "--no-browser"],
+      "runtimeArgs": [
+        "ui",
+        "--no-browser"
+      ],
       "port": 8765
+    },
+    {
+      "name": "filmmaker-ui-alt",
+      "runtimeExecutable": ".venv/bin/filmmaker",
+      "runtimeArgs": [
+        "ui",
+        "--no-browser",
+        "--port",
+        "8775"
+      ],
+      "port": 8775
     }
   ]
 }

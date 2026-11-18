@@ -87,3 +87,42 @@ def test_short_circuits_after_endpoint_fails(monkeypatch):
     assert len(calls) == 1  # only probed once, then gave up on the network
     assert out["engine"] == "glossary"
     assert all(t["engine"] == "glossary" for t in out["translations"])
+
+
+def test_split_chunks_keeps_text_and_respects_limit():
+    text = ("A sentence about the scene. " * 60 + "\n") * 5
+    pieces = tr._split_chunks(text, 500)
+    assert "".join(pieces) == text
+    assert all(len(p) <= 500 for p in pieces)
+    assert len(pieces) > 1
+
+
+def test_long_prompt_is_translated_in_chunks(monkeypatch):
+    calls = []
+
+    def fake(text, source, target, timeout):
+        calls.append(text)
+        assert len(text) <= tr.CHUNK_CHARS
+        return "VI(" + str(len(calls)) + ")"
+
+    monkeypatch.setattr(tr, "_google_translate", fake)
+    prompt = ("Close-up of the woman in the kitchen. " * 30 + "\n") * 4  # ~4.5k chars, like a full Flow prompt
+    res = tr.translate_texts([prompt])
+    assert res["engine"] == "google"
+    assert len(calls) > 1
+    out = res["translations"][0]["text"]
+    assert all(f"VI({n})" in out for n in range(1, len(calls) + 1))
+
+
+def test_long_prompt_falls_back_when_a_chunk_fails(monkeypatch):
+    seen = {"n": 0}
+
+    def flaky(text, source, target, timeout):
+        seen["n"] += 1
+        return None if seen["n"] == 2 else "ok"
+
+    monkeypatch.setattr(tr, "_google_translate", flaky)
+    prompt = "The woman walks. " * 200
+    res = tr.translate_texts([prompt])
+    assert res["engine"] == "glossary"
+    assert "người phụ nữ" in res["translations"][0]["text"]

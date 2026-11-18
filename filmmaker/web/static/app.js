@@ -1015,6 +1015,7 @@ function renderHeader() {
         h("button", { class: "btn", disabled: busy, onclick: () => runAction("keyframes"), title: "Tạo ảnh mở đầu cho các cảnh kiểu Ảnh → Video (miễn phí)" }, icon("image"), "Tạo keyframe", FREE()),
         h("button", { class: "btn primary", disabled: busy, onclick: () => runAction("video"), title: "Render các cảnh chưa xong (tốn credit, có bước xác nhận)" }, icon("video"), "Render video", PAID()),
         h("button", { class: "btn", disabled: busy, onclick: () => switchTab("final"), title: "Ghép các clip thành phim, thêm nhạc và ảnh bìa" }, icon("stitch"), "Ghép phim"),
+        rulesButton(S.cur.storyboard),
         h("button", { class: "btn icon", title: "Thêm thao tác", "aria-label": "Thêm thao tác", "aria-haspopup": "menu", onclick: (e) => projectMenu(e.currentTarget) }, icon("more")));
     }));
 }
@@ -1348,6 +1349,13 @@ function sceneTranslatableFields(sc) {
     if (sc.camera && sc.camera.notes) add("Ghi chú đạo diễn", sc.camera.notes);
     (Array.isArray(sc.dialogue) ? sc.dialogue : []).forEach((d, j) =>
       add(`Thoại ${j + 1}${d.character ? " · " + d.character : ""}`, d.line));
+  }
+  // The full prompts actually sent to Flow / Muse (the "Prompt thực tế gửi lên Flow" box),
+  // as built by the server at the last save.
+  const st = S.cur && S.cur.scene_state ? S.cur.scene_state[sc.id] : null;
+  if (st) {
+    add("Prompt ảnh (gửi lên Flow)", st.image_prompt);
+    add("Prompt video (gửi lên Flow)", st.video_prompt);
   }
   return out;
 }
@@ -1789,9 +1797,6 @@ function renderStory() {
             oninput: (e) => set("edit_style", e.target.value) }), "agent dựng phim làm theo; không gửi Flow") : null,
         isBasic(sb) ? formatSummary(sb) : renderDialogueLang(sb, set),
         h("div", { class: "stack tight" },
-          h("div", { class: "row" },
-            h("button", { class: "btn sm", onclick: () => openPromptRules(sb) }, icon("settings"), "Quy tắc prompt ảnh & video"),
-            h("span", { class: "help" }, rulesSummary(sb))),
           h("label", { class: "check" },
             h("input", { type: "checkbox", checked: !!sb.fallback_t2v,
               onchange: (e) => { sb.fallback_t2v = e.target.checked ? true : undefined; changed(); renderMain(); } }),
@@ -1811,6 +1816,15 @@ function renderStory() {
 let RULES_SCHEMA = null;
 const RULE_KINDS = [["image", "Hình ảnh"], ["video", "Video"]];
 function rulesFlow(sb) { return isBasic(sb) ? "basic" : "drama"; }
+function rulesCount(sb) {
+  return Object.values(sb.prompt_rules || {}).reduce((a, v) => a + Object.keys(v || {}).length, 0) + (sb.no_text === false ? 1 : 0);
+}
+/* In the project's action bar: always in sight, with the number of rules changed from the default. */
+function rulesButton(sb) {
+  const n = rulesCount(sb);
+  return h("button", { class: "btn", onclick: () => openPromptRules(sb), title: rulesSummary(sb) + ". Bấm để chỉnh quy tắc prompt ảnh & video." },
+    icon("settings"), "Quy tắc prompt", n ? h("span", { class: "rules-count", "aria-label": `${n} quy tắc đã đổi` }, String(n)) : null);
+}
 function rulesSummary(sb) {
   const n = Object.values(sb.prompt_rules || {}).reduce((a, v) => a + Object.keys(v || {}).length, 0);
   if (sb.no_text === false) return n ? `Đã đổi ${n} quy tắc; đang tắt câu chặn chữ trên hình` : "Đang tắt câu chặn chữ trên hình";
@@ -1879,7 +1893,7 @@ async function openPromptRules(sb) {
       { label: "Lưu", cls: "primary", onclick: (close) => {
         sb.prompt_rules = Object.keys(draft).length ? draft : undefined;
         if (sb.no_text === false) sb.no_text = undefined;  // now said by the no_text choices
-        changed(); renderMain(); close();
+        changed(); renderMain(); refreshZone("actions-zone"); close();
         toast("Đã lưu quy tắc prompt");
       } },
     ],

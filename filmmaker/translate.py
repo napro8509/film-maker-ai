@@ -17,6 +17,7 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
@@ -94,6 +95,51 @@ def _google_translate(text: str, source: str, target: str, timeout: float) -> st
     return out or None
 
 
+# The free endpoint is a GET, so the text rides in the URL. Full Flow prompts run to a few
+# thousand characters (and Thai / Vietnamese percent-encode to ~9 bytes a letter), which can
+# overflow the URL limit — longer texts are cut into pieces at line / sentence boundaries.
+CHUNK_CHARS = 1200
+MAX_PARALLEL = 6  # concurrent requests to the free endpoint for one call
+
+
+def _split_chunks(text: str, limit: int = CHUNK_CHARS) -> list[str]:
+    """Cut ``text`` into pieces of at most ``limit`` characters; ``"".join(pieces) == text``.
+
+    Cuts after a newline when possible, else after a sentence end / space, else hard."""
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = window.rfind("\n") + 1
+        if cut <= 0:
+            m = None
+            for m in re.finditer(r"[.!?;。]\s+", window):
+                pass
+            cut = m.end() if m else 0
+        if cut <= 0:
+            cut = window.rfind(" ") + 1
+        if cut <= 0:
+            cut = limit
+        pieces.append(rest[:cut])
+        rest = rest[cut:]
+    if rest:
+        pieces.append(rest)
+    return pieces
+
+
+def _join_pieces(pieces: list[str], done: list[str]) -> str:
+    """Glue translated chunks back, keeping the whitespace (line breaks) between them."""
+    out: list[str] = []
+    for piece, got in zip(pieces, done):
+        if not piece.strip():
+            out.append(piece)
+            continue
+        lead = piece[: len(piece) - len(piece.lstrip())]
+        trail = piece[len(piece.rstrip()):]
+        out.append(lead + got + (trail if "\n" in trail else " "))
+    return "".join(out).strip()
+
+
 def _glossary_translate(text: str) -> str:
     """Offline word-by-word swap. Crude by design; only used when the network fails.
 
@@ -135,30 +181,55 @@ def translate_texts(
     ``"glossary"`` when the offline fallback had to be used, ``"mixed"`` for a blend and
     ``"none"`` when there was nothing to translate.
 
-    As soon as the online endpoint fails to answer one item (offline / blocked / timed
-    out), the rest skip the network and go straight to the offline glossary. This keeps a
-    6–10 field scene from stacking up ``N × timeout`` seconds of dead waits on a flaky
-    connection — the whole "dịch nhanh" stays quick and falls back at once.
+    Long texts (whole Flow prompts) are cut into URL-safe chunks. The first chunk probes the
+    online endpoint; if it fails (offline / blocked / timed out) everything goes straight to
+    the offline glossary, so a scene never stacks up ``N × timeout`` seconds of dead waits.
+    Otherwise the remaining chunks are fetched in parallel. An item any of whose chunks
+    failed falls back to the glossary as a whole.
     """
-    results: list[dict[str, str]] = []
-    engines: set[str] = set()
     target = target or "vi"
     source = source or "auto"
-    online_down = False
-    for raw in texts:
+    # Every non-empty text, cut into URL-safe chunks; one network job per non-blank chunk.
+    split: list[list[str] | None] = []
+    jobs: list[tuple[int, int, str]] = []
+    for idx, raw in enumerate(texts):
         text = (raw or "").strip()
         if not text:
+            split.append(None)
+            continue
+        pieces = _split_chunks(text)
+        split.append(pieces)
+        jobs += [(idx, k, p.strip()) for k, p in enumerate(pieces) if p.strip()]
+
+    answers: dict[tuple[int, int], str | None] = {}
+    if jobs:
+        # Probe with the first chunk: if the endpoint is down, skip the network for the
+        # rest at once instead of stacking timeouts. Otherwise fetch the remaining chunks
+        # in parallel so a whole scene (fields + full Flow prompts) comes back quickly.
+        first = jobs[0]
+        answers[first[:2]] = _google_translate(first[2], source, target, timeout)
+        if answers[first[:2]] is not None and len(jobs) > 1:
+            rest = jobs[1:]
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(rest))) as pool:
+                got = pool.map(lambda j: _google_translate(j[2], source, target, timeout), rest)
+                for j, g in zip(rest, got):
+                    answers[j[:2]] = g
+
+    results: list[dict[str, str]] = []
+    engines: set[str] = set()
+    for idx, raw in enumerate(texts):
+        pieces = split[idx]
+        if pieces is None:
             results.append({"source": raw or "", "text": "", "engine": "none"})
             continue
-        got = None
-        if not online_down:
-            got = _google_translate(text, source, target, timeout)
-            if got is None:
-                online_down = True  # endpoint unreachable: stop hammering it
-        engine = "google" if got is not None else "glossary"
-        if got is None:
-            got = _glossary_translate(text)
-        results.append({"source": raw or "", "text": got, "engine": engine})
+        done = [answers.get((idx, k)) if p.strip() else "" for k, p in enumerate(pieces)]
+        if all(d is not None for d in done):
+            text, engine = _join_pieces(pieces, done), "google"  # type: ignore[arg-type]
+        else:
+            text, engine = _glossary_translate((raw or "").strip()), "glossary"
+        if not text:
+            text, engine = _glossary_translate((raw or "").strip()), "glossary"
+        results.append({"source": raw or "", "text": text, "engine": engine})
         engines.add(engine)
     if not engines:
         overall = "none"
