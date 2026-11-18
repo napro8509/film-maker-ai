@@ -30,7 +30,6 @@ const B = {
   savedJson: null, savedKeys: null, pending: null, timer: null, inflight: false,
   mc: null,              // boardModel() cached for the current microtask
   keyBound: false,
-  comfy: { checking: false, checked: false, online: false, url: "127.0.0.1:8188", checkpoints: [], devices: [], queue_running: 0, queue_pending: 0, comfyui_version: null, video_nodes: [], error: null },
   paletteOpen: false,
   prefsLoaded: false,
 };
@@ -167,11 +166,6 @@ function bContinuityPrevSid(sceneIdx) {
   if (!prev || bMode(prev) !== "keyframe") return null;
   if (bLocIndex(prev.location) !== li) return null;
   return prev.id;
-}
-
-function bEngine() {
-  const e = S.settings?.board_engine || S.env?.comfyui?.engine || localGet("boardEngine", "flow");
-  return e === "comfyui" ? "comfyui" : "flow";
 }
 
 function bLoadUiPrefsOnce() {
@@ -535,53 +529,8 @@ function bRetryLoad() {
   rerenderBoard();
 }
 
-/* ---------- ComfyUI server status & job execution ---------- */
-
-async function bProbeComfy(force = false) {
-  if (B.comfy.checking || (B.comfy.checked && !force)) return B.comfy;
-  B.comfy.checking = true;
-  refreshZone("board-comfy-pill");
-  try {
-    const r = await api("GET", "/api/comfy/status");
-    Object.assign(B.comfy, r, { checking: false, checked: true });
-  } catch (e) {
-    Object.assign(B.comfy, { checking: false, checked: true, online: false, error: e.message });
-  }
-  refreshZone("board-comfy-pill");
-  return B.comfy;
-}
-
-async function bSetEngine(eng) {
-  const next = eng === "comfyui" ? "comfyui" : "flow";
-  localSet("boardEngine", next);
-  if (S.settings) S.settings.board_engine = next;
-  if (S.env?.comfyui) S.env.comfyui.engine = next;
-  try { S.settings = await api("PUT", "/api/settings", { board_engine: next }); } catch { /* keep local */ }
-  if (next === "comfyui") bProbeComfy(true);
-  rerenderBoard();
-}
-
-async function bRunComfy(action, extra = {}) {
-  if (!S.cur) return;
-  if (jobRunning()) { toast("Đang có việc chạy — đợi xong hoặc bấm Dừng.", "error"); return; }
-  await flushSave();
-  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
-  if (S.cur.errors?.length) { toast("Storyboard còn lỗi: " + prettyError(S.cur.errors[0]), "error"); return; }
-  try {
-    const j = await api("POST", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/run`, { action, ...extra });
-    startJob(j);
-  } catch (e) {
-    toast(e.message, "error", 6000);
-    if (/Không kết nối được ComfyUI|checkpoint/i.test(e.message || "")) bOpenComfyModal();
-  }
-}
-
 async function bQueueMain() {
   if (jobRunning()) { toast("Đang có việc chạy", "error"); return; }
-  if (bEngine() === "comfyui") {
-    await bRunComfy("pipeline");
-    return;
-  }
   const sb = S.cur.storyboard;
   const missingChars = bChars().filter((c) => c.name && c.description && !charImageUrl(c));
   if (missingChars.length) { makePortraits([]); return; }
@@ -590,167 +539,6 @@ async function bQueueMain() {
   const missingKf = bScenes().filter((sc) => bMode(sc) === "keyframe" && !S.cur.scene_state?.[sc.id]?.keyframe_url);
   if (missingKf.length) { runAction("keyframes"); return; }
   runAction("video");
-}
-
-function bOpenComfyModal() {
-  const cfg = S.env?.comfyui || {};
-  const curUrl = S.settings?.comfyui_url || cfg.url || B.comfy.url || "127.0.0.1:8188";
-  const urlInp = h("input", { type: "text", value: curUrl, placeholder: "127.0.0.1:8188" });
-  const ckptInp = h("input", { type: "text", value: S.settings?.comfyui_checkpoint || cfg.checkpoint || "", placeholder: "Tự chọn checkpoint đầu tiên trên máy chủ" });
-  const ckptList = h("datalist", { id: "cf-ckpt-list" }, (B.comfy.checkpoints || []).map((c) => h("option", { value: c })));
-  ckptInp.setAttribute("list", "cf-ckpt-list");
-  const stepsInp = h("input", { type: "number", min: 1, max: 150, value: S.settings?.comfyui_steps || cfg.steps || 20 });
-  const cfgInp = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: S.settings?.comfyui_cfg || cfg.cfg || 7 });
-  const engSel = h("select", { value: bEngine() },
-    h("option", { value: "flow" }, "Google Flow (mặc định)"),
-    h("option", { value: "comfyui" }, "ComfyUI (chạy qua máy chủ ComfyUI)"));
-  const statusBox = h("div", { class: "stack tight" });
-
-  const drawStatus = () => {
-    const st = B.comfy;
-    if (st.checking) {
-      put(statusBox, h("div", { class: "row small muted" }, h("span", { class: "spinner" }), "Đang kiểm tra máy chủ ComfyUI…"));
-      return;
-    }
-    if (!st.checked) {
-      put(statusBox, h("div", { class: "small muted" }, "Bấm “Kiểm tra kết nối” để đọc danh sách GPU/MPS và model từ ComfyUI."));
-      return;
-    }
-    if (st.online) {
-      const devText = (st.devices || []).map((d) => d.name || d.type).filter(Boolean).join(", ") || "CPU/MPS";
-      put(statusBox,
-        h("div", { class: "banner info flush" }, icon("check"),
-          h("div", { class: "b-body" },
-            h("div", {}, h("b", {}, `Đã kết nối ComfyUI ${st.comfyui_version ? "v" + st.comfyui_version : ""}`), ` · Thiết bị: ${devText}`),
-            h("div", { class: "small muted" }, `Checkpoints: ${(st.checkpoints || []).length} · Hàng đợi: ${st.queue_running} đang chạy, ${st.queue_pending} chờ` + (st.video_nodes?.length ? ` · Video nodes: ${st.video_nodes.join(", ")}` : "")))));
-      put(ckptList, (st.checkpoints || []).map((c) => h("option", { value: c })));
-    } else {
-      put(statusBox,
-        h("div", { class: "banner warn flush" }, icon("alert"),
-          h("div", { class: "b-body" },
-            h("div", {}, h("b", {}, "Chưa kết nối được máy chủ ComfyUI")),
-            h("div", { class: "small" }, st.error || "Hãy chạy ComfyUI (mặc định cổng 8188) rồi bấm Kiểm tra kết nối. Khi chưa bật ComfyUI, bạn vẫn thiết kế flow trên Bảng, xuất/nhập file workflow.json và chạy qua Google Flow bình thường."))));
-    }
-  };
-
-  const testNow = async () => {
-    B.comfy.checking = true;
-    drawStatus();
-    try {
-      const r = await api("GET", `/api/comfy/status?url=${encodeURIComponent(urlInp.value.trim())}`);
-      Object.assign(B.comfy, r, { checking: false, checked: true });
-    } catch (e) {
-      Object.assign(B.comfy, { checking: false, checked: true, online: false, error: e.message });
-    }
-    drawStatus();
-  };
-
-  const tmplRow = S.cur?.has_comfy_template
-    ? h("div", { class: "banner info flush" }, icon("code"),
-      h("div", { class: "b-body" }, "Dự án đang gắn API Workflow ComfyUI tuỳ chỉnh (`comfy_template`)."),
-      h("button", { class: "btn sm ghost", onclick: async () => {
-        try {
-          const r = await api("DELETE", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/template`);
-          if (r.project) applyMeta(r.project);
-          toast("Đã gỡ API Workflow tuỳ chỉnh", "ok");
-        } catch (e) { toast(e.message, "error"); }
-      } }, "Gỡ template"))
-    : null;
-
-  drawStatus();
-  modal({
-    title: "Cấu hình ComfyUI & Flow Bảng",
-    wide: true,
-    body: h("div", { class: "stack" },
-      statusBox,
-      h("div", { class: "row", style: { alignItems: "flex-end" } },
-        h("div", { style: { flex: "1" } }, field("Địa chỉ máy chủ ComfyUI", urlInp, "mặc định 127.0.0.1:8188")),
-        h("button", { class: "btn sm", onclick: testNow }, icon("refresh"), "Kiểm tra kết nối"),
-        B.comfy.online ? h("button", { class: "btn sm ghost", onclick: async () => {
-          try { await api("POST", "/api/comfy/interrupt", { url: urlInp.value.trim() }); toast("Đã gửi lệnh Interrupt tới ComfyUI", "ok"); }
-          catch (e) { toast(e.message, "error"); }
-        } }, icon("stop"), "Interrupt") : null),
-      h("div", { class: "grid2" },
-        field("Engine thực thi trên Bảng", engSel),
-        field("Checkpoint ưu tiên", h("div", {}, ckptInp, ckptList), "trống = tự nhận")),
-      h("div", { class: "grid2" },
-        field("Số bước lấy mẫu (Steps)", stepsInp, "1–150"),
-        field("CFG Scale", cfgInp, "1–30")),
-      tmplRow,
-      h("p", { class: "help" }, "Mẹo: Bạn có thể bấm “Workflow JSON → Xuất ComfyUI Workflow” để tải file workflow.json kéo thẳng vào giao diện ComfyUI, hoặc nhập một file workflow_api.json (Save API Format từ ComfyUI, hỗ trợ biến {{prompt}}, {{seed}}, {{width}}, {{height}}, {{image}}) để chạy custom workflow của riêng bạn.")),
-    buttons: [
-      { label: "Huỷ" },
-      { label: "Lưu cấu hình", cls: "primary", onclick: async (close) => {
-        try {
-          S.settings = await api("PUT", "/api/settings", {
-            comfyui_url: urlInp.value.trim(),
-            comfyui_checkpoint: ckptInp.value.trim(),
-            comfyui_steps: +stepsInp.value || 20,
-            comfyui_cfg: +cfgInp.value || 7,
-            board_engine: engSel.value,
-          });
-          localSet("boardEngine", S.settings.board_engine);
-          S.env = await api("GET", "/api/env");
-          B.comfy.checked = false;
-          close();
-          rerenderBoard();
-          toast("Đã lưu cấu hình ComfyUI", "ok");
-        } catch (e) { toast(e.message, "error"); }
-      } },
-    ],
-  });
-  if (!B.comfy.checked) testNow();
-}
-
-async function bExportWorkflow(fmt = "ui") {
-  if (!S.cur) return;
-  await flushSave();
-  if (saveFailed()) { toast("Chưa lưu được storyboard: " + S.saveError, "error"); return; }
-  await bFlushBoard();
-  try {
-    const data = await api("GET", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/workflow?format=${fmt}`);
-    const text = JSON.stringify(data, null, 2);
-    const suffix = fmt === "api" ? "comfy-api.json" : "comfy-workflow.json";
-    const fname = `${S.cur.id}-${suffix}`;
-    const blob = new Blob([text], { type: "application/json" });
-    const u = URL.createObjectURL(blob);
-    const a = h("a", { href: u, download: fname });
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(u), 2000);
-    toast(fmt === "api" ? "Đã xuất ComfyUI API Prompt (.json)" : "Đã xuất ComfyUI Workflow (.json)", "ok");
-  } catch (e) { toast(e.message, "error"); }
-}
-
-function bImportWorkflow() {
-  if (!S.cur) return;
-  const inp = h("input", { type: "file", accept: ".json,application/json", class: "hidden", onchange: async (e) => {
-    const f = e.target.files?.[0];
-    inp.remove();
-    if (!f) return;
-    try {
-      await flushSave();
-      const text = await f.text();
-      const wf = JSON.parse(text);
-      const r = await api("POST", `/api/projects/${encodeURIComponent(S.cur.id)}/comfy/workflow`, { workflow: wf, apply_storyboard: true });
-      if (r.kind === "api_template") {
-        if (r.project) applyMeta(r.project);
-        rerenderBoard();
-        toast("Đã lưu ComfyUI API Workflow Template cho dự án này!", "ok", 6000);
-      } else {
-        B.pid = null;
-        if (r.project) reloadProject(r.project);
-        else await refreshCurrent();
-        rerenderBoard();
-        toast("Đã nhập ComfyUI Workflow lên Bảng", "ok");
-      }
-    } catch (err) {
-      toast("Không nhập được workflow: " + err.message, "error", 6000);
-    }
-  } });
-  document.body.append(inp);
-  inp.click();
 }
 
 /* ---------- Graph Editing Actions (Characters, Locations, Continuity, Scenes) ---------- */
@@ -859,7 +647,6 @@ function renderBoard() {
       sig: "", savedJson: null, savedKeys: null, paletteOpen: false,
     });
     bLoad(S.cur.id);
-    bProbeComfy(false);
   }
   const sb = S.cur.storyboard;
   sb.characters = sb.characters || [];
@@ -872,7 +659,7 @@ function renderBoard() {
   const vp = h("div", { class: "board-viewport", tabindex: "-1" });
   root.append(vp);
   if (B.loading) {
-    vp.append(h("div", { class: "loading" }, h("span", { class: "spinner" }), "Đang tải ComfyUI flow…"));
+    vp.append(h("div", { class: "loading" }, h("span", { class: "spinner" }), "Đang tải bảng…"));
     return root;
   }
   const model = boardModel();
@@ -1020,7 +807,7 @@ function bMinimapEl(model) {
     }));
   }
   svg.append(svgEl("rect", { class: "mm-lens", x: b.x, y: b.y, width: 200, height: 150, rx: 10 }));
-  const wrap = h("div", { class: "cf-minimap", title: "Bản đồ node ComfyUI — bấm hoặc kéo để di chuyển khung nhìn" }, svg);
+  const wrap = h("div", { class: "cf-minimap", title: "Bản đồ node — bấm hoặc kéo để di chuyển khung nhìn" }, svg);
   return wrap;
 }
 
@@ -1096,8 +883,6 @@ function bPaletteEl(model) {
     { label: "Thêm bối cảnh (LocationLoader)", tag: "+ LOCATION", run: () => { bTogglePalette(false); bAddLocation(); } },
     { label: "Thêm cảnh Ảnh → Video (Keyframe + Sampler)", tag: "+ SCENE KF", run: () => { bTogglePalette(false); bAddScene("keyframe"); } },
     { label: "Thêm cảnh Chữ → Video (T2V Sampler)", tag: "+ SCENE T2V", run: () => { bTogglePalette(false); bAddScene("t2v"); } },
-    { label: "Xuất ComfyUI Workflow (.json)", tag: "EXPORT", run: () => { bTogglePalette(false); bExportWorkflow("ui"); } },
-    { label: "Cấu hình máy chủ ComfyUI", tag: "SERVER", run: () => { bTogglePalette(false); bOpenComfyModal(); } },
   ];
   for (const cd of model.cards) {
     const title = cd.type === "cfg" ? "FilmConfig · Cấu hình phim"
@@ -1118,7 +903,7 @@ function bPaletteEl(model) {
       : h("div", { class: "small muted", style: { padding: "10px" } }, "Không tìm thấy node phù hợp."));
   };
   const inp = h("input", {
-    type: "text", placeholder: "Tìm hoặc thêm node ComfyUI (Nhân vật, Bối cảnh, Cảnh, s01…)",
+    type: "text", placeholder: "Tìm hoặc thêm node (Nhân vật, Bối cảnh, Cảnh, s01…)",
     oninput: (e) => { q = e.target.value; draw(); },
     onkeydown: (e) => {
       if (e.key === "Escape") { e.stopPropagation(); bTogglePalette(false); }
@@ -1142,28 +927,16 @@ function bFocusNode(key) {
 
 function bToolbar() {
   const zoomPct = Math.round((B.view?.zoom || 1) * 100) + "%";
-  const eng = bEngine();
   const wireLabels = { spline: "Dây: Cong", orthogonal: "Dây: Vuông", straight: "Dây: Thẳng" };
-  return h("div", { class: "board-toolbar", role: "toolbar", "aria-label": "Công cụ ComfyUI Flow" },
-    h("div", { class: "cf-engine-seg", role: "group", "aria-label": "Engine thực thi" },
-      h("button", { class: eng === "flow" ? "on" : "", title: "Thực thi qua Google Flow (gflow)", onclick: () => bSetEngine("flow") }, "Google Flow"),
-      h("button", { class: "comfy" + (eng === "comfyui" ? " on" : ""), title: "Thực thi qua máy chủ ComfyUI", onclick: () => bSetEngine("comfyui") }, "ComfyUI")),
-    zone("board-comfy-pill", bComfyPill),
+  return h("div", { class: "board-toolbar", role: "toolbar", "aria-label": "Công cụ bảng" },
     h("div", { class: "cf-queue-group" },
-      h("button", { class: "cf-queue-btn", disabled: jobRunning(), title: eng === "comfyui" ? "Queue toàn bộ workflow trên máy chủ ComfyUI" : "Chạy bước tiếp theo trên Google Flow", onclick: bQueueMain },
-        icon("play"), eng === "comfyui" ? "Queue ComfyUI" : "Chạy Flow"),
+      h("button", { class: "cf-queue-btn", disabled: jobRunning(), title: "Chạy bước tiếp theo trên Google Flow", onclick: bQueueMain },
+        icon("play"), "Chạy Flow"),
       h("button", { class: "cf-queue-more", "aria-label": "Tuỳ chọn chạy Flow", onclick: (e) => popMenu(e.currentTarget, bQueueMenuItems()) }, icon("down"))),
     h("span", { class: "board-sep", "aria-hidden": "true" }),
     h("button", { class: "btn sm board-add", title: "Thêm hoặc tìm Node (nháy đúp nền canvas)", onclick: () => bTogglePalette() },
       icon("plus"), h("span", { class: "lbl-text" }, "Thêm Node")),
-    h("button", { class: "btn sm ghost", title: "Xuất / Nhập ComfyUI Workflow JSON", onclick: (e) => popMenu(e.currentTarget, [
-      { label: "Xuất ComfyUI Workflow (.json)", icon: "download", onclick: () => bExportWorkflow("ui") },
-      { label: "Xuất ComfyUI API Prompt (.json)", icon: "code", onclick: () => bExportWorkflow("api") },
-      { label: "Nhập ComfyUI Workflow (.json)…", icon: "upload", onclick: bImportWorkflow },
-      "-",
-      { label: "Cấu hình máy chủ ComfyUI…", icon: "settings", onclick: bOpenComfyModal },
-    ], "ComfyUI Workflow") }, icon("code"), h("span", { class: "lbl-text" }, "Workflow JSON")),
-    h("button", { class: "btn sm ghost", title: "Tuỳ chọn hiển thị ComfyUI canvas", onclick: (e) => popMenu(e.currentTarget, [
+    h("button", { class: "btn sm ghost", title: "Tuỳ chọn hiển thị bảng", onclick: (e) => popMenu(e.currentTarget, [
       { label: wireLabels[B.wireStyle] + " (đổi kiểu dây)", icon: "board", onclick: bCycleWireStyle },
       { label: (B.showGroups ? "✓ " : "") + "Hiện khung nhóm từng cảnh", onclick: () => { B.showGroups = !B.showGroups; localSet("boardGroups", B.showGroups); rerenderBoard(); } },
       { label: (B.showMinimap ? "✓ " : "") + "Hiện bản đồ thu nhỏ (Minimap)", onclick: () => { B.showMinimap = !B.showMinimap; localSet("boardMinimap", B.showMinimap); rerenderBoard(); } },
@@ -1181,42 +954,15 @@ function bToolbar() {
       h("button", { class: "btn sm ghost", title: "Vừa màn hình", "aria-label": "Vừa màn hình", onclick: () => bFit(true) }, icon("fit"), h("span", { class: "lbl-text" }, "Vừa màn hình"))),
     h("span", { class: "spacer" }),
     zone("board-sel", bSelSlot),
-    h("div", { class: "board-legend", "aria-label": "Chú thích cổng ComfyUI" },
+    h("div", { class: "board-legend", "aria-label": "Chú thích cổng" },
       bLegendItems().map(([color, label]) => h("span", { class: "board-legend-item" }, h("i", { class: "cf-legend-dot", style: { background: color } }), label))),
     h("button", { class: "btn sm ghost board-legend-btn", "aria-haspopup": "menu", title: "Chú thích", onclick: (e) => popMenu(e.currentTarget,
       bLegendItems().map(([color, label]) => ({ label, extra: h("i", { class: "cf-legend-dot", style: { background: color, marginLeft: "auto" } }) }))) },
       icon("info"), h("span", { class: "lbl-text" }, "Chú thích")));
 }
 
-function bComfyPill() {
-  const st = B.comfy;
-  const dotCls = st.checking ? "checking" : st.online ? "online" : "offline";
-  const text = st.checking ? "ComfyUI…" : st.online ? `ComfyUI${st.queue_running ? ` (${st.queue_running})` : ""}` : "ComfyUI · cấu hình";
-  const tip = st.online
-    ? `Đã kết nối ComfyUI (${st.url}) · ${(st.checkpoints || []).length} checkpoint`
-    : "Bấm để cấu hình kết nối máy chủ ComfyUI hoặc nhập API Workflow";
-  return h("button", { class: "cf-status-btn", title: tip, onclick: bOpenComfyModal },
-    h("span", { class: "cf-dot " + dotCls }),
-    h("span", {}, text));
-}
-
 function bQueueMenuItems() {
-  const busy = jobRunning(), eng = bEngine();
-  if (eng === "comfyui") {
-    return [
-      { label: "Queue toàn bộ Flow (ComfyUI)", icon: "play", disabled: busy, onclick: () => bRunComfy("pipeline") },
-      { label: "Queue ảnh Nhân vật (ComfyUI)", icon: "users", disabled: busy, onclick: () => bRunComfy("portraits", { force: false }) },
-      { label: "Queue ảnh Bối cảnh (ComfyUI)", icon: "image", disabled: busy, onclick: () => bRunComfy("locations", { force: false }) },
-      { label: "Queue tất cả Keyframe (ComfyUI)", icon: "image", disabled: busy, onclick: () => bRunComfy("keyframes", { force: false }) },
-      { label: "Queue tất cả Video clip (ComfyUI)", icon: "video", disabled: busy, onclick: () => bRunComfy("video", { force: false }) },
-      "-",
-      { label: "Ghép phim hoàn chỉnh (ffmpeg)", icon: "stitch", disabled: busy, onclick: () => runAction("stitch") },
-      { label: "Dừng hàng đợi ComfyUI (Interrupt)", icon: "stop", danger: true, onclick: async () => {
-        try { await api("POST", "/api/comfy/interrupt", {}); toast("Đã gửi Interrupt tới ComfyUI", "ok"); }
-        catch (e) { toast(e.message, "error"); }
-      } },
-    ];
-  }
+  const busy = jobRunning();
   return [
     { label: "Tạo ảnh nhân vật chưa có (miễn phí)", icon: "users", disabled: busy, onclick: () => makePortraits([]) },
     { label: "Tạo ảnh bối cảnh chưa có (miễn phí)", icon: "image", disabled: busy, onclick: () => makeLocationImages([]) },
@@ -1409,7 +1155,7 @@ function bLinksSvg() {
   const marker = (id, d, cls) => svgEl("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 9, markerHeight: 9, markerUnits: "userSpaceOnUse", orient: "auto" },
     svgEl("path", { d, class: cls }));
   const svg = svgEl("svg", {
-    class: "board-links", "aria-label": "Dây nối ComfyUI", viewBox: `${x0} ${y0} ${w} ${hgt}`, width: w, height: hgt,
+    class: "board-links", "aria-label": "Dây nối", viewBox: `${x0} ${y0} ${w} ${hgt}`, width: w, height: hgt,
     style: `left:${x0}px;top:${y0}px`,
   },
     svgEl("defs", {},
@@ -1565,10 +1311,9 @@ function bCfgCard(cd) {
     [icon("settings"), h("span", { class: "cf-node-title" }, "FilmConfig"), h("span", { class: "spacer" }),
       bMoreBtn(() => [
         { label: "Mở tab Phong cách & nhân vật", icon: "users", onclick: () => switchTab("story") },
-        { label: "Cấu hình ComfyUI Server…", icon: "settings", onclick: bOpenComfyModal },
       ], "Thao tác FilmConfig")],
     () => h("div", { class: "cf-slots" },
-      h("div", { class: "cf-slots-col in" }, h("span", { class: "cf-slot-val" }, bEngine() === "comfyui" ? "Engine: ComfyUI" : "Engine: Google Flow")),
+      h("div", { class: "cf-slots-col in" }, h("span", { class: "cf-slot-val" }, sb.model === "muse" ? "Engine: Meta Muse" : "Engine: Google Flow")),
       h("div", { class: "cf-slots-col out" },
         bSlotRowOut({ slot: "MODEL", dtype: "MODEL", label: "MODEL", linked: bLinkedOut(cd.key, "MODEL"), title: "Cấu hình model & phong cách chung" }))),
     [
@@ -1667,12 +1412,12 @@ function bCharCard(cd) {
       zone(z("actions"), () => {
         const busy = jobRunning(), url = charImageUrl(c), canMake = !!(String(c.name || "").trim() && String(c.description || "").trim());
         const failed = !bCharRunning(c) && bCharFailed(c);
-        const errs = S.cur.errors?.length, isComfy = bEngine() === "comfyui";
+        const errs = S.cur.errors?.length;
         return h("div", { class: "board-card-actions row" },
           h("button", {
             class: "btn sm", disabled: busy || !canMake || !!errs,
-            title: !canMake ? "Cần nhập tên và mô tả trước" : isComfy ? "Tạo ảnh qua máy chủ ComfyUI" : "Ảnh trên Flow miễn phí",
-            onclick: () => isComfy ? bRunComfy("portraits", { names: [c.name], force: true }) : makePortraits([c.name], !!url),
+            title: !canMake ? "Cần nhập tên và mô tả trước" : "Ảnh trên Flow miễn phí",
+            onclick: () => makePortraits([c.name], !!url),
           }, icon(url || failed ? "refresh" : "image"), failed ? "Thử lại" : url ? "Tạo lại" : "Tạo ảnh", FREE()),
           h("button", { class: "btn sm ghost icon", title: "Tải ảnh lên", "aria-label": "Tải ảnh lên", onclick: () => fileInput.click() }, icon("upload")),
           fileInput);
@@ -1755,16 +1500,15 @@ function bLocCard(cd) {
       }),
       zone(z("actions"), () => {
         const busy = jobRunning(), url = locImageUrl(l), canMake = locCanMake(l);
-        const errs = S.cur.errors?.length, isComfy = bEngine() === "comfyui";
+        const errs = S.cur.errors?.length;
         return h("div", { class: "board-card-actions row" },
           h("button", {
             class: "btn sm", disabled: busy || !canMake || !!errs,
-            title: !canMake ? "Cần nhập tên và mô tả trước" : isComfy ? "Tạo bối cảnh qua ComfyUI" : "Ảnh trên Flow miễn phí",
+            title: !canMake ? "Cần nhập tên và mô tả trước" : "Ảnh trên Flow miễn phí",
             onclick: async () => {
               const imp = locationImpact(sb, S.cur.scene_state, { location: l, kind: "image" });
               if (!(await confirmLocImpact(imp, url ? "Tạo lại ảnh bối cảnh" : "Tạo ảnh bối cảnh"))) return;
-              if (isComfy) bRunComfy("locations", { names: [l.name], force: true });
-              else makeLocationImages([l.name], true);
+              makeLocationImages([l.name], true);
             },
           }, icon(url ? "refresh" : "image"), url ? "Tạo lại" : "Tạo ảnh", FREE()),
           h("button", { class: "btn sm ghost icon", title: "Tải ảnh bối cảnh lên", "aria-label": "Tải ảnh lên", onclick: () => fileInput.click() }, icon("upload")),
@@ -1873,12 +1617,12 @@ function bKfCard(cd) {
       }),
       zone(z("actions"), () => {
         const s = st(), busy = jobRunning(), errs = S.cur.errors?.length, hasKf = !!s.keyframe_url;
-        const failed = !!failedKf() && !bSceneRunning(sc, "kf"), isComfy = bEngine() === "comfyui";
+        const failed = !!failedKf() && !bSceneRunning(sc, "kf");
         return h("div", { class: "board-card-actions row" },
           h("button", {
             class: "btn sm", disabled: busy || !!errs,
-            title: isComfy ? "Tạo keyframe qua ComfyUI" : busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : "Ảnh trên Flow miễn phí",
-            onclick: () => isComfy ? bRunComfy("keyframes", { only: [sid], force: hasKf }) : runAction("keyframes", { only: [sid], force_keyframes: hasKf ? [sid] : [] }),
+            title: busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : "Ảnh trên Flow miễn phí",
+            onclick: () => runAction("keyframes", { only: [sid], force_keyframes: hasKf ? [sid] : [] }),
           }, icon(hasKf || failed ? "refresh" : "image"), failed ? "Thử lại" : hasKf ? "Tạo lại" : "Tạo KF", FREE()),
           bVideoShown(sc) ? null : h("button", { class: "btn sm ghost", disabled: !!errs, onclick: () => bShowVideo(sc) }, icon("arrowRight"), "Video"));
       }),
@@ -1962,15 +1706,6 @@ function bVidCard(cd) {
       }),
       zone(z("msg"), () => { const kids = mode === "t2v" ? bSceneCharMsgs(sc) : []; return h("div", { class: "stack tight" + (kids.length ? "" : " hidden") }, kids); }),
       zone(z("actions"), () => {
-        if (bEngine() === "comfyui") {
-          const busy = jobRunning(), errs = S.cur.errors?.length, hasClip = !!st().clip_url;
-          return h("div", { class: "board-card-actions row" },
-            h("button", {
-              class: "btn sm primary", disabled: busy || !!errs,
-              title: "Render clip cảnh này qua máy chủ ComfyUI (không tốn credit Flow)",
-              onclick: () => bRunComfy("video", { only: [sid], force: hasClip }),
-            }, icon(hasClip ? "refresh" : "video"), hasClip ? "Queue lại (Comfy)" : "Queue Video", FREE()));
-        }
         return h("div", { class: "board-card-actions" },
           renderSceneActions(sc, { keyframe: false, retry: true, blocked: S.cur.errors?.length ? "Storyboard đang lỗi — sửa lỗi ở khung phía trên trước" : "" }));
       }),
@@ -2097,7 +1832,7 @@ function bRefreshNames() {
 /* ---------- Node Creation Modals (Character, Location, Scene) ---------- */
 
 async function bRelayout() {
-  if (!(await confirmModal("Tự xếp lại bố cục DAG?", "Sắp xếp lại mọi node theo luồng ComfyUI từ trái sang phải (Sources → Keyframe → VideoSampler → SaveFilm).", "Xếp lại"))) return;
+  if (!(await confirmModal("Tự xếp lại bố cục DAG?", "Sắp xếp lại mọi node theo luồng từ trái sang phải (Sources → Keyframe → VideoSampler → SaveFilm).", "Xếp lại"))) return;
   autoLayout(true);
   B.view = null;
   rerenderBoard();

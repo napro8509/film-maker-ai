@@ -4478,37 +4478,6 @@ async function openSettings() {
             field("Chế độ hiển thị YouTube mặc định", ytPriv),
             h("p", { class: "help" }, "Token được lưu bảo mật ở ~/.config/filmmaker/settings.json (chỉ tài khoản máy bạn đọc được).")));
       })(),
-      (() => {
-        const cfUrl = h("input", { type: "text", id: "set-comfy-url", value: s.comfyui_url || "http://127.0.0.1:8188", placeholder: "http://127.0.0.1:8188" });
-        const cfCkpt = h("input", { type: "text", id: "set-comfy-ckpt", value: s.comfyui_checkpoint || "", placeholder: "Trống = tự nhận checkpoint đầu tiên" });
-        const cfSteps = h("input", { type: "number", id: "set-comfy-steps", min: 1, max: 150, value: s.comfyui_steps || 20 });
-        const cfCfg = h("input", { type: "number", id: "set-comfy-cfg", min: 1, max: 30, step: 0.5, value: s.comfyui_cfg || 7 });
-        const cfEng = h("select", { id: "set-board-engine", value: s.board_engine || "flow" },
-          h("option", { value: "flow" }, "Google Flow (mặc định)"),
-          h("option", { value: "comfyui" }, "ComfyUI (chạy local / máy chủ ComfyUI)"));
-        const cfState = h("div", { class: "row small muted" }, "Mặc định kết nối cổng 8188 khi ComfyUI đang bật.");
-        const testCf = () => {
-          put(cfState, h("span", { class: "spinner" }), "Đang kiểm tra kết nối ComfyUI…");
-          api("GET", "/api/comfy/status?url=" + encodeURIComponent(cfUrl.value.trim())).then((r) => {
-            put(cfState,
-              h("span", { class: "pill " + (r.online ? "ok" : "warn") }, r.online ? "Đã kết nối" : "Chưa bật"),
-              h("span", { class: "muted" }, r.online ? `${r.url} · ${(r.checkpoints || []).length} checkpoint` : (r.error || "Chưa kết nối được ComfyUI")));
-          }).catch((err) => put(cfState, h("span", { class: "pill bad" }, "Lỗi"), h("span", { class: "muted" }, err.message)));
-        };
-        return h("section", { class: "settings-sec" }, h("h3", {}, "ComfyUI & Flow Bảng"),
-          h("div", { class: "stack" },
-            cfState,
-            h("div", { class: "row", style: { alignItems: "flex-end" } },
-              h("div", { style: { flex: "1" } }, field("Địa chỉ máy chủ ComfyUI", cfUrl, "mặc định http://127.0.0.1:8188")),
-              h("button", { class: "btn sm", onclick: testCf }, "Kiểm tra kết nối")),
-            h("div", { class: "grid2" },
-              field("Engine thực thi trên Bảng", cfEng),
-              field("Checkpoint ưu tiên", cfCkpt)),
-            h("div", { class: "grid2" },
-              field("Steps", cfSteps),
-              field("CFG Scale", cfCfg)),
-            h("p", { class: "help" }, "Tab Bảng thiết kế theo kiến trúc node-graph của ComfyUI: xuất/nhập trực tiếp file workflow.json và chạy render qua Google Flow hoặc máy chủ ComfyUI.")));
-      })(),
       h("section", { class: "settings-sec" }, h("h3", {}, "Giao diện"), h("div", { class: "grid2" }, field("Chế độ màu", theme)))),
     buttons: [{ label: "Huỷ" }, { label: "Lưu", cls: "primary", onclick: async (c) => {
       try {
@@ -4529,11 +4498,6 @@ async function openSettings() {
           yt_privacy: document.getElementById("set-yt-priv")?.value || "public",
           auto_publish: !!document.getElementById("set-auto-pub")?.checked,
           auto_publish_platforms: pubPlats,
-          comfyui_url: document.getElementById("set-comfy-url")?.value.trim() || "http://127.0.0.1:8188",
-          comfyui_checkpoint: document.getElementById("set-comfy-ckpt")?.value.trim() || "",
-          comfyui_steps: +(document.getElementById("set-comfy-steps")?.value || 20),
-          comfyui_cfg: +(document.getElementById("set-comfy-cfg")?.value || 7),
-          board_engine: document.getElementById("set-board-engine")?.value || "flow",
           anthropic_api_key: key.value.trim() || undefined, clear_anthropic_key: clearKey,
           gemini_backend: geminiBackend.value,
           gemini_api_key: geminiKey.value.trim() || undefined, clear_gemini_key: clearGeminiKey,

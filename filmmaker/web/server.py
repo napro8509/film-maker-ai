@@ -33,7 +33,6 @@ from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import ai as ai_mod
-from .. import comfy
 from .. import durations as dur
 from .. import autopilot, film_chat, flow_caps, formats, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
@@ -76,11 +75,6 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "fb_page_id": "", "fb_access_token": "",
                     "yt_client_id": "", "yt_client_secret": "", "yt_refresh_token": "",
                     "yt_privacy": "public", "auto_publish": False, "auto_publish_platforms": [],
-                    "comfyui_url": comfy.DEFAULT_COMFYUI_URL,
-                    "comfyui_checkpoint": "",
-                    "comfyui_steps": comfy.DEFAULT_STEPS,
-                    "comfyui_cfg": comfy.DEFAULT_CFG,
-                    "board_engine": "flow",  # flow | comfyui
                     "theme": "auto"}  # auto | light | dark
 
 
@@ -524,17 +518,6 @@ class FinalSettings(BaseModel):
     smart_edit: bool = True
 
 
-class ComfyRunBody(BaseModel):
-    action: str = "keyframes"  # portraits | locations | keyframes | video | pipeline
-    only: list[str] = []
-    names: list[str] = []
-    force: bool = False
-    url: str | None = None
-    checkpoint: str | None = None
-    steps: int | None = None
-    cfg: float | None = None
-
-
 # --- app ----------------------------------------------------------------------
 
 
@@ -872,7 +855,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "srt_url": file_url(pid, srt),
             "srt_urls": {code: file_url(pid, path) for code, path in subtitle_paths(final).items()},
             "final_prefs": ui_prefs.read(pdir(pid)).get("final", {}),
-            "has_comfy_template": bool(ui_prefs.read(pdir(pid)).get("comfy_template")),
             "i2v_unsupported": i2v_off,
             "i2v_error": st_data.get("i2v_error"),
             "characters_state": characters_state(pid, raw, sb),
@@ -989,7 +971,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             "video_analysis": {"ytdlp": bool(va.ytdlp_command()), "rea_video": bool(va.rea_binary())},
             "crawler": {"ytdlp": bool(va.ytdlp_command()), "playwright": bool(cr.playwright_python()),
                         "browsers": list(cr.BROWSER_CHOICES)},
-            "comfyui": comfy.comfyui_config(s),
             "qc": qc.status(),
         }
 
@@ -1149,28 +1130,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             s["flow_ui_max_credits"] = max(0, int(s.get("flow_ui_max_credits") or 0))
             if s.get("flow_ui_window") not in ("show", "hidden", "headless"):
                 s["flow_ui_window"] = "hidden"
-            if "comfyui_url" in body:
-                try:
-                    s["comfyui_url"] = comfy.clean_comfyui_url(body["comfyui_url"])
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc))
-            if "board_engine" in body:
-                try:
-                    s["board_engine"] = comfy.clean_board_engine(body["board_engine"])
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc))
-            if "comfyui_checkpoint" in body:
-                s["comfyui_checkpoint"] = str(body.get("comfyui_checkpoint") or "").strip()[:260]
-            if "comfyui_steps" in body:
-                try:
-                    s["comfyui_steps"] = comfy.clean_steps(body["comfyui_steps"])
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc))
-            if "comfyui_cfg" in body:
-                try:
-                    s["comfyui_cfg"] = comfy.clean_cfg(body["comfyui_cfg"])
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc))
             if s.get("theme") not in THEMES:
                 s["theme"] = "auto"
             save_settings(s)
@@ -1424,305 +1383,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, str(exc))
         await run_in_threadpool(ui_prefs.update, d, lambda p: p.__setitem__("board", board))
         return board
-
-    # ---- ComfyUI workflow & execution ----
-
-    @app.get("/api/comfy/status")
-    async def comfy_status(url: str | None = None) -> dict[str, Any]:
-        cfg = comfy.comfyui_config(load_settings())
-        target = url.strip() if isinstance(url, str) and url.strip() else cfg["url"]
-        st = await run_in_threadpool(comfy.check_status, target)
-        return {**st, "engine": cfg["engine"], "configured_checkpoint": cfg["checkpoint"],
-                "steps": cfg["steps"], "cfg": cfg["cfg"]}
-
-    @app.post("/api/comfy/interrupt")
-    def comfy_interrupt(body: dict[str, Any] | None = None) -> dict[str, Any]:
-        cfg = comfy.comfyui_config(load_settings())
-        raw_url = (body or {}).get("url")
-        try:
-            url = comfy.clean_comfyui_url(raw_url) if raw_url else cfg["url"]
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        comfy.ComfyClient(url, timeout=5.0).interrupt()
-        return {"ok": True, "url": url}
-
-    @app.get("/api/projects/{pid}/comfy/workflow")
-    def get_comfy_workflow(pid: str, format: str = "ui") -> dict[str, Any]:
-        d = pdir(pid)
-        try:
-            sb = load_storyboard(sb_path(pid))
-        except (ValidationError, ValueError) as exc:
-            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
-                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-        prefs = ui_prefs.read(d)
-        board = ui_prefs.board_of(prefs)
-        if format == "api":
-            cfg = comfy.comfyui_config(load_settings())
-            return comfy.build_project_api_prompt(
-                sb,
-                checkpoint=cfg["checkpoint"] or "v1-5-pruned-emaonly.safetensors",
-                steps=cfg["steps"],
-                cfg=cfg["cfg"],
-            )
-        return comfy.build_comfy_workflow(sb, board, scene_state=detail(pid).get("scene_state"))
-
-    @app.post("/api/projects/{pid}/comfy/workflow")
-    async def post_comfy_workflow(pid: str, request: Request) -> dict[str, Any]:
-        d = pdir(pid)
-        max_bytes = 2 * 1024 * 1024
-        chunks: list[bytes] = []
-        size = 0
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > max_bytes:
-                raise HTTPException(413, "File workflow ComfyUI quá lớn (tối đa 2 MB)")
-            chunks.append(chunk)
-        try:
-            payload = json.loads(b"".join(chunks))
-        except ValueError:
-            raise HTTPException(400, "Workflow ComfyUI không phải JSON hợp lệ")
-        if not isinstance(payload, dict):
-            raise HTTPException(400, "Workflow ComfyUI phải là một đối tượng JSON")
-        apply_sb = True
-        wf_obj = payload
-        if "workflow" in payload and isinstance(payload["workflow"], dict):
-            wf_obj = payload["workflow"]
-            apply_sb = bool(payload.get("apply_storyboard", True))
-        cur_board = ui_prefs.board_of(ui_prefs.read(d))
-        try:
-            parsed = comfy.import_comfy_workflow(wf_obj, read_raw(pid), current_board=cur_board)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        if parsed["kind"] == "api_template":
-            tmpl = parsed["template"]
-            await run_in_threadpool(ui_prefs.update, d, lambda p: p.__setitem__("comfy_template", tmpl))
-            return {"kind": "api_template", "board": cur_board, "project": detail(pid)}
-        try:
-            new_board = ui_prefs.validate_board(parsed["board"])
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        await run_in_threadpool(ui_prefs.update, d, lambda p: p.__setitem__("board", new_board))
-        if apply_sb:
-            check_lang_fields(parsed["storyboard"], read_raw(pid))
-            write_raw(pid, parsed["storyboard"])
-        return {"kind": "ui_workflow", "board": new_board, "project": detail(pid)}
-
-    @app.delete("/api/projects/{pid}/comfy/template")
-    def delete_comfy_template(pid: str) -> dict[str, Any]:
-        d = pdir(pid)
-        ui_prefs.update(d, lambda p: p.pop("comfy_template", None))
-        return {"ok": True, "project": detail(pid)}
-
-    @app.post("/api/projects/{pid}/comfy/run")
-    def run_comfy_job(pid: str, body: ComfyRunBody) -> dict[str, Any]:
-        d = pdir(pid)
-        action = body.action.strip().lower()
-        if action not in ("portraits", "locations", "keyframes", "video", "pipeline"):
-            raise HTTPException(400, f"Thao tác ComfyUI không hợp lệ: {body.action}")
-        try:
-            sb = load_storyboard(sb_path(pid))
-        except (ValidationError, ValueError) as exc:
-            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
-                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-
-        cfg = comfy.comfyui_config(load_settings())
-        try:
-            url = comfy.clean_comfyui_url(body.url) if body.url else cfg["url"]
-            steps = comfy.clean_steps(body.steps) if body.steps is not None else cfg["steps"]
-            cfg_scale = comfy.clean_cfg(body.cfg) if body.cfg is not None else cfg["cfg"]
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        checkpoint = (body.checkpoint.strip() if isinstance(body.checkpoint, str) and body.checkpoint.strip()
-                      else cfg["checkpoint"])
-        template = ui_prefs.read(d).get("comfy_template")
-        template = template if isinstance(template, dict) else None
-        wanted_names = {n.strip() for n in body.names if isinstance(n, str) and n.strip()}
-        only_scenes = {s.strip() for s in body.only if isinstance(s, str) and s.strip()} or None
-
-        def work(job: Job) -> dict[str, Any]:
-            client = comfy.ComfyClient(url, timeout=30.0)
-            st = comfy.check_status(url, timeout=3.0)
-            if not st["online"]:
-                raise RuntimeError(st["error"] or f"Không kết nối được ComfyUI tại {url}")
-            ckpt = checkpoint
-            if not ckpt and not template:
-                ckpt = comfy.select_checkpoint(client)
-            job.log(f"ComfyUI ({url}) — checkpoint: {ckpt or 'custom API workflow'} · {steps} steps · CFG {cfg_scale}")
-            images_saved: dict[str, str] = {}
-            failed_all: dict[str, str] = {}
-
-            if action in ("portraits", "pipeline"):
-                rep = prog.Reporter(job.set_progress)
-                picked_chars = []
-                used: set[str] = set()
-                for i, c in enumerate(sb.characters):
-                    if wanted_names and c.name not in wanted_names:
-                        continue
-                    if not wanted_names and c.image and Path(c.image).is_file() and not body.force:
-                        continue
-                    if not (c.name.strip() and c.description.strip()):
-                        continue
-                    stem = slugify(c.name) if slugify(c.name) != "phim" else f"nhan-vat-{i + 1}"
-                    while stem in used:
-                        stem += f"-{i + 1}"
-                    used.add(stem)
-                    picked_chars.append((i, c, d / "assets" / "characters" / f"{stem}.png"))
-                for _, c, _ in picked_chars:
-                    rep.queued(f"char:{c.name.strip()}")
-                try:
-                    for i, c, dest in picked_chars:
-                        if job.stop_requested:
-                            break
-                        ck = f"char:{c.name.strip()}"
-                        rep.submitting(ck)
-                        with rep.active(ck):
-                            rep.gflow_event("start", {"source": "estimate", "expected": 15.0})
-                            try:
-                                job.log(f"[char:{c.name}] Tạo ảnh nhân vật qua ComfyUI…")
-                                comfy.generate_image_on_comfy(
-                                    client,
-                                    sb.for_flow(sb.portrait_prompt(c)),
-                                    dest,
-                                    aspect=sb.aspect,
-                                    checkpoint=ckpt,
-                                    steps=steps,
-                                    cfg=cfg_scale,
-                                    filename_prefix=f"char_{slugify(c.name)}",
-                                    template=template,
-                                    should_stop=lambda: job.stop_requested,
-                                    sleep=job.sleep,
-                                    log=job.log,
-                                )
-                                rel = dest.relative_to(d).as_posix()
-                                with sb_lock(pid):
-                                    raw = read_raw(pid)
-                                    raw_chars = raw.get("characters") or []
-                                    if i < len(raw_chars) and isinstance(raw_chars[i], dict) and raw_chars[i].get("name") == c.name:
-                                        raw_chars[i]["image"] = rel
-                                        write_raw(pid, raw)
-                                images_saved[c.name] = rel
-                                rep.done(ck)
-                                job.log(f"[char:{c.name}] OK -> {dest}")
-                            except Exception as exc:
-                                rep.failed(ck)
-                                failed_all[c.name] = str(exc)
-                                job.log(f"[char:{c.name}] ✘ {exc}")
-                finally:
-                    rep.settle()
-
-            if action in ("locations", "pipeline") and not job.stop_requested:
-                cur_sb = load_storyboard(sb_path(pid))
-                rep = prog.Reporter(job.set_progress)
-                picked_locs = []
-                used_l: set[str] = set()
-                for i, loc in enumerate(cur_sb.locations or []):
-                    if wanted_names and loc.name not in wanted_names:
-                        continue
-                    if not wanted_names and cur_sb.location_image(loc) and not body.force:
-                        continue
-                    if not (loc.name.strip() and (loc.description.strip() or (loc.image_prompt or "").strip())):
-                        continue
-                    stem = slugify(loc.name) if slugify(loc.name) != "phim" else f"boi-canh-{i + 1}"
-                    while stem in used_l:
-                        stem += f"-{i + 1}"
-                    used_l.add(stem)
-                    picked_locs.append((i, loc, d / "assets" / "locations" / f"{stem}.png"))
-                for _, loc, _ in picked_locs:
-                    rep.queued(f"loc:{loc.name.strip()}")
-                try:
-                    for i, loc, dest in picked_locs:
-                        if job.stop_requested:
-                            break
-                        lk = f"loc:{loc.name.strip()}"
-                        rep.submitting(lk)
-                        with rep.active(lk):
-                            rep.gflow_event("start", {"source": "estimate", "expected": 15.0})
-                            try:
-                                job.log(f"[loc:{loc.name}] Tạo ảnh bối cảnh qua ComfyUI…")
-                                comfy.generate_image_on_comfy(
-                                    client,
-                                    cur_sb.for_flow(cur_sb.location_prompt(loc)),
-                                    dest,
-                                    aspect=cur_sb.aspect,
-                                    checkpoint=ckpt,
-                                    steps=steps,
-                                    cfg=cfg_scale,
-                                    filename_prefix=f"loc_{slugify(loc.name)}",
-                                    template=template,
-                                    should_stop=lambda: job.stop_requested,
-                                    sleep=job.sleep,
-                                    log=job.log,
-                                )
-                                rel = dest.relative_to(d).as_posix()
-                                with sb_lock(pid):
-                                    raw = read_raw(pid)
-                                    raw_locs = raw.get("locations") or []
-                                    if i < len(raw_locs) and isinstance(raw_locs[i], dict) and raw_locs[i].get("name") == loc.name:
-                                        raw_locs[i]["image"] = rel
-                                        write_raw(pid, raw)
-                                images_saved[loc.name] = rel
-                                rep.done(lk)
-                                job.log(f"[loc:{loc.name}] OK -> {dest}")
-                            except Exception as exc:
-                                rep.failed(lk)
-                                failed_all[loc.name] = str(exc)
-                                job.log(f"[loc:{loc.name}] ✘ {exc}")
-                finally:
-                    rep.settle()
-
-            if action in ("keyframes", "pipeline") and not job.stop_requested:
-                cur_sb = load_storyboard(sb_path(pid))
-                kf_res = comfy.run_comfy_keyframes(
-                    cur_sb,
-                    out_dir(pid),
-                    client,
-                    only=only_scenes,
-                    force={s.id for s in cur_sb.scenes} if body.force else set(),
-                    checkpoint=ckpt,
-                    steps=steps,
-                    cfg=cfg_scale,
-                    template=template,
-                    should_stop=lambda: job.stop_requested,
-                    sleep=job.sleep,
-                    log=job.log,
-                    progress=job.set_progress,
-                )
-                failed_all.update(kf_res["failed"])
-
-            if action in ("video", "pipeline") and not job.stop_requested:
-                cur_sb = load_storyboard(sb_path(pid))
-                vid_res = comfy.run_comfy_videos(
-                    cur_sb,
-                    d,
-                    out_dir(pid),
-                    client,
-                    only=only_scenes,
-                    force={s.id for s in cur_sb.scenes} if body.force else set(),
-                    checkpoint=ckpt,
-                    steps=steps,
-                    cfg=cfg_scale,
-                    template=template,
-                    should_stop=lambda: job.stop_requested,
-                    sleep=job.sleep,
-                    log=job.log,
-                    progress=job.set_progress,
-                )
-                failed_all.update(vid_res["failed"])
-
-            res_out: dict[str, Any] = {"images": images_saved, "failed": failed_all}
-            if failed_all:
-                res_out["error"] = f"{len(failed_all)} mục lỗi trên ComfyUI"
-            return res_out
-
-        kind = {"portraits": "portraits", "locations": "locations", "keyframes": "keyframes"}.get(action, "video")
-        titles = {
-            "portraits": "ComfyUI · Tạo ảnh nhân vật",
-            "locations": "ComfyUI · Tạo ảnh bối cảnh",
-            "keyframes": "ComfyUI · Tạo keyframe",
-            "video": "ComfyUI · Render video",
-            "pipeline": "ComfyUI · Chạy toàn bộ flow",
-        }
-        return jobs.start(kind, titles[action], pid, work).public()
 
     @app.delete("/api/projects/{pid}")
     def delete(pid: str) -> dict[str, Any]:
