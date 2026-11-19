@@ -36,6 +36,7 @@ from .. import ai as ai_mod
 from .. import durations as dur
 from .. import autopilot, film_chat, flow_caps, formats, qc, social, manual_clip, model_change, model_meta, retirement
 from .. import progress as prog
+from .. import script_library
 from .. import rules as rules_mod
 from ..assemble import AssembleError, assemble, subtitle_paths
 from ..backup import AutoBackup, BackupError, Rclone, check_name, check_remote, last_backup
@@ -446,6 +447,9 @@ class PlanBody(BaseModel):
     genres: list[str] = []
     ai_model: str | None = None  # None / claude (default) | gemini-pro
     engine: Literal["flow", "muse"] = "flow"  # who makes the pictures and the videos
+    # A script from the library ("Kho kịch bản", filmmaker/script_library.py): its folder name. The storyboard
+    # follows that script; `idea` is then an optional extra note.
+    script: str | None = None
 
 
 def _credits(out: Path) -> str | None:
@@ -685,6 +689,27 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     def out_dir(pid: str) -> Path:
         p = sb_path(pid)
         return p.parent / "output" / p.stem  # same layout as the CLI
+
+    def script_folder(body: "PlanBody") -> Path | None:
+        """Library script of a "Phim mới" request: its folder, with `body.idea` set to the planner input.
+        400 for an unknown script."""
+        if not body.script:
+            return None
+        try:
+            folder = script_library.folder_of(workspace, body.script)
+            text = script_library.read_script(workspace, body.script)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        body.idea = script_library.idea_from_script(text, body.idea)
+        return folder
+
+    def film_dir(title: str, folder: Path | None) -> tuple[str, Path]:
+        """Where a new film goes: the library script's own folder (brief, script and reviews stay with the
+        film) while it has no storyboard yet, else a new folder named after the title."""
+        if folder is not None and not (folder / "storyboard.yaml").exists():
+            (folder / "assets").mkdir(parents=True, exist_ok=True)
+            return folder.name, folder
+        return new_project_dir(title)
 
     def new_project_dir(title: str) -> tuple[str, Path]:
         base = slugify(title)
@@ -1225,6 +1250,21 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     # ---- projects ----
 
+    # ---- script library ("Kho kịch bản") ----
+
+    @app.get("/api/scripts")
+    def list_scripts() -> list[dict[str, Any]]:
+        return script_library.list_scripts(workspace)
+
+    @app.get("/api/scripts/{sid}")
+    def get_script(sid: str) -> dict[str, Any]:
+        try:
+            folder = script_library.folder_of(workspace, sid)
+            text = script_library.read_script(workspace, sid)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc))
+        return {**(script_library.entry(folder) or {}), "text": text}
+
     @app.get("/api/projects")
     def list_projects() -> list[dict[str, Any]]:
         out = []
@@ -1351,6 +1391,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.post("/api/projects/plan")
     def plan_project(body: PlanBody) -> dict[str, Any]:
+        src_folder = script_folder(body)
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
         chosen_model = _ai_model_or_400(body.ai_model)
@@ -1385,7 +1426,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 if body.format:
                     sb.format = body.format
             apply_engine(sb, body.engine)
-            pid, d = new_project_dir(sb.title)
+            pid, d = film_dir(sb.title, src_folder)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
             job.log(f"✔ Xong: “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
@@ -2768,6 +2809,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     @app.post("/api/projects/autopilot")
     def autopilot_new(body: AutoPlanBody) -> dict[str, Any]:
         """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
+        src_folder = script_folder(body)
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
         chosen_model = _ai_model_or_400(body.ai_model)
@@ -2799,7 +2841,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 if body.format:
                     sb.format = body.format
             apply_engine(sb, body.engine)
-            pid, d = new_project_dir(sb.title)
+            pid, d = film_dir(sb.title, src_folder)
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
             job.project = pid  # the UI opens the project while the rest runs

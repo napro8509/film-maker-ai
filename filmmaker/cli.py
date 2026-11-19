@@ -221,8 +221,7 @@ def _check_model_choice(video_model: str | None, image_model: str | None) -> tup
     return vm, im
 
 
-SCRIPT_IDEA_HEAD = ("Chuyển ĐÚNG kịch bản đã duyệt dưới đây thành storyboard: giữ nguyên số cảnh, thứ tự cảnh, "
-                    "nhân vật, trang phục, bối cảnh và từng chữ của lời thoại (không viết lại, không thêm thoại).")
+from .script_library import SCRIPT_IDEA_HEAD, idea_from_script  # noqa: E402  (kept next to its only users)
 
 
 def _idea_from(idea: str | None, script_file: Path | None) -> str | None:
@@ -232,8 +231,7 @@ def _idea_from(idea: str | None, script_file: Path | None) -> str | None:
     text = script_file.read_text(encoding="utf-8").strip()
     if not text:
         raise click.BadParameter("file kịch bản trống", param_hint="'--script'")
-    extra = f"\nGhi chú thêm: {idea.strip()}" if idea and idea.strip() else ""
-    return f"{SCRIPT_IDEA_HEAD}{extra}\n\n{text}"
+    return idea_from_script(text, idea)
 
 
 def _apply_models(sb, video_model: str | None, image_model: str | None) -> None:

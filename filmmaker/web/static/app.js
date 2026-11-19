@@ -49,6 +49,7 @@ const ICONS = {
   refresh: '<path d="M20 12a8 8 0 1 1-2.3-5.7L20 8.5M20 3.5v5h-5"/>',
   sparkle: '<path d="M11 3l1.8 5.2L18 10l-5.2 1.8L11 17l-1.8-5.2L4 10l5.2-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
   template: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+  book: '<path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H11v17H5.5A1.5 1.5 0 0 1 4 18.5z"/><path d="M20 4.5A1.5 1.5 0 0 0 18.5 3H13v17h5.5a1.5 1.5 0 0 0 1.5-1.5z"/>',
   file: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>',
   import: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M12 10v7M9 14l3 3 3-3"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
@@ -3819,10 +3820,11 @@ function openNewProject() {
   const engineRow = () => engineField(() => engine, (v) => { engine = v; });
   const body = h("div");
   const render = () => {
-    const choices = [["ai", "sparkle", "Từ ý tưởng", "AI viết storyboard cho bạn"], ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
+    const choices = [["ai", "sparkle", "Từ ý tưởng", "AI viết storyboard cho bạn"], ["library", "book", "Từ kho kịch bản", "Kịch bản đã duyệt → phim"],
+      ["template", "template", "Từ mẫu", "Phim mẫu 3 cảnh để làm quen"],
       ["blank", "file", "Trống", "Tự viết từng cảnh"], ["import", "import", "Nhập file", "Mở file storyboard .yaml có sẵn"],
       ["drive", "cloud", "Từ Drive", "Khôi phục dự án đã backup"]];
-    const form = { ai: aiForm, template: () => titleForm("Ly cà phê đầu tiên"), blank: () => titleForm(""), import: importForm, drive: driveForm }[mode]();
+    const form = { ai: aiForm, library: libraryForm, template: () => titleForm("Ly cà phê đầu tiên"), blank: () => titleForm(""), import: importForm, drive: driveForm }[mode]();
     put(body, h("div", { class: "choice", role: "radiogroup", "aria-label": "Cách tạo phim" }, choices.map(([k, ic, t, d]) => h("button", { class: mode === k ? "on" : "", role: "radio", "aria-checked": String(mode === k), onclick: () => { mode = k; render(); } }, icon(ic), h("b", {}, t), h("span", {}, d)))), form);
   };
   let close;
@@ -3994,6 +3996,92 @@ function openNewProject() {
       h("div", { class: "row" }, h("span", { class: "spacer" }),
         h("button", { class: "btn", onclick: go, title: "Chỉ viết storyboard để bạn xem và sửa trước" }, "Chỉ viết storyboard"),
         h("button", { class: "btn primary", onclick: goAuto, title: "Storyboard → nhân vật → keyframe → video → AI dựng phim → thumbnail, có agent review" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
+  };
+  /* Script library ("Kho kịch bản"): every approved script.md in the workspace. The storyboard keeps the
+     script's scenes and lines word for word (new text -> image -> video flow, with dialogue). */
+  const libraryForm = () => {
+    const modelRow = field("Model AI", aiModelSelect(aiModel, (v) => { aiModel = v; render(); }), "chuyển kịch bản thành storyboard; mặc định là Claude");
+    if (!aiModelReady(aiModel)) return h("div", { class: "stack" }, modelRow, aiModelBanner(aiModel, () => { close(); openSettings(); }));
+    const box = h("div", { class: "stack" }, h("p", { class: "row muted" }, h("span", { class: "spinner" }), "Đang đọc kho kịch bản…"));
+    let items = [], picked = null, query = "";
+    const F = S.env.formats;
+    const fmtKey = F ? ((F.formats.find((f) => f.key === "clip" && !f.deprecated) || F.formats.find((f) => f.basic && !f.deprecated) || {}).key) : null;
+    const listBox = h("div", { class: "script-list", role: "radiogroup", "aria-label": "Kịch bản" });
+    const detail = h("div", { class: "stack" });
+    const search = h("input", { type: "search", placeholder: "Tìm theo tên, logline…", "aria-label": "Tìm kịch bản",
+      oninput: (e) => { query = e.target.value.trim().toLowerCase(); drawList(); } });
+    const score = (it) => it.score != null ? h("span", { class: "badge " + (it.verdict === "PASS" ? "done" : "changed") }, `${it.score}/10`) : null;
+    const drawList = () => {
+      const shown = items.filter((it) => !query || [it.title, it.subtitle, it.logline, it.id].join(" ").toLowerCase().includes(query));
+      put(listBox, shown.length ? shown.map((it) => h("button", {
+        type: "button", class: "script-row" + (picked && picked.id === it.id ? " on" : ""), role: "radio",
+        "aria-checked": String(!!(picked && picked.id === it.id)), onclick: () => { picked = it; drawList(); drawDetail(); } },
+        h("div", { class: "row" }, h("b", {}, it.title), it.subtitle ? h("span", { class: "muted" }, it.subtitle) : null, h("span", { class: "spacer" }),
+          it.has_film ? h("span", { class: "badge" }, "Đã có phim") : null, score(it)),
+        it.logline ? h("span", { class: "logline" }, it.logline) : null,
+        h("span", { class: "meta" }, [it.scenes ? `${it.scenes} cảnh` : null, it.dialogue_language, it.aspect, it.id].filter(Boolean).join(" · "))))
+        : h("p", { class: "muted" }, query ? "Không có kịch bản nào khớp." : "Kho chưa có kịch bản nào."));
+    };
+    const drawDetail = () => {
+      if (!picked) { put(detail, h("p", { class: "help" }, "Chọn một kịch bản ở trên.")); return; }
+      const it = picked;
+      const n = h("input", { type: "number", min: 1, max: 80, value: it.scenes || 10 });
+      const aspect = h("select", {}, h("option", { value: "9:16" }, "Dọc 9:16 (TikTok/Shorts)"), h("option", { value: "16:9" }, "Ngang 16:9"));
+      aspect.value = it.aspect || "9:16";
+      const lang = langPicker(DIALOGUE_LANGS, it.dialogue_language || "Vietnamese");
+      const note = h("textarea", { rows: 2, placeholder: "Ghi chú thêm cho AI (không bắt buộc), ví dụ: giữ trang phục Thái, không có tiền giấy trong hình…" });
+      const burn = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+      const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
+      const preview = h("pre", { class: "script-preview", hidden: true });
+      const toggle = h("button", { type: "button", class: "btn sm", onclick: async () => {
+        if (!preview.hidden) { preview.hidden = true; toggle.textContent = "Xem kịch bản"; return; }
+        try { if (!preview.textContent) preview.textContent = (await api("GET", `/api/scripts/${encodeURIComponent(it.id)}`)).text; preview.hidden = false; toggle.textContent = "Ẩn kịch bản"; }
+        catch (e) { toast(e.message, "error"); }
+      } }, "Xem kịch bản");
+      const payload = () => {
+        const l = lang.read();
+        if (!l.ok) { toast("Ngôn ngữ lời nói: " + l.msg, "error"); lang.input.focus(); return null; }
+        return { script: it.id, idea: note.value, scenes: Math.max(1, Math.min(80, +n.value || it.scenes || 10)), aspect: aspect.value,
+          language: l.value, dialogue_language: l.value, ...(fmtKey ? { format: fmtKey, audio: "dialogue", visual_style: "realistic", genres: [] } : {}),
+          engine, ...(aiModel === "gemini-pro" ? { ai_model: aiModel } : {}) };
+      };
+      const planOnly = async (e) => {
+        const body = payload(); if (!body) return;
+        const btn = e.currentTarget; btn.disabled = true;
+        try { startJob(await api("POST", "/api/projects/plan", body)); close(); toast(`${aiModelLabel(aiModel)} đang chuyển kịch bản thành storyboard, thường mất 1–3 phút…`, "", 6000); }
+        catch (err) { toast(err.message, "error"); btn.disabled = false; }
+      };
+      const planAll = async (e) => {
+        const body = payload(); if (!body) return;
+        const btn = e.currentTarget;
+        localSet("autoSubs", burn.checked); localSet("autoReview", autoReview.checked);
+        if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(body.scenes, autoReview.checked), "Bắt đầu"))) return;
+        btn.disabled = true;
+        try { startJob(await api("POST", "/api/projects/autopilot", { ...body, review: autoReview.checked, burn_subtitles: burn.checked })); close(); toast("Đang tạo phim tự động từ kịch bản. Bạn có thể làm việc khác.", "", 8000); }
+        catch (err) { toast(err.message, "error"); btn.disabled = false; }
+      };
+      put(detail,
+        h("div", { class: "row" }, h("b", {}, it.title), h("span", { class: "spacer" }), toggle), preview,
+        it.has_film ? h("div", { class: "banner flush", role: "note" }, icon("info"), h("div", { class: "b-body" }, "Kịch bản này đã có phim; phim mới sẽ nằm ở thư mục riêng, phim cũ giữ nguyên.")) : null,
+        h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh"), n), field("Khung hình", aspect)),
+        field("Ngôn ngữ lời nói", lang.el, "nhân vật nói và phụ đề"),
+        field("Ghi chú thêm", note),
+        h("div", { class: "auto-opts" },
+          h("label", { class: "check" }, autoReview, h("span", {}, "Cổng kiểm duyệt tự động", h("span", { class: "sub" }, "Chấm keyframe trước khi tạo video, hậu kiểm clip trước khi ghép."))),
+          h("label", { class: "check" }, burn, h("span", {}, "In phụ đề lên video", h("span", { class: "sub" }, "Luôn có thêm file .srt riêng.")))),
+        h("p", { class: "help" }, "Storyboard giữ đúng cảnh, nhân vật và từng câu thoại của kịch bản. Bạn xem và sửa lại trước khi tạo hình nếu chọn “Chỉ viết storyboard”."),
+        h("div", { class: "row" }, h("span", { class: "spacer" }),
+          h("button", { class: "btn", onclick: planOnly, title: "Chỉ chuyển kịch bản thành storyboard để bạn xem và sửa trước" }, "Chỉ viết storyboard"),
+          h("button", { class: "btn primary", onclick: planAll }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
+    };
+    api("GET", "/api/scripts").then((r) => {
+      items = r;
+      if (!items.length) { put(box, h("p", { class: "muted" }, "Kho chưa có kịch bản nào. Kịch bản là file script.md trong thư mục phim (do đội biên kịch viết).")); return; }
+      drawList(); drawDetail();
+      put(box, search, listBox, detail);
+      setTimeout(() => search.focus(), 30);
+    }).catch((e) => put(box, h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, e.message))));
+    return h("div", { class: "stack" }, modelRow, engineRow(), box);
   };
   const importForm = () => {
     const inp = h("input", { type: "file", accept: ".yaml,.yml" });
