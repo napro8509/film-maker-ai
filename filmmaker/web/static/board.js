@@ -1618,13 +1618,15 @@ function bKfCard(cd) {
       zone(z("actions"), () => {
         const s = st(), busy = jobRunning(), errs = S.cur.errors?.length, hasKf = !!s.keyframe_url;
         const failed = !!failedKf() && !bSceneRunning(sc, "kf");
-        return h("div", { class: "board-card-actions row" },
+        const kids = [h("div", { class: "board-card-actions row" },
           h("button", {
             class: "btn sm", disabled: busy || !!errs,
             title: busy ? "Đang có việc chạy" : errs ? "Storyboard đang lỗi" : "Ảnh trên Flow miễn phí",
             onclick: () => runAction("keyframes", { only: [sid], force_keyframes: hasKf ? [sid] : [] }),
           }, icon(hasKf || failed ? "refresh" : "image"), failed ? "Thử lại" : hasKf ? "Tạo lại" : "Tạo KF", FREE()),
-          bVideoShown(sc) ? null : h("button", { class: "btn sm ghost", disabled: !!errs, onclick: () => bShowVideo(sc) }, icon("arrowRight"), "Video"));
+          bVideoShown(sc) ? null : h("button", { class: "btn sm ghost", disabled: !!errs, onclick: () => bShowVideo(sc) }, icon("arrowRight"), "Video"))];
+        if (hasKf && !s.keyframe_stale && typeof renderKeyframeQC === "function") kids.push(renderKeyframeQC(sc, s, busy));
+        return h("div", { class: "stack tight" }, kids);
       }),
     ]);
 }

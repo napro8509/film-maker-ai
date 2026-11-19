@@ -103,9 +103,9 @@ def test_vimax_parallel_keyframe_candidates_and_vlm_scoring(tmp_path, monkeypatc
     out = tmp_path / "output" / "storyboard"
 
     lock = threading.Lock()
+    barrier = threading.Barrier(3, timeout=10.0)
     in_flight = 0
     max_in_flight = 0
-    img_counter = 0
     video_inputs: list[bytes] = []
 
     class ParallelFakeGflow(Gflow):
@@ -116,18 +116,18 @@ def test_vimax_parallel_keyframe_candidates_and_vlm_scoring(tmp_path, monkeypatc
             return "proj-vimax"
 
         def text_to_image(self, prompt, *, out, **kw):
-            nonlocal in_flight, max_in_flight, img_counter
+            nonlocal in_flight, max_in_flight
             with lock:
                 in_flight += 1
                 max_in_flight = max(max_in_flight, in_flight)
-                img_counter += 1
-                idx = img_counter
             try:
-                time.sleep(0.08)
+                barrier.wait()
+                with lock:
+                    max_in_flight = max(max_in_flight, in_flight)
                 p = Path(out)
-                if "c1" in p.name or idx == 1:
+                if p.name.endswith("_c1.png"):
                     _make_png(p, black=True)
-                elif "c2" in p.name or idx == 2:
+                elif p.name.endswith("_c2.png"):
                     _make_png(p, color="blue")
                 else:
                     _make_png(p, color="red")
@@ -665,3 +665,95 @@ def test_web_endpoints_settings_local_qc_keyframe_select_and_assembly_gate(tmp_p
     assert j_st["status"] == "done", j_st["lines"]
     assert any("Cổng QC loại bỏ 1 clip lỗi" in ln and "s02" in ln for ln in j_st["lines"])
     assert qc.ffprobe_clip(out / "final.mp4")["duration"] < 2.2
+
+    # 6. Invalid candidate index returns 400
+    assert c.post(f"/api/projects/{pid}/scenes/s01/select-keyframe", json={"index": 0}).status_code == 400
+
+
+@needs_ffmpeg
+def test_cli_default_pre_qc_with_ai_backend_and_partial_vlm_fallback_to_openmontage(tmp_path, monkeypatch):
+    from filmmaker import cli as cli_mod
+
+    monkeypatch.setattr(qc, "tesseract_binary", lambda: None)
+    monkeypatch.setattr(qc, "whisper_binary", lambda: None)
+
+    sb = Storyboard.model_validate({
+        "title": "Default PreQC",
+        "format": "clip",
+        "audio": "silent",
+        "scenes": [
+            {"id": "s01", "mode": "keyframe", "image_prompt": "Dawn lake", "prompt": "Ripples", "duration": 2},
+            {"id": "s02", "mode": "keyframe", "image_prompt": "Noon sky", "prompt": "Clouds", "duration": 2},
+        ],
+    })
+    monkeypatch.setattr(ai, "pick_backend", lambda *a, **k: "api")
+    cand_n, gate, kw = cli_mod._resolve_pre_qc(sb, None, None)
+    assert cand_n == 2 and gate is True and kw["backend"] == "api"
+
+    # When VLM succeeds on s01 and throws an error on s02, CLI `_qc` still falls back to OpenMontage on s02!
+    out = tmp_path / "out"
+    c1 = _make_clip(out / "clips" / "s01.mp4", duration=1.5, black=False)
+    c2 = _make_clip(out / "clips" / "s02.mp4", duration=2.0, black=True)
+    pipe = Pipeline(sb, out, Gflow(dry_run=True))
+    pipe.state.update("s01", status=DONE, video=str(c1), fingerprint=sb.scene_fingerprint(sb.scenes[0]))
+    pipe.state.update("s02", status=DONE, video=str(c2), fingerprint=sb.scene_fingerprint(sb.scenes[1]))
+
+    def flaky_ask(system, user, schema, *, images=(), **kw):
+        if "QC scene s02" in user:
+            raise RuntimeError("transient VLM timeout")
+        return qc.QCAnswer(verdict="PASS", score=9, issues=[], picture="Tốt", sound="Êm")
+
+    monkeypatch.setattr(ai, "ask", flaky_ask)
+    done = cli_mod._qc(sb, out, None, force=True)
+    assert done["s01"]["verdict"] == "PASS" and done["s01"]["vlm_checked"] is True
+    assert done["s02"]["verdict"] == "FAIL" and done["s02"]["vlm_checked"] is False
+
+
+@needs_ffmpeg
+def test_muse_candidates_serialize_browser_and_stale_candidates_cleaned(tmp_path, monkeypatch):
+    sb = Storyboard.model_validate({
+        "title": "Muse Safe",
+        "image_model": "muse",
+        "model": "muse",
+        "scenes": [{"id": "s01", "mode": "keyframe", "image_prompt": "Forest trail", "prompt": "Walk", "duration": 10}],
+    })
+    out = tmp_path / "out"
+    cdir = out / "keyframes" / "candidates"
+    _make_png(cdir / "s01_c3.png", color="purple")  # stale leftover from a 3-candidate run
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class MuseFakeGflow(Gflow):
+        def __init__(self):
+            super().__init__(dry_run=False, log=lambda *_: None)
+
+        def text_to_image(self, prompt, *, out, **kw):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return _make_png(Path(out), color="green")
+            finally:
+                with lock:
+                    active -= 1
+
+    pipe = Pipeline(sb, out, MuseFakeGflow(), sleep=lambda *_: None)
+    rep = pipe.run(RunOptions(keyframes_only=True, keyframe_candidates=2, pre_qc_gate=True, pause=(0, 0)))
+    assert rep.done == ["s01"]
+    assert max_active == 1, "Muse browser profile calls must be serialized by _ui_browser_lock"
+    assert sorted(p.name for p in cdir.glob("s01_c*.png")) == ["s01_c1.png", "s01_c2.png"]
+
+
+def test_new_film_ui_enables_auto_qc_by_default():
+    static = Path(__file__).resolve().parent.parent / "filmmaker" / "web" / "static"
+    app_js = (static / "app.js").read_text(encoding="utf-8")
+    assert "review: false" not in app_js
+    assert "review: autoReview.checked" in app_js
+    if shutil.which("node"):
+        for fn in ("app.js", "board.js"):
+            proc = subprocess.run(["node", "--check", str(static / fn)], capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stderr

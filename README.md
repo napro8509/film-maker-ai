@@ -535,10 +535,10 @@ Tạo ảnh bối cảnh bằng CLI: `filmmaker locations storyboard.yaml [--nam
 
 ## Cổng kiểm duyệt tự động (ViMax & OpenMontage)
 
-Luồng làm phim tích hợp hai cổng kiểm duyệt tự động (Automated QC) trước và sau khi render để ngăn clip lỗi lọt vào bản ghép cuối:
+Luồng làm phim mặc định (`run`, `make`, `auto` và giao diện web **Phim mới → Tạo tự động toàn bộ**) tích hợp hai cổng kiểm duyệt tự động (Automated QC) trước và sau khi render để ngăn clip lỗi lọt vào bản ghép cuối:
 
 1. **Tiền kiểm keyframe kiểu ViMax (Pre-render QC)**:
-   - Sinh song song nhiều ứng viên keyframe đầu vào (`--keyframe-candidates 2..4`, miễn phí trên Flow) kèm ảnh tham chiếu nhân vật/bối cảnh.
+   - Mặc định sinh song song 2 ứng viên keyframe đầu vào (`--keyframe-candidates 2..4`, miễn phí trên Flow) kèm ảnh tham chiếu nhân vật/bối cảnh khi có VLM sẵn sàng.
    - Kiểm tra ảnh cục bộ (`ffprobe`, độ sáng/khung hình đen, OCR `tesseract` nếu có) rồi dùng VLM (`Claude` hoặc `Gemini Pro`) chấm điểm và tự động chọn ứng viên tốt nhất trước khi gọi API tạo video tốn phí.
    - Nếu mọi ứng viên đều bị đánh `FAIL`, tự động dùng prompt sửa của VLM sinh lại 1 lượt miễn phí; khi bật `qc_gate: true` trong storyboard, cảnh có keyframe vẫn `FAIL` sẽ bị chặn không gửi lên API tạo video để bảo toàn credit.
 2. **Hậu kiểm clip kiểu OpenMontage + AI QC (Post-render QC)**:

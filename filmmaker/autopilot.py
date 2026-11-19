@@ -684,14 +684,13 @@ class Autopilot:
 
         pipe = self.pipe()
         self.log("AI QC + OpenMontage đang xem 4 frame, kiểm ffprobe và nghe từng clip mới…")
-        done_qc = qc.run(pipe, log=self.log, stop=self.should_stop, **self.ai_kw())
+        qc.run(pipe, log=self.log, stop=self.should_stop, **self.ai_kw())
         self.check_stop()
-        if not done_qc:
-            unchecked = [s for s in pipe.sb.scenes
-                         if pipe.is_done(s) and qc.current(self.out, s.id, qc.clip_of(pipe, s)) is None]
-            if unchecked:
-                qc.run_openmontage(pipe, log=self.log, stop=self.should_stop)
-                self.check_stop()
+        unchecked = {s.id for s in pipe.sb.scenes
+                     if pipe.is_done(s) and qc.current(self.out, s.id, qc.clip_of(pipe, s)) is None}
+        if unchecked:
+            qc.run_openmontage(pipe, only=unchecked, log=self.log, stop=self.should_stop)
+            self.check_stop()
 
         if self.cfg.auto_rerender_qc and self.cfg.rerender_budget > 0:
             rerendered: list[str] = self.data.setdefault("rerendered", [])
@@ -712,8 +711,9 @@ class Autopilot:
                 pipe = self.pipe()
                 rs = qc.run(pipe, only=set(candidates_redo), force=True, log=self.log,
                             stop=self.should_stop, **self.ai_kw())
-                if not rs:
-                    qc.run_openmontage(pipe, only=set(candidates_redo), force=True,
+                rem_redo = set(candidates_redo) - set(rs)
+                if rem_redo:
+                    qc.run_openmontage(pipe, only=rem_redo, force=True,
                                        log=self.log, stop=self.should_stop)
                 self.check_stop()
 

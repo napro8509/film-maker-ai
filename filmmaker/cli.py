@@ -458,8 +458,8 @@ def _resolve_pre_qc(sb, keyframe_candidates: int | None, pre_qc: bool | None) ->
         cand = max(1, min(4, int(sb.keyframe_candidates)))
     elif pre_qc is True:
         cand = int(s.get("keyframe_candidates") or 2)
-    elif backend and int(s.get("keyframe_candidates") or 1) > 1 and s.get("pre_qc", True):
-        cand = max(1, min(4, int(s["keyframe_candidates"])))
+    elif backend and s.get("pre_qc", True):
+        cand = max(1, min(4, int(s.get("keyframe_candidates") or 2)))
     else:
         cand = 1
 
@@ -584,6 +584,16 @@ def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str |
         click.echo("=== AI QC + OpenMontage: kiểm ffprobe, trích 4 frame đen/chữ, âm thanh và lời thoại ===")
         extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
         done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key, **extra)
+        unchecked = {
+            sc.id for sc in sb.scenes
+            if (not only or sc.id in only)
+            and pipe.state.scene(sc.id).get("status") == "done"
+            and qc.clip_of(pipe, sc).is_file()
+            and sc.id not in done
+            and qc.current(out_dir, sc.id, qc.clip_of(pipe, sc)) is None
+        }
+        if unchecked:
+            done.update(qc.run_openmontage(pipe, only=unchecked, force=force, log=click.echo))
     failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
     if failed:
         click.echo(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — render lại nếu muốn: "

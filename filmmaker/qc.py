@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -265,7 +266,21 @@ def _frame_luma_stats(path: Path) -> dict[str, Any]:
     return {"mean_luma": mean_y, "dark_ratio": dark_ratio, "is_black": is_black}
 
 
-_OCR_WORD_RE = re.compile(r"[A-Za-zÀ-ỹ0-9]{3,}")
+_OCR_WORD_RE = re.compile(r"[A-Za-zÀ-ỹ\u0E00-\u0E7F0-9]{3,}")
+
+
+@functools.lru_cache(maxsize=8)
+def _tesseract_lang(binary: str) -> str:
+    """Pick installed Tesseract languages (`eng`, plus `vie`/`tha` when available) once per binary."""
+    try:
+        proc = subprocess.run([binary, "--list-langs"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return "eng"
+    if proc.returncode != 0:
+        return "eng"
+    avail = {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+    picked = [code for code in ("eng", "vie", "tha") if code in avail]
+    return "+".join(picked) if picked else "eng"
 
 
 def ocr_frame(path: Path) -> str:
@@ -273,20 +288,20 @@ def ocr_frame(path: Path) -> str:
     binary = tesseract_binary()
     if not binary or not path.is_file():
         return ""
-    for lang in ("eng+vie", "eng"):
-        try:
-            proc = subprocess.run(
-                [binary, str(path), "stdout", "--psm", "6", "-l", lang],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return ""
-        if proc.returncode == 0:
-            cleaned = " ".join((proc.stdout or "").split())
-            words = _OCR_WORD_RE.findall(cleaned)
-            if len(words) >= 2 or any(len(w) >= 5 for w in words):
-                return cleaned[:160]
-            return ""
+    lang = _tesseract_lang(binary)
+    try:
+        proc = subprocess.run(
+            [binary, str(path), "stdout", "--psm", "6", "-l", lang],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    cleaned = " ".join((proc.stdout or "").split())
+    words = _OCR_WORD_RE.findall(cleaned)
+    if len(words) >= 2 or any(len(w) >= 5 for w in words):
+        return cleaned[:160]
     return ""
 
 
@@ -467,16 +482,19 @@ def black_span(clip: Path) -> float:
     return round(total, 3)
 
 
-def audio_stats(clip: Path) -> dict[str, Any]:
+def audio_stats(clip: Path, *, has_audio: bool | None = None, duration: float | None = None) -> dict[str, Any]:
     """Audio track present, mean/max volume (dB), silent share, and OpenMontage dead-air / clipping indicators."""
     out: dict[str, Any] = {"has_audio": False}
-    try:
-        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
-                                "-of", "csv=p=0", str(clip)], capture_output=True, text=True, timeout=60).stdout
-    except (OSError, subprocess.TimeoutExpired):
+    if has_audio is False:
         return out
-    if not probe.strip():
-        return out
+    if has_audio is None:
+        try:
+            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                                    "-of", "csv=p=0", str(clip)], capture_output=True, text=True, timeout=60).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return out
+        if not probe.strip():
+            return out
     out["has_audio"] = True
     try:
         err = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(clip), "-af",
@@ -508,7 +526,7 @@ def audio_stats(clip: Path) -> dict[str, Any]:
                 silent += float(line.split("silence_duration:")[1].split()[0])
             except (ValueError, IndexError):
                 pass
-    dur = reviewer.duration_of(clip)
+    dur = duration if (duration is not None and duration > 0) else reviewer.duration_of(clip)
     out["duration"] = round(dur, 2)
     out["silent_share"] = round(min(1.0, silent / dur), 2) if dur else None
     mean_db = out.get("mean_db")
@@ -545,7 +563,7 @@ def openmontage_check(clip: Path, work: Path, *, sb: Storyboard | None = None, s
     dur = probe["duration"]
     frames = extract_four_frames(clip, work, sid, duration=dur)
     b_span = black_span(clip)
-    sound = audio_stats(clip)
+    sound = audio_stats(clip, has_audio=probe["has_audio"], duration=dur)
     black_idx = [f["index"] for f in frames if f["is_black"]]
     ocr_hits = [f"frame #{f['index']} ({f['time']}s): {f['ocr_text']}" for f in frames if f.get("ocr_text")]
 
@@ -554,17 +572,21 @@ def openmontage_check(clip: Path, work: Path, *, sb: Storyboard | None = None, s
     if not frames:
         hard_issues.append("OpenMontage: không trích xuất được 4 khung hình kiểm tra từ video.")
     else:
-        # Interior frames (#2, #3) being black = mid-clip dropout; >=2 of 4 black or >=40% black = dead/blank render.
-        # A brief <=0.6s fade-in/out touching only frame #1 or #4 is left to the editor's trim rather than false-failing.
+        # Interior frames (#2, #3) being black = mid-clip dropout; >=2 of 4 black, a sampled black frame with >=0.8s
+        # black span, or >=35% black = dead/blank render. A brief <=0.6s fade touching only #1/#4 is MINOR/trimmed.
         severe_black = (
             2 in black_idx
             or 3 in black_idx
             or len(black_idx) >= 2
-            or (dur > 0 and b_span >= max(0.8, 0.4 * dur))
+            or (bool(black_idx) and b_span >= 0.8)
+            or (dur > 0 and b_span >= max(0.8, 0.35 * dur))
         )
         if severe_black:
             where = ", ".join(f"#{i}" for i in black_idx) if black_idx else f"{b_span:.1f}s"
             hard_issues.append(f"OpenMontage phát hiện khung hình đen trong video ({where}, tổng {b_span:.1f}s đen).")
+        elif black_idx:
+            where = ", ".join(f"#{i}" for i in black_idx)
+            minor_issues.append(f"OpenMontage: frame {where} tối đen ngắn ở rìa clip ({b_span:.1f}s).")
 
     allow_text = bool(sb is not None and sb.audio == "onscreen_text")
     if ocr_hits and not allow_text:
@@ -889,6 +911,7 @@ def _om_summary(om: dict[str, Any], *, black_flag: bool = False, text_flag: bool
         "black_flagged": bool(om["black_frame_indices"] or black_flag),
         "text_errors": bool(om["ocr_texts"] or text_flag),
         "ocr_texts": om["ocr_texts"],
+        "audio": om["audio"],
         "issues": om["issues"],
     }
 

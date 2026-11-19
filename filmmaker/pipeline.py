@@ -688,6 +688,8 @@ class Pipeline:
         """Promote candidate `index` (1-based, from `qc_keyframes.json`) to `<out>/keyframes/<sid>.png`."""
         from . import qc
 
+        if index < 1:
+            raise ValueError("chỉ số ứng viên keyframe phải >= 1")
         kf = self.keyframe_path(s)
         rec = qc.load_keyframe_qc(self.out).get(s.id) or {}
         cands = rec.get("candidates") or []
@@ -722,7 +724,13 @@ class Pipeline:
                                         log_line=log_line, kinds=kinds)
         chained = src is not None and img is not None
         if img is None:
-            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(sent, **kw), opts.max_retries)
+            def _t2i_call() -> Path:
+                if is_muse(kw.get("model")):
+                    with self._ui_browser_lock:
+                        return self.g.text_to_image(sent, **kw)
+                return self.g.text_to_image(sent, **kw)
+
+            img = self._with_retries("tạo keyframe", _t2i_call, opts.max_retries)
         p = Path(img)
         if not self.g.dry_run and p != dest and p.is_file():
             dest.write_bytes(p.read_bytes())
@@ -792,6 +800,11 @@ class Pipeline:
         sent = self.sb.for_flow_keyframe(self.sb.image_prompt(s), s)
         n_cand = self._effective_candidates(opts)
         use_vimax = not self.g.dry_run and (n_cand > 1 or opts.pre_qc_gate or bool(self.sb.qc_gate))
+        if not self.g.dry_run:
+            cdir0 = self.candidate_dir()
+            if cdir0.is_dir():
+                for old_p in (*cdir0.glob(f"{s.id}_c*.png"), *cdir0.glob(f"{s.id}_r*.png")):
+                    old_p.unlink(missing_ok=True)
 
         if not use_vimax:
             _, chained = self._generate_one_keyframe(sent, kf, refs, kinds, project, opts, src=src, loc=loc)

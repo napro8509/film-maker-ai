@@ -2235,6 +2235,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         pipe = Pipeline(sb, out_dir(pid), gflow(True))
         try:
             pipe.select_keyframe_candidate(scene, body.index)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
         return detail(pid)
@@ -2623,6 +2625,18 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log("=== Hậu kiểm tự động (OpenMontage + AI QC): ffprobe, 4 frame, âm thanh & lời thoại ===")
             done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
                           backend=backend, api_key=s.get("anthropic_api_key") or None, **ai_extra)
+            unchecked = {
+                sc.id for sc in sb.scenes
+                if not job.stop_requested
+                and (not only or sc.id in only)
+                and pipe.state.scene(sc.id).get("status") == DONE
+                and qc.clip_of(pipe, sc).is_file()
+                and sc.id not in done
+                and qc.current(out_dir(pid), sc.id, qc.clip_of(pipe, sc)) is None
+            }
+            if unchecked:
+                done.update(qc.run_openmontage(pipe, only=unchecked, force=force,
+                                               log=job.log, stop=lambda: job.stop_requested))
         else:
             if not local_only:
                 job.log("ℹ Chưa cấu hình VLM (Claude/Gemini) — chạy hậu kiểm kỹ thuật OpenMontage (ffprobe + 4 frame + âm thanh).")

@@ -1660,7 +1660,7 @@ function renderSceneActions(sc, { keyframe = true, video = true, retry = false, 
   if (st.clip_url && st.keyframe_url) row.append(h("button", { class: "btn sm ghost icon", title: "Xem ảnh keyframe", "aria-label": "Xem ảnh keyframe", onclick: () => lightbox(st.keyframe_url) }, icon("image")));
   if (st.clip_url) row.append(h("a", { class: "btn sm ghost icon", href: st.clip_url.split("?")[0], download: `${sc.id}.mp4`, title: "Tải clip", "aria-label": "Tải clip" }, icon("download")));
   kids.push(row);
-  if (sc.mode === "keyframe" && st.keyframe_url && !st.keyframe_stale) kids.push(renderKeyframeQC(sc, st, busy));
+  if (keyframe && sc.mode === "keyframe" && st.keyframe_url && !st.keyframe_stale) kids.push(renderKeyframeQC(sc, st, busy));
   if (done && st.clip_url) kids.push(renderQC(sc, st, busy));
   return h("div", { class: "stack tight" }, kids);
 }
@@ -1792,26 +1792,47 @@ function renderQC(sc, st, busy) {
 
 function renderQCSummary() {
   const sb = S.cur.storyboard;
+  const kfRows = (sb.scenes || []).filter((sc) => sc.mode === "keyframe")
+    .map((sc) => ({ id: sc.id, st: S.cur.scene_state?.[sc.id] }))
+    .filter(({ st }) => st && st.keyframe_url && !st.keyframe_stale);
   const rows = (sb.scenes || []).map((sc) => S.cur.scene_state?.[sc.id]).filter((st) => st && st.status === "done" && st.clip_url);
-  if (!rows.length) return h("div", { hidden: true });
-  const n = { PASS: 0, MINOR: 0, FAIL: 0 }; let none = 0;
-  for (const st of rows) { if (st.qc) n[st.qc.verdict] = (n[st.qc.verdict] || 0) + 1; else none++; }
+  if (!kfRows.length && !rows.length) return h("div", { hidden: true });
   const busy = jobRunning();
-  const fails = (sb.scenes || []).filter((sc) => S.cur.scene_state?.[sc.id]?.qc?.verdict === "FAIL").map((sc) => sc.id);
-  return h("div", { class: "card card-pad qc-summary" },
-    h("div", { class: "row" },
-      h("b", {}, "Cổng hậu kiểm (OpenMontage + AI QC)"),
-      h("span", { class: "qc-tag ok" }, `${n.PASS} đạt`),
-      n.MINOR ? h("span", { class: "qc-tag warn" }, `${n.MINOR} lỗi nhỏ`) : null,
-      n.FAIL ? h("span", { class: "qc-tag bad", title: fails.join(", ") }, `${n.FAIL} lỗi (chặn ghép): ${fails.join(", ")}`) : null,
-      none ? h("span", { class: "small muted" }, `${none} chưa QC`) : null,
+  const blocks = [];
+  if (kfRows.length) {
+    const kn = { PASS: 0, MINOR: 0, FAIL: 0 }; let knone = 0;
+    for (const { st } of kfRows) { if (st.keyframe_qc) kn[st.keyframe_qc.verdict] = (kn[st.keyframe_qc.verdict] || 0) + 1; else knone++; }
+    const kfails = kfRows.filter(({ st }) => st.keyframe_qc?.verdict === "FAIL").map(({ id }) => id);
+    blocks.push(h("div", { class: "row" },
+      h("b", {}, "Cổng tiền kiểm (ViMax Pre-QC)"),
+      h("span", { class: "qc-tag ok" }, `${kn.PASS} đạt`),
+      kn.MINOR ? h("span", { class: "qc-tag warn" }, `${kn.MINOR} lỗi nhỏ`) : null,
+      kn.FAIL ? h("span", { class: "qc-tag bad", title: kfails.join(", ") }, `${kn.FAIL} lỗi keyframe: ${kfails.join(", ")}`) : null,
+      knone ? h("span", { class: "small muted" }, `${knone} chưa chấm`) : null,
       h("span", { class: "spacer" }),
-      none ? h("button", { class: "btn sm", disabled: busy, onclick: () => runQC([]) }, icon("sparkle"), `QC ${none} clip mới`, FREE()) : null,
-      h("button", { class: "btn sm ghost", disabled: busy, title: "Chạy hậu kiểm kỹ thuật OpenMontage (ffprobe + 4 frame + âm thanh)",
-        onclick: () => runQC([], true, { local_only: true }) }, "OpenMontage 4-frame"),
-      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([], true) }, icon("refresh"), "QC lại tất cả")),
-    n.FAIL ? h("p", { class: "help" }, `Cổng QC đang chặn ${n.FAIL} clip FAIL (${fails.join(", ")}) không lọt vào bản ghép cuối. Hãy “Render lại” các cảnh này hoặc tắt cổng chặn ở tab Thành phẩm nếu muốn giữ.`) : null,
-    S.env?.qc && !S.env.qc.model ? h("p", { class: "help" }, "Chưa có model nhận dạng giọng nói nên QC chưa kiểm tra lời thoại — Cài đặt → Cổng QC → Tải model.") : null);
+      knone ? h("button", { class: "btn sm", disabled: busy, onclick: () => runQC([], false, { keyframes: true }) }, icon("sparkle"), `Pre-QC ${knone} keyframe mới`, FREE()) : null,
+      h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([], true, { keyframes: true }) }, icon("refresh"), "Chấm lại keyframe")));
+  }
+  if (rows.length) {
+    const n = { PASS: 0, MINOR: 0, FAIL: 0 }; let none = 0;
+    for (const st of rows) { if (st.qc) n[st.qc.verdict] = (n[st.qc.verdict] || 0) + 1; else none++; }
+    const fails = (sb.scenes || []).filter((sc) => S.cur.scene_state?.[sc.id]?.qc?.verdict === "FAIL").map((sc) => sc.id);
+    blocks.push(
+      h("div", { class: "row" },
+        h("b", {}, "Cổng hậu kiểm (OpenMontage + AI QC)"),
+        h("span", { class: "qc-tag ok" }, `${n.PASS} đạt`),
+        n.MINOR ? h("span", { class: "qc-tag warn" }, `${n.MINOR} lỗi nhỏ`) : null,
+        n.FAIL ? h("span", { class: "qc-tag bad", title: fails.join(", ") }, `${n.FAIL} lỗi (chặn ghép): ${fails.join(", ")}`) : null,
+        none ? h("span", { class: "small muted" }, `${none} chưa QC`) : null,
+        h("span", { class: "spacer" }),
+        none ? h("button", { class: "btn sm", disabled: busy, onclick: () => runQC([]) }, icon("sparkle"), `QC ${none} clip mới`, FREE()) : null,
+        h("button", { class: "btn sm ghost", disabled: busy, title: "Chạy hậu kiểm kỹ thuật OpenMontage (ffprobe + 4 frame + âm thanh)",
+          onclick: () => runQC([], true, { local_only: true }) }, "OpenMontage 4-frame"),
+        h("button", { class: "btn sm ghost", disabled: busy, onclick: () => runQC([], true) }, icon("refresh"), "QC lại tất cả")),
+      n.FAIL ? h("p", { class: "help" }, `Cổng QC đang chặn ${n.FAIL} clip FAIL (${fails.join(", ")}) không lọt vào bản ghép cuối. Hãy “Render lại” các cảnh này hoặc tắt cổng chặn ở tab Thành phẩm nếu muốn giữ.`) : null,
+      S.env?.qc && !S.env.qc.model ? h("p", { class: "help" }, "Chưa có model nhận dạng giọng nói nên QC chưa kiểm tra lời thoại — Cài đặt → Cổng QC → Tải model.") : null);
+  }
+  return h("div", { class: "card card-pad qc-summary stack tight" }, blocks);
 }
 
 // What we know about the clip the user may have downloaded by hand into clips/<id>.mp4 (st.manual_clip from the server).
@@ -2818,14 +2839,14 @@ function renderPublish() {
 /* ---------- autopilot ---------- */
 
 const AUTO_STEPS = [["storyboard", "Storyboard"], ["review_storyboard", "Review kịch bản"], ["characters", "Nhân vật"],
-  ["keyframes", "Keyframe"], ["review_keyframes", "Review keyframe"], ["videos", "Video"], ["review_clips", "AI QC clip"],
+  ["keyframes", "Keyframe (ViMax)"], ["review_keyframes", "Pre-QC keyframe"], ["videos", "Video"], ["review_clips", "OpenMontage + AI QC"],
   ["edit", "AI dựng phim"], ["thumbnail", "Thumbnail"], ["review_film", "Review cả phim"]];
 
 function autoCostText(scenes, review) {
-  return `Chạy liền: viết storyboard → ${review ? "agent review → " : ""}ảnh nhân vật → keyframe → ${review ? "review keyframe → " : ""}`
-    + `render ${scenes} clip video → ${review ? "AI QC từng clip (chỉ đánh dấu, không tự render lại) → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
+  return `Chạy liền: viết storyboard → ${review ? "review kịch bản → " : ""}ảnh nhân vật → ${review ? "sinh keyframe song song & ViMax Pre-QC → " : "keyframe → "}`
+    + `render ${scenes} clip video → ${review ? "hậu kiểm OpenMontage + AI QC (ffprobe, 4 frame đen/chữ, âm thanh) & loại clip lỗi → " : ""}AI dựng phim → thumbnail${review ? " → review cả phim" : ""}. `
     + `Video TỐN CREDIT (veo-lite khoảng 10 credit/clip ≈ ${scenes * 10} credit). `
-    + "Ảnh và dựng phim miễn phí. Có thể bấm Dừng bất cứ lúc nào; bấm “Tạo tự động” lần nữa để làm tiếp từ chỗ dừng.";
+    + "Ảnh, cổng QC và dựng phim miễn phí. Có thể bấm Dừng bất cứ lúc nào; bấm “Tạo tự động” lần nữa để làm tiếp từ chỗ dừng.";
 }
 
 async function openAutopilot(cur) {
@@ -2835,9 +2856,9 @@ async function openAutopilot(cur) {
   const left = (cur.storyboard.scenes || []).filter((s) => cur.scene_state?.[s.id]?.status !== "done").length;
   modal({
     title: "Tạo tự động", body: h("div", { class: "stack" },
-      h("p", {}, left ? `Làm mọi bước còn thiếu cho “${cur.storyboard.title}”: ${left} cảnh chưa có clip.` : "Mọi cảnh đã có clip: agent review, dựng lại phim và làm thumbnail nếu cần."),
+      h("p", {}, left ? `Làm mọi bước còn thiếu cho “${cur.storyboard.title}”: ${left} cảnh chưa có clip.` : "Mọi cảnh đã có clip: cổng QC tự động, dựng lại phim và làm thumbnail nếu cần."),
       h("p", { class: "help" }, autoCostText(left, review.checked)),
-      h("label", { class: "check" }, review, h("span", {}, "Agent review từng bước")),
+      h("label", { class: "check" }, review, h("span", {}, "Cổng kiểm duyệt tự động (ViMax Pre-QC & OpenMontage Post-QC)")),
       h("label", { class: "check" }, subs, h("span", {}, "In phụ đề lên video")),
       h("label", { class: "check" }, autoPub, h("span", {}, "Tự động đăng lên Facebook Reels, Story & YouTube sau khi tạo phim xong"))),
     buttons: [{ label: "Huỷ" }, { label: "Bắt đầu", cls: "primary", onclick: async (c) => {
@@ -3856,6 +3877,7 @@ function openNewProject() {
     aspect.onchange = () => localSet("filmAspect", aspect.value);
     const lang = langPicker(SUBTITLE_LANGS.filter(([v]) => v !== "none"), cleanLang(localGet("filmLang")) || "Vietnamese");
     const burn = h("input", { type: "checkbox", checked: localGet("autoSubs", true) });
+    const autoReview = h("input", { type: "checkbox", checked: localGet("autoReview", true) });
     const audioBox = h("div"), styleBox = h("div"), langBox = h("div");
     const drawAudio = () => {
       const a = F.audio.find((x) => x.key === audio);
@@ -3895,10 +3917,11 @@ function openNewProject() {
       const body = payload(); if (!body) return;
       const btn = e.currentTarget;
       localSet("autoSubs", burn.checked);
-      if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(body.scenes, false), "Bắt đầu"))) return;
+      localSet("autoReview", autoReview.checked);
+      if (!(await confirmModal("Tạo tự động toàn bộ?", autoCostText(body.scenes, autoReview.checked), "Bắt đầu"))) return;
       btn.disabled = true;
       try {
-        const j = await api("POST", "/api/projects/autopilot", { ...body, review: false, burn_subtitles: burn.checked });
+        const j = await api("POST", "/api/projects/autopilot", { ...body, review: autoReview.checked, burn_subtitles: burn.checked });
         close(); localSet("draftIdea", ""); startJob(j); toast("Đang tạo phim tự động. Bạn có thể làm việc khác.", "", 8000);
       } catch (err) { toast(err.message, "error"); btn.disabled = false; }
     };
@@ -3908,10 +3931,13 @@ function openNewProject() {
       h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Phong cách hình ảnh"), styleBox), field("Khung hình", aspect)),
       h("div", { class: "field" }, h("span", { class: "lbl" }, "Thể loại", h("span", { class: "hint" }, " · chọn nhiều")), genreChips),
       h("div", { class: "grid2" }, h("div", { class: "field" }, h("span", { class: "lbl" }, "Số cảnh"), n, minutes), h("div", { class: "stack tight" }, langBox)),
-      h("p", { class: "help" }, `Luồng I2V: mỗi cảnh ${aiModelLabel(aiModel)} viết một ảnh mở đầu và một chuyển động theo chuẩn prompt I2V → tạo ảnh → ảnh thành video. Bối cảnh được mô tả một lần và giữ nguyên giữa các cảnh. Không có chỉ đạo nội dung, camera hay thoại từng dòng như Short drama.`),
+      h("div", { class: "auto-opts" },
+        h("label", { class: "check" }, autoReview, h("span", {}, "Cổng kiểm duyệt tự động (ViMax Pre-QC & OpenMontage Post-QC)",
+          h("span", { class: "sub" }, "Sinh song song ứng viên keyframe để VLM chấm chọn trước khi tạo video; hậu kiểm ffprobe, 4 frame đen/chữ, âm thanh và loại clip lỗi khỏi bản ghép cuối.")))),
+      h("p", { class: "help" }, `Luồng I2V: mỗi cảnh ${aiModelLabel(aiModel)} viết một ảnh mở đầu và một chuyển động theo chuẩn prompt I2V → sinh song song keyframe + ViMax Pre-QC → video → hậu kiểm OpenMontage → dựng phim. Bối cảnh được mô tả một lần và giữ nguyên giữa các cảnh.`),
       h("div", { class: "row" }, h("span", { class: "spacer" }),
         h("button", { class: "btn", onclick: planOnly, title: "Chỉ viết kịch bản để bạn xem và sửa trước" }, "Chỉ viết kịch bản"),
-        h("button", { class: "btn primary", onclick: planAll, title: "Kịch bản → ảnh nhân vật → ảnh cảnh → video → dựng phim → thumbnail" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
+        h("button", { class: "btn primary", onclick: planAll, title: "Kịch bản → ảnh nhân vật → keyframe (ViMax Pre-QC) → video → OpenMontage Post-QC → dựng phim → thumbnail" }, icon("sparkle"), "Tạo tự động toàn bộ", PAID())));
   };
   /* Short drama: the original form, unchanged (`fmt` is sent so the project records its format). */
   const dramaForm = (fmt) => {
