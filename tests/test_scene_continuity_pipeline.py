@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.legacy_rules import LEGACY_RULES
+
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import Pipeline, RunOptions, file_sha
 from filmmaker.storyboard import load_storyboard
@@ -51,7 +53,8 @@ class Env:
                                for n in ("Minh", "Lan", "Tuan")],
                 "locations": [{"name": "Phòng khách", "description": ROOM, "image": "room.png"},
                               {"name": "Bếp", "description": "small kitchen"}],
-                "scenes": scenes}
+                "scenes": scenes,
+                "prompt_rules": LEGACY_RULES}  # reference order / labels as recorded (see test_prompt_rules)
         data.update(top)
         p = self.tmp / "sb.yaml"
         p.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -92,7 +95,7 @@ def env(tmp_path, monkeypatch):
 
 
 def image_call(calls, name: str) -> list[str]:
-    found = [c for c in calls if c[0] == "image" and Path(c[c.index("-o") + 1]).name == name]
+    found = [c for c in calls if c[0] == "image" and Path(c[c.index("--out-file") + 1]).name == name]
     assert len(found) == 1, found
     return found[0]
 
@@ -117,7 +120,7 @@ def test_keyframes_only_order_and_chain(env):
     """AC4 (no continuity keys = on), AC17 (refs + log), AC22 (state), AC25 (order), AC29 (no video call)."""
     kf_only(env.pipe(three()))
     calls = env.calls()
-    assert [Path(c[c.index("-o") + 1]).name for c in calls if c[0] == "image"] == ["s01.png", "s02.png", "s03.png"]
+    assert [Path(c[c.index("--out-file") + 1]).name for c in calls if c[0] == "image"] == ["s01.png", "s02.png", "s03.png"]
     assert refs(image_call(calls, "s01.png")) == ["<tmp>/room.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert refs(image_call(calls, "s02.png")) == ["<tmp>/out/keyframes/s01.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
     assert refs(image_call(calls, "s03.png")) == ["<tmp>/out/keyframes/s02.png", "<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png"]
@@ -177,7 +180,7 @@ def test_full_run_chains_in_render_scene(env):
     report = env.pipe(three()[:2]).run(RunOptions(pause=(0, 0)))
     assert report.ok, report
     calls = env.calls()
-    kinds = [(c[0], c[1], Path(c[c.index("-o") + 1]).name) for c in calls if c[0] in ("image", "video")]
+    kinds = [(c[0], c[1], Path(c[c.index("--out-file") + 1]).name) for c in calls if c[0] in ("image", "video")]
     assert kinds == [("image", "i2i", "s01.png"), ("video", "i2v", "s01.mp4"),
                      ("image", "i2i", "s02.png"), ("video", "i2v", "s02.mp4")]
     assert refs(image_call(calls, "s02.png"))[0] == "<tmp>/out/keyframes/s01.png"
@@ -241,7 +244,7 @@ def test_only_does_not_make_prev(env):
     """AC26: --only s03 while s02 has no keyframe: s02 is not made, s03 uses the location picture."""
     kf_only(env.pipe(three()), only={"s03"})
     calls = env.calls()
-    assert [Path(c[c.index("-o") + 1]).name for c in calls if c[0] == "image"] == ["s03.png"]
+    assert [Path(c[c.index("--out-file") + 1]).name for c in calls if c[0] == "image"] == ["s03.png"]
     assert refs(calls[-1])[0] == "<tmp>/room.png"
     assert "  không nối keyframe cảnh trước: chưa có keyframe s02 mới nhất; dùng ảnh bối cảnh" in env.lines
 
@@ -393,3 +396,48 @@ def test_generate_location_images(env):
     assert not any(c[0] == "video" for c in calls)
     assert any(l.startswith("[Bếp] ảnh bối cảnh: Location reference image") for l in env.lines)
     assert [k for k, it in events if it and it["phase"] == "done"] == ["loc:Bếp"]
+
+
+# --- research 2026-11-18: default reference order and labels -----------------------------------------------------
+
+@needs_ffmpeg
+def test_default_rules_put_the_setting_last_and_number_the_labels(env):
+    """Gemini image models take the aspect of the last input image, and lock identity better to numbered images:
+    by default the characters come first, the location / previous keyframe last, each labelled `Image n is …`."""
+    kf_only(env.pipe(three()[:1], prompt_rules=None))
+    calls = env.calls()
+    assert refs(image_call(calls, "s01.png")) == ["<tmp>/minh.png", "<tmp>/lan.png", "<tmp>/tuan.png", "<tmp>/room.png"]
+    assert not any("giữ giống khuôn mặt" in l for l in env.lines)  # 3 people: within Nano Banana 2's 4
+
+    pipe = env.pipe(three()[:2], prompt_rules=None)
+    pipe.state.data["i2i_ui"] = True
+    sent: list[tuple[str, list[Path]]] = []
+
+    def ui_i2i(prompt, files, *, out, **kw):
+        sent.append((prompt, list(files)))
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_bytes(b"ui-image")
+        return Path(out)
+
+    pipe.g.ui_available = lambda: True
+    pipe.g.ui_image_to_image = ui_i2i
+    kf_only(pipe, only={"s02"})
+    prompt, files = sent[0]
+    kfs = env.tmp / "out" / "keyframes"
+    assert files[-1] == kfs / "s01.png" and files[0] == (env.tmp / "minh.png").resolve()
+    assert ("Image 1 is Minh: keep Minh's facial features, hairstyle and outfit exactly the same as Image 1"
+            in prompt)
+    assert "Image 4 is the previous shot (keyframe s01): continue from it" in prompt
+
+
+@needs_ffmpeg
+def test_too_many_people_for_the_image_model_warns(env):
+    env.write(three()[:1], prompt_rules=None,
+              characters=[{"name": n, "description": f"{n} look", "image": f"{n.lower()}.png"}
+                          for n in ("Minh", "Lan", "Tuan", "Hoa", "Bao")])
+    for n in ("hoa", "bao"):
+        (env.tmp / f"{n}.png").write_bytes(f"{n}-pic".encode())
+    pipe = env.pipe()
+    pipe.sb.scenes[0].image_prompt = "Minh, Lan, Tuan, Hoa and Bao at the table"
+    kf_only(pipe)
+    assert any("5 nhân vật trong ảnh" in l and "tối đa 4" in l for l in env.lines)

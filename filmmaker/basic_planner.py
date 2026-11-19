@@ -58,7 +58,10 @@ templates, so write each field as a plain phrase. Rules:
 - `speaker` ONLY when the sound guide allows spoken lines and someone on screen speaks in this scene: `position`,
   `visual_tag`, `voice_style` (tone, pace), `line` = ONE short sentence of at most 12 words with no quotation marks
   and no apostrophes (write "do not", not "don't"), `action` = one small delivery gesture ("leans forward
-  slightly"). Only one speaker per scene; a back-and-forth goes over several scenes.
+  slightly"), `character` = the speaker's exact character name (never shown to the video model; it picks the
+  voice). Only one speaker per scene; a back-and-forth goes over several scenes.
+- The speaker's `visual_tag` must differ clearly from every listener's (clothing colour, hair, age): two people
+  described alike get each other's lines.
 - EYELINE LOCK for every scene with a `speaker` (video models otherwise turn the speaker to stare into the lens
   when the mouth opens): every position and gaze is in 2D FRAME coordinates. `position` of the speaker and of each
   listener = "frame left", "frame right" or "frame center"; `head_angle` = "three-quarter profile" or "side
@@ -88,6 +91,8 @@ templates, so write each field as a plain phrase. Rules:
   "upper-middle of the frame", without the ratio).
 - Define recurring people once in `characters` with a fixed, specific look (face, hair, signature clothing), each
   with a distinct silhouette. Each description is about that one person only (never compare to another character).
+  Give every character who speaks a fixed `voice` (gender and age, pitch, timbre, accent, pace), distinct from
+  the other speakers on at least two of these.
 - Children: never an exact age ("age 8", "8-year-old"): write "a young girl", "a little boy", "a schoolgirl".
   Google's child-safety filter blocks pictures of children described with a precise age or body details; keep
   children in everyday activities, fully and casually dressed, described by hair, clothes and expression.
@@ -96,6 +101,8 @@ templates, so write each field as a plain phrase. Rules:
 - Follow the format, sound and genres in the message: they decide pacing, the number of beats and who speaks.
 - Google Flow refuses some content and the credits are lost: no gore, injuries, weapons up close, insults, or
   children in distress. Show hard beats mildly (a look, a turned back, a quiet moment).
+- Never real, identifiable people (Flow refuses "prominent people"): no real names, famous roles, ranks or units,
+  no "true story"; characters are fictional and described by look only.
 - Scene ids: s01, s02, ...
 - `thumbnail`: `text` = a short catchy title (max ~6 words) in the message's language; `prompt` = an English
   description of an eye-catching cover picture with the main characters by exact name (no text in it)."""
@@ -111,6 +118,8 @@ style, characters and thumbnail as they are."""
 class BasicCharacter(BaseModel):
     name: str
     description: str = Field(description="Fixed look (English): face, hair, age, outfit.")
+    voice: str | None = Field(default=None, description="Fixed voice (English) for characters who speak: gender and "
+                              "age, pitch, timbre, accent, pace. Distinct from every other speaker.")
 
 
 class BasicLocation(BaseModel):

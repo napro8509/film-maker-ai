@@ -77,7 +77,8 @@ def test_auto_follows_the_film_format():
     d, b = _drama(), _basic()
     assert (d.rule("image", "no_text"), b.rule("image", "no_text")) == ("long", "short")
     assert (d.rule("video", "facing"), b.rule("video", "facing")) == ("camera", "profile")
-    assert (d.rule("video", "silence"), b.rule("video", "silence")) == ("laugh", "breath")
+    # research 2026-11-18: an open mouth makes Veo invent lines, so every format defaults to breathing only
+    assert (d.rule("video", "silence"), b.rule("video", "silence")) == ("breath", "breath")
 
 
 def test_old_no_text_checkbox_reads_as_off():
@@ -129,9 +130,9 @@ def test_drama_facing_profile_changes_the_speaker_cue():
 
 def test_drama_silence_choices_for_a_scene_without_lines():
     s = _drama().scenes[1]
-    assert SILENT_SCENE_RULE in _drama().for_flow_video("Minh sits down.", s)
-    out = _drama(prompt_rules={"video": {"silence": "breath"}}).for_flow_video("Minh sits down.", s)
-    assert I2V_SILENT_RULE in out and SILENT_SCENE_RULE not in out
+    assert I2V_SILENT_RULE in _drama().for_flow_video("Minh sits down.", s)
+    out = _drama(prompt_rules={"video": {"silence": "laugh"}}).for_flow_video("Minh sits down.", s)
+    assert SILENT_SCENE_RULE in out and I2V_SILENT_RULE not in out
     out = _drama(prompt_rules={"video": {"silence": "off"}}).for_flow_video("Minh sits down.", s)
     assert SILENT_SCENE_RULE not in out and I2V_SILENT_RULE not in out and "Spoken language" not in out
 
@@ -205,3 +206,98 @@ def test_schema_and_preview_api(client):
 
 
 from tests.test_web import client  # noqa: E402,F401
+
+
+# --- research 2026-11-18 (docs/nghien-cuu-quy-tac.md) --------------------------------------------------------------
+
+def test_near_facing_for_both_flows():
+    s = _drama().scenes[0]
+    out = _drama(prompt_rules={"video": {"facing": "near"}}).for_flow_video("x", s)
+    assert "eyes on the person spoken to just beside the lens" in out
+    kf = _drama(prompt_rules={"image": {"staging": "near"}}).for_flow_keyframe("x", s)
+    assert "eyes on Minh just beside the lens" in kf and "seen from behind the shoulder" in kf
+    b = _basic(prompt_rules={"video": {"facing": "near"}, "image": {"staging": "near"}})
+    assert "gaze on the listener just beside the viewpoint" in b.video_prompt(b.scenes[0])
+    assert "is nearest with the largest face" in b.image_prompt(b.scenes[0])
+
+
+def test_positive_no_text():
+    assert _drama(prompt_rules={"image": {"no_text": "positive"}}).for_flow("A cat.").endswith(rules.NO_TEXT_POSITIVE)
+    b = _basic(prompt_rules={"video": {"no_text": "positive"}})
+    out = b.video_prompt(b.scenes[0])
+    assert rules.NO_TEXT_POSITIVE in out and i2v_prompt.NO_TEXT_SHORT not in out
+
+
+def test_keyframe_opener_and_each_once():
+    sb = _drama(prompt_rules={"image": {"film_still_opener": True, "each_once": True}})
+    out = sb.for_flow_keyframe("Lan and Minh at a table.", sb.scenes[0])
+    assert out.startswith(rules.FILM_STILL_OPENER) and rules.EACH_ONCE in out
+    assert rules.FILM_STILL_OPENER not in _drama().for_flow_keyframe("x", _drama().scenes[0])
+
+
+def test_portrait_knees_up():
+    sb = _drama(prompt_rules={"image": {"portrait_knees_up": True}})
+    assert rules.PORTRAIT_KNEES_UP in sb.portrait_prompt(sb.characters[0])
+    assert "Full body" in _drama().portrait_prompt(_drama().characters[0])
+
+
+def test_fixed_voices_drama_and_basic():
+    d = _drama(characters=[{"name": "Lan", "description": "A woman in a red coat.", "voice": "soft low female voice"},
+                           {"name": "Minh", "description": "A man in a grey suit."}])
+    out = d.for_flow_video(d.video_prompt(d.scenes[0]), d.scenes[0])
+    assert "Lan's voice: soft low female voice." in out
+    assert "voice:" not in d.for_flow_video(d.video_prompt(d.scenes[1]), d.scenes[1])  # nobody speaks there
+    off = _drama(characters=d.model_dump()["characters"], prompt_rules={"video": {"voices": False}})
+    assert "Lan's voice" not in off.for_flow_video(off.video_prompt(off.scenes[0]), off.scenes[0])
+    b = _basic(characters=[{"name": "Fon", "description": "A young woman.", "voice": "bright Thai female voice"}])
+    b.scenes[0].video_shot.speaker.character = "Fon"
+    out = b.for_flow_video(b.video_prompt(b.scenes[0]), b.scenes[0])
+    assert "The speaker's voice: bright Thai female voice." in out and out.index("voice:") < out.index("Audio:")
+    assert "Fon" not in out  # the video model never gets a name
+
+
+def test_no_english_offscreen_and_music():
+    sb = _drama(prompt_rules={"video": {"no_english": True, "no_offscreen": True, "no_music_dialogue": True}})
+    s = sb.scenes[0]
+    out = sb.for_flow_video(sb.video_prompt(s), s)
+    assert "Lan says in Thai: Anh về rồi à?" in out
+    assert rules.NO_ENGLISH in out and rules.NO_OFFSCREEN in out and rules.NO_MUSIC_DIALOGUE in out
+    assert out.index(rules.NO_ENGLISH) < out.index(NO_TEXT)
+    silent = sb.for_flow_video(sb.video_prompt(sb.scenes[1]), sb.scenes[1])
+    assert rules.NO_MUSIC_DIALOGUE not in silent and rules.NO_ENGLISH in silent
+    assert rules.NO_ENGLISH not in _drama(dialogue_language="English",
+                                         prompt_rules={"video": {"no_english": True}}).for_flow_video("x", s)
+
+
+def test_timed_beats():
+    sb = _basic(prompt_rules={"video": {"timed_beats": True}})
+    out = sb.video_prompt(sb.scenes[0])
+    assert out.startswith("Characters face") and "[00:00-00:05]" in out and "[00:05-00:08]" in out
+    assert "After finishing the line" not in out
+
+
+def test_reference_opener_only_with_pictures():
+    sb = _drama()
+    s = sb.scenes[0]
+    assert sb.for_flow_video("x", s, refs=True).startswith(rules.REF_OPENER)
+    assert not sb.for_flow_video("x", s).startswith(rules.REF_OPENER)
+    off = _drama(prompt_rules={"video": {"ref_opener": False}})
+    assert not off.for_flow_video("x", s, refs=True).startswith(rules.REF_OPENER)
+
+
+def test_alike_speaker_and_listener_warns():
+    shot = i2v_prompt.VideoShot(camera="static", speaker=i2v_prompt.Speaker(
+        position="frame left", visual_tag="the woman in the white blouse", line="Hello there"),
+        listeners=[i2v_prompt.Listener(position="frame right", visual_tag="the woman")])
+    w = i2v_prompt.warnings(shot, audio_mode="dialogue", narration=None, names=[])
+    assert any("gần giống nhau" in m for m in w)
+    shot.listeners[0].visual_tag = "the old man in the grey shirt"
+    assert not any("gần giống nhau" in m for m in i2v_prompt.warnings(shot, audio_mode="dialogue", narration=None,
+                                                                       names=[]))
+
+
+def test_timed_beats_alone_has_no_others():
+    shot = i2v_prompt.VideoShot(camera="static close-up", speaker=i2v_prompt.Speaker(
+        position="frame left", visual_tag="the old man", line="I was wrong"))
+    out = i2v_prompt.assemble(shot, audio_mode="dialogue", language="Thai", opts={"timed_beats": True})
+    assert "stops talking, lips closed, keeping that exact eyeline." in out and "the others" not in out

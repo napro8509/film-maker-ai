@@ -801,3 +801,4 @@ a.crawl-title:hover { color: var(--accent-ink); text-decoration: underline; }
 .rules-pop .rule-choice .help { margin: 0; }
 .rules-pop .check input { margin-top: 3px; flex: none; }
 .rules-pop .rules-preview summary { cursor: pointer; font-size: var(--fs-2); }
+.rules-count { min-width: 18px; height: 18px; padding: 0 5px; border-radius: var(--r-pill); background: var(--accent); color: #fff; font-size: 11px; font-weight: var(--fw-bold); display: inline-flex; align-items: center; justify-content: center; }

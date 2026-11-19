@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.legacy_rules import FACE_CAP_WARNING, LEGACY_RULES
+
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import Pipeline, RunOptions
 from filmmaker.storyboard import load_storyboard
@@ -41,6 +43,7 @@ def make_project(tmp_path: Path, *, extra: dict | None = None) -> Path:
     for n, data in CHAR_BYTES.items():
         (chars / f"{n}.png").write_bytes(data)
     data = yaml.safe_load(FIXTURE.read_text(encoding="utf-8"))
+    data["prompt_rules"] = LEGACY_RULES  # the rules these goldens were recorded with
     if extra:
         data.update(extra)
     p = tmp_path / "storyboard.yaml"
@@ -84,6 +87,7 @@ def _keyframes_run(sb_path: Path, tmp_path: Path, monkeypatch, *, dry: bool = Fa
     keys = {sid: sorted(st) for sid, st in state.get("scenes", {}).items()}
     sb = load_storyboard(sb_path)
     has_kf = {s.id: pipe.has_keyframe(s) for s in sb.scenes}
+    lines = [x for x in lines if FACE_CAP_WARNING not in x]  # a warning added later (research 2026-11-18)
     return _norm({"calls": calls, "log": lines, "state_keys": keys, "has_keyframe": has_kf}, tmp_path)
 
 
@@ -103,7 +107,7 @@ def test_old_storyboard_dry_run_log_matches_baseline(tmp_path, monkeypatch):
     report = pipe.run(RunOptions(pause=(0, 0)))
     assert report.ok, report
     assert not (tmp_path / "out" / "state.json").exists()
-    assert _norm(lines, tmp_path) == GOLDEN_DRY_LOG
+    assert _norm([x for x in lines if FACE_CAP_WARNING not in x], tmp_path) == GOLDEN_DRY_LOG
 
 
 def test_locations_without_assignment_keep_fingerprints(tmp_path):
@@ -789,7 +793,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s01.png',
             '--project',
             'proj-123',
@@ -826,7 +830,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s02.png',
             '--project',
             'proj-123',
@@ -847,7 +851,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s03.png',
             '--project',
             'proj-123',
@@ -869,7 +873,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s04.png',
             '--project',
             'proj-123',
@@ -889,7 +893,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s05.png',
             '--project',
             'proj-123',
@@ -911,7 +915,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s06.png',
             '--project',
             'proj-123',
@@ -933,7 +937,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s07.png',
             '--project',
             'proj-123',
@@ -953,7 +957,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s08.png',
             '--project',
             'proj-123',
@@ -977,7 +981,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s09.png',
             '--project',
             'proj-123',
@@ -1001,7 +1005,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s10.png',
             '--project',
             'proj-123',
@@ -1031,7 +1035,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s11.png',
             '--project',
             'proj-123',
@@ -1055,7 +1059,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s12.png',
             '--project',
             'proj-123',
@@ -1075,7 +1079,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s13.png',
             '--project',
             'proj-123',
@@ -1111,7 +1115,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s14.png',
             '--project',
             'proj-123',
@@ -1143,7 +1147,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s15.png',
             '--project',
             'proj-123',
@@ -1163,7 +1167,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s16.png',
             '--project',
             'proj-123',
@@ -1187,7 +1191,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s17.png',
             '--project',
             'proj-123',
@@ -1211,7 +1215,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s18.png',
             '--project',
             'proj-123',
@@ -1239,7 +1243,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s19.png',
             '--project',
             'proj-123',
@@ -1275,7 +1279,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/s20.png',
             '--project',
             'proj-123',
@@ -1306,7 +1310,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
             '9:16',
             '--model',
             'nano2',
-            '-o',
+            '--out-file',
             '<tmp>/out/keyframes/x3.png',
             '--project',
             'proj-123',
@@ -1319,7 +1323,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'dim warm light, 50mm lens. Style: Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten '
          'interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal '
          'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no '
-         "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --model nano2 -o "
+         "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --model nano2 --out-file "
          '<tmp>/out/keyframes/s01.png --project proj-123 --json',
          '[s01] OK -> <tmp>/out/keyframes/s01.png',
          '[s02] keyframe: Wooden living room of an old Vietnamese house at night, Minh and Lan sit on one ',
@@ -1342,7 +1346,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
          '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref '
          '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
-         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s02.png --project '
+         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s02.png --project '
          'proj-123 --json',
          '[s02] OK -> <tmp>/out/keyframes/s02.png',
          '[s03] keyframe: Close-up of Minh opening a thick envelope at a wooden table, reading a document,',
@@ -1355,7 +1359,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber '
          'and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/minh.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s03.png --project '
+         '<tmp>/assets/characters/minh.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s03.png --project '
          'proj-123 --json',
          '[s03] OK -> <tmp>/out/keyframes/s03.png',
          '[s04] keyframe: Close-up of Hoa at a wooden table, eyes wide in disbelief, jade bangle on her wr',
@@ -1367,7 +1371,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, '
          'high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
          "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
-         '--ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '--ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s04.png --project proj-123 --json',
          '[s04] OK -> <tmp>/out/keyframes/s04.png',
          '[s05] keyframe: Medium shot of Lan sitting upright with arms folded, cold smile, red lipstick, g',
@@ -1379,7 +1383,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm '
          'film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no '
          'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken '
-         "audio only.' --ref <tmp>/assets/characters/lan.png --aspect 9:16 --model nano2 -o "
+         "audio only.' --ref <tmp>/assets/characters/lan.png --aspect 9:16 --model nano2 --out-file "
          '<tmp>/out/keyframes/s05.png --project proj-123 --json',
          '[s05] OK -> <tmp>/out/keyframes/s05.png',
          '[s06] keyframe: Tuan standing abruptly from a wooden chair in a dim living room, chair tipping b',
@@ -1391,7 +1395,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber '
          'and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s06.png --project proj-123 --json',
          '[s06] OK -> <tmp>/out/keyframes/s06.png',
          '[s07] keyframe: Minh rising from his seat facing camera, veins on his neck, dim lamp light, his ',
@@ -1404,7 +1408,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. '
          'No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any '
          "dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
-         '<tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s07.png --project '
+         '<tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s07.png --project '
          'proj-123 --json',
          '[s07] OK -> <tmp>/out/keyframes/s07.png',
          '[s08] keyframe: Mother seated at the head of the table, frail hands gripping prayer beads, eyes ',
@@ -1416,7 +1420,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal '
          'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no '
          "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s08.png --project '
+         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s08.png --project '
          'proj-123 --json',
          '[s08] OK -> <tmp>/out/keyframes/s08.png',
          '[s09] keyframe: Hoa and Lan standing face to face beside the wooden table, Hoa with loose hair g',
@@ -1430,7 +1434,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, '
          'high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
          "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
-         '--ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '--ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s09.png --project proj-123 --json',
          '[s09] OK -> <tmp>/out/keyframes/s09.png',
          '[s10] keyframe: Lan in a burgundy blouse with her hand raised mid-swing, Hoa flinching, dim livi',
@@ -1444,7 +1448,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and '
          'teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s10.png --project proj-123 --json',
          '[s10] OK -> <tmp>/out/keyframes/s10.png',
          '[s11] keyframe: Hoa holding her cheek, eyes burning, Tuan behind her lunging forward, Minh grabb',
@@ -1461,7 +1465,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
          '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref '
-         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s11.png --project proj-123 --json',
          '[s11] OK -> <tmp>/out/keyframes/s11.png',
          "[s12] keyframe: Close-up of Tuan's hands gripping the will document, Minh's hands pulling the ot",
@@ -1476,7 +1480,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. '
          'No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any '
          "dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
-         '<tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s12.png --project '
+         '<tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s12.png --project '
          'proj-123 --json',
          '[s12] OK -> <tmp>/out/keyframes/s12.png',
          '[s13] keyframe: Mother clutching her chest, prayer beads slipping from her fingers, swaying in h',
@@ -1488,7 +1492,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, '
          'fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, '
          "no watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/mother.png "
-         '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s13.png --project proj-123 --json',
+         '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s13.png --project proj-123 --json',
          '[s13] OK -> <tmp>/out/keyframes/s13.png',
          '[s14] keyframe: Minh and Tuan kneeling on a tiled floor holding their unconscious mother, Lan an',
          '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan, Hoa, Mother',
@@ -1509,7 +1513,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
          '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref '
          '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
-         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s14.png --project '
+         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s14.png --project '
          'proj-123 --json',
          '[s14] OK -> <tmp>/out/keyframes/s14.png',
          '[s15] keyframe: Hospital corridor at night, cold fluorescent light, Minh, Lan, Tuan and Hoa sitt',
@@ -1528,7 +1532,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
          "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
          '--ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref '
-         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s15.png --project proj-123 --json',
          '[s15] OK -> <tmp>/out/keyframes/s15.png',
          '[s16] keyframe: Hospital room, Mother lying awake in bed with oxygen tube, weak smile, holding a',
@@ -1540,7 +1544,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and '
          'teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s16.png --project '
+         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s16.png --project '
          'proj-123 --json',
          '[s16] OK -> <tmp>/out/keyframes/s16.png',
          '[s17] keyframe: Close-up of Tuan reading a handwritten letter in a hospital room, Minh reading o',
@@ -1554,7 +1558,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          '9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, '
          'high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
          "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
-         '--ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 -o '
+         '--ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s17.png --project proj-123 --json',
          '[s17] OK -> <tmp>/out/keyframes/s17.png',
          '[s18] keyframe: Lan and Hoa standing near a hospital window, both ashamed, Hoa with a red mark o',
@@ -1568,7 +1572,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber '
          'and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
          "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
-         '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s18.png --project proj-123 --json',
          '[s18] OK -> <tmp>/out/keyframes/s18.png',
          '[s19] keyframe: Minh and Tuan standing at the foot of a hospital bed, Mother smiling weakly betw',
@@ -1584,7 +1588,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, '
          'fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, '
          "no watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
-         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o '
+         '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file '
          '<tmp>/out/keyframes/s19.png --project proj-123 --json',
          '[s19] OK -> <tmp>/out/keyframes/s19.png',
          "[s20] keyframe: Ancestral altar in the family house in daylight, father's framed portrait, fresh",
@@ -1606,7 +1610,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
          '--ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref '
          '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
-         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s20.png --project '
+         '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s20.png --project '
          'proj-123 --json',
          '[s20] OK -> <tmp>/out/keyframes/s20.png',
          '[x3] keyframe: The whole family sits around the wooden table, lamp light',
@@ -1624,7 +1628,7 @@ GOLDEN_KEYFRAMES_RUN = {'calls': [['project', 'create', '--name', 'The Inheritan
          'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no '
          "title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
          '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png '
-         '--ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/x3.png --project '
+         '--ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/x3.png --project '
          'proj-123 --json',
          '[x3] OK -> <tmp>/out/keyframes/x3.png'],
  'state_keys': {'s01': ['keyframe', 'keyframe_prompt', 'keyframe_refs', 'updated_at'],
@@ -1680,11 +1684,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow '
  'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s01.png --project DRY-RUN-PROJECT --json",
+ "spoken audio only.' --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s01.png --project DRY-RUN-PROJECT --json",
  '  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s01.png \'Slow push-in toward the father\'"\'"\'s portrait '
  'on the altar as incense smoke curls upward; distant funeral gong and soft crying. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect "
- '9:16 -o <tmp>/out/clips/s01.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
+ '9:16 --out-file <tmp>/out/clips/s01.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s01] (dry-run) sẽ lưu -> <tmp>/out/clips/s01.mp4',
  "[s02] keyframe: Slow overhead crane down onto the table as Mother's trembling hand slides the en",
  '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan, Hoa, Mother',
@@ -1704,12 +1708,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no '
  "watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
  '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
- '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s02.png --project '
+ '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s02.png --project '
  'DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s02.png 'Slow overhead crane down onto the table as "
  'Mother\'"\'"\'s trembling hand slides the envelope to the center; clock ticking loudly. No captions, no subtitles, '
  "no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' "
- '--aspect 9:16 -o <tmp>/out/clips/s02.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --out-file <tmp>/out/clips/s02.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s02] (dry-run) sẽ lưu -> <tmp>/out/clips/s02.mp4',
  '[s03] keyframe: Minh tears open the envelope and reads; camera quickly racks focus from the pape',
  '  ảnh tham chiếu nhân vật: Minh',
@@ -1720,12 +1724,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Style: Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, '
  'shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. '
  'No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --ref <tmp>/assets/characters/minh.png --aspect 9:16 --model nano2 -o "
+ "spoken audio only.' --ref <tmp>/assets/characters/minh.png --aspect 9:16 --model nano2 --out-file "
  '<tmp>/out/keyframes/s03.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s03.png 'Minh tears open the envelope and reads; camera "
  'quickly racks focus from the paper to his face as a faint satisfied smirk appears; paper rustling. Camera movement: '
  'slow push-in. Focus: rack focus from foreground to background. No captions, no subtitles, no on-screen text or '
- "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s03.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s03] (dry-run) sẽ lưu -> <tmp>/out/clips/s03.mp4',
  '[s04] keyframe: Hoa slams her palm on the table, jade bangle clacking, and leans forward; fast w',
@@ -1737,11 +1741,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense '
  'dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; '
  "any dialogue is spoken audio only.' --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png "
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s04.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s04.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s04.png 'Hoa slams her palm on the table, jade bangle "
  'clacking, and leans forward; fast whip pan to Tuan beside her clenching his jaw. She shouts angrily in Vietnamese, '
  'voice only. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any '
- "dialogue is spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s04.mp4 --model veo-lite --project DRY-RUN-PROJECT "
+ "dialogue is spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s04.mp4 --model veo-lite --project DRY-RUN-PROJECT "
  '--json',
  '[s04] (dry-run) sẽ lưu -> <tmp>/out/clips/s04.mp4',
  '[s05] keyframe: Lan slowly tilts her head and smiles coldly, speaking calmly and mockingly in Vi',
@@ -1753,11 +1757,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, '
  'fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no '
  "watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/lan.png --aspect 9:16 "
- '--model nano2 -o <tmp>/out/keyframes/s05.png --project DRY-RUN-PROJECT --json',
+ '--model nano2 --out-file <tmp>/out/keyframes/s05.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s05.png 'Lan slowly tilts her head and smiles coldly, "
  'speaking calmly and mockingly in Vietnamese, voice only; slow dolly-in on her face. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect "
- '9:16 -o <tmp>/out/clips/s05.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
+ '9:16 --out-file <tmp>/out/clips/s05.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s05] (dry-run) sẽ lưu -> <tmp>/out/clips/s05.mp4',
  '[s06] keyframe: Tuan leaps up, his chair crashes to the floor, and he points at Minh, yelling in',
  '  ảnh tham chiếu nhân vật: Minh, Tuan',
@@ -1768,11 +1772,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense '
  'dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; '
  "any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png "
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s06.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s06.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s06.png 'Tuan leaps up, his chair crashes to the floor, and "
  'he points at Minh, yelling in Vietnamese, voice only; handheld camera shakes with the movement. No captions, no '
  'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio '
- "only.' --aspect 9:16 -o <tmp>/out/clips/s06.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "only.' --aspect 9:16 --out-file <tmp>/out/clips/s06.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s06] (dry-run) sẽ lưu -> <tmp>/out/clips/s06.mp4',
  "[s07] keyframe: Minh rises and steps into Tuan's face, the two brothers chest to chest; fast orb",
  '  ảnh tham chiếu nhân vật: Minh, Tuan',
@@ -1783,12 +1787,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast '
  'amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or '
  "lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
- '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 -o '
+ '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png --aspect 9:16 --model nano2 --out-file '
  '<tmp>/out/keyframes/s07.png --project DRY-RUN-PROJECT --json',
  '  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s07.png \'Minh rises and steps into Tuan\'"\'"\'s face, the '
  'two brothers chest to chest; fast orbiting handheld shot around them, heavy breathing, rising tension score. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s07.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s07.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s07] (dry-run) sẽ lưu -> <tmp>/out/clips/s07.mp4',
  '[s08] keyframe: Mother reaches out with a trembling hand, softly pleading in Vietnamese, voice o',
  '  ảnh tham chiếu nhân vật: Mother',
@@ -1798,12 +1802,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow '
  'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o "
+ "spoken audio only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file "
  '<tmp>/out/keyframes/s08.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s08.png 'Mother reaches out with a trembling hand, softly "
  'pleading in Vietnamese, voice only, while the shouting continues off-screen; slow push-in on her tearful eyes. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s08.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s08.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s08] (dry-run) sẽ lưu -> <tmp>/out/clips/s08.mp4',
  '[s09] keyframe: Hoa and Lan step toward each other, trading furious words in Vietnamese, voice o',
  '  ảnh tham chiếu nhân vật: Lan, Hoa',
@@ -1816,10 +1820,10 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense '
  'dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; '
  "any dialogue is spoken audio only.' --ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png "
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s09.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s09.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s09.png 'Hoa and Lan step toward each other, trading furious "
  'words in Vietnamese, voice only; rapid handheld push-in between their faces. No captions, no subtitles, no on-screen '
- "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s09.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s09] (dry-run) sẽ lưu -> <tmp>/out/clips/s09.mp4',
  "[s10] keyframe: Lan slaps Hoa hard across the face, Hoa's hair whips sideways; sharp slap sound,",
@@ -1832,11 +1836,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow depth of field, 35mm film '
  'grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
- '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o '
+ '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file '
  '<tmp>/out/keyframes/s10.png --project DRY-RUN-PROJECT --json',
  '  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s10.png \'Lan slaps Hoa hard across the face, Hoa\'"\'"\'s '
  'hair whips sideways; sharp slap sound, camera snap-zooms in, then silence. No captions, no subtitles, no on-screen '
- "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s10.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s10] (dry-run) sẽ lưu -> <tmp>/out/clips/s10.mp4',
  '[s11] keyframe: Tuan lunges at Lan while Minh grabs and shoves him back; chaotic handheld tracki',
@@ -1852,11 +1856,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
  '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref '
- '<tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s11.png --project DRY-RUN-PROJECT '
+ '<tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s11.png --project DRY-RUN-PROJECT '
  '--json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s11.png 'Tuan lunges at Lan while Minh grabs and shoves him "
  'back; chaotic handheld tracking shot as a teacup shatters on the floor. No captions, no subtitles, no on-screen text '
- "or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s11.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s11] (dry-run) sẽ lưu -> <tmp>/out/clips/s11.mp4',
  '[s12] keyframe: Tuan and Minh tug at the will until it rips in half; extreme slow motion of the ',
@@ -1870,10 +1874,10 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense '
  'dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; '
  "any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png "
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s12.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s12.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s12.png 'Tuan and Minh tug at the will until it rips in "
  'half; extreme slow motion of the paper tearing, with a deep bass hit. No captions, no subtitles, no on-screen text '
- "or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s12.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s12] (dry-run) sẽ lưu -> <tmp>/out/clips/s12.mp4',
  '[s13] keyframe: Mother gasps, clutches her chest and collapses sideways from her chair, prayer b',
@@ -1884,12 +1888,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow depth of '
  'field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no '
  'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio '
- "only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s13.png --project "
+ "only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s13.png --project "
  'DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s13.png 'Mother gasps, clutches her chest and collapses "
  'sideways from her chair, prayer beads scattering across the tiles; camera drops with her to floor level, sound fades '
  'to a high-pitched ring. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no '
- "logos; any dialogue is spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s13.mp4 --model veo-lite --project "
+ "logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s13.mp4 --model veo-lite --project "
  'DRY-RUN-PROJECT --json',
  '[s13] (dry-run) sẽ lưu -> <tmp>/out/clips/s13.mp4',
  '[s14] keyframe: Minh and Tuan kneel and cradle Mother, shouting her name in Vietnamese, voice on',
@@ -1909,12 +1913,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no '
  "logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
  '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
- '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s14.png --project '
+ '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s14.png --project '
  'DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s14.png 'Minh and Tuan kneel and cradle Mother, shouting her "
  'name in Vietnamese, voice only, while Lan and Hoa stand frozen; fast circling handheld shot. No captions, no '
  'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio '
- "only.' --aspect 9:16 -o <tmp>/out/clips/s14.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "only.' --aspect 9:16 --out-file <tmp>/out/clips/s14.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s14] (dry-run) sẽ lưu -> <tmp>/out/clips/s14.mp4',
  '[s15] keyframe: Slow lateral dolly along the row of chairs past Minh, Lan, Tuan and Hoa sitting ',
  '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan, Hoa',
@@ -1931,11 +1935,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref "
  '<tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref '
- '<tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s15.png --project DRY-RUN-PROJECT '
+ '<tmp>/assets/characters/hoa.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s15.png --project DRY-RUN-PROJECT '
  '--json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s15.png 'Slow lateral dolly along the row of chairs past "
  'Minh, Lan, Tuan and Hoa sitting in silence; distant heart monitor beeping. No captions, no subtitles, no on-screen '
- "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o "
+ "text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file "
  '<tmp>/out/clips/s15.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s15] (dry-run) sẽ lưu -> <tmp>/out/clips/s15.mp4',
  '[s16] keyframe: Mother lifts a small worn envelope from under her pillow and holds it out toward',
@@ -1946,12 +1950,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Style: Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, '
  'shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. '
  'No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o "
+ "spoken audio only.' --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file "
  '<tmp>/out/keyframes/s16.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s16.png 'Mother lifts a small worn envelope from under her "
  'pillow and holds it out toward camera; slow push-in on the envelope in her trembling hand. No captions, no '
  'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio '
- "only.' --aspect 9:16 -o <tmp>/out/clips/s16.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "only.' --aspect 9:16 --out-file <tmp>/out/clips/s16.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s16] (dry-run) sẽ lưu -> <tmp>/out/clips/s16.mp4',
  '[s17] keyframe: Tuan reads the letter and his hands begin to shake as Minh leans in behind him; ',
  '  ảnh tham chiếu nhân vật: Minh, Tuan',
@@ -1964,11 +1968,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense '
  'dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; '
  "any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref <tmp>/assets/characters/tuan.png "
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s17.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s17.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s17.png 'Tuan reads the letter and his hands begin to shake "
  'as Minh leans in behind him; slow rack focus from the paper to their faces as tears form; soft piano begins. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s17.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s17.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s17] (dry-run) sẽ lưu -> <tmp>/out/clips/s17.mp4',
  '[s18] keyframe: Lan slowly turns to Hoa and gently touches her bruised cheek, whispering an apol',
  '  ảnh tham chiếu nhân vật: Lan, Hoa',
@@ -1981,11 +1985,11 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
  "spoken audio only.' --ref <tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 "
- '--model nano2 -o <tmp>/out/keyframes/s18.png --project DRY-RUN-PROJECT --json',
+ '--model nano2 --out-file <tmp>/out/keyframes/s18.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s18.png 'Lan slowly turns to Hoa and gently touches her "
  'bruised cheek, whispering an apology in Vietnamese, voice only; Hoa\'"\'"\'s eyes fill with tears; slow arc shot '
  'around them. No captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any '
- "dialogue is spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s18.mp4 --model veo-lite --project DRY-RUN-PROJECT "
+ "dialogue is spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s18.mp4 --model veo-lite --project DRY-RUN-PROJECT "
  '--json',
  '[s18] (dry-run) sẽ lưu -> <tmp>/out/clips/s18.mp4',
  '[s19] keyframe: Minh pulls Tuan into a tight embrace, both brothers crying, as Mother reaches ou',
@@ -2000,12 +2004,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'tungsten interior light with deep shadows, shallow depth of field, 35mm film grain, high-contrast amber and teal '
  'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title '
  "cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
- '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o '
+ '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file '
  '<tmp>/out/keyframes/s19.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s19.png 'Minh pulls Tuan into a tight embrace, both brothers "
  'crying, as Mother reaches out to hold their hands; slow dolly-in, warm piano swells. No captions, no subtitles, no '
  "on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.' --aspect "
- '9:16 -o <tmp>/out/clips/s19.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
+ '9:16 --out-file <tmp>/out/clips/s19.mp4 --model veo-lite --project DRY-RUN-PROJECT --json',
  '[s19] (dry-run) sẽ lưu -> <tmp>/out/clips/s19.mp4',
  "[s20] keyframe: Slow crane up from the family bowing together before the altar to the father's p",
  '  ảnh tham chiếu nhân vật: Minh, Lan, Tuan, Hoa, Mother',
@@ -2024,12 +2028,12 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title '
  "cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/minh.png --ref "
  '<tmp>/assets/characters/lan.png --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref '
- '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 -o <tmp>/out/keyframes/s20.png --project '
+ '<tmp>/assets/characters/mother.png --aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/s20.png --project '
  'DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/s20.png 'Slow crane up from the family bowing together "
  'before the altar to the father\'"\'"\'s portrait as incense smoke rises in golden light; gentle temple bell. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/s20.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/s20.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[s20] (dry-run) sẽ lưu -> <tmp>/out/clips/s20.mp4',
  '[x1] t2v: Rain on the window of the old house at night, Tuan and Hoa leave through the gat',
  '  ảnh tham chiếu nhân vật: Tuan, Hoa',
@@ -2041,13 +2045,13 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'Cinematic Vietnamese family drama, vertical 9:16 framing, warm tungsten interior light with deep shadows, shallow '
  'depth of field, 35mm film grain, high-contrast amber and teal color grade, fast-paced tense dramatic energy. No '
  'captions, no subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is '
- "spoken audio only.' --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 -o "
+ "spoken audio only.' --ref <tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --aspect 9:16 --out-file "
  '<tmp>/out/clips/x1.mp4 --model veo-lite --duration 8 --project DRY-RUN-PROJECT --json',
  '[x1] (dry-run) sẽ lưu -> <tmp>/out/clips/x1.mp4',
  '[x2] i2v: Mother turns her head toward the altar and smiles',
  "  $ gflow video i2v --initial-frame /golden/fixed/start.png 'Mother turns her head toward the altar and smiles. "
  'Camera movement: slow dolly-in. No captions, no subtitles, no on-screen text or lettering, no title cards, no '
- "watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 -o <tmp>/out/clips/x2.mp4 --model veo-lite "
+ "watermarks, no logos; any dialogue is spoken audio only.' --aspect 9:16 --out-file <tmp>/out/clips/x2.mp4 --model veo-lite "
  '--project DRY-RUN-PROJECT --json',
  '[x2] (dry-run) sẽ lưu -> <tmp>/out/clips/x2.mp4',
  '[x3] keyframe: Nobody speaks; the clock ticks',
@@ -2064,8 +2068,8 @@ GOLDEN_DRY_LOG = ['Tạo project Flow mới: The Inheritance War',
  'color grade, fast-paced tense dramatic energy. No captions, no subtitles, no on-screen text or lettering, no title '
  "cards, no watermarks, no logos; any dialogue is spoken audio only.' --ref <tmp>/assets/characters/lan.png --ref "
  '<tmp>/assets/characters/tuan.png --ref <tmp>/assets/characters/hoa.png --ref <tmp>/assets/characters/mother.png '
- '--aspect 9:16 --model nano2 -o <tmp>/out/keyframes/x3.png --project DRY-RUN-PROJECT --json',
+ '--aspect 9:16 --model nano2 --out-file <tmp>/out/keyframes/x3.png --project DRY-RUN-PROJECT --json',
  "  $ gflow video i2v --initial-frame <tmp>/out/keyframes/x3.png 'Nobody speaks; the clock ticks. No captions, no "
  'subtitles, no on-screen text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio '
- "only.' --aspect 9:16 -o <tmp>/out/clips/x3.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
+ "only.' --aspect 9:16 --out-file <tmp>/out/clips/x3.mp4 --model veo-lite --project DRY-RUN-PROJECT --json",
  '[x3] (dry-run) sẽ lưu -> <tmp>/out/clips/x3.mp4']

@@ -202,7 +202,7 @@ def test_character_image_is_sent_as_reference(env, tmp_path):
     ref = str(tmp_path / "lan.png")
     i2i, r2v = calls()[1], calls()[3]
     assert i2i[i2i.index("--ref") + 1] == ref and "red scarf" in i2i[2]
-    assert r2v[r2v.index("--ref") + 1] == ref and "-o" in r2v
+    assert r2v[r2v.index("--ref") + 1] == ref and "--out-file" in r2v
     assert "--ref" not in calls()[4]  # the user's own image (i2v) gets no references
     assert make_pipe(sb_path, out).state.scene("s02")["rendered_as"] == "r2v"
 

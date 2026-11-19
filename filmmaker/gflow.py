@@ -143,6 +143,29 @@ MUSE_MODEL = "muse"
 def is_muse(model: str | None) -> bool:
     return (model or "").strip().lower() == MUSE_MODEL
 
+
+#: muse_ui.py exit codes: Muse wrote back instead of making it / its own "Failed to create" task row.
+MUSE_DECLINED, MUSE_FAILED = 41, 42
+
+MUSE_BLOCK_HINT = ("Nếu cảnh này lỗi lặp lại: Muse hay chặn keyframe có nước mắt, mặt đau buồn hay chủ đề cái chết "
+                   "— làm keyframe bình tĩnh hơn (sửa image_prompt rồi `run --keyframes-only --force <id>`), hoặc "
+                   "đặt `model: veo-lite` cho riêng cảnh này (render trên Flow, tốn credit).")
+
+
+def muse_fail_dir(out: Path) -> Path:
+    """Screenshots of a failed Muse request for clip `out` (…/clips/s04.mp4 -> …/muse_failed/s04/)."""
+    return out.parent.parent / "muse_failed" / out.stem
+
+
+def muse_error(exc: "GflowError", shots: Path) -> "GflowError":
+    """A Muse failure with what to do next. Muse's own "Failed to create" (nothing billed, often gone on the
+    next try when requests come one after another) is retryable; a refusal in words is not."""
+    if exc.exit_code not in (MUSE_DECLINED, MUSE_FAILED):
+        return exc
+    msg = f"{exc} {MUSE_BLOCK_HINT} Ảnh chụp lúc lỗi: {shots}"
+    return GflowError(msg, exit_code=exc.exit_code, payload=exc.payload,
+                      retryable=exc.exit_code == MUSE_FAILED and not exc.spent)
+
 # Names the Flow chat agent understands for gflow's model aliases.
 MODEL_NAMES = {
     "veo-fast": "Veo 3.1 Fast", "veo-quality": "Veo 3.1 Quality", "veo-lite": "Veo 3.1 Lite",
@@ -327,7 +350,7 @@ class Gflow:
     def text_to_image(self, prompt: str, *, out: Path, aspect: str, model: str, project: str | None) -> Path:
         if is_muse(model):
             return self.muse_image(prompt, [], out=out, aspect=aspect)
-        args = ["image", "t2i", prompt, "--aspect", aspect, "--model", model, "-o", str(out)]
+        args = ["image", "t2i", prompt, "--aspect", aspect, "--model", model, "--out-file", str(out)]
         if project:
             args += ["--project", project]
         payload = self.run_json(*args)
@@ -367,7 +390,7 @@ class Gflow:
         args = ["image", "i2i", prompt]
         for r in refs:
             args += ["--ref", str(r)]
-        args += ["--aspect", aspect, "--model", model, "-o", str(out)]
+        args += ["--aspect", aspect, "--model", model, "--out-file", str(out)]
         if project:
             args += ["--project", project]
         payload = self.run_json(*args)
@@ -377,7 +400,7 @@ class Gflow:
         return out
 
     def _video_opts(self, *, aspect: str, model: str | None, duration: int | None, project: str | None, out: Path) -> list[str]:
-        args = ["--aspect", aspect, "-o", str(out)]
+        args = ["--aspect", aspect, "--out-file", str(out)]
         if model:
             args += ["--model", model]
         if duration:
@@ -417,6 +440,11 @@ class Gflow:
 
     # --- video through Meta's Muse agent (see muse_ui.py) ----------------------
 
+    def _log_full_prompt(self, prompt: str) -> None:
+        """Dry-run: the whole video prompt as it will be sent (the `$` line above is cut at PROMPT_LOG_MAX)."""
+        if self.dry_run and len(" ".join(prompt.split())) > PROMPT_LOG_MAX:
+            self.log("  prompt video đầy đủ: " + " ".join(prompt.split()))
+
     def muse_command(self) -> list[str] | None:
         if os.environ.get("MUSE_UI_CMD"):
             return _split(os.environ["MUSE_UI_CMD"])
@@ -443,15 +471,21 @@ class Gflow:
             args += ["--duration", str(duration)]
         if os.environ.get("MUSE_UI_PROFILE"):
             args += ["--profile-dir", os.environ["MUSE_UI_PROFILE"]]
+        shots = muse_fail_dir(out)
+        args += ["--fail-shots", str(shots)]
         opts = ([*(["--image", str(image)] if image is not None else []),
                  *(a for f in files for a in ("--ref", str(f))), "--aspect", aspect])
         self.log(ui_log_line(cmd, "i2v", opts, prompt))
+        self._log_full_prompt(prompt)
         if skipped:
             self.log(f"  (bỏ {skipped} nhân vật Flow/ảnh không có file: Muse chỉ nhận ảnh trên máy)")
         if self.dry_run:
             return out, None
-        payload = self._run_ui(args, "video có thể vẫn đang tạo trên Muse (lấy lại bằng muse_ui.py fetch)",
-                               spent=True, who="Muse")
+        try:
+            payload = self._run_ui(args, "video có thể vẫn đang tạo trên Muse (lấy lại bằng muse_ui.py fetch)",
+                                   spent=True, who="Muse")
+        except GflowError as exc:
+            raise muse_error(exc, shots) from exc
         local = payload.get("local_path")
         return (Path(local) if local else out), None
 
@@ -545,6 +579,7 @@ class Gflow:
         if duration:
             opts += ["--duration", str(duration)]
         self.log(ui_log_line(cmd, "i2v", opts, prompt))
+        self._log_full_prompt(prompt)
         if self.dry_run:
             return out, None
         payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)
@@ -581,6 +616,7 @@ class Gflow:
         if self.ui_window in ("show", "hidden", "headless"):
             args += ["--window", self.ui_window]
         self.log(ui_log_line(cmd, "v2v", opts, prompt))
+        self._log_full_prompt(prompt)
         if self.dry_run:
             return out, None
         payload = self._run_ui(args, "video có thể vẫn đang tạo trên Flow", spent=True)

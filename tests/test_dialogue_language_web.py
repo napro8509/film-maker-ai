@@ -23,9 +23,9 @@ VI_RULE = DIALOGUE_RULE.format(lang="Vietnamese")
 
 def _said_once(text, rule):
     """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
-    from filmmaker.storyboard import SILENT_SCENE_RULE
+    from filmmaker.storyboard import I2V_SILENT_RULE
 
-    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+    return text.count(rule) + text.count(I2V_SILENT_RULE) == 1
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):

@@ -83,7 +83,7 @@ def env(tmp_path, monkeypatch):
 
 def call_for(calls: list[list[str]], kind: tuple[str, str], out_name: str) -> list[str] | None:
     """The `gflow <kind...>` call writing `out_name` (e.g. "k1.png"), or None."""
-    found = [c for c in calls if tuple(c[:2]) == kind and Path(c[c.index("-o") + 1]).name == out_name]
+    found = [c for c in calls if tuple(c[:2]) == kind and Path(c[c.index("--out-file") + 1]).name == out_name]
     assert len(found) <= 1, found
     return found[0] if found else None
 
@@ -201,4 +201,4 @@ def test_fallback_t2v_refs_follow_scene_characters(env, monkeypatch):
     assert refs(call_for(calls, ("video", "r2v"), "k3.mp4")) == ["<tmp>/lan.png", "<tmp>/hoa.png", "<tmp>/tuan.png"]
     assert refs(call_for(calls, ("video", "r2v"), "k4.mp4")) == ["<tmp>/tuan.png"]
     # Later keyframe scenes skip the keyframe and i2v entirely.
-    assert all(Path(c[c.index("-o") + 1]).stem == "k1" for c in calls if c[:2] in (["image", "i2i"], ["video", "i2v"]))
+    assert all(Path(c[c.index("--out-file") + 1]).stem == "k1" for c in calls if c[:2] in (["image", "i2i"], ["video", "i2v"]))

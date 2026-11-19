@@ -23,9 +23,9 @@ FAKE = Path(__file__).parent / "fake_gflow.py"
 
 def _said_once(text, rule):
     """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
-    from filmmaker.storyboard import SILENT_SCENE_RULE
+    from filmmaker.storyboard import I2V_SILENT_RULE
 
-    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+    return text.count(rule) + text.count(I2V_SILENT_RULE) == 1
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -129,7 +129,7 @@ def test_put_language_whitespace_is_collapsed_in_prompt(client):
     sb["dialogue_language"] = "  Brazilian   Portuguese "
     d = client.put("/api/projects/film", json={"storyboard": sb}).json()
     assert d["scene_state"]["s01"]["video_prompt"].count(DIALOGUE_RULE.format(lang="Brazilian Portuguese")) == 1
-    assert "Nobody speaks in this scene" in d["scene_state"]["s03"]["video_prompt"]  # "rain": no lines
+    assert "stays wordless the whole time" in d["scene_state"]["s03"]["video_prompt"]  # "rain": no lines
 
 
 # --- AC15 on the fallback path: keyframe shown as text-only when i2v is unsupported -------------------------

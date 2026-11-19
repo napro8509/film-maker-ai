@@ -55,7 +55,7 @@ def run(p: Path, *args: str):
 
 def t2i_outs(calls) -> list[str]:
     assert not any(c[0] == "video" for c in calls)  # AC29
-    return [Path(c[c.index("-o") + 1]).name for c in calls if c[:2] == ["image", "t2i"]]
+    return [Path(c[c.index("--out-file") + 1]).name for c in calls if c[:2] == ["image", "t2i"]]
 
 
 def test_locations_cmd_only_missing(env, tmp_path):

@@ -44,3 +44,15 @@ def image_cap(model: str | None) -> int:
 def video_cap(model: str | None) -> int:
     """Max `--ref` images `gflow video r2v` accepts for this video model."""
     return VIDEO_REF_CAPS.get(model or "", VIDEO_REF_DEFAULT)
+
+
+# How many people Google's image models keep recognisable in one picture (Gemini API image docs, 2026-11):
+# Nano Banana 2 up to 4 characters, Nano Banana Pro up to 5; Gemini 2.5 Flash Image works best with 3 inputs.
+# More references are accepted (IMAGE_REF_CAPS) but faces drift: the pipeline only warns.
+IMAGE_FACE_CAPS: dict[str, int] = {"nano2": 4, "nano-pro": 5, "nanopro": 5}
+IMAGE_FACE_DEFAULT = 3
+
+
+def face_cap(model: str | None) -> int:
+    """Characters one keyframe can hold while keeping every face (a warning threshold, not a limit)."""
+    return IMAGE_FACE_CAPS.get(model or "", IMAGE_FACE_DEFAULT)

@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.legacy_rules import LEGACY_RULES, LEGACY_YAML
+
 from filmmaker.gflow import Gflow
 from filmmaker.pipeline import Pipeline, RunOptions
 from filmmaker.storyboard import load_storyboard
@@ -117,7 +119,7 @@ def _write_images(folder: Path):
 def _sample(tmp_path: Path) -> Path:
     _write_images(tmp_path)
     p = tmp_path / "story.yaml"
-    p.write_text(SAMPLE, encoding="utf-8")
+    p.write_text(SAMPLE + LEGACY_YAML, encoding="utf-8")  # the rules these goldens were recorded with
     return p
 
 
@@ -126,6 +128,7 @@ def _template(tmp_path: Path) -> Path:
     _write_images(tmp_path)
     data = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
     data["characters"][0]["image"] = "lan.png"
+    data["prompt_rules"] = LEGACY_RULES
     p = tmp_path / "template.yaml"
     p.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return p
@@ -431,7 +434,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              '9:16',
              '--model',
              'nano2',
-             '-o',
+             '--out-file',
              '<tmp>/out/keyframes/k1.png',
              '--project',
              'proj-123',
@@ -445,7 +448,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'text or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/k1.mp4',
              '--model',
              'veo-lite',
@@ -461,7 +464,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              '9:16',
              '--model',
              'nano2',
-             '-o',
+             '--out-file',
              '<tmp>/out/keyframes/k2.png',
              '--project',
              'proj-123',
@@ -474,7 +477,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'title cards, no watermarks, no logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/k2.mp4',
              '--model',
              'veo-lite',
@@ -494,7 +497,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              '9:16',
              '--model',
              'nano2',
-             '-o',
+             '--out-file',
              '<tmp>/out/keyframes/k3.png',
              '--project',
              'proj-123',
@@ -507,7 +510,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'no watermarks, no logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/k3.mp4',
              '--model',
              'veo-lite',
@@ -532,7 +535,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              '9:16',
              '--model',
              'nano2',
-             '-o',
+             '--out-file',
              '<tmp>/out/keyframes/k4.png',
              '--project',
              'proj-123',
@@ -545,7 +548,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/k4.mp4',
              '--model',
              'veo-fast',
@@ -564,7 +567,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              '<tmp>/tuan.png',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/t1.mp4',
              '--model',
              'veo-lite',
@@ -578,7 +581,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/t2.mp4',
              '--model',
              'veo-lite',
@@ -594,7 +597,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/t3.mp4',
              '--model',
              'veo-lite',
@@ -611,7 +614,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
              'lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.',
              '--aspect',
              '9:16',
-             '-o',
+             '--out-file',
              '<tmp>/out/clips/i1.mp4',
              '--model',
              'veo-lite',
@@ -632,7 +635,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '9:16',
                    '--model',
                    'nano2',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/keyframes/k1.png',
                    '--project',
                    'proj-123',
@@ -647,7 +650,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    'audio only.',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/k1.mp4',
                    '--model',
                    'veo-lite',
@@ -666,7 +669,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/lan.png',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/k1.mp4',
                    '--model',
                    'veo-lite',
@@ -680,7 +683,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    'title cards, no watermarks, no logos; any dialogue is spoken audio only.',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/k2.mp4',
                    '--model',
                    'veo-lite',
@@ -699,7 +702,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/bao.png',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/k3.mp4',
                    '--model',
                    'veo-lite',
@@ -722,7 +725,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/tuan.png',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/k4.mp4',
                    '--model',
                    'veo-fast',
@@ -741,7 +744,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    '<tmp>/tuan.png',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/t1.mp4',
                    '--model',
                    'veo-lite',
@@ -755,7 +758,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    'is spoken audio only.',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/t2.mp4',
                    '--model',
                    'veo-lite',
@@ -771,7 +774,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                    'watermarks, no logos; any dialogue is spoken audio only.',
                    '--aspect',
                    '9:16',
-                   '-o',
+                   '--out-file',
                    '<tmp>/out/clips/t3.mp4',
                    '--model',
                    'veo-lite',
@@ -790,7 +793,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                '16:9',
                '--model',
                'nano2',
-               '-o',
+               '--out-file',
                '<tmp>/out/keyframes/s01.png',
                '--project',
                'proj-123',
@@ -804,7 +807,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                'dialogue is spoken audio only.',
                '--aspect',
                '16:9',
-               '-o',
+               '--out-file',
                '<tmp>/out/clips/s01.mp4',
                '--model',
                'veo-lite',
@@ -825,7 +828,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                '16:9',
                '--model',
                'nano2',
-               '-o',
+               '--out-file',
                '<tmp>/out/keyframes/s02.png',
                '--project',
                'proj-123',
@@ -839,7 +842,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                'title cards, no watermarks, no logos; any dialogue is spoken audio only.',
                '--aspect',
                '16:9',
-               '-o',
+               '--out-file',
                '<tmp>/out/clips/s02.mp4',
                '--model',
                'veo-lite',
@@ -856,7 +859,7 @@ GOLDEN_ARGV = {'normal': [['project', 'create', '--name', 'Golden sample', '--js
                'or lettering, no title cards, no watermarks, no logos; any dialogue is spoken audio only.',
                '--aspect',
                '16:9',
-               '-o',
+               '--out-file',
                '<tmp>/out/clips/s03.mp4',
                '--model',
                'veo-lite',

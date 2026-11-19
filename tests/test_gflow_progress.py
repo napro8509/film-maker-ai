@@ -104,9 +104,9 @@ def test_argv_unchanged_and_log_env_set(env):
     g.text_to_image("a dog", out=env / "k.png", aspect="9:16", model="nano2", project=None)
     calls = [json.loads(l) for l in (env / "calls.log").read_text().splitlines()]
     assert calls == [
-        ["video", "t2v", "a cat", "--aspect", "16:9", "-o", str(env / "s01.mp4"), "--model", "veo-lite",
+        ["video", "t2v", "a cat", "--aspect", "16:9", "--out-file", str(env / "s01.mp4"), "--model", "veo-lite",
          "--duration", "8", "--project", "proj-123", "--json"],
-        ["image", "t2i", "a dog", "--aspect", "9:16", "--model", "nano2", "-o", str(env / "k.png"), "--json"],
+        ["image", "t2i", "a dog", "--aspect", "9:16", "--model", "nano2", "--out-file", str(env / "k.png"), "--json"],
     ]
     envs = [json.loads(l) for l in (env / "env.log").read_text().splitlines()]
     assert envs == [{"GFLOW_CLI_LOG_LEVEL": "INFO", "GFLOW_CLI_LOG_FORMAT": "json"}] * 2

@@ -62,9 +62,9 @@ scenes:
 
 def _said_once(text, rule):
     """The film's language sentence, or for a scene without lines the "nobody speaks" one, exactly once."""
-    from filmmaker.storyboard import SILENT_SCENE_RULE
+    from filmmaker.storyboard import I2V_SILENT_RULE
 
-    return text.count(rule) + text.count(SILENT_SCENE_RULE) == 1
+    return text.count(rule) + text.count(I2V_SILENT_RULE) == 1
 
 def _story(lang: str | None) -> str:
     if lang is None:
@@ -121,9 +121,9 @@ def test_flow_ui_prompts_get_rule_once(env, monkeypatch):
     for c in ui_calls:
         p = _prompt(c)
         assert _said_once(p, VI), p  # s03 already had the sentence pasted: still once
-        from filmmaker.storyboard import SILENT_SCENE_RULE
+        from filmmaker.storyboard import I2V_SILENT_RULE
 
-        assert p.index(VI if VI in p else SILENT_SCENE_RULE) < p.index(NO_TEXT), p
+        assert p.index(VI if VI in p else I2V_SILENT_RULE) < p.index(NO_TEXT), p
     assert any("Minh waits" in _prompt(c) for c in ui_calls)
     # the t2v scene still went through gflow, with the rule
     videos = [c for c in calls() if c[0] == "video"]

@@ -101,6 +101,27 @@ CLOSING = "Single continuous shot, no scene cuts."
 #: sounds.
 DEFAULT_SOUND = "quiet ambient room tone"
 
+# --- optional sentences (popup toggles / choices; research 2026-11-18, docs/nghien-cuu-quy-tac.md) -------------
+
+#: No-text said positively (Google: describe what you want, not what you don't).
+NO_TEXT_POSITIVE = ("Clean film frame: every sign, screen and surface is blank or unreadable, and no lettering is "
+                    "added over the picture.")
+#: Gemini API: only English speech is fully supported, other languages vary; Veo slipped into English in Thai films.
+NO_ENGLISH = "No English is spoken."
+#: dramapixel: Veo fills silence with "mhm", hums and voices from outside the frame.
+NO_OFFSCREEN = "No mhm sounds, hums or off-screen voices."
+#: Magic Hour: ask for no music only where it matters; music under a line muddies the lip-sync.
+NO_MUSIC_DIALOGUE = "No background music under the dialogue."
+#: Nano Banana guide: open with a strong verb that names what to make.
+FILM_STILL_OPENER = "Create a cinematic film still:"
+#: Google's Nano Banana Pro guide: "only one of each character in each image" (look-alikes merge or double).
+EACH_ONCE = "Each named character appears only once in the picture."
+#: Portrait framing with a large face: a full-body shot leaves the face small, and text cannot keep a face.
+PORTRAIT_KNEES_UP = ("Medium-full shot from the knees up, face large and sharp, front view, neutral expression, "
+                     "plain light grey studio background, soft even lighting, sharp detail.")
+#: Veo 3.1 guide / Flow Help: say what the attached ingredients are for.
+REF_OPENER = "Using the provided reference images for the characters and the setting:"
+
 # --- guidance shared by the LLM prompts ----------------------------------------------------------------------
 
 #: Children: the clause after "...(Google's child-safety filter blocks many pictures of minors and the credits are
@@ -170,6 +191,22 @@ RULES: tuple[Rule, ...] = (
     Rule("CLOSING", "Máy quay", "chèn", "Veo tự cắt cảnh trong một clip",
          ("i2v_prompt.assemble", "storyboard._silent_shot")),
     Rule("DEFAULT_SOUND", "Âm thanh", "chèn", "Câu phủ định làm Veo thêm tiếng rì rầm / nhạc", ("i2v_prompt.assemble",)),
+    Rule("NO_TEXT_POSITIVE", "Chữ trên hình", "chèn", "Google: tả điều muốn có thay vì liệt kê điều cấm",
+         ("storyboard.for_flow (no_text = positive)", "i2v_prompt.assemble")),
+    Rule("NO_ENGLISH", "Ngôn ngữ", "chèn", "Veo chỉ hỗ trợ đầy đủ tiếng Anh, hay chen tiếng Anh vào phim Thái",
+         ("storyboard.for_flow_video (video.no_english)",)),
+    Rule("NO_OFFSCREEN", "Khớp môi", "chèn", "Veo lấp chỗ im bằng tiếng “mhm”, ngân nga, giọng ngoài khung",
+         ("storyboard.for_flow_video (video.no_offscreen)",)),
+    Rule("NO_MUSIC_DIALOGUE", "Âm thanh", "chèn", "Nhạc dưới lời thoại làm khớp môi kém",
+         ("storyboard.for_flow_video (video.no_music_dialogue)",)),
+    Rule("FILM_STILL_OPENER", "Cách viết prompt", "chèn", "Hướng dẫn Nano Banana: mở bằng động từ, nêu thứ cần tạo",
+         ("storyboard.for_flow_keyframe (image.film_still_opener)",)),
+    Rule("EACH_ONCE", "Nhân vật & tham chiếu", "chèn", "Nhân vật giống nhau bị gộp hoặc nhân đôi",
+         ("storyboard.for_flow_keyframe (image.each_once)",)),
+    Rule("PORTRAIT_KNEES_UP", "Nhân vật & tham chiếu", "chèn", "Ảnh toàn thân làm mặt nhỏ, khó giữ khuôn mặt",
+         ("storyboard.portrait_prompt (image.portrait_knees_up)",)),
+    Rule("REF_OPENER", "Nhân vật & tham chiếu", "chèn", "Veo 3.1 / Flow: nói rõ ảnh tham chiếu dùng để làm gì",
+         ("storyboard.for_flow_video (video.ref_opener)",)),
     Rule("CHILDREN_GUIDE", "Chính sách & trẻ em", "dặn LLM", "Bộ lọc trẻ em của Google chặn ảnh, mất credit",
          ("planner.SYSTEM", "reviewer.STORYBOARD_SYSTEM")),
 )
@@ -224,6 +261,8 @@ _NO_TEXT_OPTIONS = (
     ("auto", "Theo định dạng phim", "Phim drama: câu dài; các định dạng khác: câu ngắn."),
     ("long", "Câu dài", "Liệt kê đủ: không caption, phụ đề, chữ, title card, watermark, logo."),
     ("short", "Câu ngắn", "Một câu ngắn, ít phủ định (Veo dễ hiểu hơn)."),
+    ("positive", "Câu khẳng định", "“Khung hình sạch: biển, màn hình, bề mặt đều trống” thay vì liệt kê điều cấm "
+     "(Google khuyên tả điều muốn có)."),
     ("off", "Không thêm", "Không nhắc gì về chữ trên hình."),
 )
 
@@ -235,12 +274,15 @@ IMAGE_RULES: tuple[Toggle | Choice, ...] = (
             ("camera", "Người nói nhìn về camera", "Mặt to nhất, chính diện hoặc 3/4 về camera, thấy rõ miệng."),
             ("profile", "Người nói nghiêng 3/4 về người nghe",
              "Không nhìn ống kính; mọi người môi khép tự nhiên."),
+            ("near", "Gần chính diện, mắt nhìn người nghe sát ống kính",
+             "Gộp cả hai: mặt to, hơi xoay 3/4 về ống kính, thấy rõ miệng, mắt nhìn người nghe ngay cạnh ống kính; "
+             "người nghe nghiêng hoặc quay lưng."),
             ("off", "Không thêm", "Ảnh chỉ theo prompt của cảnh."))),
     Toggle("child_safe", "Viết lại mô tả trẻ em cho qua bộ lọc Google",
            "Bỏ tuổi chính xác và chi tiết cơ thể, girl → schoolgirl. Thiếu là dễ bị chặn, mất credit."),
     Toggle("portrait_everyday", "Ảnh chân dung kiểu cảnh đời thường",
-           "Không chụp studio toàn thân (bộ lọc trẻ em chặn). Drama: chỉ áp cho trẻ em; định dạng khác: mọi nhân vật "
-           "chưa có prompt chân dung riêng."),
+           "Không chụp studio toàn thân (bộ lọc trẻ em chặn). Chỉ áp cho trẻ em chưa có prompt chân dung riêng; "
+           "người lớn dùng ảnh tham chiếu nền trơn."),
     Toggle("no_identical", "Tránh “sinh đôi giống hệt”",
            "“identical twins / same face” → “trông giống nhau”: model gộp hai người giống hệt thành một thân."),
     Toggle("strip_technical", "Bỏ tỉ lệ khung, thời lượng, độ phân giải khỏi prompt",
@@ -250,6 +292,17 @@ IMAGE_RULES: tuple[Toggle | Choice, ...] = (
     Toggle("setting", "Thêm mô tả bối cảnh (Setting: …)", "Giữ căn phòng giống nhau từ cảnh này sang cảnh khác."),
     Toggle("style", "Thêm phong cách chung (Style: …)", "Phong cách hình ảnh của phim, ghi một lần cho mọi ảnh."),
     Toggle("camera", "Thêm cỡ cảnh, góc, ống kính vào ảnh", "Từ mục máy quay của cảnh.", flows=("drama",)),
+    Toggle("numbered_refs", "Đánh số ảnh tham chiếu, khoá danh tính theo số",
+           "“Image 2 is Lan: keep Lan's facial features, hairstyle and outfit exactly the same as Image 2.” "
+           "(hướng dẫn Nano Banana của Google)."),
+    Toggle("setting_last", "Ảnh bối cảnh / keyframe trước đặt cuối danh sách tham chiếu",
+           "Ảnh ra lấy tỉ lệ khung của ảnh tham chiếu cuối cùng (Gemini API)."),
+    Toggle("each_once", "Mỗi nhân vật chỉ xuất hiện một lần", "Chống nhân đôi hoặc gộp hai nhân vật giống nhau.",
+           default=False),
+    Toggle("film_still_opener", "Mở prompt bằng “Create a cinematic film still:”",
+           "Hướng dẫn Nano Banana: mở bằng động từ, nêu rõ thứ cần tạo.", default=False),
+    Toggle("portrait_knees_up", "Chân dung từ gối trở lên, mặt to",
+           "Thay cho ảnh toàn thân (mặt nhỏ, khó giữ khuôn mặt). Chỉ áp cho chân dung chụp studio.", default=False),
     Toggle("content_direction", "Thêm chỉ đạo diễn xuất vào ảnh",
            "Content direction đặt biểu cảm, dáng người của khung mở đầu.", flows=("drama",)),
 )
@@ -261,10 +314,13 @@ VIDEO_RULES: tuple[Toggle | Choice, ...] = (
            "Nhìn camera giúp Veo giao câu đúng người; nghiêng 3/4 tránh người nói nhìn chằm vào ống kính.",
            (("auto", "Theo định dạng phim", "Drama: quay mặt về camera; định dạng khác: nghiêng 3/4."),
             ("camera", "Quay mặt về camera", "Mặt và miệng thấy rõ, môi cử động theo lời."),
-            ("profile", "Nghiêng 3/4 về người nghe", "Không nhìn ống kính; ánh nhìn theo tọa độ khung hình."))),
+            ("profile", "Nghiêng 3/4 về người nghe", "Không nhìn ống kính; ánh nhìn theo tọa độ khung hình."),
+            ("near", "Gần chính diện, mắt nhìn người nghe sát ống kính",
+             "Gộp cả hai: thấy rõ miệng cho khớp môi, mắt không nhìn thẳng ống kính."))),
     Choice("silence", "Cảnh không có câu thoại (phim có thoại)",
            "Không dặn gì thì Veo hay bịa thoại (kể cả tiếng Anh) ở khoảng nửa số cảnh im lặng.",
-           (("auto", "Theo định dạng phim", "Drama: cho phép cười, ngân nga; định dạng khác: chỉ thở, khóc nhẹ."),
+           (("auto", "Theo định dạng phim", "Mọi định dạng: chỉ thở, thở dài, khóc nhẹ (miệng mở kéo Veo bịa "
+             "thoại)."),
             ("laugh", "Cho phép cười, ngân nga không lời", "Không ai nói; vẫn có thể cười, thở dài, khóc."),
             ("breath", "Chỉ thở, thở dài, khóc nhẹ", "Mọi người môi khép suốt cảnh."),
             ("off", "Không thêm", "Không dặn gì về im lặng."))),
@@ -298,6 +354,20 @@ VIDEO_RULES: tuple[Toggle | Choice, ...] = (
     Toggle("setting", "Thêm mô tả bối cảnh (video từ chữ)", "Chỉ cho cảnh không có ảnh mở đầu."),
     Toggle("style", "Thêm phong cách chung (video từ chữ)", "Chỉ cho cảnh không có ảnh mở đầu."),
     Toggle("camera", "Thêm chuyển động máy quay", "Từ mục máy quay của cảnh.", flows=("drama",)),
+    Toggle("voices", "Giọng cố định của nhân vật",
+           "Chèn nguyên văn giọng đã ghi ở nhân vật (Vertex AI: lặp đúng mô tả giọng ở mọi clip)."),
+    Toggle("ref_opener", "Nói rõ ảnh tham chiếu dùng để làm gì",
+           "“Using the provided reference images for the characters and the setting:” khi gửi video kèm ảnh "
+           "nhân vật (Veo 3.1 / Flow)."),
+    Toggle("no_english", "Không nói tiếng Anh",
+           "Thêm “No English is spoken.” và ghi ngôn ngữ ngay trong câu thoại. Veo chỉ hỗ trợ đầy đủ tiếng Anh.",
+           default=False),
+    Toggle("no_offscreen", "Không “mhm”, ngân nga, giọng ngoài khung", "Veo hay lấp chỗ im bằng tiếng người.",
+           default=False),
+    Toggle("no_music_dialogue", "Không nhạc dưới lời thoại", "Chỉ cho cảnh có câu thoại.", default=False),
+    Toggle("timed_beats", "Chia nhịp theo giây (thử nghiệm)",
+           "[00:00-00:05] nói, [00:05-00:08] ngậm miệng, người khác phản ứng. Thay cho câu ngậm miệng sau khi nói.",
+           flows=("basic",), default=False),
 )
 
 RULE_SETS: dict[str, tuple[Toggle | Choice, ...]] = {"image": IMAGE_RULES, "video": VIDEO_RULES}

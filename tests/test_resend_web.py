@@ -18,7 +18,7 @@ SERVER = Path(server.__file__)
 
 def sent_ids(c) -> list[str]:
     """Scene ids of the `video` commands the fake gflow received (from `-o .../clips/<id>.mp4`)."""
-    return [Path(x[x.index("-o") + 1]).stem for x in video_calls(c)]
+    return [Path(x[x.index("--out-file") + 1]).stem for x in video_calls(c)]
 
 
 def est(c, **body):

@@ -372,10 +372,16 @@ def _to_png_if_needed(out: Path) -> None:
         tmp.replace(out)
 
 
+#: Where screenshots of a failed request go (--fail-shots), even without --debug-dir: set by _generate.
+FAIL_SHOTS: dict = {"dir": None}
+
+
 def _shot(page, debug: Path | None, name: str) -> None:
-    if debug:
+    dirs = [d for d in (debug, FAIL_SHOTS["dir"] if name.startswith("9-") else None) if d]
+    for d in dirs:
         try:
-            page.screenshot(path=str(debug / f"{name}.png"))
+            d.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(d / f"{name}.png"))
         except Exception:
             pass
 
@@ -402,6 +408,7 @@ def _generate(args, kind: str) -> dict:
     debug = Path(args.debug_dir).expanduser() if args.debug_dir else None
     if debug:
         debug.mkdir(parents=True, exist_ok=True)
+    FAIL_SHOTS["dir"] = Path(args.fail_shots).expanduser() if getattr(args, "fail_shots", None) else None
     if kind == "image":
         prompt, sel, word, min_size = build_image_prompt(args.prompt, refs=len(refs), aspect=args.aspect), "img", "ảnh", 5_000
     else:
@@ -471,9 +478,11 @@ def _generate(args, kind: str) -> dict:
                         raise Fail(EXIT_GENERATION_FAILED, f"File {word} Muse tải về quá nhỏ", spent=True)
                     return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
                 if page.evaluate(FAILED_JS) > failed_before:
+                    time.sleep(4)  # Muse writes a line about the failure right after the task row
                     _shot(page, debug, "9-failed")
-                    raise Fail(EXIT_GENERATION_FAILED, f"Muse báo không tạo được {word} này (Failed to create…). "
-                               "Gửi lại cảnh hoặc sửa prompt.", spent=False)
+                    said = (page.evaluate(REPLY_AFTER_JS, marker) or "").replace("\n", " ").strip()
+                    raise Fail(EXIT_GENERATION_FAILED, f"Muse báo không tạo được {word} này (Failed to create…)."
+                               + (f" Muse: {said[:300]}" if said else ""), spent=False)
                 reply = page.evaluate(REPLY_AFTER_JS, marker)
                 if reply != last_reply:
                     last_reply, reply_at = reply, time.time()
@@ -553,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--window", choices=["show", "headless"], default="headless")
     v.add_argument("--timeout", type=int, default=900)
     v.add_argument("--debug-dir", help="save screenshots of each step here")
+    v.add_argument("--fail-shots", help="save a screenshot here only when the request fails")
     v.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
     im = sub.add_parser("image", help="one picture from a prompt (+ reference pictures)")
     common(im)
@@ -563,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--window", choices=["show", "headless"], default="headless")
     im.add_argument("--timeout", type=int, default=600)
     im.add_argument("--debug-dir", help="save screenshots of each step here")
+    im.add_argument("--fail-shots", help="save a screenshot here only when the request fails")
     im.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
     f = sub.add_parser("fetch", help="download the clip Muse made for an earlier message (sends nothing)")
     common(f)

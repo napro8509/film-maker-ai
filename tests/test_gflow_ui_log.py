@@ -55,7 +55,8 @@ def test_ui_i2v_log_line(ui_gflow):
     prompt = "Wide shot.\n" + "slow pan " * 60
     out, media = i2v(g, tmp, prompt=prompt)
     assert (out, media) == (tmp / "s01.mp4", None)  # dry run still logs, returns before running anything
-    assert len(lines) == 1
+    assert len(lines) == 2  # the `$` line, then the whole prompt (it was cut on the `$` line)
+    assert lines[1] == "  prompt video đầy đủ: " + " ".join(prompt.split())
     line = lines[0]
     assert line.startswith("  $ ") and CMD_RE.match(line)
     argv = shlex.split(line[4:])

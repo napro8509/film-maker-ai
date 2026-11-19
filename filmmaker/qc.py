@@ -72,7 +72,9 @@ their names, makes sense); when unsure, say so and do not FAIL for it.
 Check:
 - Picture: it is THIS scene (place, people, action from the keyframe), the right characters with the right faces
   and clothes, no morphing faces/bodies, extra limbs, people appearing or vanishing, frozen or black frames, and
-  no burned-in subtitles, captions or gibberish text (any readable or fake text in the picture = FAIL).
+  no burned-in subtitles, captions or gibberish text (any readable or fake text in the picture = FAIL). Veo
+  burns subtitles into the bottom third above all while a line is spoken: look closely at the bottom third of
+  every frame, including the who-speaks frames.
 - Sound: when the scene has dialogue, the expected lines are spoken (same meaning), in the expected language,
   once, by one speaker at a time; no extra lines nobody wrote, no line said twice, no other language. Silence or
   only music where a line was expected = FAIL. When the scene has no dialogue, nobody should talk: a

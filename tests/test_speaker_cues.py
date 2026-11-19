@@ -68,12 +68,12 @@ def test_pipeline_sends_the_cues(tmp_path, monkeypatch):
 
 def test_a_scene_without_lines_is_told_nobody_speaks():
     # The language rule alone ("characters speak only Thai") made Veo invent lines in silent scenes.
-    from filmmaker.storyboard import DIALOGUE_RULE, SILENT_SCENE_RULE
+    from filmmaker.storyboard import DIALOGUE_RULE, I2V_SILENT_RULE
 
     sb = _sb()
     quiet, talking = sb.scenes[1], sb.scenes[0]
     sent = sb.for_flow_video(sb.video_prompt(quiet), quiet)
-    assert SILENT_SCENE_RULE in sent and "Spoken language: Thai" not in sent
+    assert I2V_SILENT_RULE in sent and "Spoken language: Thai" not in sent
     assert sb.for_flow_video(sent, quiet) == sent
     assert DIALOGUE_RULE.format(lang="Thai") in sb.for_flow_video(sb.video_prompt(talking), talking)
     before = sb.scene_fingerprint(quiet)
@@ -121,7 +121,7 @@ def test_keyframe_is_staged_with_the_speaker_as_the_main_face(tmp_path, monkeypa
 def test_a_scene_without_lines_never_gets_the_language_rule():
     # s10 of "18 ngày": "boys softly singing" counted as speech, the scene got "characters speak only Vietnamese"
     # and Veo made up four lines.
-    from filmmaker.storyboard import SILENT_SCENE_RULE
+    from filmmaker.storyboard import I2V_SILENT_RULE
 
     sb = _sb()
     quiet = sb.scenes[1]
@@ -131,9 +131,9 @@ def test_a_scene_without_lines_never_gets_the_language_rule():
         return sb.for_flow_video(sb.video_prompt(quiet), quiet)
 
     singing = sent("The boys softly sing and laugh around the flashlight.")
-    assert SILENT_SCENE_RULE in singing and "Spoken language: Thai" not in singing
+    assert I2V_SILENT_RULE in singing and "Spoken language: Thai" not in singing
     talking = sent("Malee says hello.")  # someone does talk: the language rule stays
-    assert "Spoken language: Thai" in talking and SILENT_SCENE_RULE not in talking
+    assert "Spoken language: Thai" in talking and I2V_SILENT_RULE not in talking
     typed = sent("Malee: con ăn đi.")  # a line typed into the prompt is dialogue
     assert "Spoken language: Thai" in typed
     assert not sb._speech_in_prompt("The boys are singing.")

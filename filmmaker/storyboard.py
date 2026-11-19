@@ -18,7 +18,8 @@ from . import i2v_prompt, rules
 from .ai import DEFAULT_AI_MODEL, clean_ai_model
 from .i2v_prompt import VideoShot
 from .rules import (  # noqa: F401  (re-exported: other modules and tests use storyboard.<NAME>)
-    BACKGROUND_NO_WORDS, DIALOGUE_MAX, DIALOGUE_RULE, DIALOGUE_TURNS, I2V_SILENT_RULE, MAX_REFS, NO_DIALOGUE_RULE,
+    EACH_ONCE, FILM_STILL_OPENER, NO_ENGLISH, NO_MUSIC_DIALOGUE, NO_OFFSCREEN, NO_TEXT_POSITIVE, PORTRAIT_KNEES_UP,
+    REF_OPENER, BACKGROUND_NO_WORDS, DIALOGUE_MAX, DIALOGUE_RULE, DIALOGUE_TURNS, I2V_SILENT_RULE, MAX_REFS, NO_DIALOGUE_RULE,
     NO_TEXT, OLD_DIALOGUE_RULE, OLD_NO_DIALOGUE_RULE, SILENT_SCENE_RULE, SPEAKER_LOOK_WORDS, START_FRAME_CHARS,
 )
 
@@ -101,6 +102,9 @@ def file_sha(path: str | Path) -> str | None:
     return sha
 
 
+#: Words in a keyframe prompt that Muse tends to refuse to animate.
+MUSE_SENSITIVE = re.compile(r"(?i)\b(?:tears?|tear[- ]?(?:stained|streaked|tracks?)|teary|crying|cries|sobb?(?:ing|s)?|weep(?:ing|s)?|grief|grieving|red[- ]rimmed|funeral|corpse|dead body|blood)\b")
+
 class Subtitles(BaseModel):
     """The scene's subtitle line in each of the three track languages."""
     vi: str | None = Field(default=None, description="Vietnamese subtitle line.")
@@ -136,6 +140,9 @@ class Character(BaseModel):
                               "keyframe / video of a scene that mentions the name so the face stays the same.")
     image_prompt: str | None = Field(default=None, description="Prompt for generating the reference image "
                                      "(defaults to a full-body portrait built from the description).")
+    voice: str | None = Field(default=None, description="Fixed voice in English, the same in every clip: gender and "
+                              "age, pitch, timbre, accent, pace (e.g. 'warm mid-pitch female voice, native Bangkok "
+                              "Thai accent, slow pace'). Omit for characters who never speak.")
 
 
 class Location(BaseModel):
@@ -310,6 +317,27 @@ class Camera(BaseModel):
         if self.notes:
             parts.append(f"Direction: {self.notes.strip().rstrip('.')}.")
         return " ".join(parts)
+
+
+def _append(prompt: str, sentence: str) -> str:
+    """`prompt` + one more sentence (a full stop added in between when missing)."""
+    base = prompt.rstrip()
+    if base and base[-1] not in ".!?":
+        base += "."
+    return f"{base} {sentence}" if base else sentence
+
+
+def _insert_before(prompt: str, text: str, marks: tuple[str, ...]) -> str:
+    """`text` right before the earliest of `marks` found in `prompt` (the Audio line, the closing or no-text
+    sentence), else at the end."""
+    found = [i for i in (prompt.find(m) for m in marks if m) if i >= 0]
+    if not found:
+        return _append(prompt, text)
+    at = min(found)
+    head = prompt[:at].rstrip()
+    if head and head[-1] not in ".!?)":
+        head += "."
+    return f"{head} {text} {prompt[at:]}" if head else f"{text} {prompt[at:]}"
 
 
 def _line_key(text: str) -> str:
@@ -513,7 +541,7 @@ class Storyboard(StoryboardDraft):
             return "off"
         if v == "auto":
             return {"no_text": ("short", "long"), "staging": ("profile", "camera"), "facing": ("profile", "camera"),
-                    "silence": ("breath", "laugh")}[rule_id][0 if self.basic else 1]
+                    "silence": ("breath", "breath")}[rule_id][0 if self.basic else 1]
         return v
 
     @contextmanager
@@ -725,8 +753,13 @@ class Storyboard(StoryboardDraft):
         if self.rule(kind, "child_safe"):
             prompt = i2v_prompt.child_safe(prompt)
         no_text = self.rule(kind, "no_text")
-        if no_text == "off" or NO_TEXT in prompt:
+        if no_text == "off" or NO_TEXT in prompt or NO_TEXT_POSITIVE in prompt:
             return prompt
+        if no_text == "positive":
+            base = prompt.rstrip()
+            if base and base[-1] not in ".!?":
+                base += "."
+            return f"{base} {NO_TEXT_POSITIVE}" if base else NO_TEXT_POSITIVE
         if no_text == "short":  # I2V guide rule 6: one short closing sentence, not a long list of negatives
             if i2v_prompt.NO_TEXT_IMAGE in prompt:
                 return prompt
@@ -787,8 +820,10 @@ class Storyboard(StoryboardDraft):
         silent = [n for n in cast if n.casefold() not in {x.casefold() for x in speakers}]
         parts = [f"Who is who in the picture: {'; '.join(looks)}."] if looks else []
         who = " and ".join(speakers)
-        turn = ("the face toward the camera" if self.rule("video", "facing") == "camera" else
-                "in three-quarter profile toward the person spoken to, never into the lens,")
+        turn = {"camera": "the face toward the camera",
+                "near": "slightly three-quarter toward the camera with the face and mouth clearly visible, eyes on "
+                        "the person spoken to just beside the lens,"}.get(
+            self.rule("video", "facing"), "in three-quarter profile toward the person spoken to, never into the lens,")
         parts.append(f"Only {who} speak{'s' if len(speakers) == 1 else ''}: while speaking, "
                      f"{'the speaker turns' if len(speakers) > 1 else who + ' turns'} {turn} "
                      "and the lips visibly move with the words.")
@@ -801,24 +836,27 @@ class Storyboard(StoryboardDraft):
             parts.append(BACKGROUND_NO_WORDS)
         return " ".join(parts)
 
-    def keyframe_staging(self, scene: Scene, profile: bool = False) -> str:
+    def keyframe_staging(self, scene: Scene, how: str = "camera") -> str:
         """How the opening frame of a dialogue scene is staged ("" when it has none). Veo gives the line to the
         biggest face it sees talking, so the first speaker is the main face, toward the camera, and everyone
         else is smaller with the mouth closed. A listener in the foreground with an open-mouthed grin was made
-        to say the speaker's line."""
+        to say the speaker's line. `how` = the image rule "staging": camera / profile / near."""
         speakers, cast = self._dialogue_cast(scene)
         if not speakers:
             return ""
         first = speakers[0]
         others = [n for n in cast if n.casefold() != first.casefold()]
-        turn = (f"in three-quarter profile turned toward {' and '.join(others) or 'the person spoken to'}, never "
-                "looking into the lens" if profile else "turned toward the camera (front or three-quarter view)")
+        partner = " and ".join(others) or "the person spoken to"
+        turn = {"profile": f"in three-quarter profile turned toward {partner}, never looking into the lens",
+                "near": f"turned slightly three-quarter toward the camera, eyes on {partner} just beside the lens",
+                }.get(how, "turned toward the camera (front or three-quarter view)")
         text = (f"Staging for the dialogue that follows: {first} is the main subject, in the foreground with the "
                 f"largest, closest face, {turn}, face and mouth clearly visible.")
         if others:
             many = len(others) > 1
+            pose = "seen from behind the shoulder or in soft profile" if how == "near" else f"turned toward {first}"
             text += (f" {' and '.join(others)} {'are' if many else 'is'} smaller in the frame or further back, "
-                     f"turned toward {first}, mouth closed (a closed-mouth smile at most), listening.")
+                     f"{pose}, mouth closed (a closed-mouth smile at most), listening.")
         text += " Anyone in the background is small, with the mouth closed."
         return text
 
@@ -826,13 +864,14 @@ class Storyboard(StoryboardDraft):
         """A keyframe prompt as actually sent to Flow: the dialogue staging (`keyframe_staging`), then
         `for_flow`. Not part of the fingerprints, so adding it remakes nothing that is already made."""
         how = self.rule("image", "staging")
-        staging = (self.keyframe_staging(scene, profile=how == "profile")
+        staging = (self.keyframe_staging(scene, how=how)
                    if scene is not None and not self.basic and how != "off" else "")
         if staging and "Staging for the dialogue" not in prompt:
-            base = prompt.rstrip()
-            if base and base[-1] not in ".!?":
-                base += "."
-            prompt = f"{base} {staging}" if base else staging
+            prompt = _append(prompt, staging)
+        if scene is not None and self.rule("image", "each_once") and EACH_ONCE not in prompt:
+            prompt = _append(prompt, EACH_ONCE)
+        if self.rule("image", "film_still_opener") and not prompt.lstrip().startswith(FILM_STILL_OPENER):
+            prompt = f"{FILM_STILL_OPENER} {prompt.lstrip()}"
         return self.for_flow(prompt)
 
     def _speech_in_prompt(self, prompt: str) -> bool:
@@ -863,10 +902,59 @@ class Storyboard(StoryboardDraft):
                 return f"{head} {rule} {prompt[at:]}" if head else f"{rule} {prompt[at:]}"
         return f"{prompt.rstrip()} {rule}"
 
-    def for_flow_video(self, prompt: str, scene: Scene | None = None) -> str:
+    def for_flow_video(self, prompt: str, scene: Scene | None = None, refs: bool = False) -> str:
         """A video prompt as actually sent to Flow: who-is-who for the dialogue (`speaker_cues`, when the scene is
-        given), the spoken-language sentence, then `for_flow` (NO_TEXT).
-        None of these are part of the fingerprints, so adding them re-renders nothing."""
+        given), the spoken-language sentence, then `for_flow` (NO_TEXT); then the optional video rules (voices,
+        no English, no off-screen voices, no music under the line) and, when character pictures go with it
+        (`refs`), what they are for. None of these are part of the fingerprints, so adding them re-renders nothing."""
+        out = self._video_rules(prompt, scene)
+        extra = [x for x in self._video_extras(scene) if x not in out]
+        if extra:
+            out = _insert_before(out, " ".join(extra), ("Audio:", i2v_prompt.CLOSING, NO_TEXT, i2v_prompt.NO_TEXT_IMAGE,
+                                                       NO_TEXT_POSITIVE))
+        if refs and self.rule("video", "ref_opener") and not out.startswith(REF_OPENER):
+            out = f"{REF_OPENER} {out}"
+        return out
+
+    def _speaker_voices(self, scene: Scene) -> list[tuple[str, str]]:
+        """(how the prompt names the speaker, fixed voice) for the speakers of `scene` whose character has a voice.
+        Basic films name nobody in the video prompt (Veo sees only the picture): "The speaker"."""
+        by_name = {c.name.strip().casefold(): c for c in self.characters if c.name.strip()}
+        if self.basic:
+            sp = scene.video_shot.speaker if scene.video_shot is not None else None
+            if sp is None or not i2v_prompt.clean_line(sp.line):
+                return []
+            name = (sp.character or "").strip()
+            if not name:
+                cast = self.scene_characters(scene) if scene.characters is not None else []
+                name = cast[0].name if len(cast) == 1 else ""
+            c = by_name.get(name.casefold())
+            return [("The speaker", c.voice.strip())] if c and c.voice and c.voice.strip() else []
+        out: list[tuple[str, str]] = []
+        for d in scene.spoken_lines() if self.speaks() else []:
+            c = by_name.get(d.character.strip().casefold())
+            if c and c.voice and c.voice.strip() and all(n != c.name for n, _ in out):
+                out.append((c.name, c.voice.strip()))
+        return out
+
+    def _video_extras(self, scene: Scene | None) -> list[str]:
+        """Sentences of the optional video rules for this scene, in order."""
+        out: list[str] = []
+        talks = scene is not None and (bool(scene.video_shot and scene.video_shot.speaker
+                                             and i2v_prompt.clean_line(scene.video_shot.speaker.line))
+                                        if self.basic else bool(self.speaks() and scene.spoken_lines()))
+        if scene is not None and talks and self.rule("video", "voices"):
+            out += [f"{who}'s voice: {v.rstrip('.')}." for who, v in self._speaker_voices(scene)]
+        lang = self.spoken_language() if self.basic else (self.dialogue_language if self.speaks() else None)
+        if self.rule("video", "no_english") and lang and lang.casefold() not in ("english", "en"):
+            out.append(NO_ENGLISH)
+        if self.rule("video", "no_offscreen"):
+            out.append(NO_OFFSCREEN)
+        if talks and self.rule("video", "no_music_dialogue"):
+            out.append(NO_MUSIC_DIALOGUE)
+        return out
+
+    def _video_rules(self, prompt: str, scene: Scene | None = None) -> str:
         if self.basic and (i2v_prompt.CLOSING in prompt or (  # a structured I2V prompt is complete but for silence
                 scene is not None and scene.video_shot is not None and prompt.strip() == self.video_prompt(scene).strip())):
             return self._silent_shot(prompt, scene)
@@ -922,7 +1010,10 @@ class Storyboard(StoryboardDraft):
             # child-safety filter blocks it), even when the planner wrote one; the look comes from the description.
             # Not part of any fingerprint: an existing portrait is not remade.
             return i2v_prompt.child_portrait(c.description, style)
-        if self.basic and everyday and not (c.image_prompt and c.image_prompt.strip()):
+        if (self.basic and everyday and not (c.image_prompt and c.image_prompt.strip())
+                and i2v_prompt.is_minor(c.description)):
+            # Only children: an adult's reference picture in a kitchen scene is a film still, not a reference
+            # (landscape, a smile, a set table that leaks into keyframes); adults get the studio frame below.
             # A natural everyday setting, not "full body on a plain studio background": that framing of a child
             # is blocked by Google's child-safety filter (and no exact ages: child_safe).
             # A film still of an everyday moment, the person DOING something (tested on Flow with a child: the
@@ -944,9 +1035,10 @@ class Storyboard(StoryboardDraft):
         if c.image_prompt and c.image_prompt.strip():
             base = c.image_prompt.strip().rstrip(".") + "."
         else:
-            base = (f"Character reference image of {c.name}: {c.description.strip().rstrip('.')}. "
-                    "Full body, standing, facing the camera, face clearly visible, neutral expression, "
-                    "plain light grey studio background, soft even lighting, sharp detail.")
+            frame = (PORTRAIT_KNEES_UP if self.rule("image", "portrait_knees_up") else
+                     "Full body, standing, facing the camera, face clearly visible, neutral expression, "
+                     "plain light grey studio background, soft even lighting, sharp detail.")
+            base = f"Character reference image of {c.name}: {c.description.strip().rstrip('.')}. {frame}"
         if style.strip():
             base += f" Style: {style.strip().rstrip('.')}."
         return self._safe_image(base) if self.basic else base
@@ -1017,13 +1109,15 @@ class Storyboard(StoryboardDraft):
                 seen.add(key)
                 lines.append(d)
         if lines:
+            lang = self.dialogue_language
+            in_lang = f" in {lang}" if self.rule("video", "no_english") and lang else ""
             said = []
             for i, d in enumerate(lines):
                 how = f" ({d.delivery.strip().rstrip('.')})" if d.delivery else ""
                 words = d.line.strip()
                 if words[-1] not in ".!?…":
                     words += "."
-                said.append(f"{'Then ' if i else ''}{d.character}{how} says: {words}")
+                said.append(f"{'Then ' if i else ''}{d.character}{how} says{in_lang}: {words}")
             order = "in this order" if len(lines) > 1 else "only this line"
             parts.append(f"Dialogue, spoken one character at a time, {order}: " + " ".join(said))
             turns = self.rule("video", "dialogue_turns")
@@ -1034,6 +1128,28 @@ class Storyboard(StoryboardDraft):
             if silent and turns:
                 parts.append(f"{' and '.join(silent)} {'stays' if len(silent) == 1 else 'stay'} silent.")
         return " ".join(parts)
+
+    def muse_warnings(self) -> dict[str, list[str]]:
+        """Scenes rendered on Muse whose keyframe shows tears or grief: Muse often refuses those (a Thai film: two
+        such scenes were refused four times; calm keyframes went through at once)."""
+        from .gflow import is_muse
+
+        out: dict[str, list[str]] = {}
+        for sc in self.scenes:
+            if is_muse(sc.model or self.model) and MUSE_SENSITIVE.search(sc.image_prompt or ""):
+                out[sc.id] = ["Keyframe có nước mắt / khóc / đau buồn: Muse có thể từ chối (nếu bị từ chối, tả nét mặt bình tĩnh hơn "
+                              "hoặc đặt `model: veo-lite` cho riêng cảnh này, tốn credit Flow)."]
+        return out
+
+    def dialogue_fields_note(self) -> str | None:
+        """One line for films whose dialogue scenes have a `video_shot.action`: that field is not sent."""
+        if not (self.basic and self.audio == "dialogue"):
+            return None
+        if any(sc.video_shot and sc.video_shot.speaker and (sc.video_shot.speaker.line or "").strip()
+               and (sc.video_shot.action or "").strip() for sc in self.scenes):
+            return ("Cảnh có thoại: prompt video lấy hành động từ speaker.action và listeners[].silent_action; "
+                    "`video_shot.action` và `prompt` không được gửi. Xem prompt thật bằng `run --dry-run`.")
+        return None
 
     def dialogue_warnings(self) -> dict[str, list[str]]:
         """Problems with the dialogue, per scene id (Vietnamese, for the editor and `filmmaker check`):
@@ -1072,6 +1188,10 @@ class Storyboard(StoryboardDraft):
                     said[key] = f"cảnh {s.id}, {who}"
             if s.spoken_lines() and not self.speaks():
                 msgs.append("phim đang đặt Không thoại nên lời thoại cảnh này bị bỏ qua")
+            who_speaks = list(dict.fromkeys(d.character.strip() for d in s.spoken_lines() if d.character.strip()))
+            if len(who_speaks) > 1 and self.speaks():  # lip-sync: ~80% with one speaker, under 40% with several
+                msgs.append(f"{len(who_speaks)} người nói trong một cảnh ({', '.join(who_speaks)}): Veo hay giao nhầm "
+                            "câu; nên tách thành các cảnh shot / reverse-shot, mỗi cảnh một người nói")
             if msgs:
                 out[s.id] = msgs
         return out
@@ -1174,7 +1294,7 @@ class Storyboard(StoryboardDraft):
         if self.basic:  # the motion only (the look is in the picture); t2v also gets characters and style
             if scene.video_shot is not None:
                 return i2v_prompt.assemble(scene.video_shot, audio_mode=self.audio, language=self.spoken_language(),
-                                           narration=scene.narration, opts=self.shot_options())
+                                           narration=scene.narration, opts=self.shot_options(scene))
             if scene.mode == "t2v":
                 return self._compose(scene.prompt, "", self._prompt_characters(scene), kind="video")
             return scene.prompt.strip()
@@ -1219,11 +1339,14 @@ class Storyboard(StoryboardDraft):
         return self._compose(scene.image_prompt or scene.prompt, self._join(frame, content),
                              self._prompt_characters(scene), setting=self._setting(scene))
 
-    def shot_options(self) -> dict[str, bool | str]:
+    def shot_options(self, scene: Scene | None = None) -> dict[str, bool | str | int]:
         """What `i2v_prompt.assemble` adds to a structured video prompt, from the video rules."""
-        return {k: self.rule("video", k) for k in ("no_text", "facing", "locked_camera", "lens_words",
-                                                   "listener_silent", "closed_smile", "lip_lock", "default_sound",
-                                                   "closing")}
+        o: dict[str, bool | str | int] = {k: self.rule("video", k) for k in (
+            "no_text", "facing", "locked_camera", "lens_words", "listener_silent", "closed_smile", "lip_lock",
+            "default_sound", "closing", "timed_beats")}
+        if scene is not None and scene.duration:
+            o["duration"] = int(scene.duration)
+        return o
 
     def stored_image_prompt(self, scene: Scene) -> str:
         """The keyframe prompt kept in the run state (default rules: a changed rule does not remake keyframes)."""

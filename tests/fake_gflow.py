@@ -97,7 +97,7 @@ for rule in filter(None, os.environ.get("FAKE_GFLOW_FAIL", "").split(",")):
             sys.exit(int(code))
 
 def out_path():
-    return Path(argv[argv.index("-o") + 1])
+    return Path(argv[argv.index("--out-file") + 1])
 
 
 # --ref caps of the real gflow-cli (mirror of filmmaker/ref_caps.py): too many references -> exit 2, like

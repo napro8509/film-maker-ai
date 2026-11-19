@@ -43,7 +43,7 @@ Quy tắc:
   Không chép lại description. Tối đa 3 nhân vật mỗi cảnh.
 - Không yêu cầu chữ, biển hiệu, phụ đề trong hình.
 - Thoại chỉ ghi trong `dialogue`, không ghi trong prompt/image_prompt, không dùng ngoặc kép trong prompt.
-  Nhân vật nói lần lượt, mỗi dòng một người, ngắn vừa clip (khoảng 2-3 câu ngắn cho 8 giây).
+  Mỗi cảnh chỉ MỘT nhân vật nói, một câu tối đa 12 từ (câu thứ hai chỉ khi cùng người nói); đối đáp thì tách thành shot / reverse-shot ở các cảnh liền nhau. Nhân vật có thoại ghi `voice` cố định (giới, tuổi, cao độ, âm sắc, giọng vùng, tốc độ).
   KHÔNG lặp thoại: không ai nói lại/nhại câu người khác vừa nói, không câu nào trùng câu ở cảnh trước.
   Phim "Không thoại" thì để trống `dialogue` ở mọi cảnh.
 - Mỗi cảnh có `content_direction` nói rõ mục đích cảnh và cách từng nhân vật diễn.

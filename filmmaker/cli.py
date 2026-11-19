@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,12 +88,19 @@ def check(storyboard: Path | None, out: Path | None, profile: str | None) -> Non
 def _warn_dialogue(storyboard: Path) -> None:
     """Dialogue problems (a line said twice, unknown speaker...). Warnings only: rendering is not blocked."""
     try:
-        warnings = load_storyboard(storyboard).dialogue_warnings()
+        sb = load_storyboard(storyboard)
+        warnings = sb.dialogue_warnings()
     except Exception:  # a broken storyboard is reported by the other checks
         return
     for sid, msgs in warnings.items():
         for m in msgs:
             click.echo(f"! Thoại cảnh {sid}: {m}")
+    for sid, msgs in sb.muse_warnings().items():
+        for m in msgs:
+            click.echo(f"! Cảnh {sid} (Muse): {m}")
+    note = sb.dialogue_fields_note()
+    if note:
+        click.echo(f"ℹ {note}")
 
 
 _GROUP_ORDER = (("todo", "Chưa có clip"), ("interrupted", "Bị ngắt"), ("done", "Đã có clip"))
@@ -186,6 +194,57 @@ def _format_options(f):
     return f
 
 
+def _model_options(f):
+    """--video-model / --image-model / --script for `plan` and `auto` (the new flow)."""
+    f = click.option("--script", "script_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+                     help="Kịch bản đã duyệt (vd script.md): chuyển đúng thành storyboard, giữ nguyên cảnh và "
+                          "thoại; thay cho IDEA.")(f)
+    f = click.option("--image-model", default=None,
+                     help="Model ảnh (keyframe, nhân vật): nano2 (Flow, mặc định) hoặc muse.")(f)
+    f = click.option("--video-model", default=None,
+                     help="Model video: veo-lite (mặc định), veo-fast, veo-quality, omni-flash… hoặc muse "
+                          "(Meta Muse, không tốn credit Flow).")(f)
+    return f
+
+
+def _check_model_choice(video_model: str | None, image_model: str | None) -> tuple[str | None, str | None]:
+    """--video-model / --image-model cleaned; an unknown name -> exit 2 before any AI call."""
+    from .gflow import MODEL_NAMES, MUSE_MODEL
+
+    vm = (video_model or "").strip().lower() or None
+    im = (image_model or "").strip().lower() or None
+    if vm is not None and vm != MUSE_MODEL and vm not in MODEL_NAMES:
+        raise click.BadParameter(f"không biết model video {video_model!r}; dùng: "
+                                 f"{', '.join([*MODEL_NAMES, MUSE_MODEL])}", param_hint="'--video-model'")
+    if im is not None and im not in ("nano2", MUSE_MODEL) and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,40}", im):
+        raise click.BadParameter(f"tên model ảnh không hợp lệ: {image_model!r}", param_hint="'--image-model'")
+    return vm, im
+
+
+SCRIPT_IDEA_HEAD = ("Chuyển ĐÚNG kịch bản đã duyệt dưới đây thành storyboard: giữ nguyên số cảnh, thứ tự cảnh, "
+                    "nhân vật, trang phục, bối cảnh và từng chữ của lời thoại (không viết lại, không thêm thoại).")
+
+
+def _idea_from(idea: str | None, script_file: Path | None) -> str | None:
+    """IDEA, or the text of --script wrapped so the planner keeps the approved scenes and lines."""
+    if script_file is None:
+        return idea
+    text = script_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise click.BadParameter("file kịch bản trống", param_hint="'--script'")
+    extra = f"\nGhi chú thêm: {idea.strip()}" if idea and idea.strip() else ""
+    return f"{SCRIPT_IDEA_HEAD}{extra}\n\n{text}"
+
+
+def _apply_models(sb, video_model: str | None, image_model: str | None) -> None:
+    if video_model:
+        sb.model = video_model
+    if image_model:
+        sb.image_model = image_model
+    if video_model or image_model:
+        click.echo(f"Model: video {sb.model} · ảnh {sb.image_model}")
+
+
 def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: int, aspect: str,
               language: str | None, dialogue_lang: str | None, backend: str = "auto", api_key: str | None = None,
               ai_model: str | None = None, gemini_api_key: str | None = None):
@@ -219,7 +278,7 @@ def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: i
 
 
 @main.command()
-@click.argument("idea")
+@click.argument("idea", required=False)
 @click.option("-o", "--output", type=click.Path(path_type=Path), default=Path("storyboard.yaml"), show_default=True)
 @click.option("-n", "--scenes", default=6, show_default=True, help="Số cảnh.")
 @click.option("--aspect", type=click.Choice(["16:9", "9:16"]), default="16:9", show_default=True)
@@ -235,14 +294,20 @@ def _plan_new(idea: str, *, fmt: str, audio: str, visual: str, genres, scenes: i
               default="auto", show_default=True,
               help="claude_code/api (Claude) hoặc gemini_api/gemini_agy/gemini_cli (Gemini Pro).")
 @_format_options
-def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
-         ai_model: str, backend: str, fmt: str, audio: str, visual: str, genres) -> None:
+@_model_options
+def plan(idea: str | None, output: Path, scenes: int, aspect: str, language: str | None, dialogue_lang: str | None,
+         ai_model: str, backend: str, fmt: str, audio: str, visual: str, genres, video_model: str | None = None,
+         image_model: str | None = None, script_file: Path | None = None) -> None:
     """Viết storyboard từ một ý tưởng bằng AI (mặc định Claude, hoặc Gemini Pro với --ai-model gemini-pro).
 
     Mặc định dùng luồng mới (--format clip: chữ -> ảnh -> video). --format short_drama là luồng cũ, đã ngừng dùng.
     """
     from . import ai as ai_mod
 
+    if not idea and script_file is None:
+        raise click.UsageError("cần IDEA hoặc --script")
+    video_model, image_model = _check_model_choice(video_model, image_model)
+    idea = _idea_from(idea, script_file)
     if dialogue_lang is not None:  # checked before overwriting or calling AI
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
         if language is not None:
@@ -260,6 +325,7 @@ def plan(idea: str, output: Path, scenes: int, aspect: str, language: str | None
                        ai_model=chosen_model, gemini_api_key=gkey)
     except (RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    _apply_models(sb, video_model, image_model)
     save_storyboard(sb, output)
     click.echo(f"✔ {output}: {len(sb.scenes)} cảnh. Xem/sửa lại rồi chạy: filmmaker run {output} --dry-run")
 
@@ -900,8 +966,10 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
 @click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
               help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
 @_format_options
+@_model_options
 def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause, ai_model, publish_to, fmt, audio, visual, genres) -> None:
+         burn_subtitles, music, profile, pause, ai_model, publish_to, fmt, audio, visual, genres,
+         video_model=None, image_model=None, script_file=None) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
@@ -914,8 +982,11 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
     from . import publisher
     from .autopilot import AutoError, Autopilot, AutoSettings, slug
 
-    if not idea and not existing:
-        raise click.UsageError("cần IDEA hoặc --storyboard")
+    if not idea and not existing and script_file is None:
+        raise click.UsageError("cần IDEA, --script hoặc --storyboard")
+    if existing and script_file is not None:
+        raise click.UsageError("--script chỉ dùng khi viết storyboard mới (không cùng --storyboard)")
+    video_model, image_model = _check_model_choice(video_model, image_model)
     g = Gflow(profile=profile, log=click.echo)
     if not g.available():
         raise click.ClickException("không thấy lệnh gflow; chạy `filmmaker check`")
@@ -925,6 +996,10 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
     if existing:
         sb_path = existing
         chosen_model = ai_mod.effective_ai_model(ai_model or load_storyboard(sb_path).ai_model)
+        if video_model or image_model:  # switch an existing film's models before it continues
+            sb0 = load_storyboard(sb_path)
+            _apply_models(sb0, video_model, image_model)
+            save_storyboard(sb0, sb_path)
     else:
         chosen_model = ai_mod.effective_ai_model(ai_model or ai_mod.DEFAULT_AI_MODEL)
         dialogue_lang = _cli_lang(dialogue_lang, "--dialogue-lang", clean_dialogue_language)
@@ -932,17 +1007,22 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         click.echo(f"{ai_mod.ai_model_label(chosen_model)} đang viết storyboard {scenes} cảnh…")
         plan_backend = (s.get("gemini_backend") or "auto") if chosen_model == ai_mod.GEMINI_PRO else "auto"
         try:
-            sb = _plan_new(idea, fmt=fmt, audio=audio, visual=visual, genres=genres, scenes=scenes, aspect=aspect,
-                           language=language, dialogue_lang=dialogue_lang, backend=plan_backend, api_key=key,
-                           ai_model=chosen_model, gemini_api_key=gkey)
+            sb = _plan_new(_idea_from(idea, script_file), fmt=fmt, audio=audio, visual=visual, genres=genres,
+                           scenes=scenes, aspect=aspect, language=language, dialogue_lang=dialogue_lang,
+                           backend=plan_backend, api_key=key, ai_model=chosen_model, gemini_api_key=gkey)
         except (RuntimeError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
+        _apply_models(sb, video_model, image_model)
         ws = workspace or Path.home() / "FilmMaker"
-        base = slug(sb.title) or "phim"
-        d, n = ws / base, 2
-        while d.exists():
-            d, n = ws / f"{base}-{n}", n + 1
-        (d / "assets").mkdir(parents=True)
+        here = script_file.resolve().parent if script_file is not None else None
+        if here is not None and not (here / "storyboard.yaml").exists() and here.parent == ws.resolve():
+            d = here  # the script's own film folder (brief.md, script.md, reviews/ stay together)
+        else:
+            base = slug(sb.title) or "phim"
+            d, n = ws / base, 2
+            while d.exists():
+                d, n = ws / f"{base}-{n}", n + 1
+        (d / "assets").mkdir(parents=True, exist_ok=True)
         sb_path = d / "storyboard.yaml"
         save_storyboard(sb, sb_path)
         click.echo(f"✔ {sb_path}")

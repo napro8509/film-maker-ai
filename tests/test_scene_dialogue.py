@@ -76,16 +76,20 @@ def test_warnings_for_repeated_lines_and_unknown_speakers():
             {"character": "Hoa", "line": "Anh đi đâu cả đêm qua?"}]},
     ])
     w = sb.dialogue_warnings()
-    assert w["s01"] == ["Minh nói lặp câu “về đi” (đã có ở cảnh s01, Lan)"]
+    assert w["s01"][0] == "Minh nói lặp câu “về đi” (đã có ở cảnh s01, Lan)"
+    assert w["s01"][1].startswith("2 người nói trong một cảnh (Lan, Minh)")  # lip-sync: one speaker per scene
     assert "“Tuan” không có trong danh sách nhân vật" in w["s02"]
     assert any(m.startswith("Hoa nói lặp câu") for m in w["s02"])
-    clean = make([{"id": "s01", "mode": "t2v", "prompt": "x", "dialogue": TALK}])
+    clean = make([{"id": "s01", "mode": "t2v", "prompt": "x", "dialogue": TALK[:1]}])
     assert clean.dialogue_warnings() == {}
+    # TALK has two speakers: only the one-speaker-per-scene hint
+    two = make([{"id": "s01", "mode": "t2v", "prompt": "x", "dialogue": TALK}]).dialogue_warnings()["s01"]
+    assert len(two) == 1 and two[0].startswith("2 người nói trong một cảnh")
 
 
 def test_speaker_not_picked_into_scene_warns():
     sb = make([{"id": "s01", "mode": "t2v", "prompt": "x", "characters": ["Lan"], "dialogue": TALK}])
-    assert sb.dialogue_warnings()["s01"] == ["Minh có thoại nhưng chưa được chọn vào cảnh"]
+    assert sb.dialogue_warnings()["s01"][0] == "Minh có thoại nhưng chưa được chọn vào cảnh"
 
 
 def test_too_many_lines_rejected():

@@ -233,7 +233,7 @@ def test_cli_keyframes_follow_scene_characters_and_rerun_is_noop(tmp_path, monke
     res = CliRunner().invoke(main, ["run", str(sb), "--keyframes-only", "--pause", "0", "--no-backup"])
     assert res.exit_code == 0, res.output
     calls = [json.loads(l) for l in log.read_text().splitlines()]
-    images = {Path(c[c.index("-o") + 1]).stem: c for c in calls if c[:1] == ["image"]}
+    images = {Path(c[c.index("--out-file") + 1]).stem: c for c in calls if c[:1] == ["image"]}
     assert not [c for c in calls if c[:1] == ["video"]]
 
     refs = lambda c: [Path(c[i + 1]).name for i, a in enumerate(c) if a == "--ref"]  # noqa: E731

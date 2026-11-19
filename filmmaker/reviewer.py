@@ -107,7 +107,8 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
 - Prompts are concrete (who, does what, where, lighting) and avoid what Veo does badly: readable text, signs,
   screens with words, many people with precise hand actions, fast complex choreography, morphing objects.
 - `image_prompt` is a still: positions, faces and setting, no motion words. `prompt` is the motion from that frame.
-- Dialogue fits the clip (about 2-3 short lines in 8 seconds), nobody repeats a line, lines move the story.
+- Dialogue fits the clip (one speaker, one line of at most 12 words per scene), nobody repeats a line, lines move
+  the story.
   Lip-sync works best with ONE speaker per scene whose face is visible: fix scenes where two characters both
   speak by keeping one speaker (move the reply to the next scene's dialogue if it matters).
 - Every line is given to the person who says it in the picture. When it belongs to someone who is not in the

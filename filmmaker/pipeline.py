@@ -37,6 +37,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: Keyframes edited one from the other at most this many times in a row: each edit adds noise (s02..s08 of a
+#: Thai film went from 383 KB to 861 KB and looked painted) and keeps the first frame size for every scene.
+MAX_KEYFRAME_CHAIN = 2
+#: Seconds between two Muse video requests at least (a Thai film: 5 of 10 back-to-back requests failed, one
+#: at a time they went through).
+MUSE_PAUSE = (45.0, 75.0)
+
 _UNSET: Any = object()
 
 
@@ -188,13 +195,29 @@ class Pipeline:
             self.log(f"  ảnh tham chiếu nhân vật: {', '.join(n for n, _ in refs)}")
         elif log_line:
             self.log(log_line)
+        kinds = kinds or ["character"] * len(refs)
+        if self.sb.rule("image", "setting_last") and any(k != "character" for k in kinds):
+            # Gemini image models take the aspect ratio of the LAST input image: the setting (location picture or
+            # previous keyframe, made in the film's aspect) goes last, after the character portraits.
+            pairs = [x for x in zip(refs, kinds) if x[1] == "character"] + [x for x in zip(refs, kinds)
+                                                                            if x[1] != "character"]
+            refs, kinds = [r for r, _ in pairs], [k for _, k in pairs]
         files = [p for _, p in refs]
         # Say what each picture is (Nano Banana follows labelled references better); not part of any fingerprint.
         # A character keeps its face; a location/previous-keyframe reference is the setting to match, not a face.
-        kinds = kinds or ["character"] * len(refs)
         order = ["first", "second", "third", "fourth"]
+        numbered = self.sb.rule("image", "numbered_refs")
 
         def _slot(i: int, name: str) -> str:
+            if numbered:  # Google's Nano Banana guide: number the images and lock identity to the number
+                n = i + 1
+                if i < len(kinds) and kinds[i] == "location":
+                    return f"Image {n} is the scene's location ({name}): place the scene there, keeping its layout and lighting"
+                if i < len(kinds) and kinds[i] == "keyframe":
+                    return (f"Image {n} is the previous shot ({name}): continue from it, keeping the same setting, "
+                            "lighting and the characters' look")
+                return (f"Image {n} is {name}: keep {name}'s facial features, hairstyle and outfit exactly the same "
+                        f"as Image {n}")
             pos = order[i] if i < len(order) else f"{i + 1}th"
             if i < len(kinds) and kinds[i] == "location":
                 return f"the {pos} is {name}, the scene's location/background (keep this setting)"
@@ -330,7 +353,20 @@ class Pipeline:
             return None, "cảnh trước khác bối cảnh"
         if not (prev.id in planned or self.has_keyframe(prev)):
             return None, f"chưa có keyframe {prev.id} mới nhất"
+        if self.chain_depth(prev, planned) >= MAX_KEYFRAME_CHAIN:
+            return None, (f"đã nối {MAX_KEYFRAME_CHAIN} cảnh liền (sửa nối tiếp mãi làm ảnh nhiễu dần và khóa cỡ "
+                          "khung); tạo lại từ ảnh nhân vật + bối cảnh")
         return prev, ""
+
+    def chain_depth(self, s: Scene, planned: Collection[str] = ()) -> int:
+        """How many keyframes in a row the keyframe of `s` was edited from (0 = made from the reference pictures)."""
+        depth, cur = 0, s
+        while depth <= len(self.sb.scenes):
+            src, _ = self.continuity_check(cur, planned)
+            if src is None:
+                return depth
+            depth, cur = depth + 1, src
+        return depth
 
     def continuity_source(self, s: Scene) -> Scene | None:
         return self.continuity_check(s)[0]
@@ -554,7 +590,10 @@ class Pipeline:
                 self.log("Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).")
                 break
             if sent and not self.g.dry_run:
-                pause = random.uniform(*opts.pause)
+                lo, hi = opts.pause
+                if is_muse(s.model or self.sb.model):  # back-to-back Muse requests often end in "Failed to create"
+                    lo, hi = max(lo, MUSE_PAUSE[0]), max(hi, MUSE_PAUSE[1])
+                pause = random.uniform(lo, hi)
                 self.log(f"  (nghỉ {pause:.0f}s giữa các lần gửi)")
                 self.sleep(pause)
             # Checked after the pause, which may cross midnight. Not re-checked inside _render_scene
@@ -641,6 +680,10 @@ class Pipeline:
         src_sha = file_sha(self.keyframe_path(src)) if src is not None else None
         refs = [(it.label, it.path) for it in items]
         kinds = [it.kind for it in items]
+        n_chars, face_cap = kinds.count("character"), ref_caps.face_cap(self.sb.image_model)
+        if n_chars > face_cap:
+            self.log(f"  ⚠ {n_chars} nhân vật trong ảnh: model ảnh {self.sb.image_model} giữ giống khuôn mặt tốt nhất "
+                     f"với tối đa {face_cap} người (Gemini API); nên bớt người trong cảnh hoặc tách cảnh.")
         kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
         # + the film's image rules and dialogue staging; the state keeps `prompt` (default rules, fingerprint)
         sent = self.sb.for_flow_keyframe(self.sb.image_prompt(s), s)
@@ -852,7 +895,7 @@ class Pipeline:
                     send = self._cap_cli_refs([p for _, p in refs], refs, cap, "video r2v")
                     video, media_id = self._with_retries(
                         "render video",
-                        lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s), send, **common),
+                        lambda: self.g.reference_to_video(self.sb.for_flow_video(prompt, s, refs=True), send, **common),
                         opts.max_retries)
                     return video, media_id, "r2v"
                 except GflowError as exc:
@@ -1086,7 +1129,8 @@ class Pipeline:
         if not self.g.dry_run:
             self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
                               submitted_at=manual_clip.stamp_now())
-        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s), refs=refs, **common)
+        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s, refs=bool(refs)),
+                                                   refs=refs, **common)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"không thấy file video {video}", exit_code=1)
@@ -1099,7 +1143,8 @@ class Pipeline:
         """Reference-to-video by driving the Flow chat page: no start frame, the characters are attached (Flow
         characters by name, others as pictures) with no --ref cap. Never retried: Flow may have billed it. The
         caller (which already marked the scene "submitting") writes the "done" state."""
-        video, media_id = self.g.ui_image_to_video(None, self.sb.for_flow_video(prompt, s), refs=refs, **common)
+        video, media_id = self.g.ui_image_to_video(None, self.sb.for_flow_video(prompt, s, refs=bool(refs)), refs=refs,
+                                                   **common)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"không thấy file video {video}", exit_code=1)
