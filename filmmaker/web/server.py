@@ -72,7 +72,10 @@ DEFAULT_SETTINGS = {"profile": "", "pause_min": 8, "pause_max": 20, "retries": 2
                     "flow_ui_window": "hidden",  # show | hidden | headless
                     "backup_remote": DEFAULT_BACKUP_REMOTE,  # rclone remote:folder (Google Drive)
                     "auto_backup": False,  # back up after every rendered clip and at the end of each job
-                    "auto_qc": True,  # AI QC of every new clip after a render (free; only flags problems)
+                    "auto_qc": True,  # OpenMontage + AI QC of every new clip after a render
+                    "pre_qc": True,  # ViMax pre-render QC: parallel keyframe candidates + VLM selection before paid video
+                    "keyframe_candidates": 2,  # ViMax best-of-k candidate keyframes per scene (1..4)
+                    "qc_gate_assembly": True,  # exclude QC FAIL clips from final stitched/edited film
                     "fb_page_id": "", "fb_access_token": "",
                     "yt_client_id": "", "yt_client_secret": "", "yt_refresh_token": "",
                     "yt_privacy": "public", "auto_publish": False, "auto_publish_platforms": [],
@@ -315,6 +318,12 @@ class SocialBody(BaseModel):
 class QCBody(BaseModel):
     only: list[str] = []
     force: bool = False
+    local_only: bool = False
+    keyframes: bool = False
+
+
+class SelectKeyframeBody(BaseModel):
+    index: int
 
 
 class RewriteBody(BaseModel):
@@ -471,6 +480,9 @@ class RunBody(BaseModel):
     replan: bool = False  # action=edit: ignore the saved edit plan, let the agent make a new one
     smart_edit: bool = False  # action=make: finish with the editor agent instead of a plain stitch
     open_capcut: bool = True  # action=capcut: bring CapCut up when the project is written
+    keyframe_candidates: int | None = None  # ViMax parallel keyframe candidates (1..4)
+    pre_qc: bool | None = None  # ViMax pre-render QC gate before paid video API
+    skip_qc_failed: bool | None = None  # OpenMontage + AI QC gate: exclude FAIL clips from final assembly
 
 
 class PublishBody(BaseModel):
@@ -486,6 +498,9 @@ class AutoBody(BaseModel):
     review: bool = True  # AI agents review storyboard, keyframes, clips and the finished film
     burn_subtitles: bool = True
     rerender_budget: int = 3  # clips the clip review may render again (credits)
+    auto_rerender_qc: bool = False
+    keyframe_candidates: int | None = None
+    skip_qc_failed: bool | None = None
     music: str | None = None
     publish_platforms: list[str] = []
 
@@ -528,6 +543,7 @@ class FinalSettings(BaseModel):
     burn_language: str | None = None  # vi | th | en: which subtitle track to burn in (default: narration's)
     allow_missing: bool = False
     smart_edit: bool = True
+    skip_qc_failed: bool = True
 
 
 # --- app ----------------------------------------------------------------------
@@ -766,8 +782,46 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if r.get("sig") != qc.clip_sig(clip):
             return None
         keep = ("verdict", "score", "issues", "picture", "sound", "prompt", "match", "transcript", "language",
-                "dialogue_checked", "at")
-        return {k: r.get(k) for k in keep}
+                "dialogue_checked", "vlm_checked", "audio", "at")
+        view = {k: r.get(k) for k in keep}
+        om = r.get("openmontage")
+        if isinstance(om, dict):
+            om_copy = dict(om)
+            om_copy["frame_urls"] = [
+                u for fn in (om.get("frame_files") or [])
+                if (u := file_url(pid, out_dir(pid) / "qc_frames" / str(fn)))
+            ]
+            view["openmontage"] = om_copy
+        return view
+
+    def keyframe_qc_view(pid: str, r: dict[str, Any] | None, kf: Path) -> dict[str, Any] | None:
+        """ViMax pre-render keyframe QC & parallel candidates for the UI."""
+        if not r or not kf.is_file() or r.get("sig") != qc.clip_sig(kf):
+            return None
+        cdir = out_dir(pid) / "keyframes" / "candidates"
+        cands = []
+        for c in r.get("candidates") or []:
+            if not isinstance(c, dict):
+                continue
+            fn = str(c.get("file") or "")
+            cands.append({
+                "index": c.get("index"),
+                "verdict": c.get("verdict"),
+                "score": c.get("score"),
+                "issues": c.get("issues") or [],
+                "url": file_url(pid, cdir / fn) if fn else None,
+            })
+        return {
+            "best_index": r.get("best_index"),
+            "verdict": r.get("verdict"),
+            "score": r.get("score"),
+            "reason": r.get("reason") or "",
+            "issues": r.get("issues") or [],
+            "num_candidates": r.get("num_candidates") or len(cands) or 1,
+            "vlm_used": bool(r.get("vlm_used")),
+            "candidates": cands,
+            "at": r.get("at"),
+        }
 
     def detail(pid: str) -> dict[str, Any]:
         raw = read_raw(pid)
@@ -800,6 +854,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                           "models_used": retirement.models_used(pipe, meta)}
             talk = sb.dialogue_warnings()
             qc_all = qc.load(out_dir(pid))
+            kf_qc_all = qc.load_keyframe_qc(out_dir(pid))
             rewrites = ui_prefs.read(pdir(pid)).get("rewrites") or {}
             for s in sb.scenes:
                 st = pipe.state.scene(s.id)
@@ -819,6 +874,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     "updated_at": st.get("updated_at"),
                     "keyframe_url": file_url(pid, kf) if s.mode == "keyframe" else None,
                     "keyframe_stale": s.mode == "keyframe" and kf.is_file() and not pipe.has_keyframe(s),
+                    "keyframe_qc": keyframe_qc_view(pid, kf_qc_all.get(s.id), kf) if s.mode == "keyframe" else None,
                     "clip_url": file_url(pid, st.get("video")) if st.get("video") else None,
                     "image_url": file_url(pid, s.image) if s.image else None,
                     "end_image_url": file_url(pid, s.end_image) if s.end_image else None,
@@ -1121,7 +1177,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             if body.get("theme") in THEMES:
                 s["theme"] = body["theme"]
             for k in ("profile", "pause_min", "pause_max", "retries", "flow_ui", "flow_ui_max_credits", "flow_ui_window",
-                      "auto_backup", "auto_qc", "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
+                      "auto_backup", "auto_qc", "pre_qc", "keyframe_candidates", "qc_gate_assembly",
+                      "fb_page_id", "yt_client_id", "yt_privacy", "auto_publish", "auto_publish_platforms"):
                 if k in body:
                     s[k] = body[k]
             if "backup_remote" in body:
@@ -1131,6 +1188,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     raise HTTPException(400, str(exc))
             s["auto_backup"] = bool(s.get("auto_backup"))
             s["auto_qc"] = bool(s.get("auto_qc", True))
+            s["pre_qc"] = bool(s.get("pre_qc", True))
+            s["keyframe_candidates"] = max(1, min(4, int(s.get("keyframe_candidates") or 2)))
+            s["qc_gate_assembly"] = bool(s.get("qc_gate_assembly", True))
             s["auto_publish"] = bool(s.get("auto_publish"))
             if isinstance(s.get("auto_publish_platforms"), list):
                 s["auto_publish_platforms"] = [p for p in s["auto_publish_platforms"] if p in ("facebook_reel", "facebook_story", "youtube")]
@@ -2158,6 +2218,27 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                           "dialogue": [d.model_dump(exclude_none=True) for d in fix.dialogue] if fix.dialogue is not None else None}
         return out
 
+    @app.post("/api/projects/{pid}/scenes/{sid}/select-keyframe")
+    def select_keyframe(pid: str, sid: str, body: SelectKeyframeBody) -> dict[str, Any]:
+        """Promote one of the ViMax parallel keyframe candidates (`1..k`) as the active keyframe for `sid`."""
+        pdir(pid)
+        try:
+            sb = load_storyboard(sb_path(pid))
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
+                _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        scene = next((x for x in sb.scenes if x.id == sid), None)
+        if scene is None:
+            raise HTTPException(404, f"Không có cảnh: {sid}")
+        if scene.mode != "keyframe":
+            raise HTTPException(400, f"Cảnh {sid} không dùng chế độ keyframe.")
+        pipe = Pipeline(sb, out_dir(pid), gflow(True))
+        try:
+            pipe.select_keyframe_candidate(scene, body.index)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        return detail(pid)
+
     # ---- editor agent: edit plan (edit.json) ----
 
     def edit_view(pid: str) -> dict[str, Any]:
@@ -2281,6 +2362,29 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
             retired = retirement.refuse_retired(sb) if not dry else (lambda _s: None)
             bad = dur.refuse_bad_duration(sb) if not dry else (lambda _s: None)
+            eff_cand = 1
+            eff_pre_qc = False
+            ai_kw: dict[str, Any] = {}
+            if not dry:
+                model = sb.effective_ai_model
+                backend = _backend_for(model)
+                if body.pre_qc is False:
+                    eff_cand = max(1, min(4, int(body.keyframe_candidates or 1)))
+                    eff_pre_qc = False
+                else:
+                    raw_cand = (
+                        body.keyframe_candidates
+                        or sb.keyframe_candidates
+                        or (int(settings.get("keyframe_candidates", 2)) if (backend and settings.get("pre_qc", True)) else 1)
+                    )
+                    eff_cand = max(1, min(4, int(raw_cand)))
+                    eff_pre_qc = bool(body.pre_qc) if body.pre_qc is not None else bool(eff_cand > 1 or sb.qc_gate)
+                if eff_cand > 1 or eff_pre_qc:
+                    ai_kw = {
+                        "backend": backend or "auto",
+                        "api_key": settings.get("anthropic_api_key") or None,
+                        **_ai_extra_kw(model, settings),
+                    }
             report = pipe.run(RunOptions(
                 only=set(body.only) or None, force=set(body.force), retry_unknown=False,
                 confirm=set(body.confirm_resend),  # web: an interrupted scene is only resent when ticked
@@ -2288,6 +2392,10 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 pause=(float(settings.get("pause_min", 8)), float(settings.get("pause_max", 20))),
                 fail_fast=body.fail_fast, keyframes_only=keyframes_only,
                 force_keyframes=set(body.force_keyframes),
+                keyframe_candidates=eff_cand,
+                pre_qc_gate=eff_pre_qc,
+                strict_pre_qc=bool(sb.qc_gate),
+                ai_kw=ai_kw,
                 should_stop=lambda: job.stop_requested,
                 after_scene=lambda sid: after_clip(pipe, sid),
                 refuse=lambda s: retired(s) or bad(s),  # retired model first, then the duration
@@ -2320,7 +2428,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 raise RuntimeError(f"còn thiếu cảnh: {', '.join(missing)} (bật “Ghép cả khi thiếu cảnh” để ghép phần đã có)")
             if missing:
                 job.log(f"Bỏ qua cảnh chưa có: {', '.join(missing)}")
-            return clips
+            eff_skip = (body.skip_qc_failed if body.skip_qc_failed is not None
+                        else bool(sb.qc_gate if sb.qc_gate is not None else settings.get("qc_gate_assembly", True)))
+            kept, _dropped = qc.filter_clips_for_assembly(
+                sb, out_dir(pid), clips, exclude_failed=eff_skip,
+                run_local_qc=bool(settings.get("auto_qc", True)), log=job.log,
+            )
+            return kept
 
         def fill_subtitles(job: Job) -> None:
             """Translate missing vi / th / en subtitle lines (best effort) and save them to storyboard.yaml."""
@@ -2463,41 +2577,77 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
         return jobs.start(body.action, titles[body.action] + scope, pid, work).public()
 
-    # ---- AI QC of rendered clips ----
+    # ---- AI & OpenMontage / ViMax QC ----
 
-    def run_qc(job: Job, pid: str, only: set[str] | None, force: bool) -> dict[str, Any]:
+    def run_qc(job: Job, pid: str, only: set[str] | None, force: bool, *,
+               local_only: bool = False, keyframes: bool = False) -> dict[str, Any]:
         sb = load_storyboard(sb_path(pid))
         model = sb.effective_ai_model
         s = load_settings()
-        backend = _backend_for(model)
-        if not backend:
-            if model == ai_mod.GEMINI_PRO:
-                job.log(f"⚠ Bỏ qua AI QC: {ai_mod.not_ready_message(ai_mod.GEMINI_PRO)}")
-            else:
-                job.log("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
-            return {}
+        backend = None if local_only else _backend_for(model)
         pipe = Pipeline(sb, out_dir(pid), gflow(True))
+        ai_extra = _ai_extra_kw(model, s)
+
+        if keyframes:
+            job.log("")
+            job.log("=== ViMax Pre-QC: chấm chọn keyframe đầu vào trước khi render video ===")
+            checked_kf: dict[str, str] = {}
+            for sc in sb.scenes:
+                if job.stop_requested:
+                    break
+                if sc.mode != "keyframe" or (only and sc.id not in only):
+                    continue
+                kf_p = pipe.keyframe_path(sc)
+                if not kf_p.is_file():
+                    continue
+                if not force and qc.current_keyframe_qc(out_dir(pid), sc.id, kf_p) is not None:
+                    continue
+                cdir = out_dir(pid) / "keyframes" / "candidates"
+                existing = sorted(cdir.glob(f"{sc.id}_c*.png")) if cdir.is_dir() else []
+                cands = existing if existing else [kf_p]
+                kf_ai_kw = {"backend": backend, "api_key": s.get("anthropic_api_key") or None, **ai_extra} if backend else {}
+                sel = qc.select_best_keyframe(sb, sc, cands, allow_vlm=bool(backend), **kf_ai_kw)
+                chosen = cands[max(0, min(len(cands) - 1, sel["best_index"] - 1))]
+                if chosen.resolve() != kf_p.resolve():
+                    shutil.copy2(chosen, kf_p)
+                sel["sig"] = qc.clip_sig(kf_p)
+                qc.save_keyframe_qc(out_dir(pid), sc.id, sel)
+                checked_kf[sc.id] = sel["verdict"]
+                tag = {"PASS": "✔", "MINOR": "△", "FAIL": "✘"}.get(sel["verdict"], "?")
+                job.log(f"  {tag} [{sc.id}] {sel['verdict']} ({sel['score']}/10) — ứng viên #{sel['best_index']}/{len(cands)}")
+            failed_kf = sorted(k for k, v in checked_kf.items() if v == "FAIL")
+            return {"keyframe_qc": checked_kf, "qc_failed": failed_kf}
+
         job.log("")
-        job.log("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
-        done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
-                      backend=backend, api_key=s.get("anthropic_api_key") or None, **_ai_extra_kw(model, s))
+        if backend:
+            job.log("=== Hậu kiểm tự động (OpenMontage + AI QC): ffprobe, 4 frame, âm thanh & lời thoại ===")
+            done = qc.run(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested,
+                          backend=backend, api_key=s.get("anthropic_api_key") or None, **ai_extra)
+        else:
+            if not local_only:
+                job.log("ℹ Chưa cấu hình VLM (Claude/Gemini) — chạy hậu kiểm kỹ thuật OpenMontage (ffprobe + 4 frame + âm thanh).")
+            else:
+                job.log("=== Hậu kiểm OpenMontage: ffprobe, trích xuất 4 frame (đen/lỗi chữ) & đo mức âm thanh ===")
+            done = qc.run_openmontage(pipe, only=only, force=force, log=job.log, stop=lambda: job.stop_requested)
         failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
         if failed:
-            job.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở từng cảnh; “Render lại” nếu muốn (tốn credit).")
+            label = "AI QC" if backend else "OpenMontage QC"
+            job.log(f"⚠ {label} đánh FAIL: {', '.join(failed)} — xem lý do ở từng cảnh; “Render lại” nếu muốn (tốn credit).")
         return {"qc": {k: v["verdict"] for k, v in done.items()}, "qc_failed": failed}
 
     @app.post("/api/projects/{pid}/qc")
     def qc_project(pid: str, body: QCBody) -> dict[str, Any]:
-        """AI QC of the rendered clips (all new ones, or `only`; `force` = check again). Free on Flow."""
+        """Automated QC of rendered clips or keyframes (OpenMontage + VLM, or local-only OpenMontage). Free on Flow."""
         try:
             sb = load_storyboard(sb_path(pid))
         except (ValidationError, ValueError) as exc:
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
-        _ai_backend_or_400(sb.effective_ai_model)
         scope = f" ({', '.join(body.only)})" if body.only else ""
-        return jobs.start("qc", "AI QC clip" + scope, pid,
-                          lambda job: run_qc(job, pid, set(body.only) or None, body.force)).public()
+        title = ("ViMax Pre-QC keyframe" if body.keyframes else ("OpenMontage QC" if body.local_only else "AI QC clip")) + scope
+        return jobs.start("qc", title, pid,
+                          lambda job: run_qc(job, pid, set(body.only) or None, body.force,
+                                             local_only=body.local_only, keyframes=body.keyframes)).public()
 
     @app.post("/api/qc/model")
     def qc_model() -> dict[str, Any]:
@@ -2565,10 +2715,22 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         def on_stage(info: dict) -> None:
             job.stage = {**job.stage, **info}
 
-        is_gemini = _project_ai_model(pid) == ai_mod.GEMINI_PRO
+        proj_model = _project_ai_model(pid)
+        is_gemini = proj_model == ai_mod.GEMINI_PRO
+        eff_auto_cand: int | None = body.keyframe_candidates
+        if eff_auto_cand is None and not settings.get("pre_qc", True):
+            eff_auto_cand = 1
+        elif eff_auto_cand is None and _backend_for(proj_model) is not None:
+            eff_auto_cand = int(settings.get("keyframe_candidates", 2))
+        eff_skip_qc = (body.skip_qc_failed if body.skip_qc_failed is not None
+                       else bool(settings.get("qc_gate_assembly", True)))
         pilot = Autopilot(sb_path(pid), out_dir(pid), g, settings=AutoSettings(
             review=body.review, burn_subtitles=body.burn_subtitles,
-            rerender_budget=max(0, min(20, body.rerender_budget)), music=music,
+            rerender_budget=max(0, min(20, body.rerender_budget)),
+            auto_rerender_qc=body.auto_rerender_qc,
+            keyframe_candidates=eff_auto_cand,
+            exclude_qc_failed=eff_skip_qc,
+            music=music,
             ai_backend=(settings.get("gemini_backend") or "auto") if is_gemini else (settings.get("planner") or "auto"),
             api_key=settings.get("anthropic_api_key") or None,
             ai_model=ai_mod.GEMINI_PRO if is_gemini else None,
@@ -2596,8 +2758,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(400, "Hãy nhập ý tưởng.")
         chosen_model = _ai_model_or_400(body.ai_model)
         basic = check_format(body)
-        if basic:
-            body.review = False  # the review agents check drama direction (camera, dialogue, locations)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
         dialogue = (_lang_or_400(body.dialogue_language, "Ngôn ngữ thoại", dialogue=True)
                     if body.dialogue_language is not None else None)
@@ -2647,8 +2807,6 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if wp.retired:
             raise HTTPException(409, detail={"message": f"Không thể render: {len(wp.retired)} cảnh dùng model đã ngừng",
                                              "reason": "model_retired", "retired": wp.retired})
-        if sb.basic:
-            body.review = False  # the review agents check drama direction (camera, dialogue, locations)
         return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body)).public()
 
     # ---- backup (Google Drive via rclone) ----

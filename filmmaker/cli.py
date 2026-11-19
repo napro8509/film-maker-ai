@@ -354,6 +354,10 @@ def _run_options(f):
     f = click.option("--pause", default="8-20", show_default=True, help="Nghỉ ngẫu nhiên (giây) giữa các lần gửi, dạng MIN-MAX.")(f)
     f = click.option("--fail-fast", is_flag=True, help="Dừng ngay ở cảnh lỗi đầu tiên.")(f)
     f = click.option("--keyframes-only", is_flag=True, help="Chỉ tạo ảnh keyframe (miễn phí) để duyệt trước khi render video.")(f)
+    f = click.option("--keyframe-candidates", type=click.IntRange(1, 4), default=None,
+                     help="Số keyframe ứng viên sinh song song (ViMax) để VLM chấm chọn trước khi tạo video (1-4).")(f)
+    f = click.option("--pre-qc/--no-pre-qc", "pre_qc", default=None,
+                     help="Cổng Pre-QC (ViMax): chấm chọn keyframe bằng VLM trước khi gọi API tạo video tốn credit.")(f)
     f = click.option("--backup/--no-backup", "auto_backup", default=None,
                      help="Backup lên Drive sau mỗi clip (mặc định theo Cài đặt “Tự backup”).")(f)
     return f
@@ -430,8 +434,44 @@ def _adopt_clips(pipe: Pipeline, adopt, dry_run: bool) -> dict[str, str]:
     return failed
 
 
+def _resolve_pre_qc(sb, keyframe_candidates: int | None, pre_qc: bool | None) -> tuple[int, bool, dict[str, Any]]:
+    """Resolve (effective_candidates, pre_qc_gate, ai_kw) for CLI `run` / `make`."""
+    from . import ai
+
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+    is_gemini = sb.effective_ai_model == ai.GEMINI_PRO
+    gkey = (s.get("gemini_api_key") or None) if is_gemini else None
+    backend = (ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+               if is_gemini else ai.pick_backend(s.get("planner") or "auto", key))
+    ai_kw: dict[str, Any] = {}
+    if backend:
+        ai_kw["backend"] = backend
+        ai_kw["api_key"] = key
+        if is_gemini:
+            ai_kw["ai_model"] = ai.GEMINI_PRO
+            ai_kw["gemini_api_key"] = gkey
+
+    if keyframe_candidates is not None:
+        cand = max(1, min(4, int(keyframe_candidates)))
+    elif sb.keyframe_candidates:
+        cand = max(1, min(4, int(sb.keyframe_candidates)))
+    elif pre_qc is True:
+        cand = int(s.get("keyframe_candidates") or 2)
+    elif backend and int(s.get("keyframe_candidates") or 1) > 1 and s.get("pre_qc", True):
+        cand = max(1, min(4, int(s["keyframe_candidates"])))
+    else:
+        cand = 1
+
+    eff_gate = bool(pre_qc) if pre_qc is not None else bool(cand > 1 or sb.qc_gate)
+    if pre_qc is False:
+        cand = 1
+        eff_gate = False
+    return cand, eff_gate, ai_kw
+
+
 def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown, retries, pause, fail_fast,
-            keyframes_only=False, auto_backup=None, adopt=()):
+            keyframes_only=False, auto_backup=None, adopt=(), keyframe_candidates=None, pre_qc=None):
     sb = load_storyboard(storyboard)
     out_dir = _out_dir(storyboard, out)
     g = Gflow(profile=profile, dry_run=dry_run, log=click.echo)
@@ -462,6 +502,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
         # --force <id> would be the way to resend, but --adopt and --force on one scene are refused above.
         return adopt_failed.get(s.id) or retired(s) or bad(s)
 
+    cand_n, pre_qc_gate, ai_kw = (1, False, {}) if dry_run else _resolve_pre_qc(sb, keyframe_candidates, pre_qc)
     ab = None if dry_run else _auto_backup(storyboard, out_dir, auto_backup)
     try:
         report = pipe.run(RunOptions(
@@ -469,6 +510,7 @@ def _do_run(storyboard: Path, out, profile, dry_run, only, force, retry_unknown,
             max_retries=retries, pause=_parse_pause(pause), fail_fast=fail_fast,
             # Re-rendering a video keeps its approved keyframe; remake stills with --keyframes-only --force.
             keyframes_only=keyframes_only, force_keyframes=set(force) if keyframes_only else set(),
+            keyframe_candidates=cand_n, pre_qc_gate=pre_qc_gate, strict_pre_qc=bool(sb.qc_gate), ai_kw=ai_kw,
             after_scene=(lambda _sid: ab.trigger()) if ab else (lambda _sid: None),
             refuse=refuse,
         ))
@@ -514,26 +556,34 @@ def run(storyboard: Path, **kw) -> None:
     sys.exit(0 if report.ok else 1)
 
 
-def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str | None = None) -> dict:
+def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str | None = None,
+        local_only: bool = False) -> dict:
     from . import ai, qc
 
     s = user_settings.load()
     key = s.get("anthropic_api_key") or None
     is_gemini = sb.effective_ai_model == ai.GEMINI_PRO
     gkey = (s.get("gemini_api_key") or None) if is_gemini else None
-    backend = (ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
-               if is_gemini else ai.pick_backend(s.get("planner") or "auto", key))
-    if not backend:
-        if is_gemini:
-            click.echo(f"⚠ Bỏ qua AI QC: {ai.not_ready_message(ai.GEMINI_PRO)}")
-        else:
-            click.echo("⚠ Bỏ qua AI QC: chưa dùng được Claude (cài Claude Code và đăng nhập, hoặc thêm API key).")
-        return {}
-    click.echo("")
-    click.echo("=== AI QC: xem hình, nghe âm thanh và lời thoại từng clip (miễn phí) ===")
+    backend = None if local_only else (
+        ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+        if is_gemini else ai.pick_backend(s.get("planner") or "auto", key)
+    )
     pipe = Pipeline(sb, out_dir, Gflow(profile=profile, dry_run=True, log=lambda *_: None), log=lambda *_: None)
-    extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
-    done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key, **extra)
+    if not backend:
+        if not local_only:
+            if is_gemini:
+                click.echo(f"⚠ Chưa có VLM ({ai.not_ready_message(ai.GEMINI_PRO)}) — chạy hậu kiểm OpenMontage cục bộ.")
+            else:
+                click.echo("⚠ Chưa có VLM Claude — chạy hậu kiểm OpenMontage cục bộ (ffprobe, 4 frame đen/chữ, âm thanh).")
+        else:
+            click.echo("")
+            click.echo("=== OpenMontage hậu kiểm cục bộ: ffprobe, 4 frame đen/chữ và mức âm thanh ===")
+        done = qc.run_openmontage(pipe, only=only, force=force, log=click.echo)
+    else:
+        click.echo("")
+        click.echo("=== AI QC + OpenMontage: kiểm ffprobe, trích 4 frame đen/chữ, âm thanh và lời thoại ===")
+        extra = {"ai_model": ai.GEMINI_PRO, "gemini_api_key": gkey} if is_gemini else {}
+        done = qc.run(pipe, only=only, force=force, log=click.echo, backend=backend, api_key=key, **extra)
     failed = sorted(k for k, v in done.items() if v["verdict"] == "FAIL")
     if failed:
         click.echo(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — render lại nếu muốn: "
@@ -541,16 +591,61 @@ def _qc(sb, out_dir: Path, only: set[str] | None, *, force: bool, profile: str |
     return done
 
 
+def _qc_keyframes(sb, out_dir: Path, only: set[str] | None, *, force: bool, local_only: bool = False) -> dict:
+    from . import ai, qc
+
+    s = user_settings.load()
+    key = s.get("anthropic_api_key") or None
+    is_gemini = sb.effective_ai_model == ai.GEMINI_PRO
+    gkey = (s.get("gemini_api_key") or None) if is_gemini else None
+    backend = None if local_only else (
+        ai.pick_backend(s.get("gemini_backend") or "auto", ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+        if is_gemini else ai.pick_backend(s.get("planner") or "auto", key)
+    )
+    ai_kw: dict[str, Any] = {}
+    if backend:
+        ai_kw.update(backend=backend, api_key=key)
+        if is_gemini:
+            ai_kw.update(ai_model=ai.GEMINI_PRO, gemini_api_key=gkey)
+    out: dict[str, dict] = {}
+    cdir = Path(out_dir) / "keyframes" / "candidates"
+    for sc in sb.scenes:
+        if sc.mode != "keyframe" or (only and sc.id not in only):
+            continue
+        kf = Path(out_dir) / "keyframes" / f"{sc.id}.png"
+        if not kf.is_file():
+            continue
+        if not force and qc.current_keyframe_qc(out_dir, sc.id, kf) is not None:
+            continue
+        cand_files = sorted(cdir.glob(f"{sc.id}_c*.png")) if cdir.is_dir() else []
+        pool = cand_files if cand_files else [kf]
+        click.echo(f"[{sc.id}] ViMax Pre-QC đang chấm {len(pool)} keyframe…")
+        sel = qc.select_best_keyframe(sb, sc, pool, allow_vlm=bool(backend), **ai_kw)
+        best_file = Path(sel["best_path"])
+        if best_file != kf and best_file.is_file():
+            kf.write_bytes(best_file.read_bytes())
+        sel["sig"] = qc.clip_sig(kf)
+        qc.save_keyframe_qc(out_dir, sc.id, sel)
+        out[sc.id] = sel
+        tag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel["verdict"]]
+        click.echo(f"  {tag} [{sc.id}] Pre-QC {sel['verdict']} {sel['score']}/10 (ứng viên #{sel['best_index']}/{len(pool)})")
+    return out
+
+
 @main.command("qc")
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(file_okay=False, path_type=Path), help="Thư mục kết quả.")
 @click.option("--only", multiple=True, help="Chỉ QC cảnh này (lặp lại được).")
-@click.option("--force", is_flag=True, help="QC lại cả clip đã QC rồi.")
+@click.option("--force", is_flag=True, help="QC lại cả clip/keyframe đã QC rồi.")
+@click.option("--local-only", is_flag=True,
+              help="Chỉ chạy hậu kiểm OpenMontage cục bộ (ffprobe, 4 frame đen/chữ, âm thanh), không gọi VLM.")
+@click.option("--keyframes", is_flag=True,
+              help="Chấm chọn Pre-QC (ViMax) các keyframe hiện có trước khi render video.")
 @click.option("--download-model", is_flag=True, help="Tải model nhận dạng giọng nói (một lần, ~550 MB) rồi QC.")
-def qc_command(storyboard: Path, out, only, force, download_model) -> None:
-    """AI QC các clip đã render: đúng cảnh/keyframe, đúng nhân vật, hình lỗi, chữ trên hình, âm thanh và lời thoại.
+def qc_command(storyboard: Path, out, only, force, local_only, keyframes, download_model) -> None:
+    """Cổng kiểm duyệt tự động (ViMax Pre-QC & OpenMontage + AI Post-QC).
 
-    Miễn phí (không gửi gì lên Flow), chỉ đánh dấu PASS / MINOR / FAIL; kết quả lưu ở <out>/qc.json.
+    Miễn phí (không gửi gì lên Flow), đánh dấu PASS / MINOR / FAIL; lưu ở <out>/qc.json và <out>/qc_keyframes.json.
     """
     from . import qc
 
@@ -560,7 +655,13 @@ def qc_command(storyboard: Path, out, only, force, download_model) -> None:
     unknown = set(only) - {s.id for s in sb.scenes}
     if unknown:
         raise click.ClickException(f"không có cảnh: {', '.join(sorted(unknown))}")
-    done = _qc(sb, _out_dir(storyboard, out), set(only) or None, force=force)
+    target_out = _out_dir(storyboard, out)
+    if keyframes:
+        done = _qc_keyframes(sb, target_out, set(only) or None, force=force, local_only=local_only)
+        if not done:
+            click.echo("Không có keyframe mới cần Pre-QC (thêm --force để chấm lại).")
+        sys.exit(1 if any(v["verdict"] == "FAIL" for v in done.values()) else 0)
+    done = _qc(sb, target_out, set(only) or None, force=force, local_only=local_only)
     if not done:
         click.echo("Không có clip mới cần QC (thêm --force để QC lại).")
     sys.exit(1 if any(v["verdict"] == "FAIL" for v in done.values()) else 0)
@@ -607,10 +708,29 @@ def _fill_subtitles(sb, storyboard: Path, backend: str = "auto") -> None:
         click.echo(f"✔ Đã dịch phụ đề Việt / Thái / Anh cho {len(added)} cảnh (lưu vào {storyboard.name}).")
 
 
-def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, burn_lang=None):
+def _filter_final_clips(sb, out_dir: Path, clips: list[tuple[str, Path]],
+                        skip_qc_failed: bool | None = None) -> list[tuple[str, Path]]:
+    from . import qc
+
+    s = user_settings.load()
+    eff_skip = (
+        bool(skip_qc_failed)
+        if skip_qc_failed is not None
+        else bool(sb.qc_gate if sb.qc_gate is not None else s.get("qc_gate_assembly", True))
+    )
+    run_local = bool(s.get("auto_qc", True))
+    kept, _ = qc.filter_clips_for_assembly(
+        sb, out_dir, clips, exclude_failed=eff_skip, run_local_qc=run_local, log=click.echo
+    )
+    return kept
+
+
+def _do_stitch(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, burn_lang=None,
+               skip_qc_failed: bool | None = None):
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để ghép phần đã có)")
+    clips = _filter_final_clips(sb, out_dir, clips, skip_qc_failed)
     output = output or out_dir / "final.mp4"
     try:
         assemble(sb, clips, output, music=music, music_volume=volume, burn_subtitles=subtitles,
@@ -628,6 +748,8 @@ def _stitch_options(f):
     f = click.option("--burn-lang", type=click.Choice(["vi", "th", "en"]), default=None,
                      help="Track phụ đề in lên hình (mặc định: ngôn ngữ lời dẫn). Phim luôn có 3 track vi / th / en.")(f)
     f = click.option("--allow-missing", is_flag=True, help="Vẫn ghép khi còn cảnh chưa có.")(f)
+    f = click.option("--skip-qc-failed/--include-qc-failed", "skip_qc_failed", default=None,
+                     help="Loại bỏ clip bị đánh dấu FAIL bởi QC khỏi bản ghép cuối (mặc định: bật).")(f)
     return f
 
 
@@ -635,11 +757,13 @@ def _stitch_options(f):
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--out", type=click.Path(path_type=Path))
 @_stitch_options
-def stitch(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing) -> None:
+def stitch(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing,
+           skip_qc_failed=None) -> None:
     """Ghép các clip đã tạo thành một phim (ffmpeg, không tốn credit). Phim luôn có 3 track phụ đề vi / th / en."""
     sb = load_storyboard(storyboard)
     _fill_subtitles(sb, storyboard)
-    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang)
+    _do_stitch(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang,
+               skip_qc_failed=skip_qc_failed)
 
 
 def _ai_ready(backend: str, ai_model: str | None = None) -> bool:
@@ -660,13 +784,15 @@ def _ai_ready(backend: str, ai_model: str | None = None) -> bool:
 
 
 def _do_edit(sb, out_dir: Path, output: Path | None, music, volume, subtitles, allow_missing, *,
-             burn_lang: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto", plan_only: bool = False):
+             burn_lang: str | None = None, engine: str = "auto", replan: bool = False, backend: str = "auto",
+             plan_only: bool = False, skip_qc_failed: bool | None = None):
     from . import ai as ai_mod
     from .editor import edit_film, make_plan, plan_path
 
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
+    clips = _filter_final_clips(sb, out_dir, clips, skip_qc_failed)
     s = user_settings.load()
     is_gemini = sb.effective_ai_model == ai_mod.GEMINI_PRO
     eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
@@ -705,7 +831,7 @@ def _edit_options(f):
 @_edit_options
 @click.option("--plan-only", is_flag=True, help="Chỉ lập kế hoạch dựng (edit.json), chưa xuất phim.")
 def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, allow_missing, engine, replan, backend,
-         plan_only) -> None:
+         plan_only, skip_qc_failed=None) -> None:
     """Agent dựng phim: cắt thừa, chuyển cảnh, cân âm, nhạc nền -> phim liền mạch (không tốn credit).
 
     \b
@@ -716,7 +842,7 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, all
     if not plan_only:
         _fill_subtitles(sb, storyboard, backend)
     _do_edit(sb, _out_dir(storyboard, out), output, music, volume, subtitles, allow_missing, burn_lang=burn_lang,
-             engine=engine, replan=replan, backend=backend, plan_only=plan_only)
+             engine=engine, replan=replan, backend=backend, plan_only=plan_only, skip_qc_failed=skip_qc_failed)
 
 
 @main.command()
@@ -729,13 +855,15 @@ def edit(storyboard: Path, out, output, music, volume, subtitles, burn_lang, all
 @click.option("--lang", type=click.Choice(["vi", "th", "en"]), default=None,
               help="Ngôn ngữ phụ đề (mặc định: ngôn ngữ lời dẫn).")
 @click.option("--allow-missing", is_flag=True, help="Vẫn dựng khi còn cảnh chưa có.")
+@click.option("--skip-qc-failed/--include-qc-failed", "skip_qc_failed", default=None,
+              help="Loại bỏ clip bị đánh dấu FAIL bởi QC khỏi dự án CapCut (mặc định: bật).")
 @_edit_options
 @click.option("--name", help="Tên dự án trong CapCut (mặc định: tên phim).")
 @click.option("--capcut-dir", type=click.Path(file_okay=False, path_type=Path),
               help="Thư mục dự án của CapCut (mặc định: thư mục chuẩn của CapCut trên máy này).")
 @click.option("--open/--no-open", "open_app", default=True, show_default=True, help="Mở CapCut sau khi tạo dự án.")
 def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing, engine, replan, backend, name,
-           capcut_dir, open_app) -> None:
+           capcut_dir, open_app, skip_qc_failed=None) -> None:
     """Agent dựng phim thành dự án CapCut (không tốn credit).
 
     \b
@@ -755,6 +883,7 @@ def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing,
     clips, missing = _clips(sb, out_dir)
     if missing and not allow_missing:
         raise click.ClickException(f"còn thiếu cảnh: {', '.join(missing)} (dùng --allow-missing để dựng phần đã có)")
+    clips = _filter_final_clips(sb, out_dir, clips, skip_qc_failed)
     s = user_settings.load()
     is_gemini = sb.effective_ai_model == ai_mod.GEMINI_PRO
     eff_backend = (s.get("gemini_backend") or "auto") if (is_gemini and backend == "auto") else backend
@@ -783,21 +912,26 @@ def capcut(storyboard: Path, out, music, volume, subtitles, lang, allow_missing,
               help="Dựng bằng agent dựng phim (chuyển cảnh, cân âm) thay vì nối thẳng.")
 @click.option("--publish", "publish_to", multiple=True, type=click.Choice(["facebook_reel", "youtube", "all"]),
               help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
-def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, publish_to, **kw) -> None:
-    """run + stitch: từ storyboard ra thẳng phim.
+def make(storyboard: Path, output, music, volume, subtitles, burn_lang, allow_missing, smart_edit, publish_to,
+         skip_qc_failed=None, **kw) -> None:
+    """run + stitch: từ storyboard ra thẳng phim (kèm cổng Pre-QC ViMax & hậu kiểm OpenMontage).
 
     Chặn cảnh dùng model đã ngừng và cảnh có độ dài model không nhận giống `run`.
     """
     sb, out_dir, report = _do_run(storyboard, **kw)
     if kw["dry_run"] or kw["keyframes_only"]:
         return
+    if report.done and user_settings.load().get("auto_qc", True):
+        _qc(sb, out_dir, set(report.done), force=False, profile=kw.get("profile"))
     if not report.ok and not allow_missing:
         raise click.ClickException("có cảnh lỗi nên chưa ghép phim; sửa rồi chạy lại (các cảnh đã xong sẽ được giữ)")
     _fill_subtitles(sb, storyboard)
     if smart_edit:
-        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang=burn_lang)
+        _do_edit(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang=burn_lang,
+                 skip_qc_failed=skip_qc_failed)
     else:
-        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang)
+        _do_stitch(sb, out_dir, output, music, volume, subtitles, allow_missing, burn_lang,
+                   skip_qc_failed=skip_qc_failed)
     try:
         _do_thumbnail(sb, out_dir, kw.get("profile"), remake=False)
     except click.ClickException as exc:  # the film is done; a missing cover is not a failure
@@ -954,9 +1088,16 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
               help="Ngôn ngữ nhân vật nói; 'none' = không thoại.")
 @click.option("--workspace", type=click.Path(file_okay=False, path_type=Path), default=None,
               help="Thư mục chứa dự án (mặc định ~/FilmMaker, dùng chung với app).")
-@click.option("--review/--no-review", default=True, show_default=True, help="Agent review từng công đoạn.")
+@click.option("--review/--no-review", default=True, show_default=True,
+              help="Cổng kiểm duyệt tự động (ViMax Pre-QC keyframe, OpenMontage + AI QC clip, review phim).")
+@click.option("--keyframe-candidates", type=click.IntRange(1, 4), default=None,
+              help="Số keyframe ứng viên sinh song song (ViMax) mỗi cảnh để VLM chấm chọn (mặc định: 2).")
 @click.option("--rerender-budget", default=3, show_default=True,
-              help="(Không còn dùng: AI QC chỉ đánh dấu clip lỗi, không tự render lại.)")
+              help="Số clip tối đa được tự động render lại khi bật --auto-rerender-qc.")
+@click.option("--auto-rerender-qc/--no-auto-rerender-qc", default=False, show_default=True,
+              help="Tự động render lại clip bị đánh FAIL (tốn credit, tối đa --rerender-budget).")
+@click.option("--skip-qc-failed/--include-qc-failed", "skip_qc_failed", default=None,
+              help="Loại bỏ clip bị đánh FAIL khỏi bản ghép cuối (mặc định: bật).")
 @click.option("--burn-subtitles/--no-burn-subtitles", default=True, show_default=True)
 @click.option("--music", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Nhạc nền.")
 @click.option("--profile", help="gflow profile (tài khoản Google).")
@@ -967,18 +1108,18 @@ def characters(storyboard: Path, names, force, out, profile, dry_run, pause) -> 
               help="Tự động đăng video lên Facebook Reels / YouTube sau khi làm xong.")
 @_format_options
 @_model_options
-def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, rerender_budget,
-         burn_subtitles, music, profile, pause, ai_model, publish_to, fmt, audio, visual, genres,
-         video_model=None, image_model=None, script_file=None) -> None:
+def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, review, keyframe_candidates,
+         rerender_budget, auto_rerender_qc, skip_qc_failed, burn_subtitles, music, profile, pause, ai_model,
+         publish_to, fmt, audio, visual, genres, video_model=None, image_model=None, script_file=None) -> None:
     """Tự động toàn bộ: ý tưởng -> storyboard -> nhân vật -> keyframe -> video -> dựng phim -> thumbnail.
 
     \b
-    Agent review storyboard, keyframe (tạo lại ảnh lỗi, miễn phí), AI QC từng clip (hình, âm thanh, lời thoại;
-    chỉ đánh dấu, không tự render lại) và cả phim. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
+    Cổng kiểm duyệt tự động ViMax (sinh song song ứng viên keyframe + VLM chấm chọn trước khi tạo video)
+    kết hợp hậu kiểm OpenMontage + AI QC (ffprobe, 4 frame đen/chữ, âm thanh, lời thoại) và loại clip lỗi
+    khỏi bản ghép cuối. TỐN CREDIT cho video. Chạy lại cùng --storyboard để làm tiếp.
     Phim mới mặc định dùng luồng mới (--format clip); --format short_drama là luồng cũ, đã ngừng dùng.
     """
     from . import ai as ai_mod
-    from . import formats as fm
     from . import publisher
     from .autopilot import AutoError, Autopilot, AutoSettings, slug
 
@@ -1026,12 +1167,16 @@ def auto(idea, existing, scenes, aspect, language, dialogue_lang, workspace, rev
         sb_path = d / "storyboard.yaml"
         save_storyboard(sb, sb_path)
         click.echo(f"✔ {sb_path}")
-    if review and not fm.is_deprecated(load_storyboard(sb_path).format):
-        review = False  # the review agents check drama direction (camera, dialogue rows, locations); like the app
     pub_cfg = publisher.config_from_settings(s)
     plats = _resolve_publish_platforms(publish_to, pub_cfg)
     is_gemini = chosen_model == ai_mod.GEMINI_PRO
-    cfg = AutoSettings(review=review, rerender_budget=rerender_budget, burn_subtitles=burn_subtitles, music=music,
+    eff_skip = bool(skip_qc_failed) if skip_qc_failed is not None else bool(s.get("qc_gate_assembly", True))
+    eff_cand = keyframe_candidates if keyframe_candidates is not None else (
+        int(s["keyframe_candidates"]) if "keyframe_candidates" in s else None
+    )
+    cfg = AutoSettings(review=review, keyframe_candidates=eff_cand, rerender_budget=rerender_budget,
+                       auto_rerender_qc=auto_rerender_qc, exclude_qc_failed=eff_skip,
+                       burn_subtitles=burn_subtitles, music=music,
                        ai_backend=(s.get("gemini_backend") or "auto") if is_gemini else "auto",
                        api_key=key, ai_model=ai_mod.GEMINI_PRO if is_gemini else None,
                        gemini_api_key=gkey if is_gemini else None,

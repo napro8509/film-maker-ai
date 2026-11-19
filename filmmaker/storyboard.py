@@ -523,7 +523,28 @@ class Storyboard(StoryboardDraft):
     prompt_rules: dict | None = Field(default=None, description="Rules for the image and video prompts chosen in the "
                                       "'Quy tắc prompt' popup: {image: {...}, video: {...}}, only values that differ "
                                       "from the default (rules.IMAGE_RULES / rules.VIDEO_RULES). Never sent to Flow.")
+    keyframe_candidates: int | None = Field(default=None, description="ViMax pre-render QC: number of candidate "
+                                            "keyframes generated in parallel per scene and scored by VLM before paid "
+                                            "video generation (1-4). Never sent to Flow.")
+    qc_gate: bool | None = Field(default=None, description="Automated ViMax & OpenMontage QC gate before and after "
+                                 "rendering: gate broken keyframes before paid video render and exclude FAIL clips "
+                                 "from final assembly. Never sent to Flow.")
     _defaults_only: bool = PrivateAttr(default=False)
+
+    @field_validator("keyframe_candidates", mode="before")
+    @classmethod
+    def _keyframe_candidates(cls, v: object) -> int | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        if isinstance(v, bool):
+            raise ValueError("keyframe_candidates must be an integer between 1 and 4")
+        try:
+            n = int(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("keyframe_candidates must be an integer between 1 and 4") from exc
+        if not 1 <= n <= 4:
+            raise ValueError("keyframe_candidates must be between 1 and 4")
+        return n
 
     @field_validator("prompt_rules", mode="before")
     @classmethod

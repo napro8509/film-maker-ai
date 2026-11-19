@@ -662,15 +662,28 @@ pre.box { white-space: pre-wrap; word-break: break-word; background: var(--surfa
 .social-caption { white-space: pre-wrap; font-size: var(--fs-3); line-height: 1.55; overflow-wrap: anywhere; }
 .social-tags { color: var(--info-ink); font-size: var(--fs-2); overflow-wrap: anywhere; }
 
-/* AI QC of clips */
+/* Automated QC gates (ViMax Pre-QC & OpenMontage Post-QC) */
 .qc-box { border: 1px solid var(--border); border-radius: var(--r-2); padding: var(--sp-2) var(--sp-3); display: grid; gap: 6px; background: var(--surface-2); }
 .qc-box.bad { border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: var(--err-soft); }
 .qc-box.warn { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
-.qc-box.none { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.qc-box.none { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; }
 .qc-tag { font-size: var(--fs-1); font-weight: var(--fw-bold); padding: 2px 8px; border-radius: var(--r-pill); background: var(--surface-3); }
 .qc-tag.ok { color: var(--ok-ink); background: var(--ok-soft); }
 .qc-tag.warn { color: var(--warn-ink); background: var(--warn-soft); }
 .qc-tag.bad { color: var(--err-ink); background: var(--err-soft); }
+.qc-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.qc-badge { font-size: 11px; padding: 2px 7px; border-radius: var(--r-pill); border: 1px solid var(--border); background: var(--surface); }
+.qc-badge.ok { color: var(--ok-ink); border-color: color-mix(in srgb, var(--ok) 35%, var(--border)); }
+.qc-badge.warn { color: var(--warn-ink); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.qc-badge.bad { color: var(--err-ink); background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); }
+.qc-badge.muted { color: var(--muted); }
+.qc-om-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 6px; }
+.qc-om-grid img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: var(--r-1); border: 1px solid var(--border); cursor: zoom-in; }
+.qc-cand-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-top: 6px; }
+.qc-cand { border: 1px solid var(--border); border-radius: var(--r-1); padding: 4px; background: var(--surface); display: grid; gap: 4px; }
+.qc-cand.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.qc-cand img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 4px; cursor: zoom-in; }
+.qc-cand-meta { justify-content: space-between; gap: 4px; }
 .qc-transcript { white-space: pre-wrap; padding: 6px 8px; margin-top: 4px; border-radius: var(--r-1); background: var(--surface); border: 1px solid var(--border); }
 .qc-summary { margin-bottom: var(--sp-3); }
 .qc-summary .row { flex-wrap: wrap; gap: 8px; }

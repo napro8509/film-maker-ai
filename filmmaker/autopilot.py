@@ -57,7 +57,10 @@ class AutoError(RuntimeError):
 class AutoSettings:
     review: bool = True
     keyframe_rounds: int = 2  # review -> remake rounds for keyframes (free)
+    keyframe_candidates: int | None = None  # ViMax parallel keyframe candidates (None = 2 when AI ready, else 1)
     rerender_budget: int = 3  # paid re-renders the clip review may ask for, in the whole film
+    auto_rerender_qc: bool = False  # automatically spend rerender_budget on QC FAIL clips (opt-in: costs credits)
+    exclude_qc_failed: bool = True  # OpenMontage + AI QC gate: exclude FAIL clips from final assembly
     resend_interrupted: bool = True  # resend a scene once if Flow was cut off mid-render (may cost a clip twice)
     burn_subtitles: bool = True
     music: Path | None = None
@@ -159,6 +162,22 @@ class Autopilot:
             if self.cfg.gemini_api_key:
                 kw["gemini_api_key"] = self.cfg.gemini_api_key
         return kw
+
+    def _picked_backend(self) -> str | None:
+        is_gemini = self._ai_model() == reviewer.ai.GEMINI_PRO
+        return (reviewer.ai.pick_backend(self.cfg.ai_backend, ai_model=reviewer.ai.GEMINI_PRO,
+                                         gemini_api_key=self.cfg.gemini_api_key)
+                if is_gemini else reviewer.ai.pick_backend(self.cfg.ai_backend, self.cfg.api_key))
+
+    def _effective_keyframe_candidates(self, sb: Storyboard | None = None) -> int:
+        if self.cfg.keyframe_candidates is not None:
+            return max(1, min(4, int(self.cfg.keyframe_candidates)))
+        sb_obj = sb or self.sb()
+        if sb_obj.keyframe_candidates:
+            return max(1, min(4, int(sb_obj.keyframe_candidates)))
+        if self.cfg.review and self._picked_backend() is not None:
+            return 2
+        return 1
 
     def stage(self, key: str) -> dict[str, Any]:
         return self.data["stages"].setdefault(key, {})
@@ -284,6 +303,10 @@ class Autopilot:
             self.log("Đã review storyboard từ trước.")
             return
         sb = self.sb()
+        if sb.basic:
+            self.log("Storyboard theo luồng I2V chuẩn (đã kiểm quy tắc khi lập kế hoạch).")
+            self.mark("review_storyboard", "done", "chuẩn I2V")
+            return
         self.log("Agent review đang đọc storyboard (kịch bản, liên tục, prompt, thoại)…")
         try:
             rev = reviewer.review_storyboard(sb, **self.ai_kw())
@@ -427,7 +450,13 @@ class Autopilot:
         self._location_images()
         for attempt in (1, 2):
             pipe = self.pipe()
-            report = pipe.run(self.opts(keyframes_only=True))
+            n_cand = self._effective_keyframe_candidates(pipe.sb)
+            report = pipe.run(self.opts(
+                keyframes_only=True,
+                keyframe_candidates=n_cand,
+                pre_qc_gate=bool(self.cfg.review and n_cand > 1),
+                ai_kw=self.ai_kw() if n_cand > 1 else {},
+            ))
             self.check_stop()
             self._fatal(report, "tạo keyframe")
             if not report.failed:
@@ -446,11 +475,22 @@ class Autopilot:
         if not self.cfg.review:
             self.mark("review_keyframes", "skipped", "tắt review")
             return
+        from . import qc
+
         ok: dict[str, str] = self.data.setdefault("keyframe_ok", {})
         rounds = max(1, self.cfg.keyframe_rounds)
         remade_total: list[str] = []
         scores: dict[str, int] = {}
         unreviewed: set[str] = set()
+        # Keyframes already VLM-scored & approved by ViMax Pre-QC in _stage_keyframes need no redundant review.
+        pipe0 = self.pipe()
+        for s in self._keyframe_scenes(pipe0.sb):
+            kf_p = pipe0.keyframe_path(s)
+            if pipe0.has_keyframe(s):
+                kqc = qc.current_keyframe_qc(self.out, s.id, kf_p)
+                if kqc and kqc.get("vlm_used") and kqc.get("verdict") in ("PASS", "MINOR"):
+                    ok[s.id] = _file_sig(kf_p)
+                    scores[s.id] = int(kqc.get("score") or 8)
         for rnd in range(1, rounds + 1):
             pipe = self.pipe()
             items = [(s.id, pipe.keyframe_path(s)) for s in self._keyframe_scenes(pipe.sb)
@@ -476,7 +516,11 @@ class Autopilot:
             self.log(f"Tạo lại keyframe theo góp ý: {', '.join(revise)}")
             self.edit_raw(lambda raw: any([reviewer.set_scene_field(raw, sid, "image_prompt", txt)
                                            for sid, txt in revise.items()]))
-            report = self.pipe().run(self.opts(keyframes_only=True, only=set(revise), force_keyframes=set(revise)))
+            n_cand = self._effective_keyframe_candidates(pipe.sb)
+            report = self.pipe().run(self.opts(
+                keyframes_only=True, only=set(revise), force_keyframes=set(revise),
+                keyframe_candidates=n_cand, pre_qc_gate=bool(n_cand > 1), ai_kw=self.ai_kw() if n_cand > 1 else {},
+            ))
             self.check_stop()
             self._fatal(report, "tạo lại keyframe")
             remade_total += [sid for sid in revise if sid in report.done]
@@ -529,8 +573,15 @@ class Autopilot:
 
     def _video_run(self, **kw: Any) -> RunReport:
         sb = self.sb()
+        n_cand = self._effective_keyframe_candidates(sb)
+        extra_opts: dict[str, Any] = {}
+        if n_cand > 1:
+            extra_opts.update(keyframe_candidates=n_cand, pre_qc_gate=bool(self.cfg.review), ai_kw=self.ai_kw())
         report = self.pipe(sb).run(self.opts(
-            refuse=lambda s: retirement.refuse_retired(sb)(s) or dur.refuse_bad_duration(sb)(s), **kw))
+            refuse=lambda s: retirement.refuse_retired(sb)(s) or dur.refuse_bad_duration(sb)(s),
+            **extra_opts,
+            **kw,
+        ))
         self.check_stop()
         self._fatal(report, "render video")
         return report
@@ -623,17 +674,50 @@ class Autopilot:
         self._video_run(only=set(fixed), confirm=set(fixed))
 
     def _stage_review_clips(self, result: dict) -> None:
-        """AI QC of every new clip (picture vs keyframe, characters, sound, dialogue). It only flags: a FAIL
-        clip is listed for the user, who decides whether to pay for a re-render (Phim → Cảnh → Render lại)."""
+        """Post-render QC gate (OpenMontage + AI QC): checks `ffprobe`, 4 extracted frames (black/text errors),
+        audio levels, start-frame match, and speech/dialogue. Optional auto-rerender when opted in; FAIL clips
+        are gated out of final assembly by `_clips()`."""
         if not self.cfg.review:
             self.mark("review_clips", "skipped", "tắt review")
             return
         from . import qc
 
         pipe = self.pipe()
-        self.log("AI QC đang xem và nghe từng clip mới…")
-        qc.run(pipe, log=self.log, stop=self.should_stop, **self.ai_kw())
+        self.log("AI QC + OpenMontage đang xem 4 frame, kiểm ffprobe và nghe từng clip mới…")
+        done_qc = qc.run(pipe, log=self.log, stop=self.should_stop, **self.ai_kw())
         self.check_stop()
+        if not done_qc:
+            unchecked = [s for s in pipe.sb.scenes
+                         if pipe.is_done(s) and qc.current(self.out, s.id, qc.clip_of(pipe, s)) is None]
+            if unchecked:
+                qc.run_openmontage(pipe, log=self.log, stop=self.should_stop)
+                self.check_stop()
+
+        if self.cfg.auto_rerender_qc and self.cfg.rerender_budget > 0:
+            rerendered: list[str] = self.data.setdefault("rerendered", [])
+            budget_left = max(0, self.cfg.rerender_budget - len(rerendered))
+            cur_res = {s.id: qc.current(self.out, s.id, qc.clip_of(pipe, s)) for s in pipe.sb.scenes if pipe.is_done(s)}
+            candidates_redo = [sid for sid, v in cur_res.items()
+                               if v and v.get("verdict") == "FAIL" and sid not in rerendered][:budget_left]
+            if candidates_redo:
+                fixes = {sid: cur_res[sid]["prompt"] for sid in candidates_redo
+                         if cur_res[sid] and cur_res[sid].get("prompt")}
+                if fixes and not pipe.sb.basic:
+                    self.edit_raw(lambda raw: any([reviewer.set_scene_field(raw, sid, "prompt", p)
+                                                   for sid, p in fixes.items()]))
+                self.log(f"↻ Tự động render lại {len(candidates_redo)} clip lỗi QC: {', '.join(candidates_redo)}…")
+                rerendered.extend(candidates_redo)
+                self.save()
+                self._video_run(only=set(candidates_redo), force=set(candidates_redo), confirm=set(candidates_redo))
+                pipe = self.pipe()
+                rs = qc.run(pipe, only=set(candidates_redo), force=True, log=self.log,
+                            stop=self.should_stop, **self.ai_kw())
+                if not rs:
+                    qc.run_openmontage(pipe, only=set(candidates_redo), force=True,
+                                       log=self.log, stop=self.should_stop)
+                self.check_stop()
+
+        pipe = self.pipe()
         results = {s.id: qc.current(self.out, s.id, qc.clip_of(pipe, s)) for s in pipe.sb.scenes if pipe.is_done(s)}
         results = {k: v for k, v in results.items() if v}
         if not results:
@@ -643,12 +727,16 @@ class Autopilot:
         failed = sorted(k for k, v in results.items() if v["verdict"] == "FAIL")
         avg = round(sum(scores.values()) / len(scores), 1)
         if failed:
+            gate_note = ("Các clip FAIL sẽ được loại khỏi bản ghép cuối."
+                         if self.cfg.exclude_qc_failed else "Phim vẫn được dựng từ các clip hiện có.")
             self.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở tab Cảnh và bấm “Render lại” nếu muốn "
-                     "(tốn credit). Phim vẫn được dựng từ các clip hiện có.")
+                     f"(tốn credit). {gate_note}")
         result["qc_failed"] = failed
         self.mark("review_clips", "done", f"QC điểm TB {avg}/10, FAIL {len(failed)}", scores=scores, failed=failed)
 
     def _clips(self) -> list[tuple[str, Path]]:
+        from . import qc
+
         pipe = self.pipe()
         out = []
         for s in pipe.sb.scenes:
@@ -656,7 +744,13 @@ class Autopilot:
             p = Path(st.get("video", ""))
             if st.get("status") == DONE and p.is_file():
                 out.append((s.id, p))
-        return out
+        kept, _ = qc.filter_clips_for_assembly(
+            pipe.sb, self.out, out,
+            exclude_failed=self.cfg.exclude_qc_failed,
+            run_local_qc=self.cfg.review,
+            log=self.log,
+        )
+        return kept
 
     def _stage_edit(self, result: dict) -> None:
         from .editor import edit_film

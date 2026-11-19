@@ -533,13 +533,40 @@ hết credit, mất đăng nhập hoặc cảnh bị ngắt khi render thì vẫ
 Tạo ảnh nhân vật bằng CLI: `filmmaker characters storyboard.yaml [--name Lan] [--force]` (miễn phí, tự ghi `image` vào storyboard).
 Tạo ảnh bối cảnh bằng CLI: `filmmaker locations storyboard.yaml [--name "Phòng khách"] [--force]` (miễn phí, tự ghi `image` vào storyboard). Xem mục "Bối cảnh và cảnh liền mạch".
 
+## Cổng kiểm duyệt tự động (ViMax & OpenMontage)
+
+Luồng làm phim tích hợp hai cổng kiểm duyệt tự động (Automated QC) trước và sau khi render để ngăn clip lỗi lọt vào bản ghép cuối:
+
+1. **Tiền kiểm keyframe kiểu ViMax (Pre-render QC)**:
+   - Sinh song song nhiều ứng viên keyframe đầu vào (`--keyframe-candidates 2..4`, miễn phí trên Flow) kèm ảnh tham chiếu nhân vật/bối cảnh.
+   - Kiểm tra ảnh cục bộ (`ffprobe`, độ sáng/khung hình đen, OCR `tesseract` nếu có) rồi dùng VLM (`Claude` hoặc `Gemini Pro`) chấm điểm và tự động chọn ứng viên tốt nhất trước khi gọi API tạo video tốn phí.
+   - Nếu mọi ứng viên đều bị đánh `FAIL`, tự động dùng prompt sửa của VLM sinh lại 1 lượt miễn phí; khi bật `qc_gate: true` trong storyboard, cảnh có keyframe vẫn `FAIL` sẽ bị chặn không gửi lên API tạo video để bảo toàn credit.
+2. **Hậu kiểm clip kiểu OpenMontage + AI QC (Post-render QC)**:
+   - Chạy `ffprobe` kiểm tra tính toàn vẹn container, luồng hình/tiếng, độ phân giải và thời lượng.
+   - Trích xuất **4 frame** trải đều dọc clip (`output/<tên>/qc_frames/<id>_om_1..4.jpg`) để phát hiện **khung hình đen** (`blackdetect` + độ chói pixel) và **lỗi chữ/phụ đề rác** (OCR + VLM).
+   - Đo **mức âm thanh** (`volumedetect` + `silencedetect`), phát hiện mất tiếng (`dead_air`), rè/vỡ tiếng `0 dBFS` (`clipping`) và kiểm tra lời thoại qua `whisper.cpp`.
+3. **Cổng chặn bản ghép cuối**:
+   - Khi ghép phim (`stitch`, `edit`, `capcut`, `make`, `auto`), các clip bị đánh `FAIL` tự động được loại khỏi bản ghép cuối (`--include-qc-failed` để ép giữ nếu cần).
+
+```bash
+# Sinh song song 3 ứng viên keyframe + tiền kiểm ViMax trước khi render video
+filmmaker run cafe.yaml --keyframe-candidates 3 --pre-qc
+
+# Chạy hậu kiểm OpenMontage (ffprobe + 4 frame + mức âm thanh, không cần API AI)
+filmmaker qc cafe.yaml --local-only
+
+# Chấm chọn lại keyframe đầu vào bằng ViMax Pre-QC
+filmmaker qc cafe.yaml --keyframes --force
+```
+
 ## Các tuỳ chọn hay dùng
 
 | Lệnh | Tuỳ chọn |
 |---|---|
-| `run` / `make` | `--dry-run`, `--keyframes-only`, `--only s02`, `--force s02`, `--retry-unknown`, `--adopt s02`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
+| `run` / `make` | `--dry-run`, `--keyframes-only`, `--keyframe-candidates 2`, `--pre-qc/--no-pre-qc`, `--only s02`, `--force s02`, `--retry-unknown`, `--adopt s02`, `--retries 2`, `--pause 8-20`, `--fail-fast`, `--profile <tài khoản>`, `--out <thư mục>` |
+| `qc` | `--only s02`, `--force`, `--local-only` (OpenMontage), `--keyframes` (ViMax Pre-QC), `--out <thư mục>` |
 | `round-durations` | `--up`, `--down`, `--out <thư mục>` |
-| `stitch` / `make` | `--music file.mp3`, `--music-volume 0.25`, `--burn-subtitles`, `--allow-missing`, `-o phim.mp4` |
+| `stitch` / `edit` / `capcut` / `make` | `--music file.mp3`, `--music-volume 0.25`, `--burn-subtitles`, `--allow-missing`, `--skip-qc-failed/--include-qc-failed`, `-o phim.mp4` |
 
 Biến môi trường: `GFLOW_BIN` (đường dẫn lệnh gflow khác), `ANTHROPIC_API_KEY` (cho `plan`).
 Các biến của gflow như `GFLOW_CLI_OUTPUT_DIR`, `GFLOW_CLI_FLOW_HOST` vẫn dùng bình thường.

@@ -12,9 +12,11 @@ import json
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 from typing import Any, Callable, Collection, Literal
 
 from . import durations as dur
@@ -50,23 +52,27 @@ _UNSET: Any = object()
 class State:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.RLock()
         self.data: dict[str, Any] = {"project_id": None, "scenes": {}}
         if path.exists():
             self.data = json.loads(path.read_text(encoding="utf-8"))
             self.data.setdefault("scenes", {})
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
 
     def scene(self, sid: str) -> dict[str, Any]:
-        return self.data["scenes"].setdefault(sid, {})
+        with self._lock:
+            return self.data["scenes"].setdefault(sid, {})
 
     def update(self, sid: str, **fields: Any) -> None:
-        self.scene(sid).update(fields, updated_at=_now())
-        self.save()
+        with self._lock:
+            self.scene(sid).update(fields, updated_at=_now())
+            self.save()
 
 
 @dataclass
@@ -81,6 +87,11 @@ class RunOptions:
     fail_fast: bool = False
     keyframes_only: bool = False  # only make the (free) keyframe stills, no paid video
     force_keyframes: set[str] = field(default_factory=set)  # remake these keyframes even if they exist
+    # ViMax pre-render QC gate: parallel keyframe candidates (1..4) + VLM scoring before paid video API
+    keyframe_candidates: int = 1
+    pre_qc_gate: bool = False
+    strict_pre_qc: bool = False
+    ai_kw: dict[str, Any] = field(default_factory=dict)
     should_stop: Callable[[], bool] = lambda: False  # checked between scenes (UI "stop" button)
     after_scene: Callable[[str], None] = lambda _sid: None  # a clip was rendered and saved (e.g. back it up)
     # checked right before each paid video submission; a returned reason means "do not send this scene"
@@ -126,6 +137,7 @@ class Pipeline:
         self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
         self._dry_kf: set[str] = set()  # dry-run: keyframes this run "made" already (so the next scene can chain)
         self._no_flow_chars = False  # the Flow Characters page failed this run: portraits go back to plain t2i
+        self._ui_browser_lock = threading.Lock()  # serializes persistent browser profile calls (flow_ui / muse_ui)
 
     def _sha(self, path: Path) -> str | None:
         try:
@@ -228,9 +240,11 @@ class Pipeline:
 
         ui_prompt = "Reference images: " + "; ".join(_slot(i, n) for i, (n, _) in enumerate(refs)) + ". " + prompt
         if is_muse(kw.get("model")):  # Muse takes the local pictures as they are, with the labelled prompt
-            return self._with_retries(what, lambda: self.g.muse_image(self.sb.for_flow(ui_prompt), files,
-                                                                      out=kw["out"], aspect=kw["aspect"]),
-                                      opts.max_retries)
+            def _muse_call() -> Path:
+                with self._ui_browser_lock:
+                    return self.g.muse_image(self.sb.for_flow(ui_prompt), files, out=kw["out"], aspect=kw["aspect"])
+
+            return self._with_retries(what, _muse_call, opts.max_retries)
         # gflow's own i2i keeps the plain prompt (golden argv); the Flow chat page gets the labels
         cap = ref_caps.image_cap(kw.get("model"))
         if (self.state.data.get("i2i_ui") or self._prefer_ui(refs, project, cap)) and self.g.ui_available():
@@ -289,7 +303,8 @@ class Pipeline:
     def _image_via_ui(self, what: str, prompt: str, files: list[Path | str], kw: dict) -> Path | None:
         self.log(f"  → {what} qua giao diện chat của Flow")
         try:
-            return self.g.ui_image_to_image(self.sb.for_flow(prompt), files, **kw)
+            with self._ui_browser_lock:
+                return self.g.ui_image_to_image(self.sb.for_flow(prompt), files, **kw)
         except GflowError as exc:
             self.log(f"  ! Không tạo được ảnh theo ảnh nhân vật qua giao diện chat ({exc}). Tạo ảnh chỉ từ mô tả chữ.")
             return None
@@ -662,6 +677,95 @@ class Pipeline:
         self.rep.done(key)
         return kf
 
+    def _effective_candidates(self, opts: RunOptions) -> int:
+        n = opts.keyframe_candidates if opts.keyframe_candidates > 1 else (self.sb.keyframe_candidates or 1)
+        return 1 if self.g.dry_run else max(1, min(4, int(n)))
+
+    def candidate_dir(self) -> Path:
+        return self.out / "keyframes" / "candidates"
+
+    def select_keyframe_candidate(self, s: Scene, index: int) -> Path:
+        """Promote candidate `index` (1-based, from `qc_keyframes.json`) to `<out>/keyframes/<sid>.png`."""
+        from . import qc
+
+        kf = self.keyframe_path(s)
+        rec = qc.load_keyframe_qc(self.out).get(s.id) or {}
+        cands = rec.get("candidates") or []
+        chosen_row = next((c for c in cands if int(c.get("index") or 0) == index), None)
+        cand_file = (self.candidate_dir() / str(chosen_row["file"])) if chosen_row and chosen_row.get("file") else (
+            self.candidate_dir() / f"{s.id}_c{index}.png")
+        if not cand_file.is_file():
+            raise FileNotFoundError(f"không tìm thấy ảnh ứng viên #{index} ({cand_file.name})")
+        kf.parent.mkdir(parents=True, exist_ok=True)
+        kf.write_bytes(cand_file.read_bytes())
+        if rec:
+            rec = dict(rec, best_index=index, best_path=str(cand_file))
+            if chosen_row:
+                rec["verdict"] = chosen_row.get("verdict", rec.get("verdict"))
+                rec["score"] = chosen_row.get("score", rec.get("score"))
+                rec["issues"] = chosen_row.get("issues", rec.get("issues") or [])
+            rec["sig"] = qc.clip_sig(kf)
+            qc.save_keyframe_qc(self.out, s.id, rec)
+        self.state.update(s.id, keyframe=str(kf), keyframe_prompt=self.sb.stored_image_prompt(s),
+                          keyframe_refs=self.sb.refs_signature(s))
+        return kf
+
+    def _generate_one_keyframe(self, sent: str, dest: Path, refs: list[tuple[str, Path]], kinds: list[str],
+                               project: str, opts: RunOptions, *, src: Scene | None, loc: Location | None,
+                               quiet_refs: bool = False) -> tuple[Path, bool]:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        kw = dict(out=dest, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
+        img = None
+        if refs:
+            log_line = "" if (quiet_refs or loc is not None) else None
+            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", sent, refs, project, kw, opts,
+                                        log_line=log_line, kinds=kinds)
+        chained = src is not None and img is not None
+        if img is None:
+            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(sent, **kw), opts.max_retries)
+        p = Path(img)
+        if not self.g.dry_run and p != dest and p.is_file():
+            dest.write_bytes(p.read_bytes())
+            p = dest
+        return p, chained
+
+    def _generate_candidates_parallel(self, sent: str, paths: list[Path], refs: list[tuple[str, Path]],
+                                      kinds: list[str], project: str, opts: RunOptions, *, src: Scene | None,
+                                      loc: Location | None) -> tuple[list[Path], bool]:
+        """Generate `len(paths)` candidate keyframes in parallel (ViMax style). Pre-warms `flow_refs` once."""
+        if refs and not is_muse(self.sb.image_model) and project and project not in self._no_media_refs:
+            try:
+                self.flow_refs(refs, project)
+            except Exception:
+                pass
+        results: list[tuple[int, Path, bool]] = []
+        errors: list[GflowError] = []
+
+        def worker(idx: int, dest: Path) -> tuple[int, Path, bool]:
+            p, ch = self._generate_one_keyframe(sent, dest, refs, kinds, project, opts,
+                                                src=src, loc=loc, quiet_refs=(idx > 0))
+            return idx, p, ch
+
+        with ThreadPoolExecutor(max_workers=len(paths)) as pool:
+            futs = [pool.submit(worker, i, p) for i, p in enumerate(paths)]
+            for fut in futs:
+                try:
+                    results.append(fut.result())
+                except GflowError as exc:
+                    if exc.fatal:
+                        raise
+                    errors.append(exc)
+        if not results:
+            raise errors[0]
+        results.sort(key=lambda r: r[0])
+        made = [p for _, p, _ in results if p.is_file()]
+        if not made:
+            if errors:
+                raise errors[0]
+            made = [results[0][1]]
+        any_chained = any(ch for _, _, ch in results)
+        return made, any_chained
+
     def _make_keyframe(self, s: Scene, project: str, opts: RunOptions) -> Path:
         kf = self.keyframe_path(s)
         prompt = self.sb.stored_image_prompt(s)  # kept in the state: default prompt rules (see Storyboard.rule)
@@ -684,30 +788,90 @@ class Pipeline:
         if n_chars > face_cap:
             self.log(f"  ⚠ {n_chars} nhân vật trong ảnh: model ảnh {self.sb.image_model} giữ giống khuôn mặt tốt nhất "
                      f"với tối đa {face_cap} người (Gemini API); nên bớt người trong cảnh hoặc tách cảnh.")
-        kw = dict(out=kf, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
         # + the film's image rules and dialogue staging; the state keeps `prompt` (default rules, fingerprint)
         sent = self.sb.for_flow_keyframe(self.sb.image_prompt(s), s)
-        img = None
-        # Images are free on Flow, so retrying them (or falling back) is safe.
-        if refs:
-            img = self._image_with_refs("tạo keyframe theo ảnh nhân vật", sent, refs, project, kw, opts,
-                                        log_line="" if loc is not None else None, kinds=kinds)
-        chained = src is not None and img is not None
-        if img is None:
-            img = self._with_retries("tạo keyframe", lambda: self.g.text_to_image(sent, **kw), opts.max_retries)
-        if not self.g.dry_run:
-            if Path(img) != kf and Path(img).is_file():  # keep the UI's preview path stable
-                kf.parent.mkdir(parents=True, exist_ok=True)
-                kf.write_bytes(Path(img).read_bytes())
-            extra: dict[str, Any] = {}
-            # Old storyboards (no location) never get the new keys in state.json.
-            if loc is not None or "keyframe_from" in self.state.scene(s.id):
-                extra = dict(keyframe_from=src.id if chained else None,
-                             keyframe_from_sha=src_sha if chained else None)
-            self.state.update(s.id, keyframe=str(kf), keyframe_prompt=prompt,
-                              keyframe_refs=self.sb.refs_signature(s), **extra)
-        else:
-            self._dry_kf.add(s.id)
+        n_cand = self._effective_candidates(opts)
+        use_vimax = not self.g.dry_run and (n_cand > 1 or opts.pre_qc_gate or bool(self.sb.qc_gate))
+
+        if not use_vimax:
+            _, chained = self._generate_one_keyframe(sent, kf, refs, kinds, project, opts, src=src, loc=loc)
+            if not self.g.dry_run:
+                extra: dict[str, Any] = {}
+                # Old storyboards (no location) never get the new keys in state.json.
+                if loc is not None or "keyframe_from" in self.state.scene(s.id):
+                    extra = dict(keyframe_from=src.id if chained else None,
+                                 keyframe_from_sha=src_sha if chained else None)
+                self.state.update(s.id, keyframe=str(kf), keyframe_prompt=prompt,
+                                  keyframe_refs=self.sb.refs_signature(s), **extra)
+            else:
+                self._dry_kf.add(s.id)
+            return kf
+
+        from . import qc
+
+        cdir = self.candidate_dir()
+        cdir.mkdir(parents=True, exist_ok=True)
+        cand_paths = [cdir / f"{s.id}_c{i}.png" for i in range(1, n_cand + 1)]
+        if n_cand > 1:
+            self.log(f"  [ViMax Pre-QC] Sinh song song {n_cand} keyframe ứng viên cho {s.id}…")
+        made, chained = self._generate_candidates_parallel(sent, cand_paths, refs, kinds, project, opts,
+                                                           src=src, loc=loc)
+        sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
+        tag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel["verdict"]]
+        self.log(
+            f"  {tag} [ViMax Pre-QC] Chọn ứng viên #{sel['best_index']}/{len(made)} "
+            f"({sel['verdict']} {sel['score']}/10)"
+            + (f" — {sel['reason']}" if sel.get("reason") else "")
+        )
+
+        # Free pre-render remediation round if every candidate failed QC before spending paid video credits.
+        if sel["verdict"] == "FAIL":
+            s_retry = s.model_copy(update={"image_prompt": sel["image_prompt"]}) if sel.get("image_prompt") else s
+            sent_retry = self.sb.for_flow_keyframe(self.sb.image_prompt(s_retry), s_retry)
+            self.log(f"  ↻ [ViMax Pre-QC] Cả {len(made)} ứng viên đều lỗi ({'; '.join(sel['issues']) or 'FAIL'}) "
+                     f"— tạo lại {n_cand} ứng viên mới (miễn phí) trước khi tạo video…")
+            retry_paths = [cdir / f"{s.id}_r{i}.png" for i in range(1, n_cand + 1)]
+            try:
+                made_retry, ch_retry = self._generate_candidates_parallel(
+                    sent_retry, retry_paths, refs, kinds, project, opts, src=src, loc=loc
+                )
+                chained = chained or ch_retry
+                sel_retry = qc.select_best_keyframe(self.sb, s_retry, made_retry, **opts.ai_kw)
+                verdict_rank = {"PASS": 2, "MINOR": 1, "FAIL": 0}
+                if (verdict_rank[sel_retry["verdict"]], sel_retry["score"]) >= (verdict_rank[sel["verdict"]], sel["score"]):
+                    promoted: list[Path] = []
+                    for i, rp in enumerate(made_retry, 1):
+                        cp = cdir / f"{s.id}_c{i}.png"
+                        cp.write_bytes(rp.read_bytes())
+                        rp.unlink(missing_ok=True)
+                        promoted.append(cp)
+                    for c_row, cp in zip(sel_retry["candidates"], promoted):
+                        c_row["file"] = cp.name
+                    sel_retry["best_path"] = str(promoted[sel_retry["best_index"] - 1])
+                    sel = sel_retry
+                    rtag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel["verdict"]]
+                    self.log(f"  {rtag} [ViMax Pre-QC vòng 2] Chọn ứng viên #{sel['best_index']}/{len(promoted)} "
+                             f"({sel['verdict']} {sel['score']}/10)")
+                else:
+                    for rp in retry_paths:
+                        rp.unlink(missing_ok=True)
+            except GflowError as exc:
+                if exc.fatal:
+                    raise
+                self.log(f"  ⚠ [ViMax Pre-QC] Không tạo lại được ứng viên vòng 2 ({exc}); giữ ứng viên tốt nhất vòng 1.")
+
+        best_file = Path(sel["best_path"])
+        if best_file != kf and best_file.is_file():
+            kf.parent.mkdir(parents=True, exist_ok=True)
+            kf.write_bytes(best_file.read_bytes())
+        sel["sig"] = qc.clip_sig(kf)
+        qc.save_keyframe_qc(self.out, s.id, sel)
+        extra_st: dict[str, Any] = {}
+        if loc is not None or "keyframe_from" in self.state.scene(s.id):
+            extra_st = dict(keyframe_from=src.id if chained else None,
+                            keyframe_from_sha=src_sha if chained else None)
+        self.state.update(s.id, keyframe=str(kf), keyframe_prompt=prompt,
+                          keyframe_refs=self.sb.refs_signature(s), **extra_st)
         return kf
 
     def generate_portraits(self, chars: list[tuple[Character, Path]], opts: RunOptions,
@@ -947,7 +1111,26 @@ class Pipeline:
         if s.mode == "keyframe" and self.i2v_unsupported and self.sb.fallback_t2v and not ui:
             return self._render_text_only(s, common, opts)
         if s.mode == "keyframe":
+            remade_now = (not self.has_keyframe(s)) or (s.id in opts.force_keyframes)
             start_image = self._keyframe(s, project, opts, remake=s.id in opts.force_keyframes)
+            if not dry and start_image is not None and (opts.pre_qc_gate or bool(self.sb.qc_gate)):
+                from . import qc
+
+                kqc = qc.current_keyframe_qc(self.out, s.id, start_image)
+                if kqc is None:
+                    kqc = qc.select_best_keyframe(self.sb, s, [start_image], **opts.ai_kw)
+                    kqc["sig"] = qc.clip_sig(start_image)
+                    qc.save_keyframe_qc(self.out, s.id, kqc)
+                if kqc.get("verdict") == "FAIL" and not remade_now:
+                    self.log(f"  ↻ [ViMax Pre-QC] Keyframe sẵn có của {s.id} bị đánh dấu FAIL — tạo lại ứng viên mới (miễn phí) trước khi gọi API video…")
+                    start_image = self._keyframe(s, project, opts, remake=True)
+                    kqc = qc.current_keyframe_qc(self.out, s.id, start_image)
+                if (opts.strict_pre_qc or bool(self.sb.qc_gate)) and kqc and kqc.get("verdict") == "FAIL":
+                    why_fail = "; ".join(kqc.get("issues") or ["keyframe không đạt chuẩn"])
+                    raise GflowError(
+                        f"Cổng Pre-QC (ViMax) chặn gọi API tạo video cho {s.id} (chưa trừ credit): {why_fail}",
+                        exit_code=45,
+                    )
         elif s.mode == "i2v":
             start_image = Path(s.image)  # validated by the storyboard
             if not dry and not start_image.is_file():
