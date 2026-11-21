@@ -52,6 +52,9 @@ class SoftenFix(SceneFix):
     video_shot: VideoShot | None = Field(default=None, description="Full new structured video shot (camera, action, "
                                          "environment, audio, speaker, listeners). Required when the scene has one: it "
                                          "is what the video model gets, `prompt` alone changes nothing.")
+    story_point_kept: bool = Field(default=True, description="False when this version no longer tells the approved "
+                                   "script's story point for the scene (who does what to whom, what is said and why "
+                                   "it matters). Then the film is better without it than with a different story.")
 
 
 class StoryboardReview(BaseModel):
@@ -211,6 +214,9 @@ in distress. Then change all of these that apply:
 - Action and ambience: no fight, confrontation, bullying up close, pain, injury, limping, gritted teeth,
   sweat and tears together, or crowds jeering; keep the emotion (sad, worried, brave, kind) with faces, looks
   and small gestures. With children, keep it especially mild and warm.
+- The video shot's `audio` cue: plain ambience only (room tone, breeze, birdsong); no breathing, sighs, sobs,
+  crying or extra voices. In a scene where no one speaks this cue is the usual trigger.
+- A reworded line keeps its meaning, its dialect and register (the same regional words and particles).
 
 When the error says the prompt "might violate our policies about generating prominent people", Flow thinks the
 scene shows real, identifiable people (a film based on a true event). Keep the story beat and the characters'
@@ -385,10 +391,42 @@ def muse_suggestion(error: str) -> str | None:
     return m.group(1).strip(" .,;") if m else None
 
 
-def keeps_dialogue(error: str) -> bool:
-    """Whether a rewrite after this refusal must keep the approved dialogue word for word: always, except when Flow
-    could not make the SOUND ("Audio generation failed"), where the words themselves can be the trigger."""
-    return AUDIO_FAILED not in (error or "").lower()
+def keeps_dialogue(error: str, attempt: int = 1) -> bool:
+    """Whether a rewrite after this refusal must keep the approved dialogue word for word: always, except after a
+    second "Audio generation failed" (`attempt` = rewrites already made). The first audio rewrite only changes
+    the delivery and the action: on 22/11/2026 a first rewrite turned the film's key dialect line into another one."""
+    return AUDIO_FAILED not in (error or "").lower() or attempt == 0
+
+
+QUIET_AUDIO = rules.DEFAULT_SOUND + " only"
+
+
+def spoken_words(scene) -> list[str]:
+    """Every word a scene says: its dialogue lines, the video shot's speaker line and the narration (subtitle)."""
+    if scene is None:
+        return []
+    out = [d.line for d in (getattr(scene, "dialogue", None) or []) if getattr(d, "line", None)]
+    shot = getattr(scene, "video_shot", None)
+    if shot is not None and shot.speaker is not None and shot.speaker.line:
+        out.append(shot.speaker.line)
+    if getattr(scene, "narration", None):
+        out.append(scene.narration)
+    return out
+
+
+def is_silent(scene) -> bool:
+    """No one speaks in the scene (its sound is only ambience)."""
+    return scene is not None and not spoken_words(scene)
+
+
+def quiet_audio_fix(scene) -> SoftenFix | None:
+    """A code-only rewrite for a silent scene Flow could not make the sound of: the picture and the action stay,
+    only the `audio` cue becomes plain room tone (no breathing, sobs, sighs or voices for Veo to voice). None when
+    there is no video shot or its audio is already that."""
+    shot = getattr(scene, "video_shot", None)
+    if shot is None or (shot.audio or "").strip().lower() == QUIET_AUDIO:
+        return None
+    return SoftenFix(id=scene.id, video_shot=shot.model_copy(update={"audio": QUIET_AUDIO}))
 
 
 def _lock_dialogue(fix: SceneFix, scene) -> SceneFix:
@@ -402,7 +440,8 @@ def _lock_dialogue(fix: SceneFix, scene) -> SceneFix:
     return fix
 
 
-def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SoftenFix:
+def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, *,
+                 script_scene: str | None = None, **kw) -> SoftenFix:
     """`earlier`: previous rewrites of this scene that Flow refused too ({prompt, image_prompt, dialogue}),
     oldest first. With them Claude re-stages the shot instead of rewording it again. The dialogue is kept word for
     word (`keeps_dialogue`), whatever the AI returns: an approved line is the story, and a rewrite once turned
@@ -434,17 +473,33 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
         idea = muse_suggestion(error)
         if idea:
             user += f"\nMuse offered this version itself; build the new scene on it: {idea}"
-    if AUDIO_FAILED in error.lower():
-        user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
-                 "the instructions say, keeping the story point.")
     scene = next((s for s in sb.scenes if s.id == sid), None)
+    attempt = len(earlier or [])
+    if AUDIO_FAILED in error.lower():
+        if is_silent(scene):
+            user += ("\nFlow said “Audio generation failed” and NO ONE SPEAKS in this scene: the trigger is the "
+                     "`audio` cue or what is shown. Keep `audio` to plain ambience (room tone, breeze; no breathing, "
+                     "sighs, sobs, crying or voices) and change the action only as much as needed, keeping the story "
+                     "point.")
+        elif attempt == 0:
+            user += ("\nFlow said “Audio generation failed”: this first time keep every spoken word exactly as it "
+                     "is. Change the delivery (`voice_style`: calm, soft, clear; never frail, weak, trembling, "
+                     "whispering or crying), the `audio` cue (plain ambience) and the action as the instructions say.")
+        else:
+            user += ("\nFlow said “Audio generation failed” again with the words kept: now you may reword a line, "
+                     "but keep its meaning, its dialect and register (the same regional words and particles) and the "
+                     "story point; never replace it with a different sentiment.")
+    if script_scene:
+        user += ("\nThe approved script for this scene. Its story point must survive the rewrite (who does what to "
+                 "whom, what is said and why it matters); set `story_point_kept` false if no version you can give "
+                 "keeps it:\n" + script_scene.strip()[:1500])
     if scene is not None and scene.video_shot is not None:
         user += ("\nThis scene's video is made from its structured video shot, not from `action`: "
                  + json.dumps(scene.video_shot.model_dump(exclude_none=True), ensure_ascii=False)
                  + "\nReturn the full rewritten `video_shot` (same fields; the speaker's line in the same language, "
                    "matching `dialogue` and `narration`), softened the same way as the rest of the scene.")
     fix = ai.ask(SOFTEN_SYSTEM, user, SoftenFix, **_ai_kw(sb, kw))
-    return _lock_dialogue(fix, scene) if keeps_dialogue(error) else fix
+    return _lock_dialogue(fix, scene) if keeps_dialogue(error, attempt) else fix
 
 
 # --- applying fixes to the storyboard (raw YAML dict) ----------------------------

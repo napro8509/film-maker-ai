@@ -28,7 +28,7 @@ import yaml
 from . import durations as dur
 from . import model_meta, reviewer, retirement
 from . import progress as prog
-from .flow_ui import BLOCKED_MARK
+from .flow_ui import BLOCKED_MARK, EXIT_FLOW_GLITCH, is_glitch
 from .gflow import MUSE_DECLINED, MUSE_FAILED, Gflow, GflowError
 from .pipeline import DONE, SUBMITTING, Pipeline, RunOptions, RunReport
 from .storyboard import Storyboard, load_storyboard
@@ -122,6 +122,7 @@ class Autopilot:
         self.reviews_dir = self.out / "reviews"
         self._soft_lock = threading.RLock()  # autopilot.json / storyboard.yaml writes from the softener thread
         self._softener: _Softener | None = None
+        self.render_aborted: str | None = None  # set when rendering stopped early but the film is still assembled
         self.data: dict[str, Any] = {"stages": {}, "keyframe_ok": {}, "clip_reviewed": {}, "rerendered": [],
                                      "resent": []}
         try:
@@ -263,6 +264,11 @@ class Autopilot:
             self.log(f"⚠ Phim chỉ có {n - len(absent)}/{n} cảnh — thiếu: {', '.join(absent)}"
                      + (f" (cổng QC loại: {', '.join(excluded)})" if excluded else "")
                      + ". Xem lý do ở tab Cảnh trước khi đăng.")
+        changed = self.data.get("dialogue_changed") or {}
+        if changed and result.get("final"):
+            result["dialogue_changed"] = sorted(changed)
+            self.log(f"⚠ Thoại đã duyệt bị đổi khi viết lại cảnh: {', '.join(sorted(changed))} — so với kịch bản "
+                     "trước khi đăng (log có câu cũ → câu mới).")
         if result.get("thumbnail"):
             self.log(f"🖼 Thumbnail: {result['thumbnail']}")
         if result.get("film_score") is not None:
@@ -604,6 +610,8 @@ class Autopilot:
         return None, err
 
     def _video_run(self, **kw: Any) -> RunReport:
+        if self.render_aborted:  # the same error would stop every further run at once
+            return RunReport()
         sb = self.sb()
         n_cand = self._effective_keyframe_candidates(sb)
         extra_opts: dict[str, Any] = {}
@@ -618,6 +626,15 @@ class Autopilot:
             **kw,
         ))
         self.check_stop()
+        if report.aborted and not report.stopped:
+            pipe = self.pipe()
+            n = len(pipe.sb.scenes)
+            done = sum(1 for s in pipe.sb.scenes if pipe.is_done(s))
+            if n and done / n >= MIN_ASSEMBLE_SHARE:
+                self.render_aborted = report.aborted
+                self.log(f"⚠ Render video dừng giữa chừng ({report.aborted}) nhưng đã có {done}/{n} clip: dựng phim "
+                         "từ các cảnh đang có. Sửa lỗi rồi bấm lại “Tạo tự động” để làm nốt các cảnh còn thiếu.")
+                return report
         self._fatal(report, "render video")
         return report
 
@@ -694,6 +711,8 @@ class Autopilot:
                      + (f"; {', '.join(given_up)} đã bị bỏ qua sau {MAX_SOFTEN} lần đổi prompt (sửa cảnh bằng tay "
                         "rồi render lại nếu muốn)" if given_up else "") + ".")
         result["missing"] = missing
+        if self.render_aborted:
+            result["render_aborted"] = self.render_aborted
         self.mark("videos", "done" if not missing else "partial", f"{done}/{len(pipe.sb.scenes)} clip", missing=missing)
 
     def _unsent_failures(self) -> list[str]:
@@ -732,27 +751,66 @@ class Autopilot:
                                                       or {}).get("scenes") or [] if isinstance(sc, dict)}
         cur = raw_scenes.get(sid) or {}
         snap = {k: cur.get(k) for k in ("prompt", "image_prompt", "dialogue", "narration", "camera", "video_shot")}
-        try:
-            fix = reviewer.soften_scene(sb, sid, error, earlier=[*tried, snap] if tried else None, **self.ai_kw())
-        except (RuntimeError, ValueError) as exc:
-            self.log(f"  [{sid}] ⚠ không viết lại được ({exc}); để nguyên.")
-            return False
+        scene = next((x for x in sb.scenes if x.id == sid), None)
+        fix = None
+        if reviewer.AUDIO_FAILED in error.lower() and reviewer.is_silent(scene) and not tried:
+            # No one speaks: the sound cue ("gentle slow breathing"…) is the likely trigger, not the picture or the
+            # story. Plain room tone first, no AI rewrite (22/11/2026: s04 and s10 rewritten twice, still failing).
+            fix = reviewer.quiet_audio_fix(scene)
+            if fix is not None:
+                self.log(f"  [{sid}] cảnh không thoại: chỉ đổi âm thanh thành “{reviewer.QUIET_AUDIO}”, giữ nguyên "
+                         "hình và hành động.")
+        if fix is None:
+            try:
+                fix = reviewer.soften_scene(sb, sid, error, earlier=[*tried, snap] if tried else None,
+                                            script_scene=self._script_scene(sid), **self.ai_kw())
+            except (RuntimeError, ValueError) as exc:
+                self.log(f"  [{sid}] ⚠ không viết lại được ({exc}); để nguyên.")
+                return False
         fix.id = sid
+        if not getattr(fix, "story_point_kept", True):
+            with self._soft_lock:
+                self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)
+                self.save()
+            self.log(f"  [{sid}] ⚠ AI không tìm được bản qua được mà vẫn giữ ý chính của cảnh trong kịch bản: "
+                     "không dùng bản viết lại (sửa cảnh bằng tay rồi render lại).")
+            return False
+        before = reviewer.spoken_words(scene)
         with self._soft_lock:
             self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)  # the refused version
             changed = self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix])))
             if changed and sid not in self.data["resent"]:
                 self.data["resent"].append(sid)  # never also resent as "interrupted"
+            after = reviewer.spoken_words(next((x for x in self.sb().scenes if x.id == sid), None)) if changed else before
+            if after != before:
+                self.data.setdefault("dialogue_changed", {})[sid] = {"from": before, "to": after}
             self.save()
         if not changed:
             self.log(f"  [{sid}] ⚠ AI không đổi gì trong cảnh; không gửi lại bản cũ.")
             return False
+        if after != before:
+            self.log(f"  [{sid}] ⚠ ĐỔI THOẠI ĐÃ DUYỆT (Flow không tạo được âm thanh với câu gốc): "
+                     f"«{' / '.join(before) or '(không thoại)'}» → «{' / '.join(after) or '(bỏ thoại)'}». "
+                     "Xem lại cảnh này trước khi đăng phim.")
         shot_action = fix.video_shot.action if getattr(fix, "video_shot", None) is not None else ""
         self.log(f"  [{sid}] prompt mới: {(shot_action or fix.prompt or fix.image_prompt or '')[:160]}")
         if fix.dialogue is not None:
             self.log(f"  [{sid}] thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue)
                                                  or "(bỏ thoại)"))
         return True
+
+    def _script_scene(self, sid: str) -> str | None:
+        """This scene's section of the approved script (script.final.md, else script.md, next to storyboard.yaml):
+        the story point a rewrite must keep. None when there is no script or no section for the scene."""
+        for name in ("script.final.md", "script.md"):
+            try:
+                text = (self.sb_path.parent / name).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            m = re.search(rf"(?ms)^#{{2,4}}\s*{re.escape(sid)}\b.*?(?=^#{{1,4}}\s|\Z)", text)
+            if m:
+                return m.group(0).strip()
+        return None
 
     def _forget_rendered_softens(self) -> None:
         hist: dict[str, list[dict]] = self.data.setdefault("softened", {})
@@ -985,6 +1043,10 @@ class Autopilot:
                     extra += f"\n- {sid}: no clip (the video service refused it)"
             extra += ("\nJudge the story as it is actually told by the scenes in the film: name every story beat "
                       "and spoken line the viewer never gets.")
+        for sid, ch in sorted((self.data.get("dialogue_changed") or {}).items()):
+            extra += (f"\nNOTE: {sid}'s approved line was reworded so Flow could make its sound: "
+                      f"{' / '.join(ch.get('from') or []) or '-'} → {' / '.join(ch.get('to') or []) or '-'}. "
+                      "Say whether the new line still carries the story point.")
         self.log("Agent review đang xem cả phim (khung hình toàn phim + ảnh bìa)…")
         try:
             rev = reviewer.review_film(sb, sheet, thumb if thumb.is_file() else None, extra, **self.ai_kw())
@@ -1052,6 +1114,8 @@ def _refusal_reason(err: str, exit_code: Any) -> str | None:
         return "Flow chặn vì cảnh trông như có hại (thường là trẻ em bất tỉnh / gặp nguy)"
     if reviewer.AUDIO_FAILED in low:
         return "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"
+    if exit_code == EXIT_FLOW_GLITCH or ("muse" not in low and is_glitch(err)):
+        return None  # Flow's own "Something went wrong" (also in errors saved before EXIT_FLOW_GLITCH existed)
     if exit_code in (MUSE_DECLINED, MUSE_FAILED) and err and not QUOTA_RE.search(err):
         # Muse (and Flow's chat agent) says "couldn't be generated" with no reason: almost always the content
         return ("Muse không tạo được video (thường do nội dung cảnh)" if "muse" in low
@@ -1059,7 +1123,12 @@ def _refusal_reason(err: str, exit_code: Any) -> str | None:
     return None
 
 
+#: Rendering stopped on an error no retry fixes (Flow page changed, no credits, logged out…): with at least this
+#: share of the clips made, the film is still assembled from them instead of ending with nothing to watch.
+MIN_ASSEMBLE_SHARE = 0.7
 SOFTEN_WORKERS = 2  # prompt rewrites that may run at the same time while the other scenes render
+GLITCH_RETRIES = 2  # Flow's "Something went wrong": the same prompt is sent again this many times, unchanged
+GLITCH_WAIT = 45.0  # seconds before that resend (a burst of requests is what makes Flow hiccup)
 
 
 class _Softener:
@@ -1075,6 +1144,8 @@ class _Softener:
         self.ap = ap
         self.pool = ThreadPoolExecutor(max_workers=SOFTEN_WORKERS, thread_name_prefix="soften")
         self.jobs: dict[str, Future] = {}
+        self.retry_at: dict[str, float] = {}  # scene -> monotonic time its unchanged resend is due (Flow glitch)
+        self.glitches: dict[str, int] = {}
         ap._forget_rendered_softens()
 
     def start(self, sb: Storyboard, sid: str, error: str) -> bool:
@@ -1096,6 +1167,16 @@ class _Softener:
             return False
 
     def on_failed(self, s, exc: GflowError) -> None:
+        if exc.exit_code == EXIT_FLOW_GLITCH:
+            n = self.glitches.get(s.id, 0)
+            if n < GLITCH_RETRIES:
+                self.glitches[s.id] = n + 1
+                self.retry_at[s.id] = time.monotonic() + GLITCH_WAIT
+                self.ap.log(f"[{s.id}] Flow lỗi tạm thời, không phải do nội dung cảnh: gửi lại đúng prompt cũ sau "
+                            f"{GLITCH_WAIT:.0f}s (lần {n + 1}/{GLITCH_RETRIES}), không viết lại.")
+            else:
+                self.ap.log(f"[{s.id}] Flow vẫn lỗi tạm thời sau {GLITCH_RETRIES} lần gửi lại — để thử lại cuối lượt.")
+            return
         why = _refusal_reason(str(exc), exc.exit_code)
         if why:
             self.ap.log(f"[{s.id}] {why}")
@@ -1104,18 +1185,28 @@ class _Softener:
             self.start(sb, s.id, str(exc))
 
     def pending(self) -> bool:
-        return bool(self.jobs)
+        return bool(self.jobs or self.retry_at)
 
     def requeue(self, wait: bool) -> list:
-        """Scenes whose rewrite finished (fresh from storyboard.yaml). With `wait`, block until one finishes or
-        none are left (checking the stop button)."""
+        """Scenes whose rewrite finished (fresh from storyboard.yaml) and scenes due for an unchanged resend after a
+        Flow glitch. With `wait`, block until one is ready or none are left (checking the stop button)."""
         while True:
             done = [sid for sid, f in self.jobs.items() if f.done()]
             ok = [sid for sid in done if self.jobs.pop(sid).result()]
-            if ok:
+            for sid in ok:
+                self.ap.log(f"[{sid}] prompt mới đã sẵn sàng")
+            now = time.monotonic()
+            due = [sid for sid, t in self.retry_at.items() if t <= now and sid not in ok]
+            if wait and not ok and not due and not self.jobs and self.retry_at and not self.ap.should_stop():
+                sid, t = min(self.retry_at.items(), key=lambda kv: kv[1])
+                self.ap.sleep(max(0.0, t - now))  # nothing else to send: sit out the gap, then resend
+                due = [sid]
+            for sid in due:
+                self.retry_at.pop(sid, None)
+            if ok or due:
                 with self.ap._soft_lock:
                     by_id = {s.id: s for s in self.ap.sb().scenes}
-                return [by_id[sid] for sid in ok if sid in by_id]
+                return [by_id[sid] for sid in (*ok, *due) if sid in by_id]
             if not wait or not self.jobs or self.ap.should_stop():
                 return []
             self.ap.log(f"Chờ AI viết lại prompt: {', '.join(self.jobs)}…")

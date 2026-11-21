@@ -397,6 +397,11 @@ class Gflow:
     sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     _muse_sent_at: float | None = field(default=None, init=False, repr=False)  # monotonic start of the last video
     _muse_backoff: float = field(default=0.0, init=False, repr=False)
+    # gflow's own `image t2i` stopped working with Flow's current page (exit 23): text-only pictures go through the
+    # Flow chat page for the rest of this run instead of stopping the film (22/11/2026: s10, location picture).
+    t2i_via_chat: bool = field(default=False, init=False, repr=False)
+    # Held around every call that drives the shared browser profile (Flow chat page / Muse); Pipeline uses it too.
+    ui_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def _muse_space_out(self) -> None:
         """Wait so this Muse video starts at least MUSE_VIDEO_GAP (or the failure backoff) after the last one."""
@@ -504,14 +509,25 @@ class Gflow:
     def text_to_image(self, prompt: str, *, out: Path, aspect: str, model: str, project: str | None) -> Path:
         if is_muse(model):
             return self.muse_image(prompt, [], out=out, aspect=aspect)
-        args = ["image", "t2i", prompt, "--aspect", aspect, "--model", model, "--out-file", str(out)]
-        if project:
-            args += ["--project", project]
-        payload = self.run_json(*args)
-        images = payload.get("images") or []
-        if images and images[0].get("local_path"):
-            return Path(images[0]["local_path"])
-        return out
+        if not self.t2i_via_chat:
+            args = ["image", "t2i", prompt, "--aspect", aspect, "--model", model, "--out-file", str(out)]
+            if project:
+                args += ["--project", project]
+            try:
+                payload = self.run_json(*args)
+            except GflowError as exc:
+                if exc.exit_code != EXIT_UI_DRIFT or not project or not self.ui_available():
+                    raise
+                self.t2i_via_chat = True
+                self.log("  ⇄ `gflow image t2i` không chạy với giao diện Flow hiện tại (exit 23): từ giờ ảnh chỉ "
+                         "từ mô tả chữ được tạo qua giao diện chat của Flow.")
+            else:
+                images = payload.get("images") or []
+                if images and images[0].get("local_path"):
+                    return Path(images[0]["local_path"])
+                return out
+        with self.ui_lock:
+            return self.ui_image_to_image(prompt, [], out=out, aspect=aspect, model=model, project=project)
 
     def catalog_images(self, project: str) -> list[dict[str, Any]]:
         """Images gflow knows about in a Flow project (generated or uploaded), from its local catalog.

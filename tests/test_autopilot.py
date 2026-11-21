@@ -430,8 +430,9 @@ def test_soften_prompt_mentions_audio_only_for_audio_failures(monkeypatch):
     monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw: got.append((system, user)) or schema(id="s01"))
     reviewer.soften_scene(sb, "s01", "Failed\nAudio generation failed. Please try a different prompt")
     reviewer.soften_scene(sb, "s01", "Flow xoá video: deleted")
-    assert "Audio generation failed" in got[0][1] and "rewrite the dialogue" in got[0][1]
-    assert "rewrite the dialogue" not in got[1][1]
+    # a scene where no one speaks: the sound cue is the trigger, not the dialogue
+    assert "Audio generation failed" in got[0][1] and "NO ONE SPEAKS" in got[0][1]
+    assert "NO ONE SPEAKS" not in got[1][1] and "Audio generation failed" not in got[1][1]
     assert "children" in got[0][0] and "Audio generation failed" in got[0][0]
 
 

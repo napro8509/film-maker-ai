@@ -463,3 +463,30 @@ def test_pipeline_moves_on_after_queue_timeout(tmp_path, monkeypatch):
     assert calls == ["s01", "s02"]  # went on to the next scene
     assert report.done == ["s02"] and "s01" in report.failed and not report.aborted
     assert pipe.state.scene("s01")["status"] == SUBMITTING  # may be billed: never resent blindly
+
+
+# --- Flow's own "Something went wrong" (22/11/2026: s01, s02, s07) --------------------------------------------
+def test_offer_glitch_is_seen_at_once(ft, monkeypatch, tmp_path):
+    monkeypatch.setattr(flow_ui, "_new_tile", lambda page, before: None)
+    page = FakePage(bubbles=["prompt", "error\n\nSomething went wrong. Please try again.\n\nTry again"])
+    with pytest.raises(flow_ui.Fail) as ei:
+        flow_ui._offer(page, _args(tmp_path), [], 0, 0, flow_ui.Deadline(1680))
+    assert ei.value.code == flow_ui.EXIT_FLOW_GLITCH and ei.value.spent is False
+    assert ft.t < 10  # not the 240 s wait for an offer
+    assert flow_ui.SPENT["approved"] is False
+
+
+def test_failed_with_only_something_went_wrong_is_a_glitch(ft, monkeypatch, tmp_path):
+    monkeypatch.setattr(flow_ui, "_poll_download", lambda *a, **k: False)
+    page = FakePage(bubbles=[OFFER, "warning\nFailed\nSomething went wrong. Please try again."])
+    with pytest.raises(flow_ui.Fail) as ei:
+        flow_ui._wait_video(page, [], 0, tmp_path / "a.mp4", flow_ui.Deadline(1680), 5)
+    assert ei.value.code == flow_ui.EXIT_FLOW_GLITCH and ei.value.spent is True
+
+
+def test_audio_failure_next_to_something_went_wrong_stays_a_failure(ft, monkeypatch, tmp_path):
+    monkeypatch.setattr(flow_ui, "_poll_download", lambda *a, **k: False)
+    page = FakePage(bubbles=[OFFER, "Failed\nAudio generation failed. Something went wrong. Please try again."])
+    with pytest.raises(flow_ui.Fail) as ei:
+        flow_ui._wait_video(page, [], 0, tmp_path / "a.mp4", flow_ui.Deadline(1680), 5)
+    assert ei.value.code == flow_ui.EXIT_GENERATION_FAILED

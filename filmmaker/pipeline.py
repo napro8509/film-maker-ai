@@ -143,7 +143,7 @@ class Pipeline:
         self._no_media_refs: set[str] = set()  # projects where Flow refused media-id references (send files)
         self._dry_kf: set[str] = set()  # dry-run: keyframes this run "made" already (so the next scene can chain)
         self._no_flow_chars = False  # the Flow Characters page failed this run: portraits go back to plain t2i
-        self._ui_browser_lock = threading.Lock()  # serializes persistent browser profile calls (flow_ui / muse_ui)
+        self._ui_browser_lock = getattr(gflow, "ui_lock", None) or threading.RLock()  # serializes persistent browser profile calls (flow_ui / muse_ui)
 
     def _sha(self, path: Path) -> str | None:
         try:
@@ -697,7 +697,7 @@ class Pipeline:
                 continue
             self.sb.scenes[idx] = s
             self.rep.queued(f"vid:{s.id}")
-            self.log(f"[{s.id}] prompt mới đã sẵn sàng: quay lại tạo video cảnh này")
+            self.log(f"[{s.id}] quay lại tạo video cảnh này")
             out.append(s)
         return out
 

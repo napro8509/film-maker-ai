@@ -97,11 +97,16 @@ def test_soften_after_muse_refusal_keeps_dialogue_and_passes_muse_idea(monkeypat
     assert s09["video_shot"]["speaker"]["line"] == "ลุงซื้อแล้ว แต่ลุงเลี้ยงบ่ไหวดอก"
 
 
-def test_soften_after_audio_failure_may_change_dialogue(monkeypatch):
+def test_soften_after_audio_failure_keeps_words_first_then_may_change_them(monkeypatch):
     sb = _shot_sb()
-    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: _changed_fix())
-    fix = reviewer.soften_scene(sb, "s09", "Flow: Audio generation failed")
-    assert fix.dialogue is not None and fix.video_shot.speaker.line == "เดือนขออยู่กับหลานเนาะ"
+    asked: list[str] = []
+    monkeypatch.setattr(reviewer.ai, "ask", lambda s, user, *a, **k: asked.append(user) or _changed_fix())
+    first = reviewer.soften_scene(sb, "s09", "Flow: Audio generation failed")
+    assert first.dialogue is None and first.video_shot.speaker.line == "ลุงซื้อแล้ว แต่ลุงเลี้ยงบ่ไหวดอก"
+    assert "keep every spoken word" in asked[0]
+    second = reviewer.soften_scene(sb, "s09", "Flow: Audio generation failed", earlier=[{"prompt": "x"}])
+    assert second.dialogue is not None and second.video_shot.speaker.line == "เดือนขออยู่กับหลานเนาะ"
+    assert "dialect" in asked[1]
 
 
 # --- item 5: an agent-approved keyframe is not remade at render time ---------------

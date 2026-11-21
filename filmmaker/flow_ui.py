@@ -49,6 +49,9 @@ VIDEO_URL = "flow-content.google/video/"  # what the page fetches when you click
 
 EXIT_USAGE, EXIT_AUTH, EXIT_TIMEOUT, EXIT_DRIFT, EXIT_NO_CREDITS = 2, 8, 9, 23, 37
 EXIT_AGENT_DECLINED, EXIT_GENERATION_FAILED = 41, 42
+# Flow's own hiccup ("Something went wrong. Please try again." with a Try again button), not about the scene:
+# the same prompt usually goes through on the next send (22/11/2026: s01, s02, s07), so it is never rewritten.
+EXIT_FLOW_GLITCH = 43
 
 
 SPENT = {"approved": False}  # set once "Approve" was clicked
@@ -847,6 +850,16 @@ def after_offer(text: str) -> str:
 
 
 AUDIO_FAILED_RE = re.compile(r"audio generation failed", re.I)
+GLITCH_RE = re.compile(r"something went wrong", re.I)
+# Words that make a failure about the scene itself, even next to "Something went wrong".
+CONTENT_RE = re.compile(r"violat|polic|prominent|harmful|safety|not allowed|can['’]t help|cannot help|"
+                        r"different prompt|video has been (deleted|removed)", re.I)
+
+
+def is_glitch(text: str) -> bool:
+    """Flow's generic "Something went wrong. Please try again." with nothing about the content or the sound."""
+    return bool(GLITCH_RE.search(text or "")) and not CONTENT_RE.search(text or "") \
+        and not AUDIO_FAILED_RE.search(text or "")
 APPROVE_MIN_LEFT = 180  # seconds: with less left, Flow's offer is rejected (spent=False) instead of approved
 SEND_MIN_LEFT = 240 + APPROVE_MIN_LEFT + 60  # = 480 s: with less left, nothing is sent (exit 9, spent=False)
 # 240 = longest wait for Flow's offer; 60 = _stable_titles (<= 30 s) + waiting for the send button (<= 15 s) + slack
@@ -1002,11 +1015,17 @@ def _offer(page, args, titles_before: list[str], perms_before: int, bubbles_befo
         texts = _bubble_texts(page)[bubbles_before:]
         if any(NO_CREDITS_RE.search(t) for t in texts):
             return "credits"
+        if any(is_glitch(t) for t in texts[1:]):  # [0] is our own prompt
+            return "glitch"
         return None
 
     state = _wait(asked, dl.cap(240), 1.0)
     if state == "credits":
         raise Fail(EXIT_NO_CREDITS, "Flow báo không đủ credit.")
+    if state == "glitch":  # seen at once: no need to sit out the 240 s wait for an offer that never comes
+        texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:][1:] if t.strip()]
+        raise Fail(EXIT_FLOW_GLITCH, "Flow lỗi tạm thời trước khi nhận yêu cầu (chưa trừ credit): "
+                   + (texts[-1][:300] if texts else "Something went wrong"), spent=False)
     if state is None:
         texts = [t.strip() for t in _bubble_texts(page)[bubbles_before:] if t.strip()]
         reply = texts[-1][:400] if texts else "(không có)"
@@ -1079,6 +1098,8 @@ def _wait_video(page, titles_before: list[str], bubbles_before: int, out: Path, 
             # the texts just read, not a second read: a page re-render there would be exit 23
             texts = [after_offer(t).strip() for t in replies if t and after_offer(t).strip()]
             last = texts[-1] if texts else "(không có)"
+            if not audio_seen and is_glitch(last):
+                raise Fail(EXIT_FLOW_GLITCH, "Flow lỗi tạm thời sau khi nhận yêu cầu: " + last[:400], spent=True)
             raise Fail(EXIT_GENERATION_FAILED, "Flow báo tạo video lỗi: " + last[:400]
                        + (" " + AUDIO_HINT if audio_seen else ""), spent=True)
         if kind == "queued":
@@ -1125,6 +1146,8 @@ def build_image_prompt(prompt: str, *, refs: int, aspect: str, model: str | None
     spec = [f"aspect ratio {aspect}"]
     if model:
         spec.append(f"model {IMAGE_NAMES.get(model, model)}")
+    if not refs:  # text-only picture (a location, a shot with no character)
+        return f"Make exactly 1 image (not a video), {', '.join(spec)}. Image: " + prompt.strip()
     return (f"Make exactly 1 image (not a video), {', '.join(spec)}. "
             f"The {refs} attached image(s) are character references: keep those characters' faces, hair and "
             "clothes identical, but do not copy their pose or background. Image: " + prompt.strip())
@@ -1181,9 +1204,7 @@ def _download_image(ctx, src: str, out: Path) -> bool:
 
 
 def run_i2i(args) -> dict:
-    refs = list(args.ref or [])
-    if not refs:
-        raise Fail(EXIT_USAGE, "cần ít nhất một ảnh tham chiếu (--ref)")
+    refs = list(args.ref or [])  # none = a text-only picture (gflow's own t2i no longer works on Flow's page)
     for kind, value in split_refs(refs):
         if kind == "file" and not Path(value).expanduser().is_file():
             raise Fail(EXIT_USAGE, f"không thấy ảnh {value}")
@@ -1296,9 +1317,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--ref", action="append")
     a.add_argument("--duration", type=int)
     a.add_argument("--max-credits", type=int, default=0, help="reject Flow's offer above this many credits (0 = no limit)")
-    b = sub.add_parser("i2i", help="one image from a prompt + character reference images (free)")
+    b = sub.add_parser("i2i", help="one image from a prompt (+ character reference images) (free)")
     common(b, 300)
-    b.add_argument("--ref", action="append", required=True)
+    b.add_argument("--ref", action="append", help="none = a text-only picture")
     c = sub.add_parser("char", help="a Flow character (Characters -> New character) from a description (free)")
     common(c, 300)
     c.add_argument("--name", required=True)
