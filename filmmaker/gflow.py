@@ -6,14 +6,18 @@ stdout. Errors come back as {"status": "fail", "error": {exit_code, retryable, .
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import queue
+import random
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -248,6 +252,128 @@ def _profile_roots() -> list[Path]:
     return roots
 
 
+#: Stdout prefix of each answer of `muse_ui.py serve` (kept in sync with muse_ui.SERVE_RESULT: that script runs
+#: with gflow-cli's Python and cannot be imported here).
+MUSE_SERVE_RESULT = "@@result "
+#: Seconds between the STARTS of two Muse video requests (random in this range). A Thai film had 5 of 10
+#: back-to-back requests fail ("Failed to create"); spaced out they went through. Counted from the previous send, a
+#: clip that takes ~80 s to make already covers it, so the run no longer sleeps ~55 s after every clip.
+MUSE_VIDEO_GAP = (45.0, 75.0)
+#: After a failed Muse video the next one waits longer: 60 s, then 120 s, at most 180 s; a success resets it.
+MUSE_BACKOFF = (60.0, 180.0)
+#: An idle Muse browser is closed after this many seconds, so the profile is free for login / fetch / other runs.
+MUSE_SESSION_IDLE = 120.0
+
+
+class MuseSession:
+    """One `muse_ui.py serve` process: a single signed-in browser kept open across Muse requests. Starting Chrome
+    for every picture cost several seconds each, and a film asks Muse for 30-40 pictures. Requests are serialized.
+    Any trouble starting or talking to it makes `request` return None, and the caller runs the old one-shot way."""
+
+    def __init__(self, cmd: list[str], extra: list[str], *, idle: float = MUSE_SESSION_IDLE, start_timeout: float = 120):
+        self.cmd, self.extra, self.idle, self.start_timeout = cmd, extra, idle, start_timeout
+        self.proc: subprocess.Popen | None = None
+        self._results: "queue.Queue[str | None]" = queue.Queue()
+        self._on_line: Callable[[str], None] = lambda _l: None
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self.broken = False
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _start(self) -> bool:
+        run_args, env = _tcc_direct([*self.cmd, "serve", *self.extra])
+        try:
+            self.proc = subprocess.Popen(run_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
+        except OSError:
+            self.broken = True
+            return False
+        self._results = queue.Queue()
+        proc, results = self.proc, self._results
+
+        def out_pump() -> None:
+            try:
+                for line in proc.stdout:
+                    if line.startswith(MUSE_SERVE_RESULT):
+                        results.put(line[len(MUSE_SERVE_RESULT):].strip())
+            except (OSError, ValueError):
+                pass
+            results.put(None)  # the process ended
+
+        def err_pump() -> None:
+            try:
+                for line in proc.stderr:
+                    try:
+                        self._on_line(line.rstrip())
+                    except Exception:
+                        pass
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=out_pump, daemon=True).start()
+        threading.Thread(target=err_pump, daemon=True).start()
+        try:
+            ready = results.get(timeout=self.start_timeout)
+        except queue.Empty:
+            ready = None
+        if not ready or (json.loads(ready).get("status") != "ready" if ready.startswith("{") else True):
+            self.close()
+            self.broken = True
+            return False
+        return True
+
+    def request(self, argv: list[str], timeout: float, on_line: Callable[[str], None]) -> dict | None:
+        """The driver's JSON answer, None when the session cannot be used (caller falls back), or raises
+        TimeoutError after `timeout` seconds (the browser is closed then, like a one-shot run is killed)."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            if self.broken or (not self._alive() and not self._start()):
+                return None
+            self._on_line = on_line
+            try:
+                self.proc.stdin.write(json.dumps({"argv": argv}, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                self.close()
+                return None
+            try:
+                line = self._results.get(timeout=timeout)
+            except queue.Empty:
+                self.close()
+                raise TimeoutError
+            finally:
+                self._on_line = lambda _l: None
+            if line is None:  # the process died mid-request
+                self.close()
+                raise ConnectionError("trình duyệt Muse đã đóng giữa chừng")
+            self._timer = threading.Timer(self.idle, self.close)
+            self._timer.daemon = True
+            self._timer.start()
+            try:
+                return json.loads(line)
+            except ValueError:
+                return {"status": "fail", "error": {"exit_code": 23, "detail": line[:400]}}
+
+    def close(self) -> None:
+        proc, self.proc = self.proc, None
+        if self._timer is not None:
+            self._timer.cancel()
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.stdin.write(json.dumps({"quit": True}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=10)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 @dataclass
 class Gflow:
     binary: str = field(default_factory=lambda: os.environ.get("GFLOW_BIN", "gflow"))
@@ -267,6 +393,25 @@ class Gflow:
     _timings: prog.Timings | None = field(default=None, init=False, repr=False)
     _live: object | None = field(default=None, init=False, repr=False)  # token of the command now running
     _elock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _muse_session: MuseSession | None = field(default=None, init=False, repr=False)
+    sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
+    _muse_sent_at: float | None = field(default=None, init=False, repr=False)  # monotonic start of the last video
+    _muse_backoff: float = field(default=0.0, init=False, repr=False)
+
+    def _muse_space_out(self) -> None:
+        """Wait so this Muse video starts at least MUSE_VIDEO_GAP (or the failure backoff) after the last one."""
+        if self._muse_sent_at is None:
+            return
+        gap = max(random.uniform(*MUSE_VIDEO_GAP), self._muse_backoff)
+        wait = gap - (time.monotonic() - self._muse_sent_at)
+        if wait >= 1:
+            why = " (Muse vừa báo lỗi)" if self._muse_backoff else ""
+            self.log(f"  (chờ {wait:.0f}s cho đủ {gap:.0f}s giữa 2 lần gửi video Muse{why})")
+            self.sleep(wait)
+
+    def _muse_video_done(self, ok: bool) -> None:
+        lo, hi = MUSE_BACKOFF
+        self._muse_backoff = 0.0 if ok else min(hi, max(lo, self._muse_backoff * 2))
 
     def available(self) -> bool:
         return shutil.which(_split(self.binary)[0]) is not None
@@ -490,11 +635,15 @@ class Gflow:
             self.log(f"  (bỏ {skipped} nhân vật Flow/ảnh không có file: Muse chỉ nhận ảnh trên máy)")
         if self.dry_run:
             return out, None
+        self._muse_space_out()
+        self._muse_sent_at = time.monotonic()
         try:
-            payload = self._run_ui(args, "video có thể vẫn đang tạo trên Muse (lấy lại bằng muse_ui.py fetch)",
-                                   spent=True, who="Muse")
+            payload = self._run_muse(cmd, args, "video có thể vẫn đang tạo trên Muse (lấy lại bằng muse_ui.py fetch)",
+                                     spent=True)
         except GflowError as exc:
+            self._muse_video_done(False)
             raise muse_error(exc, shots) from exc
+        self._muse_video_done(True)
         local = payload.get("local_path")
         return (Path(local) if local else out), None
 
@@ -518,9 +667,59 @@ class Gflow:
             self.log(f"  (bỏ {skipped} ảnh tham chiếu không có file trên máy: Muse chỉ nhận ảnh trên máy)")
         if self.dry_run:
             return out
-        payload = self._run_ui(args, "ảnh có thể vẫn đang tạo trên Muse", spent=False, who="Muse")
+        payload = self._run_muse(cmd, args, "ảnh có thể vẫn đang tạo trên Muse", spent=False)
         local = payload.get("local_path")
         return Path(local) if local else out
+
+    def _muse_session_for(self, cmd: list[str]) -> MuseSession | None:
+        """The shared Muse browser (`muse_ui.py serve`), or None for the one-shot way: a test / custom driver
+        (MUSE_UI_CMD), FILMMAKER_MUSE_SESSION=0, or a session that failed to start."""
+        if os.environ.get("MUSE_UI_CMD") or os.environ.get("FILMMAKER_MUSE_SESSION") == "0":
+            return None
+        if self._muse_session is None:
+            extra = ["--profile-dir", os.environ["MUSE_UI_PROFILE"]] if os.environ.get("MUSE_UI_PROFILE") else []
+            self._muse_session = MuseSession(cmd, extra)
+            atexit.register(self._muse_session.close)
+        return None if self._muse_session.broken else self._muse_session
+
+    def close_muse(self) -> None:
+        if self._muse_session is not None:
+            self._muse_session.close()
+
+    def _run_muse(self, cmd: list[str], args: list[str], timeout_note: str, *, spent: bool) -> dict:
+        """A Muse request through the shared browser when it works, else one browser for this request."""
+        sess = self._muse_session_for(cmd)
+        if sess is None:
+            return self._run_ui(args, timeout_note, spent=spent, who="Muse")
+        token = object()
+        err_lines: list[str] = []
+
+        def on_line(line: str) -> None:
+            if line:
+                err_lines.append(line)
+                self.log(line)
+
+        self._set_live(token)
+        try:
+            self._emit(token, "start", kind=None, expected=None, source=None)
+            payload = sess.request(args[len(cmd):], self.timeout, on_line)
+        except TimeoutError:
+            raise GflowError(f"điều khiển Muse quá {self.timeout}s; {timeout_note}",
+                             exit_code=EXIT_TIMEOUT, payload={"error": {"spent": spent}}) from None
+        except ConnectionError as exc:
+            raise GflowError(f"Muse (giao diện chat): {exc}", exit_code=23,
+                             payload={"error": {"spent": spent}}) from None
+        finally:
+            self._set_live(None)
+        if payload is None:  # the shared browser could not start: this request the old way
+            self.log("  (không mở được phiên Muse dùng chung; mở trình duyệt riêng cho yêu cầu này)")
+            return self._run_ui(args, timeout_note, spent=spent, who="Muse")
+        if payload.get("status") != "ok":
+            err = payload.get("error") or {}
+            detail = err.get("detail") or "\n".join(err_lines[-5:])
+            raise GflowError(f"Muse (giao diện chat): {detail}", exit_code=int(err.get("exit_code") or 1),
+                             retryable=False, payload=payload)
+        return payload
 
     # --- image-to-video through the Flow chat page (see flow_ui.py) ------------
 

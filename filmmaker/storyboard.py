@@ -1024,6 +1024,8 @@ class Storyboard(StoryboardDraft):
         return self.for_flow(f"{base} {rule}" if base else rule, "video")
 
     def portrait_prompt(self, c: Character) -> str:
+        # The portrait shows the look at the first appearance: later costume changes stay in their scenes.
+        c = c.model_copy(update={"description": i2v_prompt.base_look(c.description)})
         everyday = self.rule("image", "portrait_everyday")
         style = self.style if self.rule("image", "style") else ""
         if not self.basic and everyday and i2v_prompt.is_minor(c.description):

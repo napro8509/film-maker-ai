@@ -1736,15 +1736,18 @@ function renderOpenMontageBadges(q) {
   if (!om) return null;
   const ffOk = om.ffprobe?.valid !== false;
   const nBlack = Array.isArray(om.black_frames) ? om.black_frames.length : (om.black_flagged ? 1 : 0);
-  const hasTextErr = !!(om.text_errors || (Array.isArray(om.ocr_texts) && om.ocr_texts.length));
+  const hasTextErr = !!om.text_errors;  // confirmed by the VLM
+  const ocrHint = !hasTextErr && Array.isArray(om.ocr_texts) && om.ocr_texts.length > 0;  // OCR alone: only a hint
   const aud = om.audio || q.audio || {};
   const badges = [
     h("span", { class: "qc-badge " + (ffOk ? "ok" : "bad"), title: "Kiểm tra container & luồng hình/tiếng bằng ffprobe" },
       ffOk ? "✓ ffprobe" : "✘ ffprobe lỗi"),
     h("span", { class: "qc-badge " + (nBlack ? "bad" : "ok"), title: "Trích xuất 4 frame kiểm tra khung hình đen" },
       nBlack ? `✘ ${nBlack} frame đen` : "✓ 4 frame sáng"),
-    h("span", { class: "qc-badge " + (hasTextErr ? "bad" : "ok"), title: "Kiểm tra chữ/phụ đề rác chèn lên khung hình" },
-      hasTextErr ? "✘ lỗi chữ" : "✓ không lỗi chữ"),
+    h("span", { class: "qc-badge " + (hasTextErr ? "bad" : ocrHint ? "warn" : "ok"),
+                title: ocrHint ? "OCR cục bộ nghi có chữ ở vùng phụ đề (chưa xác nhận): " + om.ocr_texts.join("; ")
+                               : "Kiểm tra chữ/phụ đề rác chèn lên khung hình" },
+      hasTextErr ? "✘ lỗi chữ" : ocrHint ? "△ nghi có chữ" : "✓ không lỗi chữ"),
   ];
   if (aud.has_audio) {
     const aCls = aud.dead_air ? "bad" : aud.clipping ? "warn" : "ok";

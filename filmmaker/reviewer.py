@@ -8,6 +8,7 @@ Reviews of pictures send small JPEGs (keyframes, three frames of each clip, a co
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -129,6 +130,7 @@ You are the storyboard reviewer. Check the whole storyboard BEFORE any picture i
   mildly, keeping the story beat: dialogue without insults, calm/soft `delivery` instead of fierce or raised,
   action and image_prompt without pain or violence (feelings through faces and small gestures).
 - Children in `characters`, `prompt` and `image_prompt` (Google's child-safety filter blocks many pictures of minors and the credits are lost): """ + rules.CHILDREN_GUIDE + """
+- Adults and children in `prompt`, `image_prompt` and `video_shot`: """ + rules.CHILD_CONTACT_RULE + """
 - Real, identifiable people (Flow refuses "prominent people"): in a film based on a true event, prompts and
   content directions must not point to the real persons — no real names, ranks, units or famous roles ("the
   retired Navy SEAL", "the Australian doctor"), no "true story". Describe characters by look and action only.
@@ -139,7 +141,10 @@ fields that change (full new text for each), plus the issues. verdict PASS when 
 KEYFRAME_SYSTEM = COMMON + """
 You are the keyframe reviewer: each picture is the opening frame of one scene, before paying for its video.
 You also get the character reference portraits. For each scene check:
-- The right characters are there (count and identity), faces/hair/clothes match their portraits.
+- The right characters are there (count and identity), faces/hair/clothes match their portraits. Clothes and
+  props follow the scene's own opening-frame prompt and the story so far: an item the scene text does not give the
+  character at this point (a cloth, bag or jacket that only appears in later scenes) is a continuity break even
+  when the portrait shows it; the portrait is for the face and the base outfit.
 - It matches the scene's opening-frame prompt and content direction (place, action set-up, emotion, framing).
 - No text, captions, watermarks, logos or garbled lettering; no deformed hands/faces/limbs; no duplicated people.
 - It works as a first frame for the action that follows (the subject is placed so the motion can happen).
@@ -229,10 +234,14 @@ When the error comes from Muse ("Muse báo không tạo được", "Muse không 
 on the moment as a whole. It most often refuses: tears, crying, a trembling chin, a voice breaking with emotion,
 grief or death; a character described as sly, smug, cryptic, knowing, unctuous, menacing or predatory (e.g. a
 money lender over an old man); pressure about debt or money on a vulnerable person; fear or confusion on an
-elderly face. Keep the story beat but make faces calm and warm, gestures friendly, the speaker polite and
-sincere, the listener attentive or gently surprised. Keep every dialogue line word for word on the first
-rewrite. Only when earlier rewrites with the same line were refused too, rephrase the line in the same language
-with the same meaning, avoiding money, debt and death words.
+elderly face; and ANY adult touching a child or handing something into a child's hands (a hug, kneeling to hold,
+a hand on the shoulder, a rope laid into open palms), however gentle: """ + rules.CHILD_CONTACT_RULE + """
+Keep the story beat but make faces calm and warm, gestures friendly, the speaker polite and sincere, the listener
+attentive or gently surprised. Muse often ends its refusal with its own idea ("I can make a different version
+instead — …"): when the message quotes one, build the new scene on it.
+Change the ACTION or staging itself: adding words like gently, warm, kindly or calm to the same action is not a
+rewrite and is refused again. Keep every dialogue line word for word: the line is the story and Muse judges the
+picture and the moment, not the words.
 
 When earlier rewrites of the scene are listed and Flow refused them the same way, rewording was not enough:
 Flow judges the opening picture and the whole moment, not single words. Change what is SHOWN, not just the
@@ -365,9 +374,39 @@ def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extr
     return ai.ask(FILM_SYSTEM, user, FilmReview, images=images, **_ai_kw(sb, kw))
 
 
+#: Muse's own alternative at the end of a refusal: "… I can make a different version instead — <idea> — if you'd like".
+_MUSE_IDEA = re.compile(r"I can (?:make|try|do|create) (?:a |an )?(?:different|other|alternative|softer)[^—–-]*[—–-]+\s*"
+                        r"(.+?)\s*(?:[—–-]+\s*)?if (?:you|you'd|you would)\b", re.I | re.S)
+
+
+def muse_suggestion(error: str) -> str | None:
+    """The alternative Muse offered in its refusal message, if any."""
+    m = _MUSE_IDEA.search(error or "")
+    return m.group(1).strip(" .,;") if m else None
+
+
+def keeps_dialogue(error: str) -> bool:
+    """Whether a rewrite after this refusal must keep the approved dialogue word for word: always, except when Flow
+    could not make the SOUND ("Audio generation failed"), where the words themselves can be the trigger."""
+    return AUDIO_FAILED not in (error or "").lower()
+
+
+def _lock_dialogue(fix: SceneFix, scene) -> SceneFix:
+    """Undo any change to the spoken words: dialogue, narration (the subtitle) and the video shot's speaker line."""
+    fix.dialogue = None
+    fix.narration = None
+    old_sp = scene.video_shot.speaker if scene is not None and scene.video_shot is not None else None
+    new_shot = getattr(fix, "video_shot", None)
+    if new_shot is not None and new_shot.speaker is not None and old_sp is not None:
+        new_shot.speaker.line = old_sp.line
+    return fix
+
+
 def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SoftenFix:
     """`earlier`: previous rewrites of this scene that Flow refused too ({prompt, image_prompt, dialogue}),
-    oldest first. With them Claude re-stages the shot instead of rewording it again."""
+    oldest first. With them Claude re-stages the shot instead of rewording it again. The dialogue is kept word for
+    word (`keeps_dialogue`), whatever the AI returns: an approved line is the story, and a rewrite once turned
+    "Dad is sorry" into "Dad is proud of you"."""
     user = (storyboard_brief(sb) + f"\n\nScene {sid} was blocked by Flow: {error[:500]}\n"
             f"Rewrite scene {sid} so it can be generated.")
     if earlier:
@@ -390,10 +429,11 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
         user += ("\nFlow refused it as “harmful content”: show the beat safely, as the instructions say (no child "
                  "who looks unconscious, limp or in danger).")
     if "muse" in error.lower():
-        user += ("\nMuse refused it without a reason: soften it as the instructions for Muse say"
-                 + (" and, since the same line was refused before, rephrase the dialogue too." if earlier else
-                    ", keeping the dialogue word for word.")
-                 )
+        user += ("\nMuse refused it without a reason: soften it as the instructions for Muse say, keeping the "
+                 "dialogue word for word and changing the action or staging, not just its adjectives.")
+        idea = muse_suggestion(error)
+        if idea:
+            user += f"\nMuse offered this version itself; build the new scene on it: {idea}"
     if AUDIO_FAILED in error.lower():
         user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
                  "the instructions say, keeping the story point.")
@@ -403,7 +443,8 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
                  + json.dumps(scene.video_shot.model_dump(exclude_none=True), ensure_ascii=False)
                  + "\nReturn the full rewritten `video_shot` (same fields; the speaker's line in the same language, "
                    "matching `dialogue` and `narration`), softened the same way as the rest of the scene.")
-    return ai.ask(SOFTEN_SYSTEM, user, SoftenFix, **_ai_kw(sb, kw))
+    fix = ai.ask(SOFTEN_SYSTEM, user, SoftenFix, **_ai_kw(sb, kw))
+    return _lock_dialogue(fix, scene) if keeps_dialogue(error) else fix
 
 
 # --- applying fixes to the storyboard (raw YAML dict) ----------------------------

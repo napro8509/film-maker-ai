@@ -52,6 +52,8 @@ RETRY_WAIT = 30  # seconds before the second try of free images that failed
 MAX_SOFTEN = 2
 # A "could not make it" that is about the account, not the scene: rewriting the prompt would not help.
 QUOTA_RE = re.compile(r"limit reached|out of credits|not enough credits|insufficient credits|try again later", re.I)
+#: Share of planned scenes missing from final.mp4 at which the film review is always REVISE (score at most 4).
+FILM_MISSING_REVISE = 0.3
 REVIEW_BATCH = 5  # most keyframes per review call (plus the portraits); bigger answers often fail to come back as JSON
 
 
@@ -247,9 +249,20 @@ class Autopilot:
             self.log("⏸ Đã dừng theo yêu cầu. Bấm lại “Tạo tự động” để làm tiếp từ chỗ dừng.")
             result["stopped"] = True
             return result
+        finally:
+            if hasattr(self.g, "close_muse"):
+                self.g.close_muse()  # free the Muse profile (login / fetch / the next run open it)
         mins = (time.time() - started) / 60
         self.log("")
         self.log(f"🎬 Xong toàn bộ trong {mins:.0f} phút: {result.get('final')}")
+        excluded = list(getattr(self, "qc_excluded", []) or [])
+        absent = sorted(set(result.get("missing") or []) | set(excluded))
+        if absent and result.get("final"):
+            n = len(self.pipe().sb.scenes)
+            result["qc_excluded"] = excluded
+            self.log(f"⚠ Phim chỉ có {n - len(absent)}/{n} cảnh — thiếu: {', '.join(absent)}"
+                     + (f" (cổng QC loại: {', '.join(excluded)})" if excluded else "")
+                     + ". Xem lý do ở tab Cảnh trước khi đăng.")
         if result.get("thumbnail"):
             self.log(f"🖼 Thumbnail: {result['thumbnail']}")
         if result.get("film_score") is not None:
@@ -522,6 +535,13 @@ class Autopilot:
                     revise[v.id] = v.image_prompt
                 else:
                     ok[v.id] = _file_sig(files[v.id])  # accepted (or out of rounds)
+                    if v.verdict == "PASS":
+                        qc.accept_keyframe(self.out, v.id, files[v.id], "PASS", v.score, "agent review")
+                    else:  # out of rounds: used as it is, but said so (no silent remake at render time)
+                        qc.accept_keyframe(self.out, v.id, files[v.id], "MINOR", v.score,
+                                           "agent review: hết vòng sửa, dùng tạm")
+                        self.log(f"  ⚠ [{v.id}] hết {rounds} vòng sửa keyframe mà vẫn {v.score}/10: dùng ảnh này để "
+                                 "render — nên xem lại ở tab Cảnh.")
             self.save()
             if not revise:
                 break
@@ -727,7 +747,8 @@ class Autopilot:
         if not changed:
             self.log(f"  [{sid}] ⚠ AI không đổi gì trong cảnh; không gửi lại bản cũ.")
             return False
-        self.log(f"  [{sid}] prompt mới: {(fix.prompt or fix.image_prompt or '')[:160]}")
+        shot_action = fix.video_shot.action if getattr(fix, "video_shot", None) is not None else ""
+        self.log(f"  [{sid}] prompt mới: {(shot_action or fix.prompt or fix.image_prompt or '')[:160]}")
         if fix.dialogue is not None:
             self.log(f"  [{sid}] thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue)
                                                  or "(bỏ thoại)"))
@@ -835,7 +856,8 @@ class Autopilot:
         failed = sorted(k for k, v in results.items() if v["verdict"] == "FAIL")
         avg = round(sum(scores.values()) / len(scores), 1)
         if failed:
-            gate_note = ("Các clip FAIL sẽ được loại khỏi bản ghép cuối."
+            gate_note = ("Cổng QC sẽ loại clip hỏng kỹ thuật; clip FAIL do AI chấm chỉ bị loại khi phim mất tối đa "
+                         f"{qc.gate_drop_limit(len(results))} cảnh, quá mức đó sẽ được giữ lại."
                          if self.cfg.exclude_qc_failed else "Phim vẫn được dựng từ các clip hiện có.")
             self.log(f"⚠ AI QC đánh FAIL: {', '.join(failed)} — xem lý do ở tab Cảnh và bấm “Render lại” nếu muốn "
                      f"(tốn credit). {gate_note}")
@@ -852,12 +874,13 @@ class Autopilot:
             p = Path(st.get("video", ""))
             if st.get("status") == DONE and p.is_file():
                 out.append((s.id, p))
-        kept, _ = qc.filter_clips_for_assembly(
+        kept, dropped = qc.filter_clips_for_assembly(
             pipe.sb, self.out, out,
             exclude_failed=self.cfg.exclude_qc_failed,
             run_local_qc=self.cfg.review,
             log=self.log,
         )
+        self.qc_excluded = dropped
         return kept
 
     def _stage_edit(self, result: dict) -> None:
@@ -944,8 +967,24 @@ class Autopilot:
                                        cols=4, rows=4 if len(sb.scenes) <= 12 else 5)
         thumb = self.out / "thumbnail.jpg"
         extra = f"Film length: {reviewer.duration_of(final):.0f} s."
-        if result.get("missing"):
-            extra += f" Scenes still missing a clip: {', '.join(result['missing'])}."
+        from . import qc
+
+        excluded = list(getattr(self, "qc_excluded", []) or [])
+        missing = list(result.get("missing") or [])
+        absent = [s.id for s in sb.scenes if s.id in set(missing) | set(excluded)]
+        if absent:
+            in_film = [s.id for s in sb.scenes if s.id not in absent]
+            extra += (f"\nIMPORTANT: final.mp4 contains ONLY these scenes: {', '.join(in_film)} "
+                      f"({len(in_film)}/{len(sb.scenes)}). The storyboard above lists every planned scene, but "
+                      "these are NOT in the film:")
+            for sid in absent:
+                if sid in excluded:
+                    why = "; ".join((qc.load(self.out).get(sid) or {}).get("issues") or [])[:200] or "QC FAIL"
+                    extra += f"\n- {sid}: left out by the QC gate ({why})"
+                else:
+                    extra += f"\n- {sid}: no clip (the video service refused it)"
+            extra += ("\nJudge the story as it is actually told by the scenes in the film: name every story beat "
+                      "and spoken line the viewer never gets.")
         self.log("Agent review đang xem cả phim (khung hình toàn phim + ảnh bìa)…")
         try:
             rev = reviewer.review_film(sb, sheet, thumb if thumb.is_file() else None, extra, **self.ai_kw())
@@ -953,6 +992,12 @@ class Autopilot:
             self.log(f"⚠ Không review được cả phim ({exc}).")
             self.mark("review_film", "skipped", str(exc)[:200])
             return
+        if absent and len(absent) / max(1, len(sb.scenes)) >= FILM_MISSING_REVISE:
+            # Half a story is not ready to publish, whatever the frames look like.
+            rev.verdict = "REVISE"
+            rev.score = min(rev.score, 4)
+            rev.issues.insert(0, f"Phim thiếu {len(absent)}/{len(sb.scenes)} cảnh ({', '.join(absent)}): "
+                                 "mạch truyện bị đứt, chưa nên đăng.")
         self.write_review("film", rev)
         self.log(f"Điểm cả phim: {rev.score}/10 ({rev.verdict}). {rev.summary}")
         for x in rev.strengths:

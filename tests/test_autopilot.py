@@ -105,7 +105,9 @@ def test_autopilot_makes_the_whole_film(env):
     out = sb_path.parent / "output" / "storyboard"
     assert Path(res["final"]).is_file() and (out / "final.mp4").is_file()
     assert Path(res["thumbnail"]).is_file()
-    assert res["film_score"] == 8
+    # s03 failed QC and the gate left it out: a third of the story is missing, so the film review is REVISE
+    assert res["film_score"] == 4 and res["film_verdict"] == "REVISE"
+    assert res["qc_excluded"] == ["s03"] and any("Phim chỉ có 2/3 cảnh" in l for l in lines)
     raw = yaml.safe_load(sb_path.read_text())
     s01, s02, s03 = raw["scenes"]
     assert s01["duration"] == 6  # 5 is not accepted by veo-lite: rounded up before anything was sent
@@ -583,8 +585,9 @@ def test_soften_scene_prompt_mentions_muse(env, monkeypatch):
                         or reviewer.SceneFix(id="s01"))
     reviewer.soften_scene(sb, sb.scenes[0].id, MUSE_ERR)
     assert "keeping the dialogue word for word" in got["user"] and "Muse" in got["system"]
+    # a second refusal re-stages the shot but still keeps the approved line (it once became "Dad is proud of you")
     reviewer.soften_scene(sb, sb.scenes[0].id, MUSE_ERR, earlier=[{"prompt": "x"}])
-    assert "rephrase the dialogue" in got["user"]
+    assert "keeping the dialogue word for word" in got["user"] and "rephrase the dialogue" not in got["user"]
 
 
 def test_refused_scene_skips_unchanged_retries_and_goes_to_rewrite(env, monkeypatch):

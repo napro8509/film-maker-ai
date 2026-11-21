@@ -35,6 +35,21 @@ def _make_png(path: Path, *, black: bool = False, color: str | None = None) -> P
     return path
 
 
+def _fake_tesseract(tmp_path: Path, words: list[tuple[str, int]]) -> Path:
+    """A `tesseract` stand-in that prints `words` as TSV (`--list-langs` prints `eng`)."""
+    rows = ["level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"]
+    rows += [f"5\t1\t1\t1\t1\t{i}\t0\t0\t10\t10\t{c}\t{w}" for i, (w, c) in enumerate(words, 1)]
+    fake = tmp_path / "fake_tesseract.py"
+    fake.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        "if '--list-langs' in sys.argv:\n    print('List of available languages (1):'); print('eng'); sys.exit(0)\n"
+        f"print({chr(10).join(rows)!r})\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return fake
+
+
 def _make_clip(
     path: Path,
     *,
@@ -330,21 +345,17 @@ def test_openmontage_ffprobe_and_four_frame_black_detection(tmp_path):
 @needs_ffmpeg
 def test_openmontage_ocr_text_errors_and_audio_dead_air_and_clipping(tmp_path, monkeypatch):
     # Fake tesseract CLI to test OCR text error gate deterministically even on machines without tesseract installed
-    fake_tess = tmp_path / "fake_tesseract.py"
-    fake_tess.write_text(
-        f"#!{sys.executable}\nimport sys\nprint('SUBTITLE WATERMARK 2026')\n",
-        encoding="utf-8",
-    )
-    fake_tess.chmod(0o755)
+    fake_tess = _fake_tesseract(tmp_path, [("SUBTITLE", 96), ("WATERMARK", 95), ("2026", 91)])
     monkeypatch.setattr(qc, "tesseract_binary", lambda: str(fake_tess))
 
     clip = _make_clip(tmp_path / "clean.mp4", duration=2.0)
     sb_no_text = Storyboard.model_validate({"title": "NoText", "format": "clip", "audio": "silent",
                                             "scenes": [{"id": "s01", "prompt": "cat sleeping", "duration": 2}]})
-    om_ocr_fail = qc.openmontage_check(clip, tmp_path / "w1", sb=sb_no_text, s=sb_no_text.scenes[0])
-    assert om_ocr_fail["verdict"] == "FAIL"
-    assert len(om_ocr_fail["ocr_texts"]) == 4
-    assert any("chữ" in x for x in om_ocr_fail["issues"])
+    om_ocr_hint = qc.openmontage_check(clip, tmp_path / "w1", sb=sb_no_text, s=sb_no_text.scenes[0])
+    # OCR alone is a hint for the VLM, never a FAIL by itself (texture used to be read as text)
+    assert om_ocr_hint["verdict"] == "MINOR" and om_ocr_hint["passed"] is True
+    assert len(om_ocr_hint["ocr_texts"]) == 4
+    assert any(x.startswith(qc.OCR_HINT_PREFIX) for x in om_ocr_hint["issues"])
 
     # When format explicitly uses onscreen_text, OCR text is expected and NOT flagged as an error
     sb_with_text = Storyboard.model_validate({"title": "WithText", "format": "clip", "audio": "onscreen_text",

@@ -134,6 +134,23 @@ CHILDREN_GUIDE = """never an
   adult kissing, feeding or holding a child's face up close. Fear or shock in a child is played as surprise or
   playful worry. Give close-ups and the main spoken lines to adults or teens when the story allows."""
 
+#: The reference portrait is made from the character description alone, so a costume change written there ("from
+#: the dusk scene onward a checked cloth on his shoulder; in the final scene tied around his waist") was drawn into
+#: the portrait and then copied into every early scene.
+OUTFIT_RULE = """each `characters` description is the look at the FIRST
+  appearance only (face, hair, body, base clothing). Never write later changes there ("from scene X onward", "in
+  the final scene", "later"): a clothing or prop change belongs in the `image_prompt` (and video fields) of the
+  scenes where it shows, written out in each of them."""
+
+#: Muse (and Flow's child-safety filter) refused every scene of "เดือนของเต้" where an adult touched a child or
+#: handed something into a child's hands (a father's hug, a hand on the shoulder, a rope laid into open palms), even
+#: when written as gentle and warm, and Muse's own suggestions to touch less were refused too.
+CHILD_CONTACT_RULE = """no adult touches a child: no hug, embrace,
+  holding, carrying, kneeling to hold, hand on the shoulder, head or cheek, wiping tears, and no object put into
+  a child's hands. Video services refuse these even when gentle. Show closeness at a small distance instead: side by
+  side, facing each other at arm's length, a warm look or nod; an object is held out toward the child, set down
+  for the child to pick up, or already in the child's hands at the start of the shot. Touching the animal is fine."""
+
 
 # --- catalogue -------------------------------------------------------------------------------------------------
 
@@ -209,6 +226,12 @@ RULES: tuple[Rule, ...] = (
          ("storyboard.for_flow_video (video.ref_opener)",)),
     Rule("CHILDREN_GUIDE", "Chính sách & trẻ em", "dặn LLM", "Bộ lọc trẻ em của Google chặn ảnh, mất credit",
          ("planner.SYSTEM", "reviewer.STORYBOARD_SYSTEM")),
+    Rule("OUTFIT_RULE", "Nhân vật & tham chiếu", "dặn LLM",
+         "Ghi thay đổi trang phục vào mô tả nhân vật làm ảnh chân dung mang đồ của cảnh cuối sang mọi cảnh",
+         ("planner.SYSTEM", "basic_planner.SYSTEM", "storyboard.portrait_prompt (base_look)")),
+    Rule("CHILD_CONTACT_RULE", "Chính sách & trẻ em", "dặn LLM",
+         "Muse từ chối mọi cảnh người lớn ôm, chạm hay trao đồ tận tay trẻ em, kể cả khi viết nhẹ nhàng",
+         ("planner.SYSTEM", "basic_planner.SYSTEM", "reviewer.STORYBOARD_SYSTEM", "reviewer.SOFTEN_SYSTEM")),
 )
 
 

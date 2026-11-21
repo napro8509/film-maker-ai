@@ -447,6 +447,22 @@ _ADULT_WORDS = re.compile(r"(?i)\b(?:man|woman|men|women|lady|gentleman|mother|f
 _SMALL_CHILD = re.compile(r"(?i)\b(?:baby|infant|toddler|newborn|months?\s+old)\b")
 
 
+#: A sentence of a character description that is about a later scene, not the look in the reference portrait.
+_LATER_LOOK = re.compile(
+    r"(?i)\b(?:scenes?\b|onwards?\b|later\b|by the end\b|at the end\b|in the (?:final|last|closing|ending)\b|"
+    r"from (?:the |that )?\w+(?: \w+)? on\b|after (?:the|that)\b|afterwards\b|eventually\b|until\b)")
+
+
+def base_look(description: str) -> str:
+    """The character's look for the reference portrait: the description without sentences about later scenes
+    ("From the dusk scene onward a checked cloth rests on his shoulder; in the final scene ..."). A portrait drawn
+    with a later-scene item carries it into every keyframe from the first scene on."""
+    parts = re.split(r"(?<=[.!?;])\s+", (description or "").strip())
+    kept = [p for p in parts if p and not _LATER_LOOK.search(p)]
+    out = " ".join(kept).strip()
+    return out if out else (description or "").strip()
+
+
 def is_minor(description: str) -> bool:
     """A character description of a child: an age under 18, or child words (girl, boy, baby...) and no adult ones.
     "a young woman" or "the boy's father" are adults; "a 15-year-old boy" and "toddler girl" are children."""

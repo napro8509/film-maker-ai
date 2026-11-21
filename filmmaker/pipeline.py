@@ -43,9 +43,6 @@ def _now() -> str:
 #: Keyframes edited one from the other at most this many times in a row: each edit adds noise (s02..s08 of a
 #: Thai film went from 383 KB to 861 KB and looked painted) and keeps the first frame size for every scene.
 MAX_KEYFRAME_CHAIN = 2
-#: Seconds between two Muse video requests at least (a Thai film: 5 of 10 back-to-back requests failed, one
-#: at a time they went through).
-MUSE_PAUSE = (45.0, 75.0)
 
 _UNSET: Any = object()
 
@@ -131,6 +128,8 @@ class Pipeline:
         self.g = gflow
         self.log = log
         self.sleep = sleep
+        if sleep is not time.sleep:  # a test's / caller's clock also spaces Muse requests (Gflow.muse_video)
+            self.g.sleep = sleep
         # Per-item progress for the web UI (keys char:<name>, kf:<sid>, vid:<sid>); a no-op without `progress`.
         self.rep = prog.Reporter(progress)
         if progress is not None:
@@ -629,11 +628,10 @@ class Pipeline:
                 report.stopped = True
                 self.log("Đã dừng theo yêu cầu (các cảnh đã xong vẫn được giữ).")
                 break
-            if sent and not self.g.dry_run:
-                lo, hi = opts.pause
-                if is_muse(s.model or self.sb.model):  # back-to-back Muse requests often end in "Failed to create"
-                    lo, hi = max(lo, MUSE_PAUSE[0]), max(hi, MUSE_PAUSE[1])
-                pause = random.uniform(lo, hi)
+            # Muse spaces its own video requests (Gflow.muse_video: from the previous send, with a backoff after a
+            # failure), so this scene's keyframe is made meanwhile instead of after a fixed ~55 s nap.
+            if sent and not self.g.dry_run and not is_muse(s.model or self.sb.model):
+                pause = random.uniform(*opts.pause)
                 self.log(f"  (nghỉ {pause:.0f}s giữa các lần gửi)")
                 self.sleep(pause)
             # Checked after the pause, which may cross midnight. Not re-checked inside _render_scene

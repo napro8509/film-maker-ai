@@ -51,6 +51,8 @@ Each scene becomes ONE short clip (4-8 seconds). Rules:
 - Never repeat dialogue: no character says or echoes a line another character already said, nobody says the same line twice, and no line repeats one from an earlier scene. Each line adds something new (an answer, a question, a reveal).
 - Spoken audio language: if the message gives a "Spoken dialogue language", write every `line` in ONLY that language. If it says "Spoken dialogue: none", no character speaks, whispers or sings words in any scene: leave `dialogue` empty everywhere and describe only ambient sound and sound effects in `prompt`. If neither is given, write `line` in the language the characters would naturally speak (the idea's language when unclear) and name that language in `delivery` (instead of "she says angrily in Thai, voice only" in the prompt, delivery = "angrily, in Thai"). Never put spoken words in quotation marks anywhere: Veo tends to burn quoted lines into the picture as subtitles.
 - Children (Google's child-safety filter blocks many pictures of minors and the credits are lost): """ + rules.CHILDREN_GUIDE + """
+- Adults and children: """ + rules.CHILD_CONTACT_RULE + """
+- Costume changes: """ + rules.OUTFIT_RULE + """
 - Google Flow refuses or silently fails some content, and the credits are lost ("Audio generation failed" when it
   will not make the sound; the clip deleted after rendering): insults or slurs (above all about disability, body,
   race or family), threats, shouting matches, fights, bullying shown up close, injuries, pain, blood, weapons, and

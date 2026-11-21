@@ -44,7 +44,8 @@ MODEL_URL = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{MODEL_N
 # music and ambient sound ("I'm good. I'm good…", a Chinese line 6 times), and QC flagged clips nobody speaks in.
 VAD_NAME = "ggml-silero-v5.1.2.bin"
 VAD_URL = f"https://huggingface.co/ggml-org/whisper-vad/resolve/main/{VAD_NAME}"
-QC_VERSION = 2  # 2: transcripts with voice-activity detection, who-speaks frames; older MINOR/FAIL are checked again
+QC_VERSION = 3  # 2: transcripts with voice-activity detection, who-speaks frames; older MINOR/FAIL are checked again
+# 3: OCR reads only the caption strip and is a hint, never a FAIL by itself: older OCR-based FAILs are checked again
 FRAMES = 6
 OPENMONTAGE_FRAMES = 4
 OPENMONTAGE_POSITIONS: tuple[float, ...] = (0.12, 0.37, 0.63, 0.88)
@@ -102,7 +103,9 @@ You are the Pre-Render Keyframe QC Judge (ViMax best-of-k gate), running BEFORE 
 You receive the scene specification, the reference portraits of the characters (and location if available), and `k`
 candidate keyframe images generated in parallel (`candidate 1` .. `candidate k`), along with local image checks.
 Evaluate EVERY candidate on:
-1. Character & setting consistency: exact character count, faces/hair/outfits matching reference portraits, same room/lighting.
+1. Character & setting consistency: exact character count, faces/hair matching reference portraits, same room/lighting.
+   Outfits and props follow THIS scene's `image_prompt` and character descriptions: an item the scene text does not
+   give the character now (a cloth or prop from later scenes) is an issue even when the portrait shows it.
 2. Shot readiness & staging: matches `image_prompt` and sets up the upcoming `action` cleanly without clutter or clipped faces.
    When the scene has spoken dialogue, the speaker MUST have the clearest, largest visible face/mouth and every listener
    must have closed lips (an open-mouthed listener steals lip-sync in video models = FAIL).
@@ -266,9 +269,6 @@ def _frame_luma_stats(path: Path) -> dict[str, Any]:
     return {"mean_luma": mean_y, "dark_ratio": dark_ratio, "is_black": is_black}
 
 
-_OCR_WORD_RE = re.compile(r"[A-Za-zÀ-ỹ\u0E00-\u0E7F0-9]{3,}")
-
-
 @functools.lru_cache(maxsize=8)
 def _tesseract_lang(binary: str) -> str:
     """Pick installed Tesseract languages (`eng`, plus `vie`/`tha` when available) once per binary."""
@@ -283,25 +283,72 @@ def _tesseract_lang(binary: str) -> str:
     return "+".join(picked) if picked else "eng"
 
 
+#: Tesseract word confidence (0..100) a word needs to count. Texture read as letters (wood grain, checked cloth,
+#: straw) comes back as short words under ~70; real captions after the preprocessing below come back at 85+.
+OCR_MIN_CONF = 80
+#: Bottom share of the frame that is read: Veo/Muse burn subtitles into the bottom third. Signs and other text
+#: elsewhere in the picture are left to the VLM, which sees the whole frame.
+OCR_BOTTOM_SHARE = 0.4
+#: Luma cut-offs: everything brighter becomes black ink on white. Two passes catch white captions (bright cut)
+#: and yellow / smaller anti-aliased captions (lower cut) while dark background texture drops out.
+OCR_LUMA_CUTS: tuple[int, ...] = (150, 200)
+_OCR_TOKEN_RE = re.compile(r"[A-Za-zÀ-ỹ฀-๿]{2,}")
+_OCR_EDGE_RE = re.compile(r"^[^\wÀ-ỹ฀-๿]+|[^\wÀ-ỹ฀-๿]+$")
+
+
+def _ocr_words(binary: str, image: Path, lang: str) -> list[str]:
+    """Confident words in `image` (Tesseract TSV output, `--psm 6` on the preprocessed caption strip)."""
+    try:
+        proc = subprocess.run([binary, str(image), "stdout", "--psm", "6", "-l", lang, "tsv"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for line in (proc.stdout or "").splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12:
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            continue
+        word = _OCR_EDGE_RE.sub("", cols[11].strip())
+        if conf >= OCR_MIN_CONF and _OCR_TOKEN_RE.fullmatch(word):
+            out.append(word)
+    return out
+
+
 def ocr_frame(path: Path) -> str:
-    """Optional local OCR check (via `tesseract` when installed) to catch burned-in captions/text on frames."""
+    """Local OCR hint (via `tesseract` when installed) for burned-in captions on a frame: '' when none.
+
+    Tesseract on a whole natural picture (the old `--psm 6` on the full frame) reads wood grain, cloth patterns and
+    straw as gibberish "words", which failed good keyframes and clips. So only the bottom caption strip is read,
+    upscaled and thresholded so bright caption ink stands out, and only confident whole words count. The result is a
+    hint for the VLM judge, never a FAIL on its own (`openmontage_check`, `_local_candidate_score`).
+    """
     binary = tesseract_binary()
-    if not binary or not path.is_file():
+    if not binary or not path.is_file() or not shutil.which("ffmpeg"):
         return ""
     lang = _tesseract_lang(binary)
-    try:
-        proc = subprocess.run(
-            [binary, str(path), "stdout", "--psm", "6", "-l", lang],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    if proc.returncode != 0:
-        return ""
-    cleaned = " ".join((proc.stdout or "").split())
-    words = _OCR_WORD_RE.findall(cleaned)
-    if len(words) >= 2 or any(len(w) >= 5 for w in words):
-        return cleaned[:160]
+    words: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="fm-ocr-") as tmp:
+        for cut in OCR_LUMA_CUTS:
+            pre = Path(tmp) / f"strip_{cut}.png"
+            vf = (f"crop=iw:ih*{OCR_BOTTOM_SHARE}:0:ih*{1 - OCR_BOTTOM_SHARE},"
+                  "scale='max(1080,iw*2)':-1:flags=lanczos,format=gray,"
+                  f"lutyuv=y='if(gt(val,{cut}),0,255)'")
+            try:
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(path), "-vf", vf, str(pre)],
+                               capture_output=True, timeout=30, check=True)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            words += _ocr_words(binary, pre, lang)
+    seen = list(dict.fromkeys(words))
+    long_words = [w for w in seen if len(w) >= 3]
+    if len(long_words) >= 2 or any(len(w) >= 5 for w in long_words):
+        return " ".join(seen)[:160]
     return ""
 
 
@@ -339,7 +386,8 @@ def inspect_image(path: Path) -> dict[str, Any]:
         out["valid"] = True
     if out["valid"] and not out["is_black"]:
         out["ocr_text"] = ocr_frame(path)
-    out["local_ok"] = bool(out["valid"] and not out["is_black"] and not out["ocr_text"])
+    # Technical soundness only: an OCR hit is a hint for the VLM (see `ocr_frame`), not a broken picture.
+    out["local_ok"] = bool(out["valid"] and not out["is_black"])
     return out
 
 
@@ -589,8 +637,8 @@ def openmontage_check(clip: Path, work: Path, *, sb: Storyboard | None = None, s
             minor_issues.append(f"OpenMontage: frame {where} tối đen ngắn ở rìa clip ({b_span:.1f}s).")
 
     allow_text = bool(sb is not None and sb.audio == "onscreen_text")
-    if ocr_hits and not allow_text:
-        hard_issues.append(f"OpenMontage phát hiện chữ/phụ đề dính trên khung hình ({'; '.join(ocr_hits)[:120]}).")
+    if ocr_hits and not allow_text:  # a hint only (see `ocr_frame`): the VLM judge confirms or dismisses it
+        minor_issues.append(ocr_hint_issue("; ".join(ocr_hits)))
 
     has_lines = bool(sb is not None and s is not None and scene_lines(sb, s))
     if has_lines and not sound.get("has_audio"):
@@ -666,17 +714,21 @@ def transcribe(clip: Path, vad_threshold: float | None = None, *, use_vad: bool 
 # --- ViMax Pre-Render Keyframe Candidate Selection & Gate ------------------------
 
 
+OCR_HINT_PREFIX = "OCR cục bộ nghi có chữ"
+
+
+def ocr_hint_issue(text: str) -> str:
+    return f"{OCR_HINT_PREFIX} ({text[:60]}) — chưa xác nhận, cần xem lại."
+
+
 def _local_candidate_score(meta: dict[str, Any]) -> tuple[Verdict, int, list[str]]:
     """Deterministic fallback score for one keyframe candidate when no VLM is reachable."""
     if not meta.get("valid"):
         return "FAIL", 1, ["Ảnh keyframe bị lỗi định dạng hoặc trống."]
-    issues: list[str] = []
     if meta.get("is_black"):
-        issues.append("Ảnh keyframe bị tối đen.")
-    if meta.get("ocr_text"):
-        issues.append(f"Ảnh keyframe dính chữ trên hình ({meta['ocr_text'][:60]}).")
-    if issues:
-        return "FAIL", 2, issues
+        return "FAIL", 2, ["Ảnh keyframe bị tối đen."]
+    if meta.get("ocr_text"):  # a hint only (see `ocr_frame`): the VLM, when reachable, decides
+        return "MINOR", 5, [ocr_hint_issue(meta["ocr_text"])]
     luma = meta.get("mean_luma")
     # Healthy exposure sits roughly around 35..220 mean luma.
     if luma is not None and (luma < 25 or luma > 242):
@@ -714,7 +766,7 @@ def select_best_keyframe(sb: Storyboard, s: Scene, candidates: list[Path], *, al
             cand_facts.append(
                 f"- candidate {idx}: size={meta.get('width')}x{meta.get('height')}, "
                 f"mean_luma={meta.get('mean_luma')}, black={meta.get('is_black')}, "
-                f"ocr={meta.get('ocr_text') or 'clean'}"
+                f"local_ocr_hint={meta.get('ocr_text') or 'none'}"
             )
         user = "\n".join([
             reviewer.storyboard_brief(sb),
@@ -725,7 +777,8 @@ def select_best_keyframe(sb: Storyboard, s: Scene, candidates: list[Path], *, al
             f"Content direction: {s.content_direction or '-'}",
             expected_dialogue(sb, s),
             "",
-            "Local technical checks of candidates:",
+            "Local technical checks of candidates (`local_ocr_hint` is a noisy Tesseract read of the bottom "
+            "caption strip: look at the picture yourself and flag text only if you actually see letters):",
             *cand_facts,
             "",
             f"Score every candidate 1..{len(valid_paths)} and choose `best_index`.",
@@ -743,7 +796,9 @@ def select_best_keyframe(sb: Storyboard, s: Scene, candidates: list[Path], *, al
         if vc is not None:
             v_verdict: Verdict = "FAIL" if lv == "FAIL" else vc.verdict
             v_score = min(vc.score, 3) if lv == "FAIL" else max(1, min(10, int(vc.score)))
-            v_issues = list(dict.fromkeys([*lissues, *vc.issues]))
+            # The VLM looked at the picture: it confirms or dismisses the OCR hint itself.
+            kept_local = [x for x in lissues if not x.startswith(OCR_HINT_PREFIX)]
+            v_issues = list(dict.fromkeys([*kept_local, *vc.issues]))
         else:
             v_verdict, v_score, v_issues = lv, lscore, list(lissues)
         cand_rows.append({
@@ -759,7 +814,7 @@ def select_best_keyframe(sb: Storyboard, s: Scene, candidates: list[Path], *, al
 
     if vlm_ans is not None and 1 <= vlm_ans.best_index <= len(cand_rows):
         chosen = cand_rows[vlm_ans.best_index - 1]
-        # Never pick a locally broken/black/OCR-text candidate if another candidate passed local checks.
+        # Never pick a locally broken/black candidate if another candidate passed local checks.
         if not chosen["local_ok"] and any(r["local_ok"] for r in cand_rows):
             chosen = max(cand_rows, key=lambda r: (r["local_ok"], verdict_rank[r["verdict"]], r["score"], -r["index"]))
         elif vlm_ans.candidates:
@@ -796,6 +851,7 @@ def select_best_keyframe(sb: Storyboard, s: Scene, candidates: list[Path], *, al
             for r in cand_rows
         ],
         "vlm_used": vlm_ans is not None,
+        "v": QC_VERSION,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -819,10 +875,37 @@ def save_keyframe_qc(out_dir: Path, sid: str, result: dict[str, Any]) -> None:
         tmp.replace(path)
 
 
+#: Issue texts the old whole-frame OCR (QC_VERSION < 3) wrote when it alone failed a keyframe or clip.
+_OLD_OCR_ISSUES = ("Ảnh keyframe dính chữ trên hình", "OpenMontage phát hiện chữ/phụ đề dính trên khung hình")
+
+
+def _old_ocr_verdict(r: dict[str, Any]) -> bool:
+    """A stored non-PASS verdict from before QC_VERSION 3 that cites the old OCR: it may be texture read as text."""
+    if r.get("v", 1) >= 3 or r.get("verdict") == "PASS":
+        return False
+    texts = [*(r.get("issues") or []), *(x for c in (r.get("candidates") or []) for x in (c.get("issues") or []))]
+    return any(str(x).startswith(_OLD_OCR_ISSUES) for x in texts)
+
+
+def accept_keyframe(out_dir: Path, sid: str, kf: Path, verdict: Verdict, score: int, note: str) -> None:
+    """Record that a later, closer look (the agent keyframe review) accepted this keyframe: its Pre-QC FAIL flag
+    must not make the render step remake an approved picture (it once remade s01 three more times, 6 images)."""
+    if not kf.is_file():
+        return
+    rec = dict(load_keyframe_qc(out_dir).get(sid) or {})
+    if rec.get("sig") == clip_sig(kf) and rec.get("verdict") != "FAIL":
+        return  # Pre-QC already passed this very file
+    rec.update(verdict=verdict, score=int(score), sig=clip_sig(kf), v=QC_VERSION, accepted_by=note,
+               at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    save_keyframe_qc(out_dir, sid, rec)
+
+
 def current_keyframe_qc(out_dir: Path, sid: str, kf: Path | None) -> dict[str, Any] | None:
     r = load_keyframe_qc(out_dir).get(sid)
     if not r or not kf or not kf.is_file() or r.get("sig") != clip_sig(kf):
         return None
+    if _old_ocr_verdict(r):
+        return None  # scored again with the caption-strip OCR, which no longer reads wood or cloth as text
     return r
 
 
@@ -909,7 +992,7 @@ def _om_summary(om: dict[str, Any], *, black_flag: bool = False, text_flag: bool
         "black_frames": om["black_frame_indices"],
         "black_span_sec": om["black_span_sec"],
         "black_flagged": bool(om["black_frame_indices"] or black_flag),
-        "text_errors": bool(om["ocr_texts"] or text_flag),
+        "text_errors": bool(text_flag),  # confirmed by the VLM; `ocr_texts` alone is only a hint
         "ocr_texts": om["ocr_texts"],
         "audio": om["audio"],
         "issues": om["issues"],
@@ -1016,7 +1099,10 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         (f"Start-frame match with the keyframe: not meaningful ({match}): rendered as Reference-to-Video with "
          "character references, which keeps the scene but reframes the shot; judge the content, not the framing"
          if reframed else f"Start-frame match with the keyframe: {match if match is not None else 'unknown'}"),
-        f"OpenMontage post-render check: {json.dumps(om_fact, ensure_ascii=False)}",
+        f"OpenMontage post-render check: {json.dumps(om_fact, ensure_ascii=False)}"
+        + (" (`ocr_texts` is a noisy Tesseract read of the bottom caption strip: it often turns wood grain, cloth or"
+           " straw into letters; set `text_errors` only if you see real text in the frames yourself)"
+           if om["ocr_texts"] else ""),
         f"Audio: {json.dumps(sound)}",
     ]
     if speech is None:
@@ -1050,6 +1136,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         verdict = "FAIL"
         score = min(score, 4)
     for m in reversed(om["issues"]):
+        if m.startswith(OCR_HINT_PREFIX) and not ans.text_errors:
+            continue  # the VLM looked at the frames and saw no text: the OCR hint was texture
         if m not in issues:
             issues.insert(0, m)
     if match is not None and match < WRONG_START and not reframed and verdict != "FAIL":  # never trust a clip of another picture
@@ -1106,8 +1194,10 @@ def current(out_dir: Path, sid: str, clip: Path | None) -> dict[str, Any] | None
     r = load(out_dir).get(sid)
     if not r or not clip or not clip.is_file() or r.get("sig") != clip_sig(clip):
         return None
-    if r.get("v", 1) < QC_VERSION and r.get("verdict") != "PASS" and r.get("dialogue_checked"):
+    if r.get("v", 1) < 2 and r.get("verdict") != "PASS" and r.get("dialogue_checked"):
         return None  # judged on a transcript that may have been made up: check again
+    if _old_ocr_verdict(r):
+        return None  # failed by the old whole-frame OCR, which read texture as text: check again
     return r
 
 
@@ -1195,6 +1285,26 @@ def run(pipe, *, only: set[str] | None = None, force: bool = False, log: Callabl
     return done
 
 
+#: Most clips the assembly gate drops for a judgement call (VLM FAIL on a technically sound clip): a quarter of the
+#: film, at least one. Past that, dropping would gut the story (a 10-scene film once came out with 5 scenes after
+#: texture was read as text), so those clips stay in and the user is told to look at them. Broken files, black
+#: renders and confirmed burned-in text are always dropped.
+MAX_GATE_DROP_SHARE = 0.25
+
+
+def _technical_fail(rec: dict[str, Any]) -> bool:
+    """FAIL for a defect in the file itself (unreadable, black/dead render, missing sound, confirmed burned-in
+    text), not a judgement of the content: such a clip would spoil the cut whatever the story needs."""
+    om = rec.get("openmontage") or {}
+    if (om.get("ffprobe") or {}).get("valid") is False:
+        return True
+    return om.get("passed") is False or bool(om.get("black_flagged") or om.get("text_errors"))
+
+
+def gate_drop_limit(n_clips: int) -> int:
+    return max(1, int(n_clips * MAX_GATE_DROP_SHARE))
+
+
 def filter_clips_for_assembly(
     sb: Storyboard,
     out_dir: Path,
@@ -1207,21 +1317,23 @@ def filter_clips_for_assembly(
     """Final assembly gate (OpenMontage + AI QC): keep broken/FAIL clips out of the final stitched/edited film.
 
     - Checks any existing `qc.json` verdict for each clip; if none is stored yet and `run_local_qc` is True,
-      runs OpenMontage (`ffprobe` + 4 extracted frames + audio) on the spot so corrupted/black/text-broken clips
-      never slip into `final.mp4` unchecked.
-    - Returns `(kept_clips, rejected_scene_ids)`. If every clip in the film was marked `FAIL` (e.g. a 1-clip test
-      or all renders flagged), keeps readable clips with a warning so assembly does not crash with an empty list,
-      while still dropping unreadable/corrupted files that would break `ffmpeg`.
+      runs OpenMontage (`ffprobe` + 4 extracted frames + audio) on the spot so corrupted/black clips never slip
+      into `final.mp4` unchecked.
+    - Technical FAILs (`_technical_fail`) are always dropped. Content FAILs (the VLM's judgement on a sound file)
+      are dropped only while the film loses at most `gate_drop_limit` clips; past that they are all kept with a
+      warning, so a run of QC false alarms cannot cut half the story out.
+    - Returns `(kept_clips, rejected_scene_ids)` in scene order; `rejected` lists only clips actually left out. If
+      every clip in the film was dropped, keeps readable clips with a warning so assembly does not crash with an
+      empty list, while still dropping unreadable/corrupted files that would break `ffmpeg`.
     """
     if not clips or not exclude_failed:
         return list(clips), []
     out_dir = Path(out_dir)
     scenes_by_id = {s.id: s for s in sb.scenes}
     work = out_dir / "qc_frames"
-    kept: list[tuple[str, Path]] = []
-    rejected: list[str] = []
-    readable_fallback: list[tuple[str, Path]] = []
     has_ffprobe = bool(shutil.which("ffprobe"))
+    rows: list[tuple[str, Path, str]] = []  # (sid, path, "ok" | "technical" | "content")
+    unreadable: set[str] = set()
 
     for sid, path in clips:
         s = scenes_by_id.get(sid)
@@ -1233,16 +1345,34 @@ def filter_clips_for_assembly(
                 _save(out_dir, sid, rec)
                 log(f"  ✘ [{sid}] Hậu kiểm OpenMontage chặn clip lỗi: {'; '.join(rec['issues'])}")
         if rec is not None and rec.get("verdict") == "FAIL":
-            rejected.append(sid)
-            om_valid = ((rec.get("openmontage") or {}).get("ffprobe") or {}).get("valid", True)
-            if om_valid:
-                readable_fallback.append((sid, path))
+            rows.append((sid, path, "technical" if _technical_fail(rec) else "content"))
+            if ((rec.get("openmontage") or {}).get("ffprobe") or {}).get("valid") is False:
+                unreadable.add(sid)
         else:
-            kept.append((sid, path))
+            rows.append((sid, path, "ok"))
+
+    technical = [sid for sid, _, kind in rows if kind == "technical"]
+    content = [sid for sid, _, kind in rows if kind == "content"]
+    limit = gate_drop_limit(len(clips))
+    drop_content = len(technical) + len(content) <= limit
+    if content and not drop_content:
+        log(f"⚠ AI QC đánh FAIL {len(content)} clip ({', '.join(content)}), nhưng loại hết sẽ mất "
+            f"{len(technical) + len(content)}/{len(clips)} cảnh (giới hạn {limit}): GIỮ LẠI các clip này trong phim — "
+            "hãy xem lý do ở tab Cảnh, rồi render lại hoặc bỏ cảnh bằng tay.")
+    drop = set(technical) | (set(content) if drop_content else set())
+    kept = [(sid, path) for sid, path, _ in rows if sid not in drop]
+    rejected = [sid for sid, _, _ in rows if sid in drop]
 
     if rejected and kept:
         log(f"🚫 Cổng QC loại bỏ {len(rejected)} clip lỗi khỏi bản ghép cuối: {', '.join(rejected)}")
         return kept, rejected
+    if rejected and not kept:
+        readable = [(sid, path) for sid, path, _ in rows if sid not in unreadable]
+        if readable:
+            log(f"⚠ Tất cả {len(rejected)} clip đều bị đánh dấu FAIL ({', '.join(rejected)}); "
+                "giữ tạm các file đọc được để tránh bản ghép rỗng — hãy render lại cảnh lỗi.")
+            return readable, rejected
+    return kept, rejected
     if rejected and not kept and readable_fallback:
         log(f"⚠ Tất cả {len(rejected)} clip đều bị đánh dấu FAIL ({', '.join(rejected)}); "
             "giữ tạm các file đọc được để tránh bản ghép rỗng — hãy render lại cảnh lỗi.")

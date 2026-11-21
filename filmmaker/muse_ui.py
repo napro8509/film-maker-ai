@@ -11,6 +11,7 @@ It prints one JSON document on stdout, shaped like flow_ui's:
   {"status": "fail", "error": {"exit_code": N, "detail": ..., "retryable": false, "spent": bool}}
 
 Subcommands:
+  serve  keep one browser open and run image / i2v requests read from stdin (one JSON per line)
   login  open a visible window on muse.ai and wait until you have signed in (one time)
   probe  open the chat page and dump its controls (for fixing selectors when Muse changes)
   i2v    make one video: prompt, optional start image, download the mp4
@@ -321,6 +322,42 @@ def _wait_for(fn, seconds: float) -> bool:
     return False
 
 
+#: Seconds between two looks at the chat while waiting for Muse's answer (was a fixed 5 s).
+POLL = 2.0
+
+#: Pictures in the page whose src is a local blob/data URL: the composer's upload previews among them.
+PREVIEWS_JS = """() => [...document.querySelectorAll('img')].filter(i => /^(blob:|data:)/.test(i.currentSrc || i.src || '')).length"""
+
+#: Our request is in the chat: the composer is empty again and the page shows the end of our message.
+SENT_JS = """(marker) => { const c = document.querySelector('textarea[aria-label="Message"]');
+  return (!c || !c.value) && (document.body.innerText || '').includes(marker); }"""
+
+#: The answer picture/video by src: its final src (progressive images swap theirs) and whether it has loaded.
+MEDIA_STATE_JS = """(src) => { const el = [...document.querySelectorAll('img, video')].find(e =>
+  (e.currentSrc || e.src || '') === src); if (!el) return 'gone';
+  return el.tagName === 'IMG' ? (el.complete && el.naturalWidth > 0 ? 'ready' : 'loading')
+                              : (el.readyState >= 2 ? 'ready' : 'loading'); }"""
+
+
+def _settled_answer(page, before: set[str], marker: str, sel: str, kind: str, first: list[dict]) -> list[dict]:
+    """Muse's answer once it stops changing: a progressive image swaps in its final src, a player its real clip.
+    Returns as soon as the same src is seen twice 1 s apart and has loaded (was a fixed 8 s / 3 s wait)."""
+    cap = time.time() + (8 if kind == "image" else 3)
+    vids, last = first, None
+    while time.time() < cap:
+        time.sleep(1.0)
+        vids = _new_videos(page, before, marker, sel) or vids
+        src = vids[-1]["src"] if kind == "video" else vids[0]["src"]
+        try:
+            ready = page.evaluate(MEDIA_STATE_JS, src) == "ready"
+        except Exception:
+            ready = False
+        if src == last and ready:
+            break
+        last = src
+    return vids
+
+
 def _new_videos(page, before: set[str], marker: str = "", sel: str = "video") -> list[dict]:
     """New videos (or, with sel="img", pictures) Muse sent as the answer to the request holding `marker`."""
     out = []
@@ -395,8 +432,17 @@ def run_image(args) -> dict:
     return _generate(args, "image")
 
 
-def _generate(args, kind: str) -> dict:
-    """One video (kind "video") or one picture (kind "image") from the Muse chat, saved at args.out."""
+def _generate(args, kind: str, session=None) -> dict:
+    """One video (kind "video") or one picture (kind "image") from the Muse chat, saved at args.out.
+    `session`: an open (ctx, page) to reuse (the `serve` loop); None opens and closes a browser for this one."""
+    if session is not None:
+        return _request(args, kind, *session, own=False)
+    with _playwright()() as pw:
+        ctx, page = _open(pw, Path(args.profile_dir).expanduser(), args.channel, headless=args.window == "headless")
+        return _request(args, kind, ctx, page, own=True)
+
+
+def _request(args, kind: str, ctx, page, *, own: bool) -> dict:
     end = time.time() + args.timeout
     image = Path(args.image).expanduser() if getattr(args, "image", None) else None
     refs = [Path(r).expanduser() for r in args.ref or []]
@@ -415,94 +461,149 @@ def _generate(args, kind: str) -> dict:
         prompt = build_prompt(args.prompt, image=image is not None, aspect=args.aspect, duration=args.duration,
                               refs=len(refs))
         sel, word, min_size = "video", "video", 10_000
+    try:
+        page.goto(MUSE, wait_until="domcontentloaded", timeout=90_000)
+        box = page.locator(COMPOSER).first
+        try:
+            box.wait_for(state="visible", timeout=60_000)
+        except Exception:
+            if _logged_out(page):
+                raise Fail(EXIT_AUTH, "Profile Muse chưa đăng nhập (hoặc hết phiên). Chạy: muse_ui.py login")
+            raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
+        # the composer is there; no fixed nap (was 3 s): the activity panel is waited for below
+        marker = _marker(prompt)
+        # Muse's activity panel (with older "Failed to create" rows) loads a moment after the chat: count
+        # those rows only once it is there, or an old row would look like a new failure. The old clips and
+        # pictures of the chat are listed after that wait too (it replaced a fixed 3 s nap before this list).
+        _wait_for(lambda: page.get_by_text("Today", exact=True).count() > 0, 15)
+        before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", "", sel]) if v["src"]}
+        failed_before = page.evaluate(FAILED_JS)
+        files = [str(f) for f in ([image] if image else []) + refs]
+        previews_before = page.evaluate(PREVIEWS_JS) if files else 0
+        if files:
+            try:
+                page.locator(FILE_INPUT).first.set_input_files(files)
+            except Exception as exc:  # an input without `multiple`: attach the pictures one by one
+                if len(files) == 1 or "multiple" not in str(exc).lower():
+                    raise
+                for f in files:
+                    page.locator(FILE_INPUT).first.set_input_files(f)
+                    time.sleep(2)
+            # let the upload previews appear: as soon as all are there (at most the old fixed 3 s + 1 s each)
+            if _wait_for(lambda: page.evaluate(PREVIEWS_JS) >= previews_before + len(files), 3 + len(files)):
+                time.sleep(0.5)
+        box.click()
+        box.fill(prompt)
+        _shot(page, debug, "1-typed")
+        if args.dry_run:
+            return {"status": "ok", "dry_run": True, "prompt": prompt}
+        sent = False
+        for name in SEND_NAMES:
+            btn = page.get_by_role("button", name=name, exact=True)
+            if btn.count() and btn.first.is_enabled():
+                btn.first.click()
+                sent = True
+                break
+        if not sent:
+            box.press("Enter")
+        SPENT["sent"] = True
+        log(f"  đã gửi yêu cầu lên Muse, chờ {word}…")
+        _wait_for(lambda: page.evaluate(SENT_JS, marker), 5)  # our bubble is in the chat (was a fixed 5 s)
+        _shot(page, debug, "2-sent")
+        last_reply, n, reply_at = "", 0, time.time()
+        while time.time() < end:
+            vids = _new_videos(page, before, marker, sel)
+            if vids:
+                vids = _settled_answer(page, before, marker, sel, kind, vids)
+                src = vids[-1]["src"] if kind == "video" else vids[0]["src"]
+                log(f"  có {word}: {src[:100]}")
+                _shot(page, debug, "3-result")
+                _download(page, ctx, src, out)
+                if kind == "image":
+                    _to_png_if_needed(out)
+                if out.stat().st_size < min_size:
+                    raise Fail(EXIT_GENERATION_FAILED, f"File {word} Muse tải về quá nhỏ", spent=True)
+                return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
+            if page.evaluate(FAILED_JS) > failed_before:
+                time.sleep(4)  # Muse writes a line about the failure right after the task row
+                _shot(page, debug, "9-failed")
+                said = (page.evaluate(REPLY_AFTER_JS, marker) or "").replace("\n", " ").strip()
+                raise Fail(EXIT_GENERATION_FAILED, f"Muse báo không tạo được {word} này (Failed to create…)."
+                           + (f" Muse: {said[:300]}" if said else ""), spent=False)
+            reply = page.evaluate(REPLY_AFTER_JS, marker)
+            if reply != last_reply:
+                last_reply, reply_at = reply, time.time()
+                if reply:
+                    log("  Muse: " + reply.replace("\n", " ")[:200])
+            elif reply and time.time() - reply_at > REPLY_SETTLE and _asks_or_declines(reply):
+                # Muse wrote back (a question / a refusal) and nothing has been generating since
+                _shot(page, debug, "9-declined")
+                raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}, trả lời: " + reply[:600], spent=False)
+            n += 1
+            if debug and n % 15 == 0:
+                _shot(page, debug, f"wait-{n:03d}")
+            time.sleep(POLL)
+        _shot(page, debug, "9-timeout")
+        import re
+        if last_reply and re.search(DECLINE_RE, last_reply, re.I):
+            raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}: " + last_reply[:500], spent=False)
+        raise Fail(EXIT_TIMEOUT, f"Hết thời gian chờ {word} từ Muse. Trả lời cuối: " + last_reply[:300], spent=True)
+    finally:
+        if own:
+            ctx.close()
+
+
+#: Stdout prefix of each answer of `serve` (one JSON document per request, the same shape as a one-shot run).
+SERVE_RESULT = "@@result "
+
+
+def _fail_result(exc: BaseException) -> dict:
+    if isinstance(exc, Fail):
+        return {"status": "fail", "error": {"exit_code": exc.code, "detail": exc.detail, "retryable": False,
+                                            "spent": exc.spent}}
+    return {"status": "fail", "error": {"exit_code": EXIT_DRIFT, "detail": f"{type(exc).__name__}: {exc}".strip()[:800],
+                                        "retryable": False, "spent": SPENT["sent"]}}
+
+
+def run_serve(args, parser) -> dict:
+    """Keep ONE signed-in browser open and run requests read from stdin, one JSON per line:
+    {"argv": ["image", "--prompt", ..., "-o", ...]} (the same arguments as a one-shot `image` / `i2v` run).
+    Each answer is printed as one line `@@result {json}`. Launching Chrome for every picture cost several seconds
+    each; a film asks Muse for 30-40 pictures. Ends on EOF or {"quit": true}; a broken browser ends it too (the
+    caller then starts a new one)."""
     with _playwright()() as pw:
         ctx, page = _open(pw, Path(args.profile_dir).expanduser(), args.channel, headless=args.window == "headless")
+        print(SERVE_RESULT + json.dumps({"status": "ready"}), flush=True)
         try:
-            page.goto(MUSE, wait_until="domcontentloaded", timeout=90_000)
-            box = page.locator(COMPOSER).first
-            try:
-                box.wait_for(state="visible", timeout=60_000)
-            except Exception:
-                if _logged_out(page):
-                    raise Fail(EXIT_AUTH, "Profile Muse chưa đăng nhập (hoặc hết phiên). Chạy: muse_ui.py login")
-                raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
-            time.sleep(3)
-            marker = _marker(prompt)
-            before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", "", sel]) if v["src"]}
-            # Muse's activity panel (with older "Failed to create" rows) loads a moment after the chat: count
-            # those rows only once it is there, or an old row would look like a new failure.
-            _wait_for(lambda: page.get_by_text("Today", exact=True).count() > 0, 15)
-            failed_before = page.evaluate(FAILED_JS)
-            files = [str(f) for f in ([image] if image else []) + refs]
-            if files:
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
                 try:
-                    page.locator(FILE_INPUT).first.set_input_files(files)
-                except Exception as exc:  # an input without `multiple`: attach the pictures one by one
-                    if len(files) == 1 or "multiple" not in str(exc).lower():
-                        raise
-                    for f in files:
-                        page.locator(FILE_INPUT).first.set_input_files(f)
-                        time.sleep(2)
-                time.sleep(3 + len(files))  # let the upload previews appear
-            box.click()
-            box.fill(prompt)
-            _shot(page, debug, "1-typed")
-            if args.dry_run:
-                return {"status": "ok", "dry_run": True, "prompt": prompt}
-            sent = False
-            for name in SEND_NAMES:
-                btn = page.get_by_role("button", name=name, exact=True)
-                if btn.count() and btn.first.is_enabled():
-                    btn.first.click()
-                    sent = True
+                    job = json.loads(line)
+                except ValueError:
+                    print(SERVE_RESULT + json.dumps(_fail_result(Fail(EXIT_USAGE, "dòng lệnh không phải JSON"))), flush=True)
+                    continue
+                if job.get("quit"):
                     break
-            if not sent:
-                box.press("Enter")
-            SPENT["sent"] = True
-            log(f"  đã gửi yêu cầu lên Muse, chờ {word}…")
-            time.sleep(5)
-            _shot(page, debug, "2-sent")
-            last_reply, n, reply_at = "", 0, time.time()
-            while time.time() < end:
-                vids = _new_videos(page, before, marker, sel)
-                if vids:
-                    time.sleep(3 if kind == "video" else 8)  # the player / a progressive image swaps in the final src
-                    vids = _new_videos(page, before, marker, sel) or vids
-                    src = vids[-1]["src"] if kind == "video" else vids[0]["src"]
-                    log(f"  có {word}: {src[:100]}")
-                    _shot(page, debug, "3-result")
-                    _download(page, ctx, src, out)
-                    if kind == "image":
-                        _to_png_if_needed(out)
-                    if out.stat().st_size < min_size:
-                        raise Fail(EXIT_GENERATION_FAILED, f"File {word} Muse tải về quá nhỏ", spent=True)
-                    return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
-                if page.evaluate(FAILED_JS) > failed_before:
-                    time.sleep(4)  # Muse writes a line about the failure right after the task row
-                    _shot(page, debug, "9-failed")
-                    said = (page.evaluate(REPLY_AFTER_JS, marker) or "").replace("\n", " ").strip()
-                    raise Fail(EXIT_GENERATION_FAILED, f"Muse báo không tạo được {word} này (Failed to create…)."
-                               + (f" Muse: {said[:300]}" if said else ""), spent=False)
-                reply = page.evaluate(REPLY_AFTER_JS, marker)
-                if reply != last_reply:
-                    last_reply, reply_at = reply, time.time()
-                    if reply:
-                        log("  Muse: " + reply.replace("\n", " ")[:200])
-                elif reply and time.time() - reply_at > REPLY_SETTLE and _asks_or_declines(reply):
-                    # Muse wrote back (a question / a refusal) and nothing has been generating since
-                    _shot(page, debug, "9-declined")
-                    raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}, trả lời: " + reply[:600], spent=False)
-                n += 1
-                if debug and n % 6 == 0:
-                    _shot(page, debug, f"wait-{n:03d}")
-                time.sleep(5)
-            _shot(page, debug, "9-timeout")
-            import re
-            if last_reply and re.search(DECLINE_RE, last_reply, re.I):
-                raise Fail(EXIT_AGENT_DECLINED, f"Muse không tạo {word}: " + last_reply[:500], spent=False)
-            raise Fail(EXIT_TIMEOUT, f"Hết thời gian chờ {word} từ Muse. Trả lời cuối: " + last_reply[:300], spent=True)
+                SPENT["sent"] = False
+                try:
+                    a = parser.parse_args(job.get("argv") or [])
+                    if a.cmd not in ("image", "i2v"):
+                        raise Fail(EXIT_USAGE, f"serve chỉ chạy image / i2v, không chạy {a.cmd}")
+                    if a.cmd == "image":
+                        a.image, a.duration = None, None
+                    res = _generate(a, "image" if a.cmd == "image" else "video", session=(ctx, page))
+                except SystemExit:
+                    res = _fail_result(Fail(EXIT_USAGE, "tham số không hợp lệ"))
+                except BaseException as exc:  # noqa: BLE001 - every failure is reported, the loop goes on
+                    res = _fail_result(exc)
+                    if ctx.pages == [] or page.is_closed():
+                        print(SERVE_RESULT + json.dumps(res, ensure_ascii=False), flush=True)
+                        raise Fail(EXIT_DRIFT, "trình duyệt Muse đã đóng") from exc
+                print(SERVE_RESULT + json.dumps(res, ensure_ascii=False), flush=True)
         finally:
             ctx.close()
+    return {"status": "ok", "served": True}
 
 
 def run_fetch(args) -> dict:
@@ -575,6 +676,9 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--debug-dir", help="save screenshots of each step here")
     im.add_argument("--fail-shots", help="save a screenshot here only when the request fails")
     im.add_argument("--dry-run", action="store_true", help="attach + type only, do not send")
+    sv = sub.add_parser("serve", help="keep one browser open and run image / i2v requests read from stdin (JSON lines)")
+    common(sv)
+    sv.add_argument("--window", choices=["show", "headless"], default="headless")
     f = sub.add_parser("fetch", help="download the clip Muse made for an earlier message (sends nothing)")
     common(f)
     f.add_argument("--marker", required=True, help="text from that message (e.g. the end of the scene prompt)")
@@ -582,7 +686,10 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args(argv)
     try:
-        result = {"login": run_login, "probe": run_probe, "i2v": run_i2v, "image": run_image, "fetch": run_fetch}[args.cmd](args)
+        if args.cmd == "serve":
+            result = run_serve(args, ap)
+        else:
+            result = {"login": run_login, "probe": run_probe, "i2v": run_i2v, "image": run_image, "fetch": run_fetch}[args.cmd](args)
         code = 0
     except Fail as f:
         result = {"status": "fail", "error": {"exit_code": f.code, "detail": f.detail, "retryable": False, "spent": f.spent}}

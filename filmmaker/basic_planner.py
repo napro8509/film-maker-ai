@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import ai
 from . import durations as durations_mod
-from . import formats, i2v_prompt, model_meta, planner
+from . import formats, i2v_prompt, model_meta, planner, rules
 from .ai import GEMINI_PRO, clean_ai_model
 from .i2v_prompt import Listener, Speaker, VideoShot
 from .storyboard import NO_DIALOGUE, NO_SUBTITLES, Storyboard, Thumbnail, clean_language
@@ -96,6 +96,8 @@ templates, so write each field as a plain phrase. Rules:
 - Children: never an exact age ("age 8", "8-year-old"): write "a young girl", "a little boy", "a schoolgirl".
   Google's child-safety filter blocks pictures of children described with a precise age or body details; keep
   children in everyday activities, fully and casually dressed, described by hair, clothes and expression.
+- Adults and children in `image_prompt` and the video fields: """ + rules.CHILD_CONTACT_RULE + """
+- Costume changes: """ + rules.OUTFIT_RULE + """
 - `style` = one short sentence for the shared look (palette, lighting, mood); the visual style named in the
   message is added automatically, do not repeat it.
 - Follow the format, sound and genres in the message: they decide pacing, the number of beats and who speaks.
