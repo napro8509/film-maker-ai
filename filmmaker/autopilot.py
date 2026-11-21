@@ -12,10 +12,12 @@ crash). Reviews that cannot run (no Claude) are skipped, never fatal. Reports go
 from __future__ import annotations
 
 import hashlib
+import threading
 import json
 import re
 import time
 import unicodedata
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +29,7 @@ from . import durations as dur
 from . import model_meta, reviewer, retirement
 from . import progress as prog
 from .flow_ui import BLOCKED_MARK
-from .gflow import Gflow, GflowError
+from .gflow import MUSE_DECLINED, MUSE_FAILED, Gflow, GflowError
 from .pipeline import DONE, SUBMITTING, Pipeline, RunOptions, RunReport
 from .storyboard import Storyboard, load_storyboard
 from .thumbnail import ThumbnailError
@@ -46,6 +48,10 @@ STAGES: list[tuple[str, str]] = [
 ]
 LABELS = dict(STAGES)
 RETRY_WAIT = 30  # seconds before the second try of free images that failed
+#: Times a refused scene gets its prompt rewritten and is sent again; after that it is skipped (film made without it).
+MAX_SOFTEN = 2
+# A "could not make it" that is about the account, not the scene: rewriting the prompt would not help.
+QUOTA_RE = re.compile(r"limit reached|out of credits|not enough credits|insufficient credits|try again later", re.I)
 REVIEW_BATCH = 5  # most keyframes per review call (plus the portraits); bigger answers often fail to come back as JSON
 
 
@@ -112,6 +118,8 @@ class Autopilot:
         self._kf_batch = REVIEW_BATCH  # shrinks when Claude cannot answer a batch, for the rest of this run
         self.state_path = self.out / "autopilot.json"
         self.reviews_dir = self.out / "reviews"
+        self._soft_lock = threading.RLock()  # autopilot.json / storyboard.yaml writes from the softener thread
+        self._softener: _Softener | None = None
         self.data: dict[str, Any] = {"stages": {}, "keyframe_ok": {}, "clip_reviewed": {}, "rerendered": [],
                                      "resent": []}
         try:
@@ -122,6 +130,10 @@ class Autopilot:
     # --- small helpers -------------------------------------------------------------
 
     def save(self) -> None:
+        with self._soft_lock:
+            self._save()
+
+    def _save(self) -> None:
         self.out.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -577,6 +589,9 @@ class Autopilot:
         extra_opts: dict[str, Any] = {}
         if n_cand > 1:
             extra_opts.update(keyframe_candidates=n_cand, pre_qc_gate=bool(self.cfg.review), ai_kw=self.ai_kw())
+        soft = self._softener
+        if soft is not None:
+            extra_opts.update(on_failed=soft.on_failed, requeue=soft.requeue)
         report = self.pipe(sb).run(self.opts(
             refuse=lambda s: retirement.refuse_retired(sb)(s) or dur.refuse_bad_duration(sb)(s),
             **extra_opts,
@@ -587,12 +602,43 @@ class Autopilot:
         return report
 
     def _stage_videos(self, result: dict) -> None:
-        self._video_run(confirm=set())
-        failed = self._unsent_failures()
+        self._softener = _Softener(self)
+        try:
+            self._first_video_passes()
+        finally:
+            self._softener.close()
+            self._softener = None
+        self._after_first_passes(result)
+
+    def _first_video_passes(self) -> None:
+        """Render every scene. A scene refused for its content does not hold the others up: the AI rewrites its
+        prompt in the background (`_Softener`) while the next scenes render, and the run goes back to it as soon
+        as the new prompt is ready."""
+        soft = self._softener
+        refused = self._refused_now()
+        if refused:
+            # refused on an earlier run: sending the same prompt again is refused again, so rewrite it first
+            self.log(f"Cảnh đã bị từ chối ở lần trước: {', '.join(refused)} — đổi prompt (chạy nền), "
+                     "không gửi lại bản cũ; các cảnh khác vẫn tạo tiếp.")
+            pipe = self.pipe()
+            by_id = {s.id: s for s in pipe.sb.scenes}
+            for sid in refused:
+                self.log(f"[{sid}] {self._refusal(pipe, by_id[sid])}")
+                soft.start(pipe.sb, sid, str(pipe.state.scene(sid).get("error") or ""))
+        skip = set(self._refused_now())  # rewriting (sent again by `requeue` when ready) or out of rewrites
+        if skip:
+            rest = {s.id for s in self.sb().scenes} - skip
+            # `only` must not be empty (= every scene): with nothing else to send, the run just waits for rewrites
+            self._video_run(only=rest or {"\0none"}, confirm=set())
+        else:
+            self._video_run(confirm=set())
+
+    def _after_first_passes(self, result: dict) -> None:
+        failed = self._retry_candidates()
         if failed:
             self.log(f"Thử lại cảnh lỗi (chưa trừ credit): {', '.join(failed)}")
             self._video_run(only=set(failed), confirm=set())
-        still = self._unsent_failures()
+        still = self._retry_candidates()
         if still:
             # Flow's agent kept answering "Something went wrong" for the same scenes (18 ngày: s10, s14, s26, s42
             # failed every time while the others went through): it is the scene's picture, not chance. A new
@@ -620,8 +666,13 @@ class Autopilot:
         if done == 0:
             raise AutoError("không render được cảnh nào; xem log ở trên")
         if missing:
-            self.log(f"⚠ Còn thiếu clip: {', '.join(missing)} — phim vẫn được dựng từ các cảnh đã có; "
-                     "bấm lại “Tạo tự động” để thử tiếp.")
+            hist = self.data.get("softened") or {}
+            given_up = [sid for sid in missing if len(hist.get(sid, [])) >= MAX_SOFTEN]
+            retry = [sid for sid in missing if sid not in given_up]
+            self.log(f"⚠ Còn thiếu clip: {', '.join(missing)} — phim vẫn được dựng từ các cảnh đã có"
+                     + (f"; bấm lại “Tạo tự động” để thử tiếp {', '.join(retry)}" if retry else "")
+                     + (f"; {', '.join(given_up)} đã bị bỏ qua sau {MAX_SOFTEN} lần đổi prompt (sửa cảnh bằng tay "
+                        "rồi render lại nếu muốn)" if given_up else "") + ".")
         result["missing"] = missing
         self.mark("videos", "done" if not missing else "partial", f"{done}/{len(pipe.sb.scenes)} clip", missing=missing)
 
@@ -631,47 +682,104 @@ class Autopilot:
         return [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and
                 pipe.state.scene(s.id).get("status") != SUBMITTING]
 
-    def _soften_blocked(self) -> None:
-        """Scenes Flow blocked after it started (credits spent): it made the clip and then deleted it (safety
-        filter), it refused the scene as showing "prominent people" (real persons of a true story), or it could not
-        make the clip's sound ("Audio generation failed"). Sending the same scene again
-        fails the same way, so Claude rewrites it gently, then it is sent once more (counts as its one resend)."""
+    def _refused_now(self) -> list[str]:
+        """Scenes with no clip whose last answer was a content refusal."""
         pipe = self.pipe()
-        blocked = []
-        for s in pipe.sb.scenes:
-            err = str(pipe.state.scene(s.id).get("error") or "")
-            if pipe.is_done(s) or s.id in self.data["resent"]:
-                continue
-            if BLOCKED_MARK in err:
-                blocked.append((s, "Flow đã xoá video (bộ lọc an toàn)"))
-            elif reviewer.PROMINENT in err.lower():
-                blocked.append((s, "Flow chặn vì cảnh giống người nổi tiếng / người thật"))
-            elif reviewer.HARMFUL in err.lower():
-                blocked.append((s, "Flow chặn vì cảnh trông như có hại (thường là trẻ em bất tỉnh / gặp nguy)"))
-            elif reviewer.AUDIO_FAILED in err.lower():
-                blocked.append((s, "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"))
-        if not blocked:
-            return
-        fixed: list[str] = []
-        for s, why in blocked:
-            self.log(f"[{s.id}] {why}: nhờ Claude viết lại cảnh nhẹ nhàng hơn…")
-            try:
-                fix = reviewer.soften_scene(pipe.sb, s.id, str(pipe.state.scene(s.id).get("error")), **self.ai_kw())
-            except (RuntimeError, ValueError) as exc:
-                self.log(f"  ⚠ không viết lại được ({exc}); để nguyên.")
-                continue
-            fix.id = s.id
-            if self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix]))):
-                self.log(f"  prompt mới: {(fix.prompt or fix.image_prompt or '')[:160]}")
-                if fix.dialogue is not None:
-                    self.log("  thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue) or "(bỏ thoại)"))
-                fixed.append(s.id)
-        if not fixed:
-            return
-        self.data["resent"] += fixed
-        self.save()
-        # a changed opening-frame prompt makes the keyframe stale: it is remade (free) before the video
-        self._video_run(only=set(fixed), confirm=set(fixed))
+        return [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and self._refusal(pipe, s)]
+
+    def _retry_candidates(self) -> list[str]:
+        """Unsent failures worth sending again unchanged (timeouts, a dropped page…). A scene refused for its
+        content is not: the same prompt (even with a new keyframe) is refused again, so it goes straight to
+        `_soften_blocked`, which changes the prompt."""
+        pipe = self.pipe()
+        by_id = {s.id: s for s in pipe.sb.scenes}
+        return [sid for sid in self._unsent_failures() if not self._refusal(pipe, by_id[sid])]
+
+    def _refusal(self, pipe: Pipeline, s) -> str | None:
+        """Why the video service refused scene `s` because of what it shows or says, or None (no refusal, or an
+        error a new prompt cannot fix: login, timeout, credits…)."""
+        st = pipe.state.scene(s.id)
+        return _refusal_reason(str(st.get("error") or ""), st.get("exit_code"))
+
+    def _soften_one(self, sb: Storyboard, sid: str, error: str) -> bool:
+        """Ask the AI to rewrite refused scene `sid` gently and save it in storyboard.yaml. True = changed (send
+        it again). Safe to call from a worker thread (`_Softener`): it only touches storyboard.yaml and
+        `self.data["softened"]` / `["resent"]`, under `self._soft_lock`."""
+        with self._soft_lock:
+            hist: dict[str, list[dict]] = self.data.setdefault("softened", {})
+            tried = list(hist.get(sid, []))
+            raw_scenes = {sc.get("id"): sc for sc in (yaml.safe_load(self.sb_path.read_text(encoding="utf-8"))
+                                                      or {}).get("scenes") or [] if isinstance(sc, dict)}
+        cur = raw_scenes.get(sid) or {}
+        snap = {k: cur.get(k) for k in ("prompt", "image_prompt", "dialogue", "narration", "camera", "video_shot")}
+        try:
+            fix = reviewer.soften_scene(sb, sid, error, earlier=[*tried, snap] if tried else None, **self.ai_kw())
+        except (RuntimeError, ValueError) as exc:
+            self.log(f"  [{sid}] ⚠ không viết lại được ({exc}); để nguyên.")
+            return False
+        fix.id = sid
+        with self._soft_lock:
+            self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)  # the refused version
+            changed = self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix])))
+            if changed and sid not in self.data["resent"]:
+                self.data["resent"].append(sid)  # never also resent as "interrupted"
+            self.save()
+        if not changed:
+            self.log(f"  [{sid}] ⚠ AI không đổi gì trong cảnh; không gửi lại bản cũ.")
+            return False
+        self.log(f"  [{sid}] prompt mới: {(fix.prompt or fix.image_prompt or '')[:160]}")
+        if fix.dialogue is not None:
+            self.log(f"  [{sid}] thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue)
+                                                 or "(bỏ thoại)"))
+        return True
+
+    def _forget_rendered_softens(self) -> None:
+        hist: dict[str, list[dict]] = self.data.setdefault("softened", {})
+        if hist:
+            pipe = self.pipe()
+            for s in pipe.sb.scenes:
+                if s.id in hist and pipe.is_done(s):
+                    hist.pop(s.id)  # rendered since: a later refusal starts again from zero
+
+    def _soften_blocked(self) -> None:
+        """Scenes the video service refused because of their content: Flow made the clip and deleted it (safety
+        filter), refused it as "prominent people" / "harmful content", could not make its sound ("Audio generation
+        failed"), or Muse answered "couldn't be generated". Sending the same scene again fails the same way, so the
+        AI rewrites the scene gently (storyboard.yaml) and it is sent again. At most MAX_SOFTEN rewrites per scene;
+        the second one gets the refused versions and re-stages the shot. Still refused after that: the scene is
+        skipped and the film is made without it."""
+        hist: dict[str, list[dict]] = self.data.setdefault("softened", {})
+        self._forget_rendered_softens()
+        for _round in range(MAX_SOFTEN):
+            pipe = self.pipe()
+            blocked = []
+            for s in pipe.sb.scenes:
+                if pipe.is_done(s) or len(hist.get(s.id, [])) >= MAX_SOFTEN:
+                    continue
+                why = self._refusal(pipe, s)
+                if why:
+                    blocked.append((s, why))
+            if not blocked:
+                break
+            raw_scenes = {sc.get("id"): sc for sc in (yaml.safe_load(self.sb_path.read_text(encoding="utf-8"))
+                                                      or {}).get("scenes") or [] if isinstance(sc, dict)}
+            fixed: list[str] = []
+            for s, why in blocked:
+                n = len(hist.get(s.id, [])) + 1
+                self.log(f"[{s.id}] {why}: nhờ AI viết lại prompt cho dễ qua hơn (lần {n}/{MAX_SOFTEN})…")
+                if self._soften_one(pipe.sb, s.id, str(pipe.state.scene(s.id).get("error"))):
+                    fixed.append(s.id)
+            if not fixed:
+                break
+            self.sleep(RETRY_WAIT)  # back-to-back requests to Muse often fail on their own
+            # a changed opening-frame prompt makes the keyframe stale: it is remade (free) before the video
+            self._video_run(only=set(fixed), confirm=set(fixed))
+        pipe = self.pipe()
+        gave_up = [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and len(hist.get(s.id, [])) >= MAX_SOFTEN
+                   and self._refusal(pipe, s)]
+        if gave_up:
+            self.log(f"⚠ Đã đổi prompt {MAX_SOFTEN} lần mà vẫn bị từ chối: {', '.join(gave_up)} — bỏ qua, "
+                     "dựng phim không có cảnh này.")
 
     def _stage_review_clips(self, result: dict) -> None:
         """Post-render QC gate (OpenMontage + AI QC): checks `ffprobe`, 4 extracted frames (black/text errors),
@@ -885,6 +993,91 @@ class Autopilot:
 
 class _Stopped(Exception):
     pass
+
+
+def _refusal_reason(err: str, exit_code: Any) -> str | None:
+    """Why the video service refused a scene because of what it shows or says (from its error / exit code), or
+    None (no refusal, or an error a new prompt cannot fix: login, timeout, credits…)."""
+    low = err.lower()
+    if BLOCKED_MARK in err:
+        return "Flow đã xoá video (bộ lọc an toàn)"
+    if reviewer.PROMINENT in low:
+        return "Flow chặn vì cảnh giống người nổi tiếng / người thật"
+    if reviewer.HARMFUL in low:
+        return "Flow chặn vì cảnh trông như có hại (thường là trẻ em bất tỉnh / gặp nguy)"
+    if reviewer.AUDIO_FAILED in low:
+        return "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"
+    if exit_code in (MUSE_DECLINED, MUSE_FAILED) and err and not QUOTA_RE.search(err):
+        # Muse (and Flow's chat agent) says "couldn't be generated" with no reason: almost always the content
+        return ("Muse không tạo được video (thường do nội dung cảnh)" if "muse" in low
+                else "Flow không tạo được video (thường do nội dung cảnh)")
+    return None
+
+
+SOFTEN_WORKERS = 2  # prompt rewrites that may run at the same time while the other scenes render
+
+
+class _Softener:
+    """Rewrites refused scenes in the background during a video run.
+
+    `on_failed` (called by the pipeline when a scene fails) starts the AI rewrite of a scene refused for its
+    content in a worker thread, so the pipeline moves straight on to the next scene instead of waiting for it.
+    `requeue` hands the rewritten scenes back to the same run, which sends them again before the next scene;
+    when only rewrites are left it waits for them. At most MAX_SOFTEN rewrites per scene (shared with
+    `Autopilot._soften_blocked`)."""
+
+    def __init__(self, ap: Autopilot):
+        self.ap = ap
+        self.pool = ThreadPoolExecutor(max_workers=SOFTEN_WORKERS, thread_name_prefix="soften")
+        self.jobs: dict[str, Future] = {}
+        ap._forget_rendered_softens()
+
+    def start(self, sb: Storyboard, sid: str, error: str) -> bool:
+        """Start rewriting `sid` (refused with `error`). False = not started (already rewriting, or out of tries)."""
+        with self.ap._soft_lock:
+            n = len(self.ap.data.setdefault("softened", {}).get(sid, []))
+        if sid in self.jobs or n >= MAX_SOFTEN:
+            return False
+        self.ap.log(f"[{sid}] nhờ AI viết lại prompt cho dễ qua hơn (lần {n + 1}/{MAX_SOFTEN}, chạy nền) — "
+                    "tạo tiếp các cảnh sau, xong sẽ quay lại cảnh này.")
+        self.jobs[sid] = self.pool.submit(self._job, sb, sid, error)
+        return True
+
+    def _job(self, sb: Storyboard, sid: str, error: str) -> bool:
+        try:
+            return self.ap._soften_one(sb, sid, error)
+        except Exception as exc:  # noqa: BLE001 - a worker must never kill the run
+            self.ap.log(f"  [{sid}] ⚠ lỗi khi viết lại prompt: {_short_error(exc)}")
+            return False
+
+    def on_failed(self, s, exc: GflowError) -> None:
+        why = _refusal_reason(str(exc), exc.exit_code)
+        if why:
+            self.ap.log(f"[{s.id}] {why}")
+            with self.ap._soft_lock:  # a worker may be writing storyboard.yaml
+                sb = self.ap.sb()
+            self.start(sb, s.id, str(exc))
+
+    def pending(self) -> bool:
+        return bool(self.jobs)
+
+    def requeue(self, wait: bool) -> list:
+        """Scenes whose rewrite finished (fresh from storyboard.yaml). With `wait`, block until one finishes or
+        none are left (checking the stop button)."""
+        while True:
+            done = [sid for sid, f in self.jobs.items() if f.done()]
+            ok = [sid for sid in done if self.jobs.pop(sid).result()]
+            if ok:
+                with self.ap._soft_lock:
+                    by_id = {s.id: s for s in self.ap.sb().scenes}
+                return [by_id[sid] for sid in ok if sid in by_id]
+            if not wait or not self.jobs or self.ap.should_stop():
+                return []
+            self.ap.log(f"Chờ AI viết lại prompt: {', '.join(self.jobs)}…")
+            wait_futures(list(self.jobs.values()), timeout=5, return_when=FIRST_COMPLETED)
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=True)  # a rewrite still running is kept: `_soften_blocked` sends it later
 
 
 def _even_chunks(items: list, n: int) -> list[list]:

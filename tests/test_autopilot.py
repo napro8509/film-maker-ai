@@ -406,6 +406,7 @@ def test_scenes_flow_never_accepted_get_a_last_try_with_a_new_keyframe(env, monk
     monkeypatch.setattr(p, "_video_run", lambda **kw: runs.append(kw))
     monkeypatch.setattr(p, "_unsent_failures", lambda: next(left))
     monkeypatch.setattr(p, "_soften_blocked", lambda: None)
+    monkeypatch.setattr(p, "_refusal", lambda pipe, s: None)  # not a content refusal (e.g. a dropped page)
     monkeypatch.setattr(p, "pipe", lambda *a: type("P", (), {"sb": p.sb(), "is_done": lambda self, s: True,
                                                               "state": None})())
     try:
@@ -509,3 +510,191 @@ def test_keyframe_reviewer_checks_who_faces_the_camera():
     assert "Who speaks" in reviewer.KEYFRAME_SYSTEM and "facing the camera" in reviewer.KEYFRAME_SYSTEM
     # a listener who is the biggest face or has an open mouth is mouthing the line in the video
     assert "largest / closest face" in reviewer.KEYFRAME_SYSTEM and "open-mouthed grin" in reviewer.KEYFRAME_SYSTEM
+
+
+MUSE_ERR = ("Muse (giao diện chat): Muse báo không tạo được video này (Failed to create…). "
+            "Muse: That s03 video couldn't be generated")
+
+
+def _muse_refused(sb_path, sid="s03", error=MUSE_ERR):
+    from filmmaker.pipeline import State
+    _pilot(sb_path, review=False)[0].run()
+    out = sb_path.parent / "output" / "storyboard"
+    State(out / "state.json").update(sid, status="failed", error=error, exit_code=42, submitted_at=None)
+    (out / "clips" / f"{sid}.mp4").unlink()
+    return out
+
+
+def test_muse_refusal_is_rewritten_and_succeeds(env, monkeypatch):
+    sb_path, calls, _ = env
+    _muse_refused(sb_path)
+    seen = []
+    monkeypatch.setattr(reviewer, "soften_scene", lambda sb, sid, err, earlier=None, **kw: (
+        seen.append(earlier), reviewer.SceneFix(id=sid, prompt="He smiles warmly and nods"))[1])
+    n = len([c for c in calls() if c[0] == "video"])
+    p, lines = _pilot(sb_path, review=False)
+    p._soften_blocked()
+    assert yaml.safe_load(sb_path.read_text())["scenes"][2]["prompt"] == "He smiles warmly and nods"
+    assert len([c for c in calls() if c[0] == "video"]) == n + 1
+    assert seen == [None]  # first rewrite: no refused rewrites to show yet
+    assert any("lần 1/2" in l for l in lines) and not any("bỏ qua" in l for l in lines)
+    assert "s03" not in p.data["softened"] or p.data["softened"]["s03"]  # kept until the next pass clears it
+
+
+def test_muse_refusal_rewritten_at_most_twice_then_skipped(env, monkeypatch):
+    from filmmaker.pipeline import State
+    sb_path, calls, _ = env
+    out = _muse_refused(sb_path)
+    prompts = iter(["Calm version one", "Re-staged version two", "never used"])
+    seen = []
+    monkeypatch.setattr(reviewer, "soften_scene", lambda sb, sid, err, earlier=None, **kw: (
+        seen.append(earlier), reviewer.SceneFix(id=sid, prompt=next(prompts)))[1])
+    p, lines = _pilot(sb_path, review=False)
+    sent: list[set] = []
+
+    def still_refused(**kw):  # Muse refuses every version
+        sent.append(kw["only"])
+        State(out / "state.json").update("s03", status="failed", error=MUSE_ERR, exit_code=42)
+
+    monkeypatch.setattr(p, "_video_run", still_refused)
+    p._soften_blocked()
+    assert sent == [{"s03"}, {"s03"}]  # two rewritten resends, no third
+    # the second rewrite sees both refused versions: the original and the first rewrite
+    assert seen[0] is None and [e["prompt"] for e in seen[1]] == ["Rain on the street", "Calm version one"]
+    assert yaml.safe_load(sb_path.read_text())["scenes"][2]["prompt"] == "Re-staged version two"
+    assert any("lần 2/2" in l for l in lines)
+    assert any("bỏ qua" in l and "s03" in l for l in lines)
+    p._soften_blocked()  # a later pass gives up straight away
+    assert len(sent) == 2
+
+
+def test_quota_error_is_not_rewritten(env, monkeypatch):
+    sb_path, calls, _ = env
+    _muse_refused(sb_path, error="Muse không tạo video, trả lời: Daily limit reached, try again later")
+    monkeypatch.setattr(reviewer, "soften_scene", lambda *a, **k: pytest.fail("must not rewrite"))
+    p, lines = _pilot(sb_path, review=False)
+    p._soften_blocked()
+
+
+def test_soften_scene_prompt_mentions_muse(env, monkeypatch):
+    sb = load_storyboard(env[0])
+    got = {}
+    monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw: got.update(user=user, system=system)
+                        or reviewer.SceneFix(id="s01"))
+    reviewer.soften_scene(sb, sb.scenes[0].id, MUSE_ERR)
+    assert "keeping the dialogue word for word" in got["user"] and "Muse" in got["system"]
+    reviewer.soften_scene(sb, sb.scenes[0].id, MUSE_ERR, earlier=[{"prompt": "x"}])
+    assert "rephrase the dialogue" in got["user"]
+
+
+def test_refused_scene_skips_unchanged_retries_and_goes_to_rewrite(env, monkeypatch):
+    # thai-tham-ruong-cua-bo s07/s09: Muse refused the same prompt with a new keyframe too. A content refusal
+    # is not sent again unchanged (no plain retry, no new keyframe): the next send has a rewritten prompt.
+    sb_path, calls, _ = env
+    _muse_refused(sb_path)
+    p, lines = _pilot(sb_path, review=False)
+    runs: list[dict] = []
+    softened = []
+    monkeypatch.setattr(p, "_video_run", lambda **kw: runs.append(kw))
+    monkeypatch.setattr(p, "_soften_blocked", lambda: softened.append(True))
+    try:
+        p._stage_videos({})
+    except Exception:  # what follows is not under test here
+        pass
+    others = {s.id for s in p.sb().scenes} - {"s03"}
+    assert runs == [{"only": others, "confirm": set()}]  # s03 is never sent with its refused prompt
+    assert softened == [True]  # rewritten in the background while the others render; leftovers checked after
+    assert any("chạy nền" in l for l in lines)
+    assert not any("thử lần cuối" in l or "Thử lại cảnh lỗi" in l for l in lines)
+
+
+def test_refused_scene_is_rewritten_in_background_while_next_scenes_render(env, monkeypatch):
+    # The run does not wait for the AI rewrite: s03 is sent while s02's new prompt is being written, then the
+    # run goes back to s02 with the new prompt.
+    import time as _time
+    sb_path, calls, _ = env
+    sb_path.write_text(STORY.replace("duration: 5", "duration: 6"))
+    monkeypatch.setenv("FAKE_GFLOW_FAIL", "Lan sips coffee:42:false:1")
+    lines: list[str] = []
+
+    def soften(sb, sid, err, earlier=None, **kw):
+        for _ in range(200):  # the rewrite "takes long": finishes only once the next scene was sent
+            if any(l.startswith("[s03] t2v") for l in lines):
+                break
+            _time.sleep(0.05)
+        return reviewer.SceneFix(id=sid, prompt="Lan smiles at the window")
+
+    monkeypatch.setattr(reviewer, "soften_scene", soften)
+    p = Autopilot(sb_path, sb_path.parent / "output" / "storyboard", Gflow(log=lambda *_: None),
+                  settings=AutoSettings(pause=(0, 0), review=False), log=lines.append, sleep=lambda *_: None)
+    p._stage_videos({})
+
+    def at(prefix):
+        return next(i for i, l in enumerate(lines) if l.startswith(prefix))
+
+    assert len([c for c in calls() if c[0] == "video"]) == 4  # s01, s02 (refused), s03, s02 (new prompt)
+    assert at("[s02] LỖI") < at("[s03] t2v") < at("[s02] prompt mới đã sẵn sàng") < at("[s02] OK")
+    assert any("chạy nền" in l for l in lines)
+    assert yaml.safe_load(sb_path.read_text())["scenes"][1]["prompt"] == "Lan smiles at the window"
+    assert p.data["resent"] == ["s02"] and p.stage("videos")["status"] == "done"
+    assert p._softener is None  # worker pool closed
+
+
+def test_softener_requeue_waits_only_while_rewrites_are_pending(env, monkeypatch):
+    sb_path, _, _ = env
+    p, _ = _pilot(sb_path, review=False)
+    soft = autopilot._Softener(p)
+    assert soft.requeue(True) == []  # nothing pending: never blocks
+    monkeypatch.setattr(reviewer, "soften_scene", lambda sb, sid, err, **kw: reviewer.SceneFix(id=sid, prompt="calm"))
+    assert soft.start(p.sb(), "s03", "Muse: couldn't be generated")
+    assert not soft.start(p.sb(), "s03", "again")  # already rewriting
+    got = soft.requeue(True)
+    assert [s.id for s in got] == ["s03"] and got[0].prompt.startswith("calm")
+    p.data["softened"]["s03"] = [{}] * autopilot.MAX_SOFTEN
+    assert not soft.start(p.sb(), "s03", "x")  # out of rewrites
+    soft.close()
+
+
+def _basic_raw() -> dict:
+    return {"characters": [{"name": "Prasert", "description": "stocky man"}],
+            "scenes": [{"id": "s07", "mode": "keyframe", "prompt": "old", "narration": "old line",
+                        "video_shot": {"camera": "Static medium two-shot",
+                                       "action": "the man gives a cryptic slight smile",
+                                       "speaker": {"position": "frame left", "visual_tag": "the stocky man",
+                                                   "line": "old line"}}}]}
+
+
+def test_soften_rewrites_the_video_shot_that_is_actually_sent():
+    # thai-tham-ruong-cua-bo s07: basic films send `video_shot`, not `prompt`. Three rewrites changed only
+    # `prompt` and dialogue, so Muse got the very same refused prompt each time.
+    from filmmaker.i2v_prompt import VideoShot
+    raw = _basic_raw()
+    shot = VideoShot.model_validate({"camera": "Static medium shot", "action": "the man smiles warmly",
+                                     "speaker": {"position": "frame left", "visual_tag": "the stocky man",
+                                                 "line": "new line"}})
+    fix = reviewer.SoftenFix(id="s07", prompt="the man smiles warmly", video_shot=shot)
+    assert reviewer.apply_scene_fixes(raw, [fix]) == ["s07"]
+    vs = raw["scenes"][0]["video_shot"]
+    assert vs["action"] == "the man smiles warmly" and vs["speaker"]["line"] == "new line"
+
+
+def test_new_dialogue_reaches_the_video_shot_speaker_without_a_new_shot():
+    raw = _basic_raw()
+    fix = reviewer.SoftenFix(id="s07", dialogue=[reviewer.DialogueFix(character="Prasert", line="new line")])
+    reviewer.apply_scene_fixes(raw, [fix])
+    assert raw["scenes"][0]["video_shot"]["speaker"]["line"] == "new line"
+
+
+def test_soften_scene_asks_for_the_video_shot(tmp_path, monkeypatch):
+    raw = _basic_raw()
+    raw.update(title="t", format="short_film", audio="dialogue", dialogue_language="Thai")
+    raw["scenes"][0]["image_prompt"] = "two men in a rice field"
+    p = tmp_path / "storyboard.yaml"
+    p.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+    sb = load_storyboard(p)
+    got = {}
+    monkeypatch.setattr(reviewer.ai, "ask", lambda system, user, schema, **kw: got.update(user=user, schema=schema)
+                        or schema(id="s07"))
+    reviewer.soften_scene(sb, "s07", MUSE_ERR, earlier=[{"prompt": "x", "video_shot": {"action": "earlier act"}}])
+    assert got["schema"] is reviewer.SoftenFix
+    assert "cryptic slight smile" in got["user"] and "video_shot" in got["user"] and "earlier act" in got["user"]

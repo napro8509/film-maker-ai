@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from . import ai, rules
+from .i2v_prompt import VideoShot
 from .storyboard import NO_DIALOGUE, Camera, Storyboard
 
 Verdict = Literal["PASS", "REVISE"]
@@ -44,6 +45,12 @@ class SceneFix(BaseModel):
     dialogue: list[DialogueFix] | None = Field(default=None, description="Full corrected dialogue of the scene, only when it must change.")
     camera: Camera | None = Field(default=None, description="Full new camera direction (replaces the old one), only "
                                   "when the shot itself changes (a new framing or composition).")
+
+
+class SoftenFix(SceneFix):
+    video_shot: VideoShot | None = Field(default=None, description="Full new structured video shot (camera, action, "
+                                         "environment, audio, speaker, listeners). Required when the scene has one: it "
+                                         "is what the video model gets, `prompt` alone changes nothing.")
 
 
 class StoryboardReview(BaseModel):
@@ -218,6 +225,15 @@ child-safety filter: keep the beat but frame it so the child is a natural part o
 adult (medium or wide shot, fully dressed, awake and calm or playful), drop exact ages and body details, and
 move close-ups or the line to the adult.
 
+When the error comes from Muse ("Muse báo không tạo được", "Muse không tạo"), Muse gave no reason; it refuses
+on the moment as a whole. It most often refuses: tears, crying, a trembling chin, a voice breaking with emotion,
+grief or death; a character described as sly, smug, cryptic, knowing, unctuous, menacing or predatory (e.g. a
+money lender over an old man); pressure about debt or money on a vulnerable person; fear or confusion on an
+elderly face. Keep the story beat but make faces calm and warm, gestures friendly, the speaker polite and
+sincere, the listener attentive or gently surprised. Keep every dialogue line word for word on the first
+rewrite. Only when earlier rewrites with the same line were refused too, rephrase the line in the same language
+with the same meaning, avoiding money, debt and death words.
+
 When earlier rewrites of the scene are listed and Flow refused them the same way, rewording was not enough:
 Flow judges the opening picture and the whole moment, not single words. Change what is SHOWN, not just the
 wording. Re-stage the shot so it no longer recreates a well-known real photo, news footage or famous moment:
@@ -349,7 +365,7 @@ def review_film(sb: Storyboard, sheet: Path | None, thumbnail: Path | None, extr
     return ai.ask(FILM_SYSTEM, user, FilmReview, images=images, **_ai_kw(sb, kw))
 
 
-def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SceneFix:
+def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | None = None, **kw) -> SoftenFix:
     """`earlier`: previous rewrites of this scene that Flow refused too ({prompt, image_prompt, dialogue}),
     oldest first. With them Claude re-stages the shot instead of rewording it again."""
     user = (storyboard_brief(sb) + f"\n\nScene {sid} was blocked by Flow: {error[:500]}\n"
@@ -360,6 +376,8 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
         for i, e in enumerate(earlier[-4:], 1):
             user += f"\n  attempt {i}: opening frame: {str(e.get('image_prompt') or '-')[:600]}"
             user += f"\n             action: {str(e.get('prompt') or '-')[:600]}"
+            if isinstance(e.get("video_shot"), dict):
+                user += f"\n             video shot: {json.dumps(e['video_shot'], ensure_ascii=False)[:900]}"
             if e.get("dialogue"):
                 user += "\n             dialogue: " + " / ".join(
                     f"{d.get('character')}: {d.get('line')}" for d in e["dialogue"] if isinstance(d, dict))
@@ -371,10 +389,21 @@ def soften_scene(sb: Storyboard, sid: str, error: str, earlier: list[dict] | Non
     if HARMFUL in error.lower():
         user += ("\nFlow refused it as “harmful content”: show the beat safely, as the instructions say (no child "
                  "who looks unconscious, limp or in danger).")
+    if "muse" in error.lower():
+        user += ("\nMuse refused it without a reason: soften it as the instructions for Muse say"
+                 + (" and, since the same line was refused before, rephrase the dialogue too." if earlier else
+                    ", keeping the dialogue word for word.")
+                 )
     if AUDIO_FAILED in error.lower():
         user += ("\nFlow said “Audio generation failed”: rewrite the dialogue, its delivery and the action as "
                  "the instructions say, keeping the story point.")
-    return ai.ask(SOFTEN_SYSTEM, user, SceneFix, **_ai_kw(sb, kw))
+    scene = next((s for s in sb.scenes if s.id == sid), None)
+    if scene is not None and scene.video_shot is not None:
+        user += ("\nThis scene's video is made from its structured video shot, not from `action`: "
+                 + json.dumps(scene.video_shot.model_dump(exclude_none=True), ensure_ascii=False)
+                 + "\nReturn the full rewritten `video_shot` (same fields; the speaker's line in the same language, "
+                   "matching `dialogue` and `narration`), softened the same way as the rest of the scene.")
+    return ai.ask(SOFTEN_SYSTEM, user, SoftenFix, **_ai_kw(sb, kw))
 
 
 # --- applying fixes to the storyboard (raw YAML dict) ----------------------------
@@ -419,6 +448,19 @@ def apply_scene_fixes(raw: dict, fixes: list[SceneFix]) -> list[str]:
                     scene["camera"] = cam
                 else:
                     scene.pop("camera", None)
+                touched = True
+        shot = getattr(fix, "video_shot", None)
+        if shot is not None and not shot.is_empty():
+            new_shot = shot.model_dump(exclude_none=True)
+            if new_shot != (scene.get("video_shot") or {}):
+                scene["video_shot"] = new_shot
+                touched = True
+        elif fix.dialogue is not None and isinstance(scene.get("video_shot"), dict):
+            # the video is made from video_shot: a new line must reach its speaker too
+            sp = scene["video_shot"].get("speaker")
+            line = next((d.line.strip() for d in fix.dialogue if d.line.strip()), "")
+            if isinstance(sp, dict) and line and sp.get("line") != line:
+                sp["line"] = line
                 touched = True
         if fix.dialogue is not None:
             rows = [d.model_dump(exclude_none=True) for d in fix.dialogue

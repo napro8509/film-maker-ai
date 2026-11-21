@@ -2193,7 +2193,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return 0.0
 
     def _scene_snapshot(scene: dict) -> dict[str, Any]:
-        return {k: scene.get(k) for k in ("prompt", "image_prompt", "dialogue", "camera")}
+        return {k: scene.get(k) for k in ("prompt", "image_prompt", "dialogue", "camera", "video_shot")}
 
     @app.post("/api/projects/{pid}/scenes/{sid}/rewrite-prompt")
     def rewrite_prompt(pid: str, sid: str, body: RewriteBody | None = None) -> dict[str, Any]:

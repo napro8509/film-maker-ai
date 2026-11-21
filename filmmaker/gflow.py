@@ -144,6 +144,15 @@ def is_muse(model: str | None) -> bool:
     return (model or "").strip().lower() == MUSE_MODEL
 
 
+#: The Flow image model a picture falls back to when Muse could not make it.
+FLOW_FALLBACK_IMAGE_MODEL = "nano2"
+
+
+def other_image_model(model: str | None) -> str:
+    """The other picture service: a picture Muse could not make is made on Flow, and the other way round."""
+    return FLOW_FALLBACK_IMAGE_MODEL if is_muse(model) else MUSE_MODEL
+
+
 #: muse_ui.py exit codes: Muse wrote back instead of making it / its own "Failed to create" task row.
 MUSE_DECLINED, MUSE_FAILED = 41, 42
 

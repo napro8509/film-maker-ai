@@ -12,6 +12,7 @@ import json
 import random
 import re
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ from typing import Any, Callable, Collection, Literal
 from . import durations as dur
 from . import flow_caps, manual_clip, model_meta, ref_caps
 from . import progress as prog
-from .gflow import EXIT_NOT_PORTED, Gflow, GflowError, is_muse
+from .gflow import EXIT_NOT_PORTED, Gflow, GflowError, is_muse, other_image_model
 from .flow_ui import character_ref
 from .storyboard import MAX_REFS, Character, Location, RefItem, Scene, Storyboard, file_sha  # noqa: F401
 from .thumbnail import render_cover
@@ -99,6 +100,12 @@ class RunOptions:
     refuse: Callable[[Scene], str | None] = lambda _s: None
     # web: only resend "submitting" scenes whose id is here; None = CLI rules (force/retry_unknown)
     confirm: set[str] | None = None
+    # a scene failed (its state is already saved): e.g. start rewriting a refused prompt in the background
+    on_failed: Callable[[Scene, GflowError], None] = lambda _s, _e: None
+    # scenes to send (again) in this same run, e.g. once their rewritten prompt is ready. Polled between scenes
+    # with wait=False; with wait=True (nothing else left to send) it may block until one is ready, and [] means
+    # there is nothing more to wait for.
+    requeue: Callable[[bool], list[Scene]] = lambda _wait: []
 
 
 @dataclass
@@ -503,11 +510,13 @@ class Pipeline:
         """Pictures and every scene's video are made on Muse: nothing of this film goes to Flow."""
         return is_muse(self.sb.image_model) and all(is_muse(s.model or self.sb.model) for s in self.sb.scenes)
 
-    def ensure_project(self) -> str:
+    def ensure_project(self, *, for_flow: bool = False) -> str:
+        """The film's Flow project. `for_flow`: one is needed even in a film made on Muse only (a picture Muse
+        could not make goes to Flow)."""
         pid = self.sb.project_id or self.state.data.get("project_id")
         if pid:
             return pid
-        if self.flow_free():
+        if self.flow_free() and not for_flow:
             return ""  # no Flow project is ever needed
         self.log(f"Tạo project Flow mới: {self.sb.title}")
         pid = self.g.create_project(self.sb.title)
@@ -570,6 +579,8 @@ class Pipeline:
         if report.skipped:
             self.log(f"Đã xong từ trước (bỏ qua): {', '.join(report.skipped)}")
         if not todo:
+            todo = self._take_requeued(opts, wait=True)  # e.g. only scenes whose prompt is being rewritten
+        if not todo:
             self.log("Không còn cảnh nào cần tạo.")
             return report
 
@@ -598,7 +609,21 @@ class Pipeline:
     def _send_scenes(self, todo: list[Scene], resend: set[str], project: str, opts: RunOptions,
                      report: RunReport) -> RunReport:
         sent = False  # pause only between real submissions, not after a scene `refuse` skipped
-        for s in todo:
+        queue = deque(todo)
+        while True:
+            # a scene whose new prompt is ready goes first: back to it right away, the rest follow
+            ready = self._take_requeued(opts, wait=not queue and not opts.should_stop())
+            queue.extendleft(reversed(ready))
+            if not queue:
+                break
+            s = queue.popleft()
+            if not project and not self._muse_only([s]):
+                try:
+                    project = self.ensure_project()
+                except GflowError as exc:
+                    self.rep.drop_queued()
+                    report.aborted = str(exc)
+                    break
             if opts.should_stop():
                 self.rep.drop_queued()
                 report.stopped = True
@@ -645,6 +670,8 @@ class Pipeline:
                                           submitted_at=None)
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
+                if not exc.fatal and not opts.fail_fast:
+                    opts.on_failed(s, exc)
                 if exc.fatal:
                     self.rep.drop_queued()
                     report.aborted = f"dừng toàn bộ vì lỗi nghiêm trọng ở {s.id} (exit {exc.exit_code})"
@@ -654,12 +681,27 @@ class Pipeline:
                     report.aborted = f"--fail-fast: dừng ở {s.id}"
                     break
                 continue
+            report.failed.pop(s.id, None)  # sent again in this run (new prompt) and made it
             report.done.append(s.id)
             self.log(f"[{s.id}] {'(dry-run) sẽ lưu' if self.g.dry_run else 'OK'} -> {video}")
             self.rep.done(f"vid:{s.id}")  # before after_scene: a slow backup must not keep the overlay
             if not self.g.dry_run:
                 opts.after_scene(s.id)
         return report
+
+    def _take_requeued(self, opts: RunOptions, *, wait: bool) -> list[Scene]:
+        """Scenes `opts.requeue` hands back (their storyboard entry changed, e.g. a softened prompt): they replace
+        the old version in `self.sb`, so the stale keyframe is remade and the new prompt is sent."""
+        out: list[Scene] = []
+        for s in opts.requeue(wait) or []:
+            idx = next((i for i, x in enumerate(self.sb.scenes) if x.id == s.id), None)
+            if idx is None:
+                continue
+            self.sb.scenes[idx] = s
+            self.rep.queued(f"vid:{s.id}")
+            self.log(f"[{s.id}] prompt mới đã sẵn sàng: quay lại tạo video cảnh này")
+            out.append(s)
+        return out
 
     def _keyframe(self, s: Scene, project: str, opts: RunOptions, *, remake: bool) -> Path:
         kf = self.keyframe_path(s)
@@ -714,9 +756,9 @@ class Pipeline:
 
     def _generate_one_keyframe(self, sent: str, dest: Path, refs: list[tuple[str, Path]], kinds: list[str],
                                project: str, opts: RunOptions, *, src: Scene | None, loc: Location | None,
-                               quiet_refs: bool = False) -> tuple[Path, bool]:
+                               quiet_refs: bool = False, model: str | None = None) -> tuple[Path, bool]:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        kw = dict(out=dest, aspect=self.sb.aspect, model=self.sb.image_model, project=project)
+        kw = dict(out=dest, aspect=self.sb.aspect, model=model or self.sb.image_model, project=project)
         img = None
         if refs:
             log_line = "" if (quiet_refs or loc is not None) else None
@@ -739,9 +781,9 @@ class Pipeline:
 
     def _generate_candidates_parallel(self, sent: str, paths: list[Path], refs: list[tuple[str, Path]],
                                       kinds: list[str], project: str, opts: RunOptions, *, src: Scene | None,
-                                      loc: Location | None) -> tuple[list[Path], bool]:
+                                      loc: Location | None, model: str | None = None) -> tuple[list[Path], bool]:
         """Generate `len(paths)` candidate keyframes in parallel (ViMax style). Pre-warms `flow_refs` once."""
-        if refs and not is_muse(self.sb.image_model) and project and project not in self._no_media_refs:
+        if refs and not is_muse(model or self.sb.image_model) and project and project not in self._no_media_refs:
             try:
                 self.flow_refs(refs, project)
             except Exception:
@@ -751,7 +793,7 @@ class Pipeline:
 
         def worker(idx: int, dest: Path) -> tuple[int, Path, bool]:
             p, ch = self._generate_one_keyframe(sent, dest, refs, kinds, project, opts,
-                                                src=src, loc=loc, quiet_refs=(idx > 0))
+                                                src=src, loc=loc, quiet_refs=(idx > 0), model=model)
             return idx, p, ch
 
         with ThreadPoolExecutor(max_workers=len(paths)) as pool:
@@ -773,6 +815,60 @@ class Pipeline:
             made = [results[0][1]]
         any_chained = any(ch for _, _, ch in results)
         return made, any_chained
+
+    @staticmethod
+    def _image_ai(model: str | None) -> str:
+        return "Muse" if is_muse(model) else "Flow"
+
+    def _project_for(self, model: str, project: str) -> str:
+        """The project a picture made with `model` needs: a Flow picture in a Muse-only film still needs one."""
+        if is_muse(model) or project:
+            return project
+        return self.ensure_project(for_flow=True)
+
+    def _on_other_ai(self, first: GflowError, alt: str, fn: Callable[[], Any]) -> Any:
+        """Run the other-AI attempt; when it fails too, the first AI's error is the one reported."""
+        try:
+            return fn()
+        except GflowError as exc:
+            if exc.fatal:
+                raise
+            self.log(f"  ⚠ {self._image_ai(alt)} cũng không tạo được ({exc}).")
+            raise first from exc
+
+    def _keyframe_other_ai(self, s: Scene, s_retry: Scene, sel: dict[str, Any], chained: bool,
+                           refs: list[tuple[str, Path]], kinds: list[str], project: str, opts: RunOptions, *,
+                           n_cand: int, src: Scene | None, loc: Location | None) -> tuple[dict[str, Any], bool]:
+        """Two rounds on the film's picture AI and every keyframe still fails Pre-QC: this one picture is made on
+        the other AI (Muse <-> Flow). Every other picture and the video keep the AI chosen for the film."""
+        from . import qc
+
+        alt = other_image_model(self.sb.image_model)
+        self.log(f"  ⇄ [ViMax Pre-QC] {self._image_ai(self.sb.image_model)} 2 lần vẫn chưa đạt — tạo riêng keyframe "
+                 f"{s.id} bằng {self._image_ai(alt)}…")
+        cdir = self.candidate_dir()
+        alt_paths = [cdir / f"{s.id}_a{i}.png" for i in range(1, n_cand + 1)]
+        sent_alt = self.sb.for_flow_keyframe(self.sb.image_prompt(s_retry), s_retry)
+        try:
+            made_alt, ch_alt = self._generate_candidates_parallel(sent_alt, alt_paths, refs, kinds,
+                                                                  self._project_for(alt, project), opts,
+                                                                  src=src, loc=loc, model=alt)
+        except GflowError as exc:
+            if exc.fatal:
+                raise
+            self.log(f"  ⚠ [ViMax Pre-QC] {self._image_ai(alt)} cũng không tạo được ({exc}); giữ ứng viên tốt nhất.")
+            return sel, chained
+        sel_alt = qc.select_best_keyframe(self.sb, s_retry, made_alt, **opts.ai_kw)
+        rank = {"PASS": 2, "MINOR": 1, "FAIL": 0}
+        tag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel_alt["verdict"]]
+        self.log(f"  {tag} [ViMax Pre-QC · {self._image_ai(alt)}] Chọn ứng viên #{sel_alt['best_index']}/"
+                 f"{len(made_alt)} ({sel_alt['verdict']} {sel_alt['score']}/10)")
+        if (rank[sel_alt["verdict"]], sel_alt["score"]) < (rank[sel["verdict"]], sel["score"]):
+            for p in alt_paths:
+                p.unlink(missing_ok=True)
+            return sel, chained
+        sel_alt["image_model"] = alt
+        return sel_alt, chained or ch_alt
 
     def _make_keyframe(self, s: Scene, project: str, opts: RunOptions) -> Path:
         kf = self.keyframe_path(s)
@@ -803,11 +899,20 @@ class Pipeline:
         if not self.g.dry_run:
             cdir0 = self.candidate_dir()
             if cdir0.is_dir():
-                for old_p in (*cdir0.glob(f"{s.id}_c*.png"), *cdir0.glob(f"{s.id}_r*.png")):
+                for old_p in (*cdir0.glob(f"{s.id}_c*.png"), *cdir0.glob(f"{s.id}_r*.png"), *cdir0.glob(f"{s.id}_a*.png")):
                     old_p.unlink(missing_ok=True)
 
         if not use_vimax:
-            _, chained = self._generate_one_keyframe(sent, kf, refs, kinds, project, opts, src=src, loc=loc)
+            try:
+                _, chained = self._generate_one_keyframe(sent, kf, refs, kinds, project, opts, src=src, loc=loc)
+            except GflowError as exc:
+                if exc.fatal or self.g.dry_run:
+                    raise
+                alt = other_image_model(self.sb.image_model)
+                self.log(f"  ⇄ [{s.id}] {self._image_ai(self.sb.image_model)} không tạo được keyframe ({exc}); "
+                         f"tạo riêng ảnh này bằng {self._image_ai(alt)}…")
+                _, chained = self._on_other_ai(exc, alt, lambda: self._generate_one_keyframe(
+                    sent, kf, refs, kinds, self._project_for(alt, project), opts, src=src, loc=loc, model=alt))
             if not self.g.dry_run:
                 extra: dict[str, Any] = {}
                 # Old storyboards (no location) never get the new keys in state.json.
@@ -827,8 +932,17 @@ class Pipeline:
         cand_paths = [cdir / f"{s.id}_c{i}.png" for i in range(1, n_cand + 1)]
         if n_cand > 1:
             self.log(f"  [ViMax Pre-QC] Sinh song song {n_cand} keyframe ứng viên cho {s.id}…")
-        made, chained = self._generate_candidates_parallel(sent, cand_paths, refs, kinds, project, opts,
-                                                           src=src, loc=loc)
+        try:
+            made, chained = self._generate_candidates_parallel(sent, cand_paths, refs, kinds, project, opts,
+                                                               src=src, loc=loc)
+        except GflowError as exc:
+            if exc.fatal:
+                raise
+            alt = other_image_model(self.sb.image_model)
+            self.log(f"  ⇄ [{s.id}] {self._image_ai(self.sb.image_model)} không tạo được keyframe ({exc}); "
+                     f"tạo riêng ảnh này bằng {self._image_ai(alt)}…")
+            made, chained = self._on_other_ai(exc, alt, lambda: self._generate_candidates_parallel(
+                sent, cand_paths, refs, kinds, self._project_for(alt, project), opts, src=src, loc=loc, model=alt))
         sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
         tag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel["verdict"]]
         self.log(
@@ -872,6 +986,9 @@ class Pipeline:
                 if exc.fatal:
                     raise
                 self.log(f"  ⚠ [ViMax Pre-QC] Không tạo lại được ứng viên vòng 2 ({exc}); giữ ứng viên tốt nhất vòng 1.")
+            if sel["verdict"] == "FAIL":
+                sel, chained = self._keyframe_other_ai(s, s_retry, sel, chained, refs, kinds, project, opts,
+                                                       n_cand=n_cand, src=src, loc=loc)
 
         best_file = Path(sel["best_path"])
         if best_file != kf and best_file.is_file():
@@ -944,11 +1061,21 @@ class Pipeline:
                     if key_prefix == "char" and self.use_flow_characters():
                         img = self._flow_character_image(c, prompt, dest, project)
                     if img is None:
-                        img = self._with_retries(
-                            f"tạo {label}",
-                            lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest, aspect=self.sb.aspect,
-                                                         model=self.sb.image_model, project=project),
-                            opts.max_retries)
+                        def _t2i(model: str, proj: str) -> Path:
+                            return self._with_retries(
+                                f"tạo {label}",
+                                lambda: self.g.text_to_image(self.sb.for_flow(prompt), out=dest,
+                                                             aspect=self.sb.aspect, model=model, project=proj),
+                                opts.max_retries)
+                        try:
+                            img = _t2i(self.sb.image_model, project)
+                        except GflowError as exc:
+                            if exc.fatal or self.g.dry_run:
+                                raise
+                            alt = other_image_model(self.sb.image_model)
+                            self.log(f"  ⇄ [{c.name}] {self._image_ai(self.sb.image_model)} không tạo được {label} "
+                                     f"({exc}); tạo riêng ảnh này bằng {self._image_ai(alt)}…")
+                            img = self._on_other_ai(exc, alt, lambda: _t2i(alt, self._project_for(alt, project)))
             except GflowError as exc:
                 self.rep.failed(key)
                 report.failed[c.name] = str(exc)
@@ -1044,6 +1171,8 @@ class Pipeline:
             except GflowError as exc:
                 report.failed[s.id] = str(exc)
                 self.log(f"[{s.id}] LỖI: {exc}")
+                if not exc.fatal and not opts.fail_fast:
+                    opts.on_failed(s, exc)
                 if exc.fatal:
                     self.rep.drop_queued()
                     report.aborted = f"dừng vì lỗi nghiêm trọng ở {s.id} (exit {exc.exit_code})"

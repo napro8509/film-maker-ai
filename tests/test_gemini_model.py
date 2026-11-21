@@ -359,8 +359,8 @@ def test_planner_translate_and_titles_and_downstream_modules_route_to_gemini(tmp
         seen_ask.append({"schema": schema.__name__, **kw})
         if schema is reviewer.StoryboardReview:
             return reviewer.StoryboardReview(verdict="PASS", score=9, summary="Tốt")
-        if schema is reviewer.SceneFix:
-            return reviewer.SceneFix(id="s01", prompt="Safe prompt")
+        if schema in (reviewer.SceneFix, reviewer.SoftenFix):
+            return schema(id="s01", prompt="Safe prompt")
         if schema is social.SocialPack:
             return social.SocialPack(
                 posts=[social.Post(platform="facebook", language="Vietnamese", title="T", hook="H", caption="C", hashtags=["phim"])]
