@@ -3309,30 +3309,113 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     continue
         return sorted(out, key=lambda x: -x["created"])
 
+    def clone_model(mode: str, model: str | None) -> str:
+        if mode not in CLONE_MODELS:
+            raise HTTPException(400, f"Không có chế độ {mode}.")
+        model = model or CLONE_MODELS[mode][0]
+        if model not in CLONE_MODELS[mode]:
+            raise HTTPException(400, f"Model {model} không dùng được cho chế độ này.")
+        return model
+
+    def start_clone_job(source: str, folder: Path, kid: str, mode: str, model: str, *, title: str = "",
+                        upload: Path | None = None) -> dict[str, Any]:
+        backend = _ai_backend_or_400(ai_mod.DEFAULT_AI_MODEL)
+
+        def work(job: Job) -> dict[str, Any]:
+            job.log(f"Clone video: {title or source}")
+            try:
+                cl.init(source, folder, durations=cl.MODEL_DURATIONS[model], model=model, mode=mode,
+                        backend=backend, log=job.log)
+                if title:  # an uploaded file: keep its own name, not the temporary one
+                    data = cl.load(folder)
+                    data["title"], data["source"] = title, ""
+                    cl.save(folder, data)
+            except Exception:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
+            finally:
+                if upload:
+                    upload.unlink(missing_ok=True)
+            job.log("✔ Xong. Kiểm tra nhân vật mới: tải ảnh nhân vật lên, hoặc bấm “Tạo nhân vật” từ mô tả (miễn phí).")
+            return {"clone": kid}
+
+        return jobs.start("clone_init", "Clone video: tải & chia đoạn", None, work).public()
+
     @app.post("/api/clones")
     def start_clone(body: CloneStartBody) -> dict[str, Any]:
         url = body.url.strip()
         if not va.is_url(url):
             raise HTTPException(400, "Hãy dán một link http(s) tới video.")
-        model = body.model or CLONE_MODELS[body.mode][0]
-        if model not in CLONE_MODELS[body.mode]:
-            raise HTTPException(400, f"Model {model} không dùng được cho chế độ này.")
-        backend = _ai_backend_or_400(ai_mod.DEFAULT_AI_MODEL)
+        model = clone_model(body.mode, body.model)
         kid = va.new_id(re.sub(r"^https?://(www\.)?", "", url).split("/")[0])
+        return start_clone_job(url, clones_root / kid, kid, body.mode, model)
+
+    @app.post("/api/clones/upload")
+    async def start_clone_upload(file: UploadFile = File(...), mode: str = Form("regen"),
+                                 model: str = Form("")) -> dict[str, Any]:
+        """Clone a video file from this computer (instead of a link)."""
+        name = Path(file.filename or "video.mp4").name
+        ext = Path(name).suffix.lower()
+        if ext not in va.VIDEO_EXTS:
+            raise HTTPException(400, f"Chỉ nhận file video {', '.join(va.VIDEO_EXTS)}")
+        model = clone_model(mode, model or None)
+        _ai_backend_or_400(ai_mod.DEFAULT_AI_MODEL)  # fail before the upload is written
+        kid = va.new_id(slugify(Path(name).stem)[:24] or "video")
         folder = clones_root / kid
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f"upload{ext}"
+        try:
+            with tmp.open("wb") as fh:
+                while chunk := await file.read(1 << 20):
+                    fh.write(chunk)
+        except Exception:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        if not tmp.stat().st_size:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(400, "File video rỗng.")
+        return start_clone_job(str(tmp), folder, kid, mode, model, title=Path(name).stem, upload=tmp)
 
-        def work(job: Job) -> dict[str, Any]:
-            job.log(f"Clone video: {url}")
-            try:
-                cl.init(url, folder, durations=cl.MODEL_DURATIONS[model], model=model, mode=body.mode,
-                        backend=backend, log=job.log)
-            except Exception:
-                shutil.rmtree(folder, ignore_errors=True)
-                raise
-            job.log("✔ Xong. Kiểm tra nhân vật mới rồi bấm “Tạo nhân vật” (miễn phí).")
-            return {"clone": kid}
+    @app.post("/api/clones/{kid}/cast/picture")
+    async def clone_cast_picture(kid: str, name: str = Form(...), file: UploadFile = File(...)) -> dict[str, Any]:
+        """Your own picture for one cast member: it becomes that person's reference (no Flow character needed)."""
+        folder = kdir(kid)
+        if clone_busy(kid):
+            raise HTTPException(409, detail={"message": "Bản clone này đang chạy; chờ xong rồi sửa.", "reason": "job_running"})
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in IMAGE_EXT:
+            raise HTTPException(400, f"Chỉ nhận ảnh {', '.join(sorted(IMAGE_EXT))}")
+        data = cl.load(folder)
+        c = next((x for x in data.get("cast") or [] if x.get("name") == name), None)
+        if c is None:
+            raise HTTPException(404, f"Không có nhân vật {name} (bấm Lưu trước nếu vừa thêm/đổi tên).")
+        d = folder / "cast"
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / f"{slugify(name) or 'nhan-vat'}-upload{ext}"
+        for old in d.glob(f"{dest.stem}.*"):
+            old.unlink()
+        with dest.open("wb") as fh:
+            while chunk := await file.read(1 << 20):
+                fh.write(chunk)
+        rel = dest.relative_to(folder).as_posix()
+        c.update(ref=rel, picture=rel, uploaded=True)
+        cl.save(folder, data)
+        return get_clone(kid)
 
-        return jobs.start("clone_init", "Clone video: tải & chia đoạn", None, work).public()
+    @app.delete("/api/clones/{kid}/cast/picture")
+    def clone_cast_picture_delete(kid: str, name: str) -> dict[str, Any]:
+        folder = kdir(kid)
+        if clone_busy(kid):
+            raise HTTPException(409, detail={"message": "Bản clone này đang chạy; chờ xong rồi sửa.", "reason": "job_running"})
+        data = cl.load(folder)
+        c = next((x for x in data.get("cast") or [] if x.get("name") == name), None)
+        if c is None:
+            raise HTTPException(404, f"Không có nhân vật {name}.")
+        c["ref"] = ""
+        c.pop("picture", None)
+        c.pop("uploaded", None)
+        cl.save(folder, data)
+        return get_clone(kid)
 
     @app.get("/api/clones/{kid}")
     def get_clone(kid: str) -> dict[str, Any]:
@@ -3371,7 +3454,8 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                     raise HTTPException(400, f"Trùng tên nhân vật: {name}")
                 prev = old.get(c.get("old_name") or name) or {}
                 item = {**prev, **{k: str(c.get(k) or "").strip() for k in CAST_KEYS}}
-                if prev and (item["new_look"] != prev.get("new_look") or item["name"] != prev.get("name")):
+                if prev and not prev.get("uploaded") and (item["new_look"] != prev.get("new_look")
+                                                          or item["name"] != prev.get("name")):
                     item["ref"] = ""  # a new look needs a new Flow character
                     item.pop("picture", None)
                 item.setdefault("ref", "")

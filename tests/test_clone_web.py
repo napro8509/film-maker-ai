@@ -155,3 +155,66 @@ def test_clone_run_redo_and_edit_mode_needs_rights(client, monkeypatch):
     data["mode"] = "edit"
     cl.save(folder, data)
     assert c.post(f"/api/clones/{kid}/run", json={}).status_code == 400
+
+
+def test_clone_upload_video_file(client, monkeypatch):
+    c = client
+    seen = []
+
+    def init(source, folder, **kw):
+        seen.append(Path(source).read_bytes())  # the uploaded file is there while init reads it
+        return _fake_init([])(source, folder, **kw)
+
+    monkeypatch.setattr(cl, "init", init)
+    bad = c.post("/api/clones/upload", files={"file": ("x.txt", b"hi", "text/plain")})
+    assert bad.status_code == 400
+    assert c.post("/api/clones/upload", data={"mode": "edit", "model": "veo-lite"},
+                  files={"file": ("a.mp4", b"mp4", "video/mp4")}).status_code == 400
+    assert c.post("/api/clones/upload", files={"file": ("a.mp4", b"", "video/mp4")}).status_code == 400
+    assert not list((c.ws / ".clones").iterdir())  # refused uploads leave nothing behind
+    r = c.post("/api/clones/upload", data={"mode": "regen", "model": "omni-1.2-flash"},
+               files={"file": ("Bữa sáng nhà Mai.MOV", b"video-bytes", "video/quicktime")})
+    j = _wait(c, r.json())
+    assert j["status"] == "done", j["lines"]
+    kid = j["result"]["clone"]
+    folder = c.ws / ".clones" / kid
+    assert seen == [b"video-bytes"]
+    assert not list(folder.glob("upload.*"))  # the temporary copy is gone
+    d = c.get(f"/api/clones/{kid}").json()
+    assert d["title"] == "Bữa sáng nhà Mai" and d["source"] == "" and d["model"] == "omni-1.2-flash"
+
+
+def test_clone_upload_failed_init_cleans_up(client, monkeypatch):
+    c = client
+
+    def boom(source, folder, **_):
+        raise RuntimeError("ffprobe failed")
+
+    monkeypatch.setattr(cl, "init", boom)
+    j = _wait(c, c.post("/api/clones/upload", files={"file": ("a.mp4", b"x", "video/mp4")}).json())
+    assert j["status"] == "failed"
+    assert not list((c.ws / ".clones").iterdir())
+
+
+def test_clone_cast_picture_upload(client, monkeypatch):
+    c = client
+    kid = _make(c, monkeypatch)
+    folder = c.ws / ".clones" / kid
+    url = f"/api/clones/{kid}/cast/picture"
+    assert c.post(url, data={"name": "Mẹ"}, files={"file": ("a.gif", b"g", "image/gif")}).status_code == 400
+    assert c.post(url, data={"name": "Ai"}, files={"file": ("a.png", b"p", "image/png")}).status_code == 404
+    d = c.post(url, data={"name": "Mẹ"}, files={"file": ("me.png", b"png1", "image/png")}).json()
+    m = d["cast"][0]
+    assert m["uploaded"] and m["ref"] == m["picture"] and m["ref"].startswith("cast/")
+    assert c.get(m["picture_url"]).content == b"png1"
+    assert cl.segment_refs(folder, cl.load(folder)) == [str(folder / m["ref"])]
+    # a new picture replaces the old one (another extension too)
+    d = c.post(url, data={"name": "Mẹ"}, files={"file": ("me.jpg", b"jpg2", "image/jpeg")}).json()
+    assert [p.name for p in (folder / "cast").iterdir()] == [Path(d["cast"][0]["ref"]).name]
+    # editing the look keeps your own picture (only a Flow character made from the look is dropped)
+    r = c.put(f"/api/clones/{kid}", json={"cast": [{"name": "Mẹ", "replaces": "the woman", "new_look": "red"}]})
+    assert r.json()["cast"][0]["ref"] == d["cast"][0]["ref"]
+    # “Tạo nhân vật” then has nothing to make for her
+    assert cl.make_cast(folder, gf=None, log=lambda *_: None)[0]["ref"] == d["cast"][0]["ref"]
+    d = c.delete(url, params={"name": "Mẹ"}).json()
+    assert d["cast"][0]["ref"] == "" and not d["cast"][0].get("uploaded")

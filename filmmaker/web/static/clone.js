@@ -52,12 +52,36 @@ function renderCloneStart() {
   };
   model.onchange = () => { if (mode === "regen") localSet("cloneModel", model.value); };
   paint();
+  let picked = null;  // a video file from this computer, used instead of the link
+  const fileName = h("span", { class: "muted small ellipsis" }, "");
+  const clearFile = h("button", { type: "button", class: "btn sm ghost icon hidden", title: "Bỏ file", "aria-label": "Bỏ file video đã chọn", onclick: () => pickFile(null) }, icon("x"));
+  const fileInput = h("input", { type: "file", accept: "video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.m4v,.webm,.mkv", class: "hidden",
+    onchange: (e) => pickFile(e.target.files[0] || null) });
+  const pickFile = (f) => {
+    picked = f;
+    if (!f) fileInput.value = "";
+    fileName.textContent = f ? `${f.name} · ${(f.size / 1048576).toFixed(1)} MB` : "";
+    clearFile.classList.toggle("hidden", !f);
+    url.disabled = !!f;
+  };
   const go = async (e) => {
     const v = url.value.trim();
-    if (!/^https?:\/\//i.test(v)) { toast("Hãy dán một link http(s) tới video", "error"); url.focus(); return; }
+    if (!picked && !/^https?:\/\//i.test(v)) { toast("Hãy dán một link http(s) tới video, hoặc chọn file video từ máy", "error"); url.focus(); return; }
     const btn = e.currentTarget; btn.disabled = true;
-    localSet("cloneUrl", v);
-    try { startJob(await api("POST", "/api/clones", { url: v, mode, model: model.value })); localSet("cloneUrl", ""); toast("Đang tải video, chia đoạn và nhờ AI liệt kê nhân vật…", "", 6000); }
+    try {
+      if (picked) {
+        const fd = new FormData();
+        fd.append("file", picked); fd.append("mode", mode); fd.append("model", model.value);
+        toast("Đang tải file video lên…", "", 4000);
+        startJob(await api("POST", "/api/clones/upload", fd, true));
+        pickFile(null);
+      } else {
+        localSet("cloneUrl", v);
+        startJob(await api("POST", "/api/clones", { url: v, mode, model: model.value }));
+        localSet("cloneUrl", "");
+      }
+      toast("Đang chia đoạn video và nhờ AI liệt kê nhân vật…", "", 6000);
+    }
     catch (err) { toast(err.message, "error"); }
     btn.disabled = false;
   };
@@ -70,6 +94,9 @@ function renderCloneStart() {
     h("section", { class: "card ana-card" }, h("div", { class: "card-head" }, h("h3", {}, "Clone một video mới")),
       h("div", { class: "stack" },
         field("Link video", url),
+        h("div", { class: "row small" }, h("span", { class: "muted" }, "hoặc"),
+          h("button", { type: "button", class: "btn sm", onclick: () => fileInput.click() }, icon("upload"), "Tải video từ máy"),
+          fileName, clearFile, fileInput),
         picker,
         field("Model video", model),
         va.ytdlp === false ? h("div", { class: "banner warn flush" }, icon("alert"), h("div", { class: "b-body" }, h("div", {}, "Chưa cài yt-dlp nên chỉ tải được link thẳng tới file .mp4: ", h("code", {}, "brew install yt-dlp")))) : null,
@@ -174,8 +201,25 @@ function renderCloneDetail(d) {
     renderCloneFinal(d, regen ? 4 : 3, step, busy));
 }
 
+async function clonePicture(c, file) {
+  if (!(await saveClone(true))) return;
+  try {
+    if (file) {
+      const fd = new FormData();
+      fd.append("name", c.name); fd.append("file", file);
+      S.clone = await api("POST", `/api/clones/${S.clone.id}/cast/picture`, fd, true);
+      toast(`Đã dùng ảnh cho ${c.name}`, "ok");
+    } else {
+      S.clone = await api("DELETE", `/api/clones/${S.clone.id}/cast/picture?name=${encodeURIComponent(c.name)}`);
+    }
+    renderMain();
+  } catch (err) { toast(err.message, "error"); }
+}
+
 function renderCloneCast(d, c, i, busy) {
   if (c._old === undefined) c._old = c.name;
+  const picInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", class: "hidden",
+    onchange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) clonePicture(c, f); } });
   const inp = (key, attrs = {}) => h(attrs.rows ? "textarea" : "input", { ...attrs, value: c[key] || "", disabled: busy, oninput: (e) => { c[key] = e.target.value; cloneDirty(); } });
   return h("div", { class: "clone-person" },
     h("div", { class: "clone-pic", style: c.picture_url ? { backgroundImage: `url("${c.picture_url}")` } : null }, c.picture_url ? null : icon("users")),
@@ -184,8 +228,11 @@ function renderCloneCast(d, c, i, busy) {
       field("Thay cho người này trong clip gốc", inp("replaces", { rows: 2, placeholder: "the young woman with a long black braid in the white dress" }), "tiếng Anh"),
       field("Ngoại hình mới", inp("new_look", { rows: 2, placeholder: "sky-blue linen dress, wavy chestnut bob" }), "tiếng Anh"),
       h("div", { class: "row small" },
-        c.ref ? h("span", { class: "badge done mini" }, String(c.ref).startsWith("character:") ? "Đã có nhân vật Flow" : "Đã có ảnh nhân vật") : h("span", { class: "badge todo mini" }, "Chưa tạo nhân vật"),
+        c.ref ? h("span", { class: "badge done mini" }, String(c.ref).startsWith("character:") ? "Đã có nhân vật Flow" : c.uploaded ? "Ảnh bạn tải lên" : "Đã có ảnh nhân vật") : h("span", { class: "badge todo mini" }, "Chưa có nhân vật"),
         h("span", { class: "spacer" }),
+        picInput,
+        h("button", { class: "btn sm", disabled: busy, title: "Dùng ảnh của bạn làm nhân vật mới (thay cho việc tạo từ mô tả)", onclick: () => picInput.click() }, icon("upload"), c.uploaded ? "Đổi ảnh" : "Tải ảnh lên"),
+        c.uploaded ? h("button", { class: "btn sm ghost", disabled: busy, title: "Bỏ ảnh đã tải lên", onclick: () => clonePicture(c, null) }, icon("x"), "Bỏ ảnh") : null,
         h("button", { class: "btn sm ghost", disabled: busy, onclick: () => { d.cast.splice(i, 1); cloneDirty(); renderMain(); } }, icon("trash"), "Bỏ"))));
 }
 
@@ -215,7 +262,7 @@ function renderCloneRender(d, n, step, { busy, castReady, plansReady }) {
   const rights = h("input", { type: "checkbox" });
   const muse = cloneOnMuse(d);
   const credit = d.model === "veo-lite" ? ` · khoảng ${todo.length * 5} credit` : "";
-  const blocker = !castReady ? (muse ? "Vẽ ảnh nhân vật trước." : "Tạo nhân vật Flow trước.") : !plansReady ? "Cần mô tả hành động trước." : null;
+  const blocker = !castReady ? (muse ? "Vẽ ảnh nhân vật hoặc tải ảnh lên trước." : "Tạo nhân vật Flow hoặc tải ảnh nhân vật lên trước.") : !plansReady ? "Cần mô tả hành động trước." : null;
   const COST = () => (muse ? FREE() : PAID());
   const run = (only) => {
     if (!regen && !rights.checked) { toast("Hãy xác nhận bạn có quyền dùng video gốc", "error"); return; }
