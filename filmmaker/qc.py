@@ -915,14 +915,19 @@ def current_keyframe_qc(out_dir: Path, sid: str, kf: Path | None) -> dict[str, A
 SPEAK_FRAMES = 6  # spread over the whole line: a line split between two mouths must show
 
 
-def speaking_frames(clip: Path, segments: list[dict[str, Any]], dest: Path) -> tuple[Path, list[float]] | None:
-    """A strip of frames taken while speech is heard (the first line, or the first two seconds-or-more of speech
-    when whisper split it into short pieces), to see whose mouth moves."""
+def speaking_frames(clip: Path, segments: list[dict[str, Any]], dest: Path, *,
+                    whole: bool = False) -> tuple[Path, list[float]] | None:
+    """A strip of frames taken while speech is heard, to see whose mouth moves. `whole` (the scene has ONE line):
+    spread over all the speech, so a line whose second half another person says shows it (22/11/2026: s05 got
+    PASS with frames from the first half only). Else the first line, or the first two seconds-or-more of speech
+    when whisper split it into short pieces."""
     segs = [s for s in segments if s["end"] > s["start"]]
     if not segs:
         return None
     a, b = segs[0]["start"], segs[0]["end"]
-    for s in segs[1:]:  # "Không được, đoạn này dài quá" | "Nắm tay nhau…": one line, two pieces
+    if whole:
+        b = max(s["end"] for s in segs)
+    for s in ([] if whole else segs[1:]):  # "Không được, đoạn này dài quá" | "Nắm tay nhau…": one line, two pieces
         if b - a >= 2.5 or s["start"] - b > 0.6:
             break
         b = s["end"]
@@ -1081,7 +1086,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
             images.append((f"scene {s.id} OpenMontage QC frame {f['index']}/4 (at {f['time']}s)", fp))
     if strip:
         images.append((f"scene {s.id} clip: {FRAMES} frames in time order", strip))
-    talk = speaking_frames(clip, speech["segments"], work / f"{s.id}_speaking.jpg") if speech and has_lines else None
+    talk = (speaking_frames(clip, speech["segments"], work / f"{s.id}_speaking.jpg",
+                            whole=len(scene_lines(sb, s)) == 1) if speech and has_lines else None)
     if talk:
         images.append((f"scene {s.id}: {SPEAK_FRAMES} frames while the line is heard (at "
                        + ", ".join(f"{x}s" for x in talk[1]) + "): whose mouth moves?", talk[0]))

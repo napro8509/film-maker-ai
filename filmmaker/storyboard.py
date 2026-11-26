@@ -19,7 +19,7 @@ from .ai import DEFAULT_AI_MODEL, clean_ai_model
 from .i2v_prompt import VideoShot
 from .rules import (  # noqa: F401  (re-exported: other modules and tests use storyboard.<NAME>)
     EACH_ONCE, FILM_STILL_OPENER, NO_ENGLISH, NO_MUSIC_DIALOGUE, NO_OFFSCREEN, NO_TEXT_POSITIVE, PORTRAIT_KNEES_UP,
-    REF_OPENER, BACKGROUND_NO_WORDS, DIALOGUE_MAX, DIALOGUE_RULE, DIALOGUE_TURNS, I2V_SILENT_RULE, MAX_REFS, NO_DIALOGUE_RULE,
+    REF_OPENER, BACKGROUND_NO_WORDS, DIALOGUE_MAX, DIALOGUE_RULE, DIALOGUE_TURNS, I2V_SILENT_RULE, MAX_REFS, OLD_I2V_SILENT_RULE, NO_DIALOGUE_RULE,
     NO_TEXT, OLD_DIALOGUE_RULE, OLD_NO_DIALOGUE_RULE, SILENT_SCENE_RULE, SPEAKER_LOOK_WORDS, START_FRAME_CHARS,
 )
 
@@ -910,6 +910,7 @@ class Storyboard(StoryboardDraft):
         """A structured I2V prompt of a scene without a line in a film with dialogue gets I2V_SILENT_RULE (before
         its Audio line). Without it the prompt said nothing about speech and Veo made the people talk, in English,
         in about half of such scenes of Thai films (2026-11-15). Not part of the fingerprint: nothing re-renders."""
+        prompt = prompt.replace(OLD_I2V_SILENT_RULE, I2V_SILENT_RULE)  # pasted / saved with the old sentence
         shot = scene.video_shot if scene is not None else None
         how = self.rule("video", "silence")
         rule = {"breath": I2V_SILENT_RULE, "laugh": SILENT_SCENE_RULE}.get(how, "")
@@ -1005,6 +1006,7 @@ class Storyboard(StoryboardDraft):
                 prompt = f"{base} {cues}" if base else cues
         lang_rule = self.dialogue_rule()
         prompt = OLD_DIALOGUE_RULE.sub(lambda _: lang_rule, prompt).replace(OLD_NO_DIALOGUE_RULE, NO_DIALOGUE_RULE)
+        prompt = prompt.replace(OLD_I2V_SILENT_RULE, I2V_SILENT_RULE)
         silence = self.rule("video", "silence")
         if lang_rule == NO_DIALOGUE_RULE:
             rule = "" if silence == "off" else lang_rule

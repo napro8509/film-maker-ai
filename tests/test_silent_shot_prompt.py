@@ -48,3 +48,17 @@ def test_applied_twice_is_idempotent():
     sb = _sb()
     once = _sent(sb, 0)
     assert sb.for_flow_video(once, sb.scenes[0]) == once
+
+
+def test_silent_sentence_asks_for_no_crying_and_replaces_the_old_one():
+    """22/11/2026: the old sentence asked for "soft crying" next to a plain-ambience Audio line, and Flow answered
+    "Audio generation failed" to the same silent scene six times."""
+    from filmmaker.rules import OLD_I2V_SILENT_RULE
+
+    p = _sent(_sb(), 0)
+    assert "crying" not in p and "sighs" not in p
+    sb = _sb()
+    s = sb.scenes[0]
+    old = sb.video_prompt(s).replace("Audio:", OLD_I2V_SILENT_RULE + " Audio:", 1)
+    out = sb.for_flow_video(old, s)
+    assert OLD_I2V_SILENT_RULE not in out and out.count(I2V_SILENT_RULE) == 1

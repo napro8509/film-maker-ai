@@ -753,13 +753,14 @@ class Autopilot:
         snap = {k: cur.get(k) for k in ("prompt", "image_prompt", "dialogue", "narration", "camera", "video_shot")}
         scene = next((x for x in sb.scenes if x.id == sid), None)
         fix = None
-        if reviewer.AUDIO_FAILED in error.lower() and reviewer.is_silent(scene) and not tried:
+        quiet = self._can_quiet(scene, error)
+        if quiet:
             # No one speaks: the sound cue ("gentle slow breathing"…) is the likely trigger, not the picture or the
-            # story. Plain room tone first, no AI rewrite (22/11/2026: s04 and s10 rewritten twice, still failing).
+            # story. Plain room tone, no AI rewrite, and not one of the MAX_SOFTEN rewrites: it changes neither the
+            # picture nor the story (22/11/2026: s04 rewritten twice, then skipped, its sound cue never tried).
             fix = reviewer.quiet_audio_fix(scene)
-            if fix is not None:
-                self.log(f"  [{sid}] cảnh không thoại: chỉ đổi âm thanh thành “{reviewer.QUIET_AUDIO}”, giữ nguyên "
-                         "hình và hành động.")
+            self.log(f"  [{sid}] cảnh không thoại: chỉ đổi âm thanh thành “{reviewer.QUIET_AUDIO}”, giữ nguyên "
+                     "hình và hành động (không tính vào số lần viết lại).")
         if fix is None:
             try:
                 fix = reviewer.soften_scene(sb, sid, error, earlier=[*tried, snap] if tried else None,
@@ -777,7 +778,10 @@ class Autopilot:
             return False
         before = reviewer.spoken_words(scene)
         with self._soft_lock:
-            self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)  # the refused version
+            if quiet:
+                self.data.setdefault("quieted", {}).setdefault(sid, []).append(_quiet_key(scene))
+            else:
+                self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)  # the refused version
             changed = self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix])))
             if changed and sid not in self.data["resent"]:
                 self.data["resent"].append(sid)  # never also resent as "interrupted"
@@ -799,6 +803,45 @@ class Autopilot:
                                                  or "(bỏ thoại)"))
         return True
 
+    def _can_quiet(self, scene, error: str) -> bool:
+        """A silent scene Flow could not make the sound of, whose sound cue is not plain room tone yet and was not
+        quieted for this same action before: it gets the code-only sound fix (`reviewer.quiet_audio_fix`)."""
+        return (scene is not None and reviewer.AUDIO_FAILED in (error or "").lower() and reviewer.is_silent(scene)
+                and reviewer.quiet_audio_fix(scene) is not None
+                and _quiet_key(scene) not in (self.data.get("quieted") or {}).get(scene.id, []))
+
+    def _out_of_rewrites(self, scene, error: str) -> bool:
+        """MAX_SOFTEN rewrites used and nothing free left to try (the sound fix of a silent scene)."""
+        n = len((self.data.get("softened") or {}).get(scene.id, []))
+        return n >= MAX_SOFTEN and not self._can_quiet(scene, error)
+
+    def rewrite_refused(self, only: set[str] | None = None) -> list[str]:
+        """Before a plain "Render video" (web): a scene whose last answer was a content / sound refusal, and that
+        nobody edited since (same fingerprint as the refused send), gets the step "Tạo tự động" would take before
+        sending it again (the sound fix, or an AI rewrite while rewrites are left) instead of the refused prompt
+        going out again and costing credits. Returns the scenes changed."""
+        changed: list[str] = []
+        pipe = self.pipe()
+        for s in pipe.sb.scenes:
+            if (only and s.id not in only) or pipe.is_done(s):
+                continue
+            st = pipe.state.scene(s.id)
+            why = self._refusal(pipe, s)
+            if not why:
+                continue
+            if st.get("fingerprint") and st.get("fingerprint") != pipe.sb.scene_fingerprint(s):
+                self.log(f"[{s.id}] cảnh đã được sửa sau lần bị từ chối: gửi bản mới đang có.")
+                continue
+            err = str(st.get("error") or "")
+            if self._out_of_rewrites(s, err):
+                self.log(f"[{s.id}] {why}; đã viết lại {MAX_SOFTEN} lần — gửi lại bản đang có (nếu vẫn lỗi, sửa cảnh "
+                         "bằng tay rồi render lại).")
+                continue
+            self.log(f"[{s.id}] {why}: đổi prompt trước khi render lại…")
+            if self._soften_one(pipe.sb, s.id, err):
+                changed.append(s.id)
+        return changed
+
     def _script_scene(self, sid: str) -> str | None:
         """This scene's section of the approved script (script.final.md, else script.md, next to storyboard.yaml):
         the story point a rewrite must keep. None when there is no script or no section for the scene."""
@@ -819,6 +862,12 @@ class Autopilot:
             for s in pipe.sb.scenes:
                 if s.id in hist and pipe.is_done(s):
                     hist.pop(s.id)  # rendered since: a later refusal starts again from zero
+        quieted: dict[str, list[str]] = self.data.get("quieted") or {}
+        if quieted:
+            pipe = self.pipe()
+            for s in pipe.sb.scenes:
+                if s.id in quieted and pipe.is_done(s):
+                    quieted.pop(s.id)
 
     def _soften_blocked(self) -> None:
         """Scenes the video service refused because of their content: Flow made the clip and deleted it (safety
@@ -833,7 +882,7 @@ class Autopilot:
             pipe = self.pipe()
             blocked = []
             for s in pipe.sb.scenes:
-                if pipe.is_done(s) or len(hist.get(s.id, [])) >= MAX_SOFTEN:
+                if pipe.is_done(s) or self._out_of_rewrites(s, str(pipe.state.scene(s.id).get("error") or "")):
                     continue
                 why = self._refusal(pipe, s)
                 if why:
@@ -845,7 +894,8 @@ class Autopilot:
             fixed: list[str] = []
             for s, why in blocked:
                 n = len(hist.get(s.id, [])) + 1
-                self.log(f"[{s.id}] {why}: nhờ AI viết lại prompt cho dễ qua hơn (lần {n}/{MAX_SOFTEN})…")
+                if not self._can_quiet(s, str(pipe.state.scene(s.id).get("error") or "")):
+                    self.log(f"[{s.id}] {why}: nhờ AI viết lại prompt cho dễ qua hơn (lần {n}/{MAX_SOFTEN})…")
                 if self._soften_one(pipe.sb, s.id, str(pipe.state.scene(s.id).get("error"))):
                     fixed.append(s.id)
             if not fixed:
@@ -855,7 +905,8 @@ class Autopilot:
             self._video_run(only=set(fixed), confirm=set(fixed))
         pipe = self.pipe()
         gave_up = [s.id for s in pipe.sb.scenes if not pipe.is_done(s) and len(hist.get(s.id, [])) >= MAX_SOFTEN
-                   and self._refusal(pipe, s)]
+                   and self._refusal(pipe, s)
+                   and self._out_of_rewrites(s, str(pipe.state.scene(s.id).get("error") or ""))]
         if gave_up:
             self.log(f"⚠ Đã đổi prompt {MAX_SOFTEN} lần mà vẫn bị từ chối: {', '.join(gave_up)} — bỏ qua, "
                      "dựng phim không có cảnh này.")
@@ -1098,6 +1149,12 @@ class Autopilot:
         return {"stages": [{"key": k, "label": lbl, **(self.data["stages"].get(k) or {})} for k, lbl in STAGES]}
 
 
+def _quiet_key(scene) -> str:
+    """What the sound fix was made for: the scene's action (a later rewrite of the action may need it again)."""
+    shot = getattr(scene, "video_shot", None)
+    return (shot.action if shot is not None and shot.action else scene.prompt) or ""
+
+
 class _Stopped(Exception):
     pass
 
@@ -1152,10 +1209,16 @@ class _Softener:
         """Start rewriting `sid` (refused with `error`). False = not started (already rewriting, or out of tries)."""
         with self.ap._soft_lock:
             n = len(self.ap.data.setdefault("softened", {}).get(sid, []))
-        if sid in self.jobs or n >= MAX_SOFTEN:
+        scene = next((x for x in sb.scenes if x.id == sid), None)
+        quiet = self.ap._can_quiet(scene, error)
+        if sid in self.jobs or (n >= MAX_SOFTEN and not quiet):
             return False
-        self.ap.log(f"[{sid}] nhờ AI viết lại prompt cho dễ qua hơn (lần {n + 1}/{MAX_SOFTEN}, chạy nền) — "
-                    "tạo tiếp các cảnh sau, xong sẽ quay lại cảnh này.")
+        if quiet:
+            self.ap.log(f"[{sid}] đổi âm thanh của cảnh không thoại (chạy nền) — tạo tiếp các cảnh sau, xong sẽ quay "
+                        "lại cảnh này.")
+        else:
+            self.ap.log(f"[{sid}] nhờ AI viết lại prompt cho dễ qua hơn (lần {n + 1}/{MAX_SOFTEN}, chạy nền) — "
+                        "tạo tiếp các cảnh sau, xong sẽ quay lại cảnh này.")
         self.jobs[sid] = self.pool.submit(self._job, sb, sid, error)
         return True
 

@@ -310,6 +310,41 @@ def _asks_or_declines(text: str) -> bool:
     return t.endswith("?") or bool(re.search(DECLINE_RE, t, re.I))
 
 
+def _press_send(page, box) -> None:
+    """Click Muse's send button (or press Enter when there is none)."""
+    for name in SEND_NAMES:
+        btn = page.get_by_role("button", name=name, exact=True)
+        if btn.count() and btn.first.is_enabled():
+            btn.first.click()
+            return
+    box.press("Enter")
+
+
+def _send_and_confirm(page, box, prompt: str, marker: str, debug: Path | None) -> None:
+    """Send the typed request and make sure it reached the chat. Not in the chat after SENT_WAIT: still in the box
+    (the click came too early) or gone with a page re-render; either way nothing reached Muse, so it is typed
+    again if needed and sent once more. Still not there: exit 9, spent=False (nothing to wait 15 minutes for)."""
+    _press_send(page, box)
+    if _wait_for(lambda: page.evaluate(SENT_JS, marker), SENT_WAIT):
+        return
+    log("  Muse chưa nhận tin nhắn: gửi lại một lần…")
+    if not _still_unsent(page):
+        box.click()
+        box.fill(prompt)
+    _press_send(page, box)
+    if not _wait_for(lambda: page.evaluate(SENT_JS, marker), SENT_WAIT):
+        _shot(page, debug, "9-unsent")
+        raise Fail(EXIT_TIMEOUT, "Muse không nhận tin nhắn sau 2 lần bấm gửi (không thấy tin nhắn trong chat): "
+                   "chưa gửi gì, thử lại sau.", spent=False)
+
+
+def _still_unsent(page) -> bool:
+    try:
+        return bool(page.evaluate(UNSENT_JS))
+    except Exception:
+        return False
+
+
 def _wait_for(fn, seconds: float) -> bool:
     end = time.time() + seconds
     while time.time() < end:
@@ -331,6 +366,12 @@ PREVIEWS_JS = """() => [...document.querySelectorAll('img')].filter(i => /^(blob
 #: Our request is in the chat: the composer is empty again and the page shows the end of our message.
 SENT_JS = """(marker) => { const c = document.querySelector('textarea[aria-label="Message"]');
   return (!c || !c.value) && (document.body.innerText || '').includes(marker); }"""
+#: Our prompt is still sitting in the composer: the send did not go through (the page was not ready yet).
+UNSENT_JS = """() => { const c = document.querySelector('textarea[aria-label="Message"]');
+  return !!(c && c.value && c.value.trim().length > 0); }"""
+#: Seconds to see our message in the chat after a send before trying once more / giving up (nothing is billed:
+#: on 22/11/2026 a send right after the page opened never reached Muse and the run then waited 15 minutes).
+SENT_WAIT = 15
 
 #: The answer picture/video by src: its final src (progressive images swap theirs) and whether it has loaded.
 MEDIA_STATE_JS = """(src) => { const el = [...document.querySelectorAll('img, video')].find(e =>
@@ -476,6 +517,7 @@ def _request(args, kind: str, ctx, page, *, own: bool) -> dict:
         # those rows only once it is there, or an old row would look like a new failure. The old clips and
         # pictures of the chat are listed after that wait too (it replaced a fixed 3 s nap before this list).
         _wait_for(lambda: page.get_by_text("Today", exact=True).count() > 0, 15)
+        time.sleep(1.5)  # the chat still re-renders right after that: text typed sooner was lost (22/11/2026)
         before = {v["src"] for v in page.evaluate(VIDEOS_JS, ["", "", sel]) if v["src"]}
         failed_before = page.evaluate(FAILED_JS)
         files = [str(f) for f in ([image] if image else []) + refs]
@@ -494,21 +536,15 @@ def _request(args, kind: str, ctx, page, *, own: bool) -> dict:
                 time.sleep(0.5)
         box.click()
         box.fill(prompt)
+        if not _wait_for(lambda: box.input_value() == prompt, 3):  # the page re-rendered and dropped the text
+            box.click()
+            box.fill(prompt)
         _shot(page, debug, "1-typed")
         if args.dry_run:
             return {"status": "ok", "dry_run": True, "prompt": prompt}
-        sent = False
-        for name in SEND_NAMES:
-            btn = page.get_by_role("button", name=name, exact=True)
-            if btn.count() and btn.first.is_enabled():
-                btn.first.click()
-                sent = True
-                break
-        if not sent:
-            box.press("Enter")
+        _send_and_confirm(page, box, prompt, marker, debug)
         SPENT["sent"] = True
         log(f"  đã gửi yêu cầu lên Muse, chờ {word}…")
-        _wait_for(lambda: page.evaluate(SENT_JS, marker), 5)  # our bubble is in the chat (was a fixed 5 s)
         _shot(page, debug, "2-sent")
         last_reply, n, reply_at = "", 0, time.time()
         while time.time() < end:

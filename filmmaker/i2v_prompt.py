@@ -22,7 +22,7 @@ import re
 from pydantic import BaseModel, Field, field_validator
 
 from .rules import (  # noqa: F401  (re-exported as i2v_prompt.<NAME>)
-    CLOSING, DEFAULT_SOUND, MAX_WORDS, NO_TEXT_IMAGE, NO_TEXT_POSITIVE, NO_TEXT_SHORT, SILENT_BINDING,
+    CLOSING, DEFAULT_SOUND, MAX_WORDS, NO_TEXT_IMAGE, NO_TEXT_POSITIVE, NO_TEXT_SHORT, ONE_SPEAKER_RULE, SILENT_BINDING,
 )
 
 # Review 2: the start frame already holds the place and the light; "... matching the starting frame" only dilutes.
@@ -81,6 +81,24 @@ def clean_line(text: str | None) -> str:
 
 def word_count(text: str | None) -> int:
     return len(re.findall(r"[\w'-]+", str(text or ""), re.UNICODE))
+
+
+# A sentence end (. ! ? … or "...") with more words after it.
+_SENTENCE_BREAK = re.compile(r"(?:[.!?。！？]+|…)\s*(?=\S)")
+# Scripts written without spaces between words (Thai, Lao, Khmer, Myanmar, Japanese, Chinese): there a space
+# ends a phrase or a sentence, so "ทอเสร็จแล้วเหรอคะแม่อุ๊ย ความลับเหรอคะ" is two.
+_NO_SPACE_SCRIPT = re.compile(r"[\u0E00-\u0EFF\u1000-\u109F\u1780-\u17FF\u3040-\u30FF\u4E00-\u9FFF]")
+
+
+def line_parts(line: str | None) -> int:
+    """How many sentences / phrases a spoken line has (1 for an empty or one-sentence line)."""
+    t = clean_line(line)
+    if not t:
+        return 1
+    n = 1 + len(_SENTENCE_BREAK.findall(t))
+    if _NO_SPACE_SCRIPT.search(t):
+        n = max(n, len(t.split()))
+    return n
 
 
 class Speaker(BaseModel):
@@ -524,7 +542,10 @@ def assemble(shot: VideoShot, *, audio_mode: str | None, language: str | None, n
     lang = f" in {language}" if language else ""
     sp = shot.speaker
     if audio_mode == "dialogue" and sp and clean_line(sp.line):
-        return safe(_dialogue(shot, sp, language=language, env=env, sound=sound, opts=o))
+        text = _dialogue(shot, sp, language=language, env=env, sound=sound, opts=o)
+        if line_parts(sp.line) > 1 and any(clean_text(x.visual_tag) for x in shot.listeners or []):
+            text = _before_audio(text, ONE_SPEAKER_RULE.format(who=_cap(_tag(sp.visual_tag))))
+        return safe(text)
     if audio_mode == "voiceover" and clean_line(narration):
         voice_style = clean_text(sp.voice_style).rstrip(" .") if sp else ""
         head = (f"A narrator voice-over speaks{lang} in {_a(voice_style or 'calm, warm storytelling')} voice: "
@@ -538,6 +559,16 @@ def assemble(shot: VideoShot, *, audio_mode: str | None, language: str | None, n
     body = _with_env(act, env)
     positive = NO_TEXT_POSITIVE if o["no_text"] == "positive" else ""
     return safe(" ".join(p for p in (camera, _sentence(body), positive, _audio_line(sound, o)) if p))
+
+
+def _before_audio(text: str, sentence: str) -> str:
+    """`sentence` put before the prompt's Audio line (or its closing sentence), else at the end."""
+    for mark in ("Audio:", CLOSING):
+        at = text.find(mark)
+        if at >= 0:
+            head = text[:at].rstrip()
+            return f"{head} {sentence} {text[at:]}" if head else f"{sentence} {text[at:]}"
+    return f"{text.rstrip()} {sentence}"
 
 
 def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, sound: str,
@@ -680,6 +711,9 @@ def warnings(shot: VideoShot, *, audio_mode: str | None, narration: str | None, 
     if audio_mode == "dialogue" and sp and line:
         if word_count(line) > MAX_WORDS:
             out.append(f"Câu thoại {word_count(line)} từ (tối đa {MAX_WORDS}): hãy rút gọn hoặc tách sang cảnh khác.")
+        if line_parts(line) > 1 and shot.listeners:
+            out.append(f"Câu thoại có {line_parts(line)} câu/vế: Veo dễ cho người nghe nói vế sau. Prompt đã dặn chỉ "
+                       "một người nói; tốt nhất viết thành một câu liền hoặc tách sang cảnh khác.")
         if not clean_text(sp.visual_tag):
             out.append("Người nói thiếu đặc điểm nhận dạng (vị trí + ngoại hình).")
         if len(shot.listeners or []) and not clean_text(sp.position):

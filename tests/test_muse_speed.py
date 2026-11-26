@@ -214,3 +214,76 @@ def test_page_scripts_parse_as_javascript(name):
     r = subprocess.run(["node", "-e", "new Function('return (' + process.argv[1] + ')')", code],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# --- a send that never reached the chat (22/11/2026: s04 waited 15 minutes for nothing) ------------------
+
+
+class _Composer:
+    def __init__(self, page):
+        self.page = page
+
+    def click(self):
+        pass
+
+    def fill(self, text):
+        self.page.box = text
+
+    def press(self, key):
+        self.page.send()
+
+
+class _ChatPage:
+    """`deliver`: for each press of send, whether the message reaches the chat (else the page drops it)."""
+
+    def __init__(self, deliver):
+        self.deliver = list(deliver)
+        self.box = "the prompt"
+        self.chat: list[str] = []
+        self.sends = 0
+
+    def send(self):
+        self.sends += 1
+        ok = self.deliver.pop(0) if self.deliver else False
+        if ok:
+            self.chat.append(self.box)
+        self.box = ""  # a re-render empties the box even when the message is lost
+
+    def get_by_role(self, *_a, **_k):
+        return SimpleNamespace(count=lambda: 0)
+
+    def evaluate(self, js, arg=None):
+        if js == muse_ui.SENT_JS:
+            return not self.box and any(arg in m for m in self.chat)
+        if js == muse_ui.UNSENT_JS:
+            return bool(self.box)
+        raise AssertionError(js)
+
+
+@pytest.fixture
+def quick(monkeypatch):
+    monkeypatch.setattr(muse_ui, "SENT_WAIT", 0.2)
+    monkeypatch.setattr(muse_ui.time, "sleep", lambda s: None)
+
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def test_message_lost_on_first_send_is_typed_and_sent_again(quick):
+    page = _ChatPage([False, True])
+    muse_ui._send_and_confirm(page, _Composer(page), "the prompt", "prompt", None)
+    assert page.sends == 2 and page.chat == ["the prompt"]
+
+
+def test_message_that_never_reaches_muse_fails_fast_and_unbilled(quick):
+    page = _ChatPage([False, False])
+    with pytest.raises(muse_ui.Fail) as exc:
+        muse_ui._send_and_confirm(page, _Composer(page), "the prompt", "prompt", None)
+    assert exc.value.code == muse_ui.EXIT_TIMEOUT and exc.value.spent is False
+    assert page.sends == 2
+
+
+def test_message_seen_at_once_is_sent_once(quick):
+    page = _ChatPage([True])
+    muse_ui._send_and_confirm(page, _Composer(page), "the prompt", "prompt", None)
+    assert page.sends == 1

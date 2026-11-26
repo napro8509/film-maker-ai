@@ -123,3 +123,49 @@ Có thể chạy lại "Tạo tự động": state.json giữ 8 clip đã xong, 
 Test: `tests/test_monitor_fixes_1122.py` (17), thêm 3 test trang Flow giả trong `tests/test_flow_ui_queue.py`, sửa 2 test kiểm hành vi cũ (`test_soften_prompt_mentions_audio_only_for_audio_failures`, `test_soften_after_audio_failure_keeps_words_first_then_may_change_them`). Cả bộ: 1552 qua, chỉ còn `test_autopilot_basic_format_runs_vimax_and_openmontage_and_gates_bad_clip` lỗi sẵn (gọi API Anthropic thật, key không hợp lệ); `test_stitch_translates_and_writes_three_tracks` thỉnh thoảng lỗi khi chạy song song và qua khi chạy riêng.
 
 Chưa làm: đổi cảnh không thoại sang Muse ở lần lỗi audio thứ 2 (mục B3.2), và mục 6–7 của bảng ưu tiên. Chưa thử với lần gửi thật.
+
+## Đã sửa tiếp: s04 không được đổi prompt sau khi khởi động lại app
+
+**Nguyên nhân** (lần chạy sau khi khởi động lại app lúc 02:09):
+- "Tạo tự động" bỏ qua s04 ngay từ đầu: `autopilot.json` đã ghi `softened.s04` = 2 lượt (bằng `MAX_SOFTEN`) từ đêm trước. Bộ đếm chỉ xoá khi cảnh render được. Bản sửa "cảnh không thoại lỗi audio thì chỉ đổi âm thanh" chỉ chạy khi cảnh chưa từng bị viết lại, nên không bao giờ tới s04. Phim ra với 9/10 cảnh.
+- Nút "Render video" (job `e481ba1ec9`) chỉ chạy pipeline. Cơ chế đổi prompt chỉ có trong "Tạo tự động", nên app gửi lại đúng bản đã bị từ chối, mất thêm 5 credit, và lại bị "Audio generation failed".
+
+**Sửa:**
+- `autopilot.py` `_can_quiet`, `_out_of_rewrites`, `_quiet_key`: lượt đổi âm thanh (không gọi AI, giữ hình và hành động) **không tính vào 2 lượt viết lại**. Nó được thử một lần cho mỗi phiên bản hành động của cảnh, kể cả khi cảnh đã hết lượt. Bộ nhớ lưu ở `autopilot.json` → `quieted`, và xoá khi cảnh render được. `_Softener.start` và `_soften_blocked` dùng cùng điều kiện.
+- `Autopilot.rewrite_refused(only)` + `server.py` `rewrite_refused_scenes`: "Render video" (và "Render + ghép phim") giờ làm cùng bước với "Tạo tự động" trước khi gửi một cảnh lần trước bị từ chối vì nội dung hoặc âm thanh. Bước đó là đổi âm thanh, hoặc nhờ AI viết lại nếu còn lượt. Nếu cảnh đã được sửa tay sau lần bị từ chối (fingerprint khác), app gửi bản đó, không ghi đè. Nếu hết lượt thì app ghi rõ trong log rồi gửi bản đang có.
+- Thử trên bản sao của dự án thật: s04 được đổi âm thanh thành "quiet ambient room tone only" mà không gọi AI.
+
+Test: thêm 5 test trong `tests/test_monitor_fixes_1122.py`. Cả bộ: 1558 qua, chỉ còn test lỗi sẵn do key API.
+
+Lưu ý cho s04 của phim này: hành động hiện tại vẫn là bản viết lại lần 2 ("Jaa tỉnh, tự kéo khăn"), đã lệch kịch bản. Nếu muốn đúng kịch bản, sửa tay hành động về bản gốc trước khi bấm render. Lượt đổi âm thanh vẫn áp dụng vì đó là một phiên bản hành động mới.
+
+## Đã sửa tiếp: s04 vẫn lỗi audio sau khi đổi âm thanh
+
+**Nguyên nhân (khả năng cao, chưa kiểm chứng bằng lần gửi thật):** job 12:32 đã đổi âm thanh của s04 thành room tone rồi mới gửi, nhưng Flow vẫn báo "Audio generation failed". Lúc gửi, app tự chèn `rules.I2V_SILENT_RULE` vào mọi cảnh không thoại của phim có thoại: "…the only human sounds are breathing, sighs or soft crying." Câu này không nằm trong storyboard nên viết lại không xoá được, và nó mâu thuẫn với dòng Audio ("no breathing, no sighs, no sobs"). Kết quả của phim này: s04 lỗi audio 6/6 lần; s10 chỉ qua khi không còn mặt người trong khung; 8 cảnh có thoại đều qua.
+
+**Sửa:** `I2V_SILENT_RULE` giờ là "Everyone in the frame keeps lips closed and stays wordless the whole time; the soundtrack is only the ambient sound of the place." Câu này vẫn giữ mục đích chống Veo bịa thoại, nhưng không còn đòi tiếng thở hay tiếng khóc. Câu cũ trong prompt đã lưu (`OLD_I2V_SILENT_RULE`) được thay khi gửi. Prompt gửi của s04 giờ không còn chữ "crying" hay "sighs". Câu chèn không thuộc fingerprint, nên các clip đã xong không bị render lại. Test: `tests/test_silent_shot_prompt.py`; cả bộ 1559 qua (trừ test lỗi sẵn do key API).
+
+Tuỳ chọn "laugh" (`SILENT_SCENE_RULE`, dùng cho short drama) vẫn cho phép "breathing, sighs, crying, laughing"; chưa đổi vì phim này không dùng.
+
+## s04 làm bằng Muse; sửa lỗi gửi tin nhắn Muse
+
+- s04 lỗi "Audio generation failed" 7 lần trên Flow/Veo 3.1 Lite (kể cả sau khi bỏ câu chèn đòi tiếng khóc). Đổi riêng s04 sang `model: muse` (storyboard.yaml).
+- Lần thử Muse đầu tiên (13:0x–13:23) chờ hết giờ mà không có gì: yêu cầu **không hề tới Muse** (chat Muse không có tin nhắn nào sau 6:46 sáng). Đây là lỗi do bản tăng tốc Muse ngày 21/11: bước chờ "tin nhắn đã vào chat" tối đa 5 giây không kiểm tra kết quả, nên lần gửi bị mất (trang Muse còn đang tải lại khi app gõ và bấm gửi) bị coi như đã gửi.
+- Sửa (`muse_ui.py` `_send_and_confirm`, `UNSENT_JS`, `SENT_WAIT = 15`): sau khi bấm gửi phải thấy tin nhắn trong chat. Nếu không thấy, app gõ lại khi cần và gửi lại một lần. Vẫn không thấy thì báo lỗi exit 9, chưa tốn gì, sau khoảng 30 giây thay vì 15 phút. Thêm 1,5 giây chờ trang ổn định trước khi gõ, và kiểm tra ô chat giữ đúng chữ sau khi gõ. Test: 3 test trang giả trong `tests/test_muse_speed.py`.
+- Lần thử thứ hai: Muse tạo video ngay. `clips/s04.mp4` dài 10 giây, có tiếng, QC PASS 9/10. `final.mp4` chưa được dựng lại với s04.
+
+## s05: nửa sau câu thoại ra miệng người nghe
+
+**Hiện tượng:** câu của Jaa "ทอเสร็จแล้วเหรอคะแม่อุ๊ย ความลับเหรอคะ" (một người nói). Từ 0 đến 2,9 giây Jaa mở miệng; từ 4,0 đến 7,9 giây ("ความลับเหรอคะ") lại là bà Kham mở miệng.
+
+**Nguyên nhân:**
+- Câu thoại là hai câu hỏi. Câu đầu kết thúc bằng lời gọi "แม่อุ๊ย", nên Veo cho người được gọi nói câu sau. Luật "một câu, tối đa 12 từ" chỉ đếm khoảng trắng, mà tiếng Thái viết liền nên câu này chỉ tính 2 "từ"; không có kiểm tra "một câu".
+- QC có bước lấy khung hình lúc nghe thấy tiếng nói, nhưng `qc.speaking_frames` dừng sau khoảng 2,5 giây đầu. 6 khung hình đều rơi vào nửa Jaa nói, nên QC chấm PASS 8/10.
+
+**Sửa:**
+- `rules.ONE_SPEAKER_RULE` và `i2v_prompt.line_parts` / `assemble`: câu thoại có từ 2 câu/vế trở lên (dấu câu, hoặc khoảng trắng trong chữ Thái, Lào, Khmer, Myanmar, Nhật, Trung) và có người nghe thì prompt thêm "{người nói} says every part of the line alone in one continuous turn; nobody else in the frame speaks at any moment." trước dòng Audio. Câu một vế không đổi (prompt mẫu trong golden test giữ nguyên).
+- `i2v_prompt.warnings`: cảnh báo "Câu thoại có N câu/vế…" trong trình sửa và `filmmaker check`.
+- `qc.speaking_frames(whole=True)` khi cảnh chỉ có một câu thoại: 6 khung hình rải trên toàn bộ đoạn có tiếng nói.
+- Test: 3 test mới trong `tests/test_monitor_fixes_1122.py`.
+
+**Kết quả:** render lại s05 trên Flow (5 credit), giữ nguyên câu đã duyệt. Phóng to khuôn mặt lúc 4,0–5,2 giây: Jaa mở miệng, bà Kham ngậm miệng nhìn xuống. QC PASS 8/10. Đã dựng lại `final.mp4` (10 cảnh, 69,9 giây). Clip s05 cũ được sao lưu ở scratchpad.

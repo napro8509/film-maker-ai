@@ -139,12 +139,14 @@ def test_silent_scene_audio_failure_only_quiets_the_sound_first(tmp_path, monkey
     s04 = ap.sb().scenes[0]
     assert s04.video_shot.audio == reviewer.QUIET_AUDIO
     assert s04.video_shot.action == SILENT["video_shot"]["action"] and s04.image_prompt == "veranda"
-    assert len(ap.data["softened"]["s04"]) == 1
+    assert "s04" not in (ap.data.get("softened") or {})  # not one of the MAX_SOFTEN rewrites
+    assert ap.data["quieted"]["s04"] == [SILENT["video_shot"]["action"]]
 
 
 def test_second_silent_audio_failure_asks_the_ai_about_the_sound_cue(tmp_path, monkeypatch):
     ap = _ap(tmp_path, [SILENT], [])
     ap.data["softened"] = {"s04": [{"prompt": "old"}]}
+    ap.data["quieted"] = {"s04": [SILENT["video_shot"]["action"]]}  # the sound fix was tried for this action
     asked: list[str] = []
 
     def fake(system, user, schema, **kw):
@@ -275,3 +277,122 @@ def test_chat_image_command_accepts_no_reference(monkeypatch, capsys):
     assert flow_ui.main(["i2i", "--project", "p1", "--prompt", "a veranda", "--aspect", "9:16", "-o", "x.png",
                          "--profile-dir", "none"]) == 0
     assert seen == [None]
+
+
+# --- 22/11 follow-up: s04 was out of rewrites before its sound was ever quieted ------------------------
+
+
+def _refused_state(ap: Autopilot, error: str, *, edited: bool = False, code: int = 42) -> None:
+    import json
+
+    pipe = ap.pipe()
+    s = pipe.sb.scenes[0]
+    fp = "edited-since" if edited else pipe.sb.scene_fingerprint(s)
+    (ap.out / "state.json").write_text(json.dumps({"project_id": "p", "scenes": {s.id: {
+        "status": "submitting", "error": error, "exit_code": code, "fingerprint": fp}}}), encoding="utf-8")
+
+
+def test_scene_out_of_rewrites_still_gets_the_sound_fix(tmp_path, monkeypatch):
+    lines: list[str] = []
+    ap = _ap(tmp_path, [SILENT], lines)
+    ap.data["softened"] = {"s04": [{"prompt": "a"}, {"prompt": "b"}]}  # both rewrites used on the action
+    scene = ap.sb().scenes[0]
+    assert not ap._out_of_rewrites(scene, AUDIO_FAIL)
+    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: pytest.fail("the sound fix needs no AI"))
+    soft = _Softener(ap)
+    try:
+        assert soft.start(ap.sb(), "s04", AUDIO_FAIL)
+        assert [s.id for s in soft.requeue(True)] == ["s04"]
+    finally:
+        soft.close()
+    assert ap.sb().scenes[0].video_shot.audio == reviewer.QUIET_AUDIO
+    assert len(ap.data["softened"]["s04"]) == 2
+    assert ap._out_of_rewrites(ap.sb().scenes[0], AUDIO_FAIL)  # now there is nothing free left
+
+
+def test_render_video_changes_a_refused_scene_first(tmp_path, monkeypatch):
+    lines: list[str] = []
+    ap = _ap(tmp_path, [SILENT], lines)
+    ap.data["softened"] = {"s04": [{"prompt": "a"}, {"prompt": "b"}]}
+    _refused_state(ap, "Flow báo tạo video lỗi: " + AUDIO_FAIL)
+    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: pytest.fail("the sound fix needs no AI"))
+    assert ap.rewrite_refused({"s04"}) == ["s04"]
+    assert ap.sb().scenes[0].video_shot.audio == reviewer.QUIET_AUDIO
+    assert any("đổi prompt trước khi render lại" in x for x in lines)
+    # the quieted version is refused too: now really out of tries, the current version is sent as it is
+    _refused_state(ap, "Flow báo tạo video lỗi: " + AUDIO_FAIL)
+    assert ap.rewrite_refused({"s04"}) == []
+    assert any("đã viết lại 2 lần" in x for x in lines)
+
+
+def test_render_video_rewrites_with_ai_while_rewrites_are_left(tmp_path, monkeypatch):
+    ap = _ap(tmp_path, [SPOKEN], [])
+    _refused_state(ap, "Flow xoá video: deleted")
+    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: reviewer.SoftenFix(id="s07", prompt="she nods"))
+    assert ap.rewrite_refused(None) == ["s07"]
+    assert ap.sb().scenes[0].prompt == "she nods" and len(ap.data["softened"]["s07"]) == 1
+
+
+def test_render_video_leaves_a_scene_edited_by_hand_alone(tmp_path, monkeypatch):
+    lines: list[str] = []
+    ap = _ap(tmp_path, [SILENT], lines)
+    _refused_state(ap, "Flow báo tạo video lỗi: " + AUDIO_FAIL, edited=True)
+    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: pytest.fail("no rewrite of a hand edit"))
+    assert ap.rewrite_refused(None) == []
+    assert ap.sb().scenes[0].video_shot.audio == SILENT["video_shot"]["audio"]
+    assert any("đã được sửa" in x for x in lines)
+
+
+def test_render_video_ignores_scenes_that_were_not_refused(tmp_path, monkeypatch):
+    ap = _ap(tmp_path, [SILENT], [])
+    _refused_state(ap, "Hết thời gian chờ", code=9)
+    monkeypatch.setattr(reviewer.ai, "ask", lambda *a, **k: pytest.fail("a timeout is not a refusal"))
+    assert ap.rewrite_refused(None) == []
+
+
+# --- s05: the second half of one line came out of the listener's mouth ------------------------------
+
+
+S05_SHOT = VideoShot(
+    camera="Static medium two-shot", action="",
+    speaker=Speaker(position="frame right", visual_tag="the standing young nurse in white with a steel cup",
+                    voice_style="calm, soft, clear", line="ทอเสร็จแล้วเหรอคะแม่อุ๊ย ความลับเหรอคะ", gaze="frame left"),
+    listeners=[{"position": "frame left", "visual_tag": "the grey-haired woman on the loom bench",
+                "silent_action": "resting a hand on the folded cloth"}],
+    audio="quiet veranda room tone")
+
+
+def test_line_parts():
+    from filmmaker.i2v_prompt import line_parts
+
+    assert line_parts("ทอเสร็จแล้วเหรอคะแม่อุ๊ย ความลับเหรอคะ") == 2  # Thai: a space ends a phrase
+    assert line_parts("I am fine. Thanks!") == 2
+    assert line_parts("Con về rồi đây mẹ") == 1  # spaces between words, one sentence
+    assert line_parts("") == 1 and line_parts("Thanks!") == 1
+
+
+def test_two_part_line_tells_veo_one_person_says_all_of_it():
+    from filmmaker import i2v_prompt as ip
+
+    p = ip.assemble(S05_SHOT, audio_mode="dialogue", language="Thai")
+    rule = ip.ONE_SPEAKER_RULE.format(who="The standing young nurse in white with a steel cup")
+    assert rule in p and p.index(rule) < p.index("Audio:")
+    one = S05_SHOT.model_copy(update={"speaker": S05_SHOT.speaker.model_copy(update={"line": "ทอเสร็จแล้วเหรอคะ"})})
+    assert "says every part of the line" not in ip.assemble(one, audio_mode="dialogue", language="Thai")
+    alone = S05_SHOT.model_copy(update={"listeners": None})
+    assert "says every part of the line" not in ip.assemble(alone, audio_mode="dialogue", language="Thai")
+    assert any("2 câu/vế" in w for w in ip.warnings(S05_SHOT, audio_mode="dialogue", narration=None, names=[]))
+
+
+@pytest.mark.skipif(not __import__("shutil").which("ffmpeg"), reason="needs ffmpeg")
+def test_qc_speaking_frames_cover_the_whole_line(tmp_path):
+    from filmmaker import qc
+    from tests.test_auto_qc_gates import _make_clip
+
+    clip = _make_clip(tmp_path / "s05.mp4", duration=8.0)
+    segs = [{"start": 0.0, "end": 2.9, "text": "ทอเสร็จแล้วเหรอคะแม่อุ๊ย"},
+            {"start": 4.0, "end": 7.9, "text": "ความลับเหรอคะ"}]
+    _, first = qc.speaking_frames(clip, segs, tmp_path / "a.jpg")
+    _, whole = qc.speaking_frames(clip, segs, tmp_path / "b.jpg", whole=True)
+    assert max(first) < 3.0  # the old strip: the first half only
+    assert max(whole) > 6.0 and min(whole) < 1.0

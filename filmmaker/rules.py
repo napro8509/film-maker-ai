@@ -82,8 +82,19 @@ SILENT_SCENE_RULE = ("Nobody speaks in this scene: no dialogue, no words, no voi
                      "only ambient sound and sound effects.")
 #: The same for the structured I2V prompts of the basic formats, said positively (those templates avoid
 #: negatives). Veo made characters speak English in about half the scenes of a Thai film (2026-11-15).
-I2V_SILENT_RULE = ("Everyone in the frame keeps lips closed and stays wordless the whole time; the only human sounds "
-                   "are breathing, sighs or soft crying.")
+#: 2026-11-22: it used to end "the only human sounds are breathing, sighs or soft crying", which asked Veo for
+#: crying while the scene's Audio line asked for plain ambience. Flow then answered "Audio generation failed" to
+#: s04 of "ผ้าทอผืนสุดท้าย" 6 times out of 6, quiet sound cue or not; the only silent scene that went through had
+#: no face in frame. Said positively, like the rest of these templates.
+I2V_SILENT_RULE = ("Everyone in the frame keeps lips closed and stays wordless the whole time; the soundtrack is "
+                   "only the ambient sound of the place.")
+#: The sentence used before; prompts that still carry it get I2V_SILENT_RULE instead.
+OLD_I2V_SILENT_RULE = ("Everyone in the frame keeps lips closed and stays wordless the whole time; the only human "
+                       "sounds are breathing, sighs or soft crying.")
+#: A spoken line made of two or more sentences / phrases: Veo gave the second one to the person addressed in the
+#: first (22/11/2026, s05 of "ผ้าทอผืนสุดท้าย": "…เหรอคะแม่อุ๊ย ความลับเหรอคะ", the second question in the old
+#: woman's mouth). Said once, after the listeners, with the speaker's own visual tag.
+ONE_SPEAKER_RULE = "{who} says every part of the line alone in one continuous turn; nobody else in the frame speaks at any moment."
 #: Basic formats without speech (silent / on-screen text / music). Said with what IS heard: "no music" made Veo
 #: add odd music.
 SILENT_RULE = "Nobody speaks; the sound is only ambient sound and sound effects."
@@ -199,8 +210,11 @@ RULES: tuple[Rule, ...] = (
     Rule("OLD_NO_DIALOGUE_RULE", "Âm thanh", "chèn", "Câu cũ, prompt đã lưu được thay", ("storyboard.for_flow_video",)),
     Rule("SILENT_SCENE_RULE", "Âm thanh", "chèn", "Veo bịa thoại ở ~½ số cảnh không thoại",
          ("storyboard.for_flow_video (drama)",)),
-    Rule("I2V_SILENT_RULE", "Âm thanh", "chèn", "Veo cho nhân vật nói tiếng Anh ở ~½ số cảnh của phim Thái",
-         ("storyboard._silent_shot (basic)",)),
+    Rule("I2V_SILENT_RULE", "Âm thanh", "chèn", "Veo cho nhân vật nói tiếng Anh ở ~½ số cảnh của phim Thái; bản cũ "
+         "đòi tiếng khóc làm Flow báo “Audio generation failed”", ("storyboard._silent_shot (basic)",)),
+    Rule("OLD_I2V_SILENT_RULE", "Âm thanh", "chèn", "Câu cũ, prompt đã lưu được thay", ("storyboard._silent_shot",)),
+    Rule("ONE_SPEAKER_RULE", "Thoại", "chèn", "Câu thoại nhiều vế: Veo cho người được gọi nói vế sau",
+         ("i2v_prompt.assemble",)),
     Rule("SILENT_RULE", "Âm thanh", "chèn", "“no music” làm Veo thêm nhạc lạ", ("formats.AUDIO",)),
     Rule("OLD_SILENT_RULE", "Âm thanh", "chèn", "Câu cũ, prompt đã lưu được thay", ("storyboard.for_flow_video",)),
     Rule("VOICEOVER_RULE", "Âm thanh", "chèn", "Nhân vật không mấp máy khi có thuyết minh",

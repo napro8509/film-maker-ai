@@ -2387,11 +2387,15 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         scope = f" ({', '.join(body.only)})" if body.only else ""
 
         def do_run(job: Job, *, dry: bool, keyframes_only: bool) -> dict[str, Any]:
+            nonlocal sb
             g = gflow(dry_run=dry, log=job.log)
             if not dry and not g.available():
                 raise RuntimeError("không thấy lệnh gflow")
             if dry:
                 job.log("== XEM TRƯỚC: không gửi gì lên Flow ==")
+            elif not keyframes_only:
+                # a scene Flow refused last time is changed first, as "Tạo tự động" does, not sent again as it was
+                sb = rewrite_refused_scenes(job, pid, set(body.only) or None) or sb
             pipe = Pipeline(sb, out_dir(pid), g, log=job.log, sleep=job.sleep, progress=None if dry else job.set_progress)
             meta = model_meta.load()
 
@@ -2742,6 +2746,35 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             job.log(f"⚠ Không tự động đăng được video: {exc}")
 
     # ---- autopilot: one button from the idea to the finished film ----
+
+    def rewrite_refused_scenes(job: Job, pid: str, only: set[str] | None) -> Storyboard | None:
+        """Before "Render video": scenes whose last answer was a content / sound refusal get the sound fix or an
+        AI rewrite (`Autopilot.rewrite_refused`). The new storyboard when something changed, else None."""
+        from ..autopilot import Autopilot, AutoSettings
+
+        settings = load_settings()
+        is_gemini = _project_ai_model(pid) == ai_mod.GEMINI_PRO
+
+        def edit_raw(fn: Callable[[dict], bool]) -> bool:
+            with sb_lock(pid):
+                raw = read_raw(pid)
+                if not fn(raw):
+                    return False
+                write_raw(pid, raw)
+                return True
+
+        pilot = Autopilot(sb_path(pid), out_dir(pid), gflow(log=job.log), settings=AutoSettings(
+            ai_backend=(settings.get("gemini_backend") or "auto") if is_gemini else (settings.get("planner") or "auto"),
+            api_key=settings.get("anthropic_api_key") or None,
+            ai_model=ai_mod.GEMINI_PRO if is_gemini else None,
+            gemini_api_key=(settings.get("gemini_api_key") or None) if is_gemini else None),
+            log=job.log, sleep=job.sleep, should_stop=lambda: job.stop_requested, edit_raw=edit_raw)
+        try:
+            changed = pilot.rewrite_refused(only)
+        except Exception as exc:  # noqa: BLE001 - the render itself still runs
+            job.log(f"⚠ Không đổi được prompt của cảnh bị từ chối: {exc}")
+            return None
+        return load_storyboard(sb_path(pid)) if changed else None
 
     def auto_work(job: Job, pid: str, body: AutoBody) -> dict[str, Any]:
         from .. import publisher
