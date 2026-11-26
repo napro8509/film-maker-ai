@@ -38,7 +38,16 @@ ADD_BTN = f'{PROMPT_BOX} button[aria-label="Add ingredients to the prompt box"]'
 CLEAR_BTN = f'{PROMPT_BOX} button[aria-label="Clear prompt"]'
 SEND_BTN = f'{PROMPT_BOX} button[aria-label="Start generation"]'
 CHIP = f"{PROMPT_BOX} flow-ingredient-chip"
-NEW_SESSION_BTN = 'flow-agent-panel button[aria-label="Start new session"]'
+NEW_SESSION_BTN = 'flow-agent-panel button[aria-label="Start new session"]'  # before 2026-11-26
+# Since 2026-11-26 the chat opens as a compact card over the grid ("Use side panel" moves it back into the right
+# panel). The compact card shows only the agent's last line: no flow-chat-bubble and no flow-permission-message, so
+# Flow's "kick off … costing N credits?" was never seen, never approved, and Flow cancelled it ("confirmation timed
+# out"). The driver always switches to the side panel. A new chat is now "Open session history" -> "Create new
+# session", and the prompt box has no "Clear prompt" button any more.
+SIDE_PANEL_BTN = 'button[aria-label="Use side panel"]'
+AGENT_PANEL = "flow-agent-panel"
+HISTORY_BTN = f'{AGENT_PANEL} button[aria-label="Open session history"]'
+CREATE_SESSION_TEXT = "Create new session"
 ADD_MENU = "flow-add-menu-popover-content"
 PERMISSION = "flow-permission-message"
 BUBBLE = "flow-chat-bubble"
@@ -296,6 +305,68 @@ def _open_project(page, project: str, deadline: Deadline | None = None) -> None:
         if deadline is not None and deadline.expired():
             raise _pre_send_timeout()
         raise Fail(EXIT_DRIFT, "Không thấy ô chat của Flow (giao diện có thể đã thay đổi).")
+
+
+def _side_panel(page) -> None:
+    """Make the chat a side panel (Flow remembers the choice). In the compact card Flow's offer is not shown."""
+    if page.locator(AGENT_PANEL).count() and page.locator(f"{AGENT_PANEL} {PROMPT_BOX}").count():
+        return
+    btn = page.locator(SIDE_PANEL_BTN)
+    if not _wait(lambda: btn.count() > 0 or page.locator(f"{AGENT_PANEL} {PROMPT_BOX}").count() > 0, 10):
+        return  # neither: an older page with the panel built in, or a layout the selectors below will report
+    if btn.count():
+        btn.first.click()
+        _wait(lambda: page.locator(f"{AGENT_PANEL} {PROMPT_BOX}").count() > 0, 10)
+        log("  đã chuyển chat Flow sang khung bên phải (Use side panel)")
+
+
+def _to_side_panel(page) -> None:
+    """No-wait version of _side_panel for polling loops: click "Use side panel" only if it is on the page now."""
+    btn = page.locator(SIDE_PANEL_BTN)
+    if btn.count() and btn.first.is_visible():
+        btn.first.click()
+        time.sleep(1.0)
+        log("  đã chuyển chat Flow sang khung bên phải (Use side panel)")
+
+
+def _new_session(page) -> None:
+    """A fresh chat, so nothing from earlier scenes is carried over."""
+    _side_panel(page)
+    if page.locator(NEW_SESSION_BTN).count():
+        page.locator(NEW_SESSION_BTN).first.click()
+        time.sleep(1.5)
+        return
+    hist = page.locator(HISTORY_BTN)
+    if not hist.count():
+        log("  (không thấy nút lịch sử phiên chat của Flow, dùng phiên hiện tại)")
+        return
+    hist.first.click()
+    create = page.locator(f"{AGENT_PANEL} button", has_text=CREATE_SESSION_TEXT)
+    if not _wait(lambda: create.count() > 0, 10):
+        page.keyboard.press("Escape")
+        log("  (không thấy “Create new session”, dùng phiên hiện tại)")
+        return
+    create.first.click()
+    _wait(lambda: page.locator(f"{AGENT_PANEL} {EDITOR}").count() > 0, 10)
+    time.sleep(1.0)
+
+
+def _clear_prompt(page) -> None:
+    """Empty the prompt box (text and attached chips)."""
+    if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
+        page.locator(CLEAR_BTN).first.click()
+        time.sleep(0.5)
+        return
+    if not page.locator(EDITOR).count():
+        return
+    editor = page.locator(EDITOR).first
+    editor.click()
+    for _ in range(3):
+        page.keyboard.press("ControlOrMeta+A")
+        page.keyboard.press("Backspace")
+        time.sleep(0.3)
+        if not page.locator(CHIP).count() and not editor.inner_text().strip():
+            break
 
 
 ASSET_TITLE = ".asset-title"
@@ -962,12 +1033,8 @@ def run_i2v(args) -> dict:
 
 
 def _i2v_on_page(page, args, prompt: str, files: list[str], out: Path, dl: Deadline) -> dict:
-    if page.locator(NEW_SESSION_BTN).count():
-        page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
-        time.sleep(1.5)
-    if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
-        page.locator(CLEAR_BTN).first.click()
-        time.sleep(0.5)
+    _new_session(page)  # fresh chat: no context from earlier scenes
+    _clear_prompt(page)
 
     _attach_refs(page, files, dl)
 
@@ -977,14 +1044,13 @@ def _i2v_on_page(page, args, prompt: str, files: list[str], out: Path, dl: Deadl
     time.sleep(0.5)
     if args.dry_run:
         log("  (dry-run) đã gắn ảnh và gõ prompt, không bấm gửi.")
-        page.locator(CLEAR_BTN).first.click()
+        _clear_prompt(page)
         return {"status": "ok", "dry_run": True}
 
     if dl.left() < SEND_MIN_LEFT:  # not enough time to wait for the offer and the clip: do not spend anything
         left = int(dl.left())
         try:
-            if page.locator(CLEAR_BTN).count():
-                page.locator(CLEAR_BTN).first.click()
+            _clear_prompt(page)
         except Exception:
             pass
         raise Fail(EXIT_TIMEOUT, f"Chỉ còn {left} giây nên không gửi yêu cầu (chưa gửi, chưa trừ credit) — thử render lại.",
@@ -1006,6 +1072,7 @@ def _offer(page, args, titles_before: list[str], perms_before: int, bubbles_befo
     """Flow asks to confirm the cost (or starts straight away when "Confirm before generating" is Never).
     Returns the credits approved (None if Flow started by itself). From the end of this on, never resubmit."""
     def asked():
+        _to_side_panel(page)  # the compact card hides the offer; its "Use side panel" may appear only now
         if page.locator(PERMISSION).count() > perms_before:
             p = page.locator(PERMISSION).last
             if p.locator('[role=radio][aria-label="Approve"]:not(.read-only)').count():
@@ -1220,12 +1287,8 @@ def run_i2i(args) -> dict:
         window = "headless" if args.headless else args.window
         ctx, page = _session(pw, Path(args.profile_dir).expanduser(), args.channel, window, args.project)
         try:
-            if page.locator(NEW_SESSION_BTN).count():
-                page.locator(NEW_SESSION_BTN).first.click()  # fresh chat: no context from earlier scenes
-                time.sleep(1.5)
-            if page.locator(CLEAR_BTN).count() and page.locator(CLEAR_BTN).first.is_visible():
-                page.locator(CLEAR_BTN).first.click()
-                time.sleep(0.5)
+            _new_session(page)  # fresh chat: no context from earlier scenes
+            _clear_prompt(page)
             _attach_refs(page, refs)
             editor = page.locator(EDITOR)
             editor.click()
@@ -1233,7 +1296,7 @@ def run_i2i(args) -> dict:
             time.sleep(0.5)
             if args.dry_run:
                 log("  (dry-run) đã gắn ảnh và gõ prompt, không bấm gửi.")
-                page.locator(CLEAR_BTN).first.click()
+                _clear_prompt(page)
                 return {"status": "ok", "dry_run": True}
 
             before = _stable_image_ids(page)  # after the uploads, so an uploaded picture is never taken for the result
@@ -1248,6 +1311,7 @@ def run_i2i(args) -> dict:
             started, answered, res = time.time(), False, None
             while time.time() - started < args.timeout:
                 # Images are free; Flow may still ask to confirm. Never approve anything that makes a video.
+                _to_side_panel(page)
                 if not answered and page.locator(PERMISSION).count() > perms_before:
                     perm = page.locator(PERMISSION).last
                     approve = perm.locator('[role=radio][aria-label="Approve"]:not(.read-only)')
