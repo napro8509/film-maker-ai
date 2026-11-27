@@ -554,6 +554,12 @@ def test_autopilot_basic_format_runs_vimax_and_openmontage_and_gates_bad_clip(tm
         raise AssertionError(f"Unexpected schema: {schema}")
 
     monkeypatch.setattr(ai, "ask", fake_ask)
+    from filmmaker import editor
+
+    def no_network(*a, **k):  # the editor agent would call the real API with the test key: rules instead
+        raise RuntimeError("không gọi API thật trong test")
+
+    monkeypatch.setattr(editor, "ai_plan", no_network)
 
     out = proj / "output" / "storyboard"
     logs: list[str] = []
@@ -647,7 +653,7 @@ def test_web_endpoints_settings_local_qc_keyframe_select_and_assembly_gate(tmp_p
     def wait_job(job_resp):
         for _ in range(1200):
             j = c.get(f"/api/jobs/{job_resp['id']}").json()
-            if j["status"] != "running":
+            if j["status"] not in ("running", "queued"):
                 return j
             time.sleep(0.05)
         raise AssertionError("job timed out")
@@ -756,7 +762,8 @@ def test_muse_candidates_serialize_browser_and_stale_candidates_cleaned(tmp_path
     rep = pipe.run(RunOptions(keyframes_only=True, keyframe_candidates=2, pre_qc_gate=True, pause=(0, 0)))
     assert rep.done == ["s01"]
     assert max_active == 1, "Muse browser profile calls must be serialized by _ui_browser_lock"
-    assert sorted(p.name for p in cdir.glob("s01_c*.png")) == ["s01_c1.png", "s01_c2.png"]
+    # one browser: the first candidate passed Pre-QC, so the second was not made (F8); the stale c3 is gone
+    assert sorted(p.name for p in cdir.glob("s01_c*.png")) == ["s01_c1.png"]
 
 
 def test_new_film_ui_enables_auto_qc_by_default():
@@ -768,3 +775,34 @@ def test_new_film_ui_enables_auto_qc_by_default():
         for fn in ("app.js", "board.js"):
             proc = subprocess.run(["node", "--check", str(static / fn)], capture_output=True, text=True)
             assert proc.returncode == 0, proc.stderr
+
+
+@needs_ffmpeg
+def test_one_browser_makes_the_other_candidates_only_when_the_first_is_not_good(tmp_path, monkeypatch):
+    """F8: on one browser the candidates come one after the other; a weak first one still gets a rival."""
+    sb = Storyboard.model_validate({
+        "title": "Muse", "image_model": "muse", "model": "muse",
+        "scenes": [{"id": "s01", "mode": "keyframe", "image_prompt": "Forest trail", "prompt": "Walk", "duration": 10}],
+    })
+    made: list[str] = []
+
+    class G(Gflow):
+        def __init__(self):
+            super().__init__(dry_run=False, log=lambda *_: None)
+
+        def text_to_image(self, prompt, *, out, **kw):
+            made.append(Path(out).name)
+            return _make_png(Path(out), color="green")
+
+    picks = iter([{"verdict": "MINOR", "score": 6}, {"verdict": "PASS", "score": 8}])
+
+    def select(sb_, s, cands, **kw):
+        r = next(picks)
+        return {**r, "best_index": len(cands), "best_path": str(cands[-1]), "reason": "", "issues": [],
+                "candidates": [], "image_prompt": None}
+
+    monkeypatch.setattr(qc, "select_best_keyframe", select)
+    out = tmp_path / "out"
+    Pipeline(sb, out, G(), sleep=lambda *_: None).run(
+        RunOptions(keyframes_only=True, keyframe_candidates=2, pre_qc_gate=True, pause=(0, 0)))
+    assert made == ["s01_c1.png", "s01_c2.png"]

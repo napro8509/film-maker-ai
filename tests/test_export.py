@@ -216,7 +216,7 @@ def test_web_publish_endpoints(project_dir):
     job_id = r_pub.json()["id"]
     for _ in range(30):
         j = client.get(f"/api/jobs/{job_id}").json()
-        if j["status"] != "running":
+        if j["status"] not in ("running", "queued"):
             break
         time.sleep(0.05)
     assert j["status"] == "done"

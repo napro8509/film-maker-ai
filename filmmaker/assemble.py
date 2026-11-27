@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 
 from .storyboard import SUBTITLE_LANGS, Storyboard, subtitle_code
@@ -99,9 +101,75 @@ def subtitle_track_args(tracks: dict[str, Path], first_input: int) -> tuple[list
 
 
 def burn_track(sb: Storyboard, tracks: dict[str, Path], language: str | None) -> Path | None:
-    """The .srt to burn into the picture: the chosen track, else the primary one."""
+    """The .srt to burn into the picture: the chosen track, else the primary one. Lines in a script written
+    without spaces (Thai, Lao, Khmer, Chinese, Japanese) are broken into a `.burn.srt` copy first: ffmpeg
+    only wraps at spaces and cuts them off at both edges of the picture."""
     code = subtitle_code(language) or sb.primary_subtitle_code()
-    return tracks.get(code) or next(iter(tracks.values()), None)
+    track = tracks.get(code) or next(iter(tracks.values()), None)
+    if track is None:
+        return None
+    try:
+        text = track.read_text(encoding="utf-8")
+    except OSError:
+        return track
+    width = 50 if sb.aspect == "16:9" else 18
+    wrapped = "\n".join(wrap_unspaced(line, width) for line in text.split("\n"))
+    if wrapped == text:
+        return track
+    out = track.with_suffix(".burn.srt")
+    out.write_text(wrapped, encoding="utf-8")
+    return out
+
+
+#: Scripts written without spaces between words.
+_UNSPACED = re.compile("[\u0e00-\u0eff\u1780-\u17ff\u3040-\u30ff\u3400-\u9fff]")
+_THAI_LEADING_VOWELS = "\u0e40\u0e41\u0e42\u0e43\u0e44\u0ec0\u0ec1\u0ec2\u0ec3\u0ec4"
+
+
+def _columns(text: str) -> int:
+    """Width of `text` in characters; marks drawn above or below a letter take no room."""
+    return sum(unicodedata.category(c) != "Mn" for c in text)
+
+
+def _words(text: str) -> list[str]:
+    """`text` cut where a line may break, nothing dropped. macOS knows Thai word boundaries; elsewhere the
+    cut is between letters (never before a mark, never after a leading vowel)."""
+    try:
+        from Foundation import NSString
+
+        ns, starts = NSString.stringWithString_(text), []
+        ns.enumerateSubstringsInRange_options_usingBlock_(
+            (0, ns.length()), 3, lambda _sub, rng, _enclosing, _stop: starts.append(rng.location))
+        # Thai / CJK are all in the basic plane, where NSString's offsets are Python's
+        if starts and ns.length() == len(text):
+            cuts = [0, *[i for i in starts if i > 0], len(text)]
+            return [text[a:b] for a, b in zip(cuts, cuts[1:]) if b > a]
+    except ImportError:
+        pass
+    out: list[str] = []
+    for c in text:
+        if out and (unicodedata.category(c).startswith("M") or c in "\u0e30\u0e32\u0e33\u0e46"
+                    or out[-1][-1] in _THAI_LEADING_VOWELS):
+            out[-1] += c
+        else:
+            out.append(c)
+    return out
+
+
+def wrap_unspaced(line: str, width: int) -> str:
+    """One subtitle line broken to at most `width` characters per row; lines with spaces-only scripts, numbers
+    and timestamps are left for ffmpeg to wrap."""
+    if not _UNSPACED.search(line) or _columns(line) <= width:
+        return line
+    rows, row = [], ""
+    for word in _words(line):
+        if row.strip() and _columns(row + word.rstrip()) > width:
+            rows.append(row.rstrip())
+            row = ""
+        row += word
+    if row.strip():
+        rows.append(row.rstrip())
+    return "\n".join(rows)
 
 
 def assemble(sb: Storyboard, clips: list[tuple[str, Path]], output: Path, *, music: Path | None = None,

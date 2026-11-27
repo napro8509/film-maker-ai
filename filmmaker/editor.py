@@ -712,11 +712,15 @@ def ai_plan(sb: Storyboard, infos: dict[str, ClipInfo], order: list[str], *, has
                 content.append({"type": "image", "source": {
                     "type": "base64", "media_type": "image/jpeg",
                     "data": base64.standard_b64encode(path.read_bytes()).decode()}})
-        response = anthropic.Anthropic().messages.parse(
-            model=MODEL, max_tokens=16000, system=system, messages=[{"role": "user", "content": content}],
-            output_format=EditPlan, output_config={"effort": "medium"},
-            extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
-        )
+        try:
+            response = anthropic.Anthropic().messages.parse(
+                model=MODEL, max_tokens=16000, system=system, messages=[{"role": "user", "content": content}],
+                output_format=EditPlan, output_config={"effort": "medium"},
+                extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"}, extra_body={"fallbacks": "default"},
+            )
+        except anthropic.APIError as exc:
+            # a bad key, an outage or a rate limit: "auto" then edits by the default rules instead of failing the film
+            raise RuntimeError(f"Anthropic API lỗi: {exc}") from exc
         if response.stop_reason == "refusal" or not response.parsed_output:
             raise RuntimeError("Claude không lập được kế hoạch dựng cho phim này.")
         plan = response.parsed_output

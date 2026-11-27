@@ -441,3 +441,9 @@ def test_too_many_people_for_the_image_model_warns(env):
     pipe.sb.scenes[0].image_prompt = "Minh, Lan, Tuan, Hoa and Bao at the table"
     kf_only(pipe)
     assert any("5 nhân vật trong ảnh" in l and "tối đa 4" in l for l in env.lines)
+
+
+def test_shot_description_may_change_a_characters_outfit():
+    from filmmaker.pipeline import OUTFIT_CHANGE
+
+    assert "dresses Lert differently" in OUTFIT_CHANGE.format(name="Lert")

@@ -91,7 +91,7 @@ const toast = (msg, kind = "") => toasts.push({ msg, kind });
 const flushSave = async () => { flushes++; };
 const saveFailed = () => saveBad;
 const reloadProject = (d) => reloads.push(d);
-const jobRunning = () => running;
+const jobRunning = () => running, projBusy = () => running;
 const openModelChange = (o) => modelChanges.push(o);
 const icon = () => null;
 const FREE = () => null, PAID = () => null;

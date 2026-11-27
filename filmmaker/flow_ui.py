@@ -927,6 +927,16 @@ CONTENT_RE = re.compile(r"violat|polic|prominent|harmful|safety|not allowed|can[
                         r"different prompt|video has been (deleted|removed)", re.I)
 
 
+#: The agent's answer that accepts the request ("I will generate 1 video using …") rather than declining it.
+PROMISED_RE = re.compile(r"^\W*(I will|I'll|I am going to|I'm going to) (now )?(generate|create)\b", re.I)
+
+
+def promised_without_offer(reply: str) -> bool:
+    """Flow said it would make the video but never showed what to approve (seen on a very busy machine):
+    nothing about the scene is wrong, so the same prompt is sent again instead of being rewritten."""
+    return bool(PROMISED_RE.search(reply or "")) and not CONTENT_RE.search(reply or "")
+
+
 def is_glitch(text: str) -> bool:
     """Flow's generic "Something went wrong. Please try again." with nothing about the content or the sound."""
     return bool(GLITCH_RE.search(text or "")) and not CONTENT_RE.search(text or "") \
@@ -1111,6 +1121,9 @@ def _offer(page, args, titles_before: list[str], perms_before: int, bubbles_befo
                            "lại (app tự nhận clip, không tốn credit).", spent=True)
             raise Fail(EXIT_AGENT_DECLINED, "Hết thời gian chờ trước khi Flow đề nghị tạo video (chưa đồng ý, chưa trừ "
                        "credit). Trả lời của Flow: " + reply, spent=False)
+        if promised_without_offer(reply):
+            raise Fail(EXIT_FLOW_GLITCH, "Flow lỗi tạm thời: đã nhận lời nhưng không hiện thẻ xin xác nhận (chưa đồng ý, "
+                       "chưa trừ credit): " + reply[:300], spent=False)
         raise Fail(EXIT_AGENT_DECLINED, "Flow không đề nghị tạo video. Trả lời của Flow: " + reply)
     credits = None
     if state == "ask":

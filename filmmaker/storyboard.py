@@ -143,6 +143,10 @@ class Character(BaseModel):
     voice: str | None = Field(default=None, description="Fixed voice in English, the same in every clip: gender and "
                               "age, pitch, timbre, accent, pace (e.g. 'warm mid-pitch female voice, native Bangkok "
                               "Thai accent, slow pace'). Omit for characters who never speak.")
+    outfits: dict[str, str] | None = Field(default=None, description="Other clothes the story gives this character, "
+                                           "by a short name, in English (e.g. {'chairman': 'cream silk shirt, grey "
+                                           "trousers, bareheaded'}). The description above keeps the usual look; a "
+                                           "scene picks one of these with its `outfits`. Omit if the clothes never change.")
 
 
 class Location(BaseModel):
@@ -395,6 +399,9 @@ class SceneDraft(BaseModel):
                                                 "said, one speaker per line. Each line is said once by one "
                                                 "character only: no character repeats or echoes another's line, "
                                                 "and no line repeats an earlier scene. Empty when nobody speaks.")
+    outfits: dict[str, str] | None = Field(
+        default=None, description="Clothes changed in this scene: character name -> a name from that character's "
+        "`outfits` (or the clothes themselves, in English). Characters not listed wear their usual description.")
 
     @field_validator("location", mode="before")
     @classmethod
@@ -745,8 +752,28 @@ class Storyboard(StoryboardDraft):
     def _characters_in(self, text: str) -> list[Character]:
         return [c for c in self.characters if re.search(rf"\b{re.escape(c.name)}\b", text, re.IGNORECASE)]
 
+    def scene_outfit(self, c: Character, scene: "Scene | None") -> str:
+        """What `c` wears in `scene` instead of the clothes of the description ("" = the usual look). F30: a
+        character's portrait shows one outfit; a story that dresses them differently later must say so."""
+        if scene is None or not getattr(scene, "outfits", None):
+            return ""
+        want = next((v for k, v in scene.outfits.items() if k.strip().casefold() == c.name.strip().casefold()), "")
+        want = str(want or "").strip()
+        if not want:
+            return ""
+        named = {k.strip().casefold(): v for k, v in (c.outfits or {}).items()}
+        return str(named.get(want.casefold(), want)).strip().rstrip(".")
+
+    def _look(self, c: Character, scene: "Scene | None") -> str:
+        desc = c.description.strip().rstrip(".") if self.basic else c.description.strip()
+        wear = self.scene_outfit(c, scene)
+        if not wear:
+            return f"{c.name}: {desc}."
+        return (f"{c.name}: {desc.rstrip('.')}. In this shot {c.name} wears {wear}, not the clothes described above "
+                f"or shown in {c.name}'s reference picture (same face and hair).")
+
     def _compose(self, text: str, direction: str = "", chars: list[Character] | None = None,
-                 setting: str = "", kind: str = "image") -> str:
+                 setting: str = "", kind: str = "image", scene: "Scene | None" = None) -> str:
         """`chars` = characters whose description is added; None = those named in `text`.
         `setting` (the location sentence) goes after the direction, before the characters.
         `kind` = the rule set ("image" / "video") that decides whether setting, looks and style are added."""
@@ -760,8 +787,7 @@ class Storyboard(StoryboardDraft):
         if not self.rule(kind, "looks"):
             chars = []
         if chars:  # basic formats: no "look.." double stop (the drama keeps its text: fingerprints)
-            parts.append(" ".join(f"{c.name}: {c.description.strip().rstrip('.') if self.basic else c.description.strip()}."
-                                  for c in chars))
+            parts.append(" ".join(self._look(c, scene) for c in chars))
         if self.style.strip() and self.rule(kind, "style"):
             parts.append(f"Style: {self.style.strip().rstrip('.')}.")
         return " ".join(parts)
@@ -1321,13 +1347,14 @@ class Storyboard(StoryboardDraft):
                 return i2v_prompt.assemble(scene.video_shot, audio_mode=self.audio, language=self.spoken_language(),
                                            narration=scene.narration, opts=self.shot_options(scene))
             if scene.mode == "t2v":
-                return self._compose(scene.prompt, "", self._prompt_characters(scene), kind="video")
+                return self._compose(scene.prompt, "", self._prompt_characters(scene), kind="video", scene=scene)
             return scene.prompt.strip()
         perf = self.performance(scene)
         camera = self.rule("video", "camera")
         if scene.mode == "t2v":
             return self._compose(scene.prompt, self._join(self.direction(scene) if camera else "", perf),
-                                 self._prompt_characters(scene), setting=self._setting(scene), kind="video")
+                                 self._prompt_characters(scene), setting=self._setting(scene), kind="video",
+                                 scene=scene)
         # In keyframe/i2v mode the look and framing are already in the image; keep the prompt on the motion.
         motion = self.direction(scene, MOTION_FIELDS + ("focus",)) if camera else ""
         action = scene.prompt.strip().rstrip(".")
@@ -1343,8 +1370,9 @@ class Storyboard(StoryboardDraft):
         setting = self._setting(scene)
         if scene.image_prompt and scene.image_prompt.strip():
             return self._compose(f"{scene.image_prompt.strip().rstrip('.')}. {scene.prompt.strip()}",
-                                 direction, self._prompt_characters(scene), setting=setting, kind="video")
-        return self._compose(scene.prompt, direction, self._prompt_characters(scene), setting=setting, kind="video")
+                                 direction, self._prompt_characters(scene), setting=setting, kind="video", scene=scene)
+        return self._compose(scene.prompt, direction, self._prompt_characters(scene), setting=setting, kind="video",
+                             scene=scene)
 
     def image_prompt(self, scene: Scene) -> str:
         # A still has no motion: only the framing, lens, focus, composition and lighting apply.
@@ -1357,12 +1385,12 @@ class Storyboard(StoryboardDraft):
             if self.rule("image", "strip_technical"):
                 text = i2v_prompt.strip_technical(text)
             return self._safe_image(self._compose(text, staging, self._prompt_characters(scene),
-                                                  setting=self._setting(scene)))
+                                                  setting=self._setting(scene), scene=scene))
         content = (f"Content direction: {scene.content_direction.rstrip('.')}."
                    if scene.content_direction and self.rule("image", "content_direction") else "")
         frame = self.direction(scene, FRAME_FIELDS) if self.rule("image", "camera") else ""
         return self._compose(scene.image_prompt or scene.prompt, self._join(frame, content),
-                             self._prompt_characters(scene), setting=self._setting(scene))
+                             self._prompt_characters(scene), setting=self._setting(scene), scene=scene)
 
     def shot_options(self, scene: Scene | None = None) -> dict[str, bool | str | int]:
         """What `i2v_prompt.assemble` adds to a structured video prompt, from the video rules."""

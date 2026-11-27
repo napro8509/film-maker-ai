@@ -33,11 +33,11 @@ def client(tmp_path, monkeypatch):
     return c
 
 
-def wait(c, job, timeout=60):
+def wait(c, job, timeout=180):
     end = time.time() + timeout
     while time.time() < end:
         j = c.get(f"/api/jobs/{job['id']}").json()
-        if j["status"] != "running":
+        if j["status"] not in ("running", "queued"):
             return j
         time.sleep(0.1)
     raise AssertionError("job did not finish")
@@ -132,7 +132,10 @@ def test_stop_and_one_job_at_a_time(client, monkeypatch):
     monkeypatch.setattr(server, "load_settings", lambda: {"pause_min": 2, "pause_max": 2, "retries": 0, "profile": ""})
     pid = client.post("/api/projects", json={"title": "C", "source": "template"}).json()["id"]
     j = client.post(f"/api/projects/{pid}/run", json={"action": "video"}).json()
-    assert client.post(f"/api/projects/{pid}/run", json={"action": "dry"}).status_code == 409
+    queued = client.post(f"/api/projects/{pid}/run", json={"action": "dry"})  # F14: waits its turn, not refused
+    assert queued.status_code == 200 and queued.json()["status"] == "queued"
+    assert client.post(f"/api/projects/{pid}/run", json={"action": "dry"}).status_code == 409  # same job twice
+    client.post(f"/api/jobs/{queued.json()['id']}/stop")  # taken out of the queue
     time.sleep(0.5)
     client.post(f"/api/jobs/{j['id']}/stop")
     j = wait(client, j)

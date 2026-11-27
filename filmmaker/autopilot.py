@@ -30,7 +30,7 @@ from . import model_meta, reviewer, retirement
 from . import progress as prog
 from .flow_ui import BLOCKED_MARK, EXIT_FLOW_GLITCH, is_glitch
 from .gflow import MUSE_DECLINED, MUSE_FAILED, Gflow, GflowError
-from .pipeline import DONE, SUBMITTING, Pipeline, RunOptions, RunReport
+from .pipeline import DONE, REF_LIMIT, REF_UNSUPPORTED, SUBMITTING, Pipeline, RunOptions, RunReport
 from .storyboard import Storyboard, load_storyboard
 from .thumbnail import ThumbnailError
 
@@ -777,12 +777,15 @@ class Autopilot:
                      "không dùng bản viết lại (sửa cảnh bằng tay rồi render lại).")
             return False
         before = reviewer.spoken_words(scene)
+        cast = [c.name for c in sb.scene_characters(scene)] if scene is not None else []
         with self._soft_lock:
             if quiet:
                 self.data.setdefault("quieted", {}).setdefault(sid, []).append(_quiet_key(scene))
             else:
                 self.data.setdefault("softened", {}).setdefault(sid, []).append(snap)  # the refused version
             changed = self.edit_raw(lambda raw: bool(reviewer.apply_scene_fixes(raw, [fix])))
+            if changed and cast:
+                self._keep_cast(sid, cast)
             if changed and sid not in self.data["resent"]:
                 self.data["resent"].append(sid)  # never also resent as "interrupted"
             after = reviewer.spoken_words(next((x for x in self.sb().scenes if x.id == sid), None)) if changed else before
@@ -802,6 +805,24 @@ class Autopilot:
             self.log(f"  [{sid}] thoại mới: " + (" / ".join(f"{d.character}: {d.line}" for d in fix.dialogue)
                                                  or "(bỏ thoại)"))
         return True
+
+    def _keep_cast(self, sid: str, cast: list[str]) -> None:
+        """A rewrite often says "the young woman" instead of a name: the scene then lost its characters and was sent
+        with no character pictures at all (F27, 27/11/2026). Pin the scene's people to the ones it had before."""
+        after = next((x for x in self.sb().scenes if x.id == sid), None)
+        if after is None or after.characters is not None:
+            return
+        now = {c.name for c in self.sb().scene_characters(after)}
+        if set(cast) - now:
+            def pin(raw: dict) -> bool:
+                for sc in raw.get("scenes") or []:
+                    if isinstance(sc, dict) and sc.get("id") == sid and sc.get("characters") is None:
+                        sc["characters"] = list(cast)
+                        return True
+                return False
+
+            self.edit_raw(pin)
+            self.log(f"  [{sid}] giữ nhân vật của cảnh sau khi viết lại: {', '.join(cast)}")
 
     def _can_quiet(self, scene, error: str) -> bool:
         """A silent scene Flow could not make the sound of, whose sound cue is not plain room tone yet and was not
@@ -1173,6 +1194,8 @@ def _refusal_reason(err: str, exit_code: Any) -> str | None:
         return "Flow không tạo được âm thanh (thường do lời thoại hoặc cảnh trẻ em bị tổn thương)"
     if exit_code == EXIT_FLOW_GLITCH or ("muse" not in low and is_glitch(err)):
         return None  # Flow's own "Something went wrong" (also in errors saved before EXIT_FLOW_GLITCH existed)
+    if REF_LIMIT.search(err) or REF_UNSUPPORTED.search(err):
+        return None  # about the character pictures sent along, not the scene: the pipeline sends fewer of them
     if exit_code in (MUSE_DECLINED, MUSE_FAILED) and err and not QUOTA_RE.search(err):
         # Muse (and Flow's chat agent) says "couldn't be generated" with no reason: almost always the content
         return ("Muse không tạo được video (thường do nội dung cảnh)" if "muse" in low

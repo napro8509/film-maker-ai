@@ -20,7 +20,7 @@ const all = (n) => (n && n.tag ? [n, ...n.kids.flatMap(all)] : []);
 const text = (n) => (n && n.tag ? n.kids.map(text).join("") : String(n ?? ""));
 const icon = () => null, FREE = () => null, PAID = () => null, fmtDur = (s) => s + "s", NATIVE = () => true;
 let S, calls = [], toasts = [], runs = [], jobs = [], zones = 0, running = false;
-const jobRunning = () => running, refreshZone = () => { zones++; }, toast = (m, k = "") => toasts.push({ m, k });
+const jobRunning = () => running, projBusy = () => running, refreshZone = () => { zones++; }, toast = (m, k = "") => toasts.push({ m, k });
 const api = async (method, url, body) => { calls.push({ method, url, body: JSON.parse(JSON.stringify(body ?? null)) });
   return method === "PUT" ? { ...S.edit.data, plan: body } : { id: "j1" }; };
 const flushSave = async () => {}, saveFailed = () => false, prettyError = (e) => e, confirmModal = async () => true;

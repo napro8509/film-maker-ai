@@ -86,11 +86,51 @@ def test_restore_cookies_puts_saved_session_back(tmp_path):
     class Ctx:
         added = None
 
+        def cookies(self):
+            return []
+
         def add_cookies(self, c):
             Ctx.added = c
 
     muse_ui._restore_cookies(Ctx(), tmp_path)
     assert Ctx.added == [{"name": "a", "value": "b"}]
+
+
+def test_restore_never_writes_an_old_copy_over_a_renewed_cookie(tmp_path):
+    """F17: the saved sign-in cookie from the day of login overwrote the one Muse had renewed: signed out."""
+    old = {"name": "hatch_sess", "value": "old", "domain": ".muse.ai", "path": "/"}
+    gone = {"name": "csrf", "value": "x", "domain": "muse.ai", "path": "/"}
+    (tmp_path / "muse-state.json").write_text(json.dumps({"cookies": [old, gone]}))
+
+    class Ctx:
+        added = None
+
+        def cookies(self):
+            return [{**old, "value": "renewed"}]
+
+        def add_cookies(self, c):
+            Ctx.added = c
+
+    muse_ui._restore_cookies(Ctx(), tmp_path)
+    assert Ctx.added == [gone]
+
+
+def _state(tmp_path, **extra):
+    import time
+
+    cookie = {"name": "hatch_sess", "value": "v", "domain": ".muse.ai", "path": "/", "expires": time.time() + 86400 * 20}
+    (tmp_path / "muse-state.json").write_text(json.dumps({"cookies": [cookie], **extra}))
+
+
+def test_session_status(tmp_path):
+    assert muse_ui.session_status(tmp_path)["signed_in"] is False  # never signed in
+    _state(tmp_path)
+    st = muse_ui.session_status(tmp_path)
+    assert st["signed_in"] is True and 19 < st["days_left"] <= 20
+    muse_ui._mark_signed_out(tmp_path)
+    assert muse_ui.session_status(tmp_path)["signed_in"] is False
+    _state(tmp_path)  # signing in again writes a fresh state
+    assert muse_ui.session_status(tmp_path)["signed_in"] is True
 
 
 def test_restore_cookies_without_file_is_a_no_op(tmp_path):

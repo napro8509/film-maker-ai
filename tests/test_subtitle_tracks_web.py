@@ -41,6 +41,11 @@ def test_stitch_translates_and_writes_three_tracks(client, monkeypatch):
     # pretend a planner backend exists (no real Claude in tests)
     monkeypatch.setattr(planner, "claude_code_binary", lambda: "/bin/true")
     monkeypatch.setattr(planner, "claude_code_status", lambda: {"available": True, "logged_in": True, "method": "x"})
+    from filmmaker import qc
+
+    # F7: the automatic clip QC after the render (OCR on 4 frames per clip) made this test pass its 60 s wait
+    monkeypatch.setattr(qc, "tesseract_binary", lambda: None)
+    monkeypatch.setattr(qc, "whisper_binary", lambda: None)
     assert run(client, pid, action="video")["status"] == "done"
     j = run(client, pid, action="stitch", burn_subtitles=True, burn_language="th")
     assert j["status"] == "done", j["lines"]

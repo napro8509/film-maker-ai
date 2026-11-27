@@ -174,7 +174,7 @@ def test_field_order_unchanged():
                                                      "format", "audio", "visual_style", "genres", "ai_model",
                                                      "prompt_rules", "keyframe_candidates", "qc_gate"]
     assert list(StoryboardDraft.model_fields) == new_sb
-    new_scene += ["content_direction", "dialogue"]  # scene-dialogue: appended after every old field
+    new_scene += ["content_direction", "dialogue", "outfits"]  # scene-dialogue, then outfits (F30): appended last
     assert list(Scene.model_fields)[:-3] == old_scene + new_scene == list(SceneDraft.model_fields)
     # video_shot: basic formats only; screen_time: films made from a reference video (set by the app, not Claude)
     assert list(Scene.model_fields)[-3:] == ["characters", "video_shot", "screen_time"]

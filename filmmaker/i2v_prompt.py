@@ -571,6 +571,10 @@ def _before_audio(text: str, sentence: str) -> str:
     return f"{text.rstrip()} {sentence}"
 
 
+#: A speaker the shot keeps turned away from the viewer.
+FROM_BEHIND = re.compile(r"(?i)\bfrom behind\b|\bback view\b|\bback to (?:us|the (?:viewer|viewpoint|camera))\b")
+
+
 def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, sound: str,
               opts: dict | None = None) -> str:
     """The eyeline guide's 5 blocks: [1 locked-off viewpoint + focal length] [2 identity + frame position]
@@ -597,7 +601,19 @@ def _dialogue(shot: VideoShot, sp: Speaker, *, language: str | None, env: str, s
     gesture = _gesture(sp.action)
     listeners = [x for x in shot.listeners or [] if clean_text(x.visual_tag)]
     out: list[str] = []
-    if facing in ("camera", "near"):  # the speaker's mouth clearly visible; listeners turn to the speaker
+    if FROM_BEHIND.search(f"{sp.head_angle or ''} {sp.visual_tag or ''}"):
+        # A speaker staged with their back to us: "turns head toward frame ..." made Veo show the face.
+        pos = f"Positioned on frame {side}, " if side else ""
+        if block1:
+            out.append(block1)
+        out.append(f"{t_say}{pos}{tag} {gesture + ', then ' if gesture else ''}keeps facing away with the face hidden "
+                   f"for the whole shot, the head never turning around, {speech}: {line}{no_text}")
+        for lst in listeners:
+            lside = frame_side(lst.position)
+            where = f"On frame {lside}, " if lside else ""
+            out.append(_sentence(f"{where}{_tag(lst.visual_tag)} "
+                                 f"{_silent(lst.silent_action, o['listener_silent'], o['closed_smile'])}"))
+    elif facing in ("camera", "near"):  # the speaker's mouth clearly visible; listeners turn to the speaker
         pos = f"Positioned on frame {side}, " if side else ""
         if block1:
             out.append(block1)

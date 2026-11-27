@@ -77,7 +77,9 @@ class QCAnswer(BaseModel):
     text_errors: bool = Field(default=False, description="True if any frame has burned-in subtitles, captions, "
                                                          "watermarks, logos or gibberish lettering.")
     prompt: str | None = Field(default=None, description="When FAIL and the action prompt is the cause: a corrected "
-                                                         "action prompt (English). Name characters exactly.")
+                                                         "action only (English): who does what in this shot, one or two "
+                                                         "sentences. No camera or lens, no dialogue line, no sound, no "
+                                                         "'no text' sentence: the tool adds those itself.")
 
 
 class KeyframeCandidateVerdict(BaseModel):
@@ -979,6 +981,26 @@ def expected_dialogue(sb: Storyboard, s: Scene) -> str:
     return f"Expected dialogue, in {lang}, in this order, each line once:\n{rows}"
 
 
+_CAMERA_WORDS = re.compile(r"(?i)\b(locked[- ]off|camera|lens|\d+\s?mm|shot\b|close-up|depth of field|dolly|pan(s|ning)?\b|"
+                           r"tracking|framing|stationary viewpoint)")
+_SPOKEN = re.compile(r"(?i)\b(says?|said|speaks?|whispers?|shouts?)\b\s*[:“\"']|[“\"][^”\"]{3,}[”\"]|[\u0e00-\u0e7f]")
+_NO_TEXT_LIKE = re.compile(r"(?i)\bno (captions|subtitles|on-screen text|text|lettering|watermarks?)\b|clean film frame")
+_SOUND = re.compile(r"(?i)^(audio|sound|ambience|ambient|music)\b|\broom tone\b")
+
+
+def action_only(prompt: str | None) -> str | None:
+    """F19: the QC's suggested prompt replaces the scene's "Hành động" box, which holds only the action (the tool
+    adds the camera, the dialogue, the sound and the no-text sentence itself). Drop those sentences when the model
+    wrote a whole prompt anyway, so pressing "Dùng prompt gợi ý" does not repeat them."""
+    if not prompt or not prompt.strip():
+        return prompt
+    sentences = re.split(r"(?<=[.!?])\s+", prompt.strip())
+    kept = [x for x in sentences if not (_CAMERA_WORDS.search(x) and not re.search(r"(?i)\b(walks?|turns?|lifts?|looks?|"
+            r"holds?|nods?|smiles?|steps?|reaches?|sits?|stands?|raises?|lowers?)\b", x))
+            and not _SPOKEN.search(x) and not _NO_TEXT_LIKE.search(x) and not _SOUND.search(x)]
+    return " ".join(kept).strip() or prompt.strip()
+
+
 def uses_reference_video(sb: Storyboard, s: Scene) -> bool:
     """True when the clip was rendered with character refs next to the start picture: Flow then makes it as
     Reference-to-Video, which reframes the shot, so a low first-frame match does not mean another picture."""
@@ -986,6 +1008,15 @@ def uses_reference_video(sb: Storyboard, s: Scene) -> bool:
         return bool(sb.start_frame_char_refs(s))
     except Exception:
         return False
+
+
+def reframes_start(sb: Storyboard, s: Scene) -> bool:
+    """True when a right clip may start on a reframed picture: Reference-to-Video on Flow, and every Muse clip
+    (Muse zooms into the attached picture even without character refs: 27/11/2026, a correct closing shot scored
+    0.61 and was cut from the film as "another picture")."""
+    from .gflow import is_muse
+
+    return is_muse(s.model or sb.model) or uses_reference_video(sb, s)
 
 
 def _om_summary(om: dict[str, Any], *, black_flag: bool = False, text_flag: bool = False) -> dict[str, Any]:
@@ -1010,7 +1041,7 @@ def check_scene_openmontage(sb: Storyboard, s: Scene, clip: Path, keyframe: Path
     from .flow_ui import frame_match
 
     raw_match = frame_match(keyframe, clip) if keyframe and keyframe.is_file() else None
-    reframed = keyframe is not None and uses_reference_video(sb, s)
+    reframed = keyframe is not None and reframes_start(sb, s)
     match = round(raw_match, 3) if raw_match is not None and raw_match == raw_match else None
     om = openmontage_check(clip, work, sb=sb, s=s)
     issues = list(om["issues"])
@@ -1059,7 +1090,7 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
     from .flow_ui import frame_match
 
     raw_match = frame_match(keyframe, clip) if keyframe and keyframe.is_file() else None
-    reframed = keyframe is not None and uses_reference_video(sb, s)
+    reframed = keyframe is not None and reframes_start(sb, s)
     match = round(raw_match, 3) if raw_match is not None and raw_match == raw_match else None  # None or NaN: unknown
     om = openmontage_check(clip, work, sb=sb, s=s)
     sound = om["audio"]
@@ -1102,8 +1133,8 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         "ocr_texts": om["ocr_texts"],
     }
     facts = [
-        (f"Start-frame match with the keyframe: not meaningful ({match}): rendered as Reference-to-Video with "
-         "character references, which keeps the scene but reframes the shot; judge the content, not the framing"
+        (f"Start-frame match with the keyframe: not meaningful ({match}): the renderer (Muse, or Reference-to-Video "
+         "with character references) keeps the scene but reframes the shot; judge the content, not the framing"
          if reframed else f"Start-frame match with the keyframe: {match if match is not None else 'unknown'}"),
         f"OpenMontage post-render check: {json.dumps(om_fact, ensure_ascii=False)}"
         + (" (`ocr_texts` is a noisy Tesseract read of the bottom caption strip: it often turns wood grain, cloth or"
@@ -1157,7 +1188,7 @@ def check_scene(sb: Storyboard, s: Scene, clip: Path, keyframe: Path | None, wor
         "issues": issues,
         "picture": ans.picture,
         "sound": ans.sound,
-        "prompt": ans.prompt,
+        "prompt": action_only(ans.prompt),
         "match": match,
         "audio": sound,
         "openmontage": _om_summary(om, black_flag=ans.black_frames, text_flag=ans.text_errors),

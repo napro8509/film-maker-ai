@@ -260,9 +260,9 @@ def web(film, tmp_path, monkeypatch):
 
 
 def _wait(c, job):
-    for _ in range(200):
+    for _ in range(1200):  # up to 60 s: OCR + frames on a busy machine took longer than the old 10 s
         j = c.get(f"/api/jobs/{job['id']}").json()
-        if j["status"] != "running":
+        if j["status"] not in ("running", "queued"):
             return j
         time.sleep(0.05)
     raise AssertionError("job still running")

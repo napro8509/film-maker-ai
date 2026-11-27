@@ -61,6 +61,7 @@ def _open(pw, profile: Path, channel: str | None, headless: bool):
         try:
             ctx = pw.chromium.launch_persistent_context(str(profile), **({"channel": ch} if ch else {}), **kw)
             _restore_cookies(ctx, profile)
+            CURRENT["profile"] = profile
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             return ctx, page
         except Exception as exc:
@@ -92,16 +93,76 @@ def _state_file(profile: Path) -> Path:
     return profile / "muse-state.json"
 
 
+#: The profile in use by this process (set by _open): where the session is saved / marked signed out.
+CURRENT: dict = {"profile": None}
+#: Muse's own sign-in cookie (about 30 days, renewed by the site as it is used).
+SESSION_COOKIE = "hatch_sess"
+
+
 def _restore_cookies(ctx, profile: Path) -> None:
+    """Put back the saved cookies the browser does not have (session cookies Chrome dropped at close). Never one it
+    already has: Muse renews its sign-in cookie as it is used, and writing the older saved copy over the renewed one
+    signed the profile out (27/11/2026, after ten days of runs that each restored the cookies saved at login)."""
     f = _state_file(profile)
     if not f.is_file():
         return
     try:
         cookies = json.loads(f.read_text()).get("cookies") or []
-        if cookies:
-            ctx.add_cookies(cookies)
+        have = {(c.get("name"), c.get("domain"), c.get("path")) for c in ctx.cookies()}
+        missing = [c for c in cookies if (c.get("name"), c.get("domain"), c.get("path")) not in have]
+        if missing:
+            ctx.add_cookies(missing)
     except Exception as exc:
         log(f"  (không nạp được cookie Muse đã lưu: {exc})")
+
+
+def _save_session(ctx, profile: Path | None) -> None:
+    """Keep the saved session current (renewed cookies) after Muse answered: what the next run restores."""
+    if not profile:
+        return
+    try:
+        f = _state_file(profile)
+        ctx.storage_state(path=str(f))
+        f.chmod(0o600)
+    except Exception as exc:
+        log(f"  (không lưu được phiên Muse: {exc})")
+
+
+def _mark_signed_out(profile: Path | None) -> None:
+    """Remember that Muse showed its sign-in page, so the app asks for `login` before the next Muse film."""
+    if not profile:
+        return
+    f = _state_file(profile)
+    try:
+        data = json.loads(f.read_text()) if f.is_file() else {}
+        data["signed_out_at"] = time.time()
+        f.write_text(json.dumps(data))
+        f.chmod(0o600)
+    except Exception:
+        pass
+
+
+def session_status(profile: Path | str = DEFAULT_PROFILE) -> dict:
+    """Is the Muse profile signed in, judged from the saved session alone (no browser, instant)?
+    signed_in: False = surely not (never signed in, signed out, or the sign-in cookie expired); True = it was at
+    the last run (Muse can still end a session early: the first request then stops with a sign-in error)."""
+    f = _state_file(Path(profile).expanduser())
+    if not f.is_file():
+        return {"signed_in": False, "reason": "chưa đăng nhập Muse lần nào"}
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return {"signed_in": False, "reason": "không đọc được phiên Muse đã lưu"}
+    if data.get("signed_out_at"):
+        return {"signed_in": False, "reason": "Muse đã đăng xuất ở lần chạy trước"}
+    sess = [c for c in data.get("cookies") or [] if c.get("name") == SESSION_COOKIE and "muse.ai" in str(c.get("domain"))]
+    if not sess:
+        return {"signed_in": False, "reason": "chưa có phiên đăng nhập Muse"}
+    expires = max(float(c.get("expires") or -1) for c in sess)
+    if 0 < expires < time.time():
+        return {"signed_in": False, "reason": "phiên đăng nhập Muse đã hết hạn"}
+    days = (expires - time.time()) / 86400 if expires > 0 else None
+    return {"signed_in": True, "days_left": round(days, 1) if days is not None else None}
 
 
 def run_login(args) -> dict:
@@ -142,9 +203,10 @@ def run_login(args) -> dict:
 
 
 def _check_signed_in(args) -> bool:
-    """Reopen the profile headless and look again, after the page had time to render."""
+    """Reopen the profile and look again, after the page had time to render. In a real window: muse.ai shows a
+    headless browser its signed-out page even when the same profile is signed in."""
     with _playwright()() as pw:
-        ctx, page = _open(pw, Path(args.profile_dir).expanduser(), args.channel, headless=True)
+        ctx, page = _open(pw, Path(args.profile_dir).expanduser(), args.channel, headless=False)
         try:
             page.goto(MUSE, wait_until="domcontentloaded", timeout=90_000)
             try:
@@ -269,7 +331,8 @@ def build_image_prompt(description: str, *, refs: int, aspect: str) -> str:
              "Do not ask me any questions and do not describe it, just generate it and send me the image."]
     if refs:
         parts.append(f"The {refs} attached image(s) are references, in the order they are attached: keep the "
-                     "characters' faces, hair and clothes and the places exactly as in them.")
+                     "characters' faces, hair and clothes and the places exactly as in them. Where the description "
+                     "below dresses someone differently, use the clothes of the description.")
     parts.append(f"Image: aspect ratio {aspect}, one single frame (no collage, no text, no watermark).")
     parts.append("Description: " + description.strip())
     return " ".join(parts)
@@ -473,6 +536,30 @@ def run_image(args) -> dict:
     return _generate(args, "image")
 
 
+#: Screenshot of a chat that never showed its composer, when the request asked for no screenshots itself.
+NO_CHAT_SHOTS = Path("~/.filmmaker/muse-failed").expanduser()
+
+
+def _open_chat(page, debug: Path | None):
+    """Open muse.ai and return its composer. A page that comes up without one gets a reload before giving up
+    (27/11/2026: one load of three in a row never showed it, the next request worked). Nothing is sent yet, so
+    trying again costs nothing."""
+    for attempt in (1, 2):
+        page.goto(MUSE, wait_until="domcontentloaded", timeout=90_000)
+        box = page.locator(COMPOSER).first
+        try:
+            box.wait_for(state="visible", timeout=60_000)
+            return box
+        except Exception:
+            if _logged_out(page):
+                _mark_signed_out(CURRENT["profile"])
+                raise Fail(EXIT_AUTH, "Profile Muse chưa đăng nhập (hoặc hết phiên). Chạy: muse_ui.py login")
+            if attempt == 1:
+                log("  chưa thấy ô chat của Muse, tải lại trang…")
+    _shot(page, debug or (None if FAIL_SHOTS["dir"] else NO_CHAT_SHOTS), "9-no-composer")
+    raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
+
+
 def _generate(args, kind: str, session=None) -> dict:
     """One video (kind "video") or one picture (kind "image") from the Muse chat, saved at args.out.
     `session`: an open (ctx, page) to reuse (the `serve` loop); None opens and closes a browser for this one."""
@@ -503,14 +590,7 @@ def _request(args, kind: str, ctx, page, *, own: bool) -> dict:
                               refs=len(refs))
         sel, word, min_size = "video", "video", 10_000
     try:
-        page.goto(MUSE, wait_until="domcontentloaded", timeout=90_000)
-        box = page.locator(COMPOSER).first
-        try:
-            box.wait_for(state="visible", timeout=60_000)
-        except Exception:
-            if _logged_out(page):
-                raise Fail(EXIT_AUTH, "Profile Muse chưa đăng nhập (hoặc hết phiên). Chạy: muse_ui.py login")
-            raise Fail(EXIT_DRIFT, "Không thấy ô chat của Muse (giao diện có thể đã thay đổi).")
+        box = _open_chat(page, debug)
         # the composer is there; no fixed nap (was 3 s): the activity panel is waited for below
         marker = _marker(prompt)
         # Muse's activity panel (with older "Failed to create" rows) loads a moment after the chat: count
@@ -559,6 +639,7 @@ def _request(args, kind: str, ctx, page, *, own: bool) -> dict:
                     _to_png_if_needed(out)
                 if out.stat().st_size < min_size:
                     raise Fail(EXIT_GENERATION_FAILED, f"File {word} Muse tải về quá nhỏ", spent=True)
+                _save_session(ctx, CURRENT["profile"])
                 return {"status": "ok", "local_path": str(out), "reply": page.evaluate(REPLY_AFTER_JS, marker)[:400]}
             if page.evaluate(FAILED_JS) > failed_before:
                 time.sleep(4)  # Muse writes a line about the failure right after the task row

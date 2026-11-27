@@ -47,6 +47,21 @@ MAX_KEYFRAME_CHAIN = 2
 _UNSET: Any = object()
 
 
+#: A first keyframe candidate with at least this Pre-QC score (and PASS) is taken without making the others (F8).
+EARLY_PASS_SCORE = 8
+
+#: Muse (free) would not make the video: its own "Failed to create" row, or a written refusal.
+MUSE_REFUSED = re.compile(r"Muse \(giao diện chat\): Muse (báo không tạo được|không tạo) video")
+
+#: A story may change someone's clothes (day one a street vendor, the next morning the chairman): the portrait
+#: shows only one outfit, so the shot's own description must be able to override it (27/11/2026).
+OUTFIT_CHANGE = " (if the description of this shot dresses {name} differently, use the clothes of the description)"
+
+#: Flow's chat agent declining because the pictures sent with a video are over the model's limit.
+REF_LIMIT = re.compile(r"maximum of \d+ (total )?(image )?references?|reference (count|images?)[^.]{0,40}(above|exceed)", re.I)
+REF_UNSUPPORTED = re.compile(r"does(n't| not) support (character( entity)?|image|multiple) references?", re.I)
+
+
 class State:
     def __init__(self, path: Path):
         self.path = path
@@ -235,14 +250,14 @@ class Pipeline:
                     return (f"Image {n} is the previous shot ({name}): continue from it, keeping the same setting, "
                             "lighting and the characters' look")
                 return (f"Image {n} is {name}: keep {name}'s facial features, hairstyle and outfit exactly the same "
-                        f"as Image {n}")
+                        f"as Image {n}{OUTFIT_CHANGE.format(name=name)}")
             pos = order[i] if i < len(order) else f"{i + 1}th"
             if i < len(kinds) and kinds[i] == "location":
                 return f"the {pos} is {name}, the scene's location/background (keep this setting)"
             if i < len(kinds) and kinds[i] == "keyframe":
                 return (f"the {pos} is {name}, the previous shot (continue from it, keeping the same setting, "
                         "lighting and the characters' look)")
-            return f"the {pos} is {name} (keep {name}'s face, hair and clothes exactly)"
+            return f"the {pos} is {name} (keep {name}'s face, hair and clothes exactly{OUTFIT_CHANGE.format(name=name)})"
 
         ui_prompt = "Reference images: " + "; ".join(_slot(i, n) for i, (n, _) in enumerate(refs)) + ". " + prompt
         if is_muse(kw.get("model")):  # Muse takes the local pictures as they are, with the labelled prompt
@@ -814,6 +829,12 @@ class Pipeline:
         any_chained = any(ch for _, _, ch in results)
         return made, any_chained
 
+    def _images_one_at_a_time(self) -> bool:
+        """Keyframes come out of one signed-in browser (Muse, or the Flow chat page), so "parallel" candidates are
+        made one after the other."""
+        return is_muse(self.sb.image_model) or bool(getattr(self.g, "t2i_via_chat", False)) or (
+            bool(self.state.data.get("i2i_ui")) or bool(self.sb.use_character_refs and self.g.ui_available()))
+
     @staticmethod
     def _image_ai(model: str | None) -> str:
         return "Muse" if is_muse(model) else "Flow"
@@ -928,20 +949,36 @@ class Pipeline:
         cdir = self.candidate_dir()
         cdir.mkdir(parents=True, exist_ok=True)
         cand_paths = [cdir / f"{s.id}_c{i}.png" for i in range(1, n_cand + 1)]
+        def gen(paths: list[Path]) -> tuple[list[Path], bool]:
+            try:
+                return self._generate_candidates_parallel(sent, paths, refs, kinds, project, opts, src=src, loc=loc)
+            except GflowError as exc:
+                if exc.fatal:
+                    raise
+                alt = other_image_model(self.sb.image_model)
+                self.log(f"  ⇄ [{s.id}] {self._image_ai(self.sb.image_model)} không tạo được keyframe ({exc}); "
+                         f"tạo riêng ảnh này bằng {self._image_ai(alt)}…")
+                return self._on_other_ai(exc, alt, lambda: self._generate_candidates_parallel(
+                    sent, paths, refs, kinds, self._project_for(alt, project), opts, src=src, loc=loc, model=alt))
+
+        serial = n_cand > 1 and self._images_one_at_a_time()
         if n_cand > 1:
-            self.log(f"  [ViMax Pre-QC] Sinh song song {n_cand} keyframe ứng viên cho {s.id}…")
-        try:
-            made, chained = self._generate_candidates_parallel(sent, cand_paths, refs, kinds, project, opts,
-                                                               src=src, loc=loc)
-        except GflowError as exc:
-            if exc.fatal:
-                raise
-            alt = other_image_model(self.sb.image_model)
-            self.log(f"  ⇄ [{s.id}] {self._image_ai(self.sb.image_model)} không tạo được keyframe ({exc}); "
-                     f"tạo riêng ảnh này bằng {self._image_ai(alt)}…")
-            made, chained = self._on_other_ai(exc, alt, lambda: self._generate_candidates_parallel(
-                sent, cand_paths, refs, kinds, self._project_for(alt, project), opts, src=src, loc=loc, model=alt))
-        sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
+            self.log(f"  [ViMax Pre-QC] Sinh {n_cand} keyframe ứng viên cho {s.id}"
+                     + (" (lần lượt trên một trình duyệt; ứng viên đầu đạt thì dừng)…" if serial else " song song…"))
+        if serial:
+            # F8: one browser makes the pictures one after the other (~2 min each on the Flow chat page): a first
+            # candidate that clearly passes is taken, instead of always waiting for the others.
+            made, chained = gen(cand_paths[:1])
+            sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
+            if sel["verdict"] == "PASS" and sel["score"] >= EARLY_PASS_SCORE:
+                self.log(f"  ⏩ [ViMax Pre-QC] Ứng viên #1 đạt {sel['score']}/10: bỏ qua {n_cand - 1} ứng viên còn lại.")
+            else:
+                more, ch_more = gen(cand_paths[1:])
+                made, chained = made + more, chained or ch_more
+                sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
+        else:
+            made, chained = gen(cand_paths)
+            sel = qc.select_best_keyframe(self.sb, s, made, **opts.ai_kw)
         tag = {"PASS": "✔", "MINOR": "~", "FAIL": "✘"}[sel["verdict"]]
         self.log(
             f"  {tag} [ViMax Pre-QC] Chọn ứng viên #{sel['best_index']}/{len(made)} "
@@ -1443,6 +1480,33 @@ class Pipeline:
                      f"(bỏ {', '.join(left)}: Flow chỉ nhận 3 ảnh, ưu tiên người nói / tương tác).")
         return self.ui_refs(picked, project)
 
+    def _send_with_fewer_refs(self, s: Scene, start_image: Path, prompt: str, common: dict,
+                              refs: list[Path | str] | None) -> tuple[Path, str | None]:
+        """Send the clip; when Flow declines because of the character references themselves (too many pictures,
+        or "the model does not support character references"), no offer was made and nothing billed, so send it
+        again with the main character only, then with the start picture alone. Rewording cannot help those."""
+        while True:
+            try:
+                return self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s, refs=bool(refs)),
+                                                refs=refs, **common)
+            except GflowError as exc:
+                over, unsupported = REF_LIMIT.search(str(exc)), REF_UNSUPPORTED.search(str(exc))
+                muse = bool(MUSE_REFUSED.search(str(exc)))
+                if not refs or not (over or unsupported or muse):
+                    raise
+                if muse:
+                    # Muse often refuses a clip only while character pictures ride along (27/11/2026: three of four
+                    # scenes refused three times each passed at once without them). Free to try again.
+                    self.log("  ! Muse từ chối cảnh này: gửi lại chỉ với ảnh mở đầu, không kèm ảnh nhân vật.")
+                    refs = []
+                elif over and len(refs) > 1:
+                    one = self.sb.start_frame_char_refs(s, limit=1)
+                    self.log(f"  ! Flow báo quá số ảnh tham chiếu (chưa trừ credit): gửi lại chỉ kèm {one[0][0]}.")
+                    refs = self.ui_refs(one, common["project"])
+                else:
+                    self.log("  ! Flow không nhận ảnh nhân vật kèm theo (chưa trừ credit): gửi lại chỉ với ảnh mở đầu.")
+                    refs = []
+
     def _render_via_ui(self, s: Scene, start_image: Path, prompt: str, common: dict,
                        refs: list[Path | str] | None = None) -> Path:
         """Image-to-video by driving the Flow chat page (flow_ui.py). `refs` = extra character references (Flow
@@ -1452,8 +1516,7 @@ class Pipeline:
         if not self.g.dry_run:
             self.state.update(s.id, status=SUBMITTING, fingerprint=self.sb.scene_fingerprint(s), error=None,
                               submitted_at=manual_clip.stamp_now())
-        video, media_id = self.g.ui_image_to_video(start_image, self.sb.for_flow_video(prompt, s, refs=bool(refs)),
-                                                   refs=refs, **common)
+        video, media_id = self._send_with_fewer_refs(s, start_image, prompt, common, refs)
         if not self.g.dry_run:
             if not Path(video).is_file():
                 raise GflowError(f"không thấy file video {video}", exit_code=1)

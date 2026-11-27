@@ -404,3 +404,22 @@ def test_pro_agent_sees_the_footage_and_old_plans_are_upgraded(media, tmp_path, 
     assert len(seen) == n  # a plan the user edited is never thrown away
     editor.make_plan(board(), clips, out, backend="claude_code", log=logs.append)
     assert len(seen) == n
+
+
+def test_api_error_in_the_editor_becomes_a_fallback_error(monkeypatch):
+    """F7: a bad key or an outage made the "auto" edit fail the film instead of editing by the default rules."""
+    import anthropic
+    import httpx
+
+    class Boom:
+        class messages:
+            @staticmethod
+            def parse(**kw):
+                raise anthropic.AuthenticationError("invalid x-api-key", response=httpx.Response(
+                    401, request=httpx.Request("POST", "https://api.anthropic.com")), body=None)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: Boom())
+    infos = {s: info(s) for s in ("s01", "s02")}
+    with pytest.raises(RuntimeError, match="Anthropic API lỗi"):
+        editor.ai_plan(board(), infos, ["s01", "s02"], has_music=False, backend="api", log=lambda *_: None)

@@ -275,6 +275,8 @@ def test_web_autopilot_new_film_plans_then_opens_the_project(web, make_client, m
     assert job["status"] == "done", job["lines"][-15:]
     assert job["project"] and (c.ws / job["project"] / "output" / "storyboard" / "final.mp4").is_file()
     assert job["title"] == "Tạo tự động: Phim tự động"
+    # a later export from the "Ghép phim" tab keeps the subtitles burned in
+    assert c.get(f"/api/projects/{job['project']}").json()["final_prefs"]["burn_subtitles"] is True
 
 
 def test_web_autopilot_refuses_bad_storyboard(web):
@@ -702,3 +704,16 @@ def test_soften_scene_asks_for_the_video_shot(tmp_path, monkeypatch):
     reviewer.soften_scene(sb, "s07", MUSE_ERR, earlier=[{"prompt": "x", "video_shot": {"action": "earlier act"}}])
     assert got["schema"] is reviewer.SoftenFix
     assert "cryptic slight smile" in got["user"] and "video_shot" in got["user"] and "earlier act" in got["user"]
+
+
+def test_rewrite_that_drops_the_names_keeps_the_scene_characters(env, monkeypatch):
+    """F27: the AI rewrite said "the young woman" instead of Lan, so the scene was sent with no character picture."""
+    sb_path, calls, _ = env
+    _muse_refused(sb_path, sid="s01")
+    monkeypatch.setattr(reviewer, "soften_scene", lambda sb, sid, err, earlier=None, **kw: reviewer.SceneFix(
+        id=sid, prompt="The young woman smiles softly", image_prompt="A young woman at a quiet cafe"))
+    p, lines = _pilot(sb_path, review=False)
+    p._soften_blocked()
+    scene = yaml.safe_load(sb_path.read_text())["scenes"][0]
+    assert scene["prompt"] == "The young woman smiles softly" and scene["characters"] == ["Lan"]
+    assert any("giữ nhân vật" in l for l in lines)

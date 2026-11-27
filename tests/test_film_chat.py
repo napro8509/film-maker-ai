@@ -196,7 +196,7 @@ def test_planning_remembers_the_idea(web, monkeypatch):
     jid = r.json()["id"]
     for _ in range(100):
         j = web.get(f"/api/jobs/{jid}").json()
-        if j["status"] != "running":
+        if j["status"] not in ("running", "queued"):
             break
         time.sleep(0.05)
     assert j["status"] == "done", j["lines"][-5:]

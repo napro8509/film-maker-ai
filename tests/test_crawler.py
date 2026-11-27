@@ -538,7 +538,7 @@ def _wait_job(c, job, timeout=20):
     end = time.time() + timeout
     while time.time() < end:
         j = c.get(f"/api/jobs/{job['id']}").json()
-        if j["status"] != "running":
+        if j["status"] not in ("running", "queued"):
             return j
         time.sleep(0.03)
     raise AssertionError("job did not finish in time")

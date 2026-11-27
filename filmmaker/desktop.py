@@ -201,8 +201,8 @@ def main(workspace: Path | None = None) -> None:
 
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_("Đang có việc chạy")
-        alert.setInformativeText_(f"“{job.title}” đang chạy. Thoát bây giờ sẽ dừng ngay, "
-                                  "cảnh đang render có thể bị ngắt. Vẫn thoát?")
+        alert.setInformativeText_(f"“{job.title}” đang chạy. Thoát bây giờ sẽ ngắt cảnh đang làm; lần mở app sau "
+                                  "sẽ tự làm tiếp việc này và hàng đợi từ chỗ dở (muốn huỷ hẳn thì bấm Dừng trước). Vẫn thoát?")
         alert.addButtonWithTitle_("Ở lại")
         alert.addButtonWithTitle_("Thoát")
         return alert.runModal() != AppKit.NSAlertFirstButtonReturn

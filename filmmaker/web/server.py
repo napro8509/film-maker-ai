@@ -7,6 +7,7 @@ is embedded in the page, so other websites cannot start paid renders.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -197,6 +198,7 @@ class Job:
     # Per-item progress (char:<name>, kf:<sid>, vid:<sid>), written by the pipeline thread via set_progress.
     progress: dict[str, dict] = field(default_factory=dict)
     stage: dict[str, Any] = field(default_factory=dict)  # autopilot: the step now running
+    replay: dict[str, Any] | None = None  # the request that started it: used to start it again after a restart
     _plock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_progress(self, key: str, item: dict | None) -> None:
@@ -230,40 +232,158 @@ class Job:
         }
 
 
-class Jobs:
-    """One job at a time: gflow drives a single browser profile."""
+#: The request that started a job (method, path, JSON body), set by the guard middleware: a job keeps it so the
+#: queue can be rebuilt after the app was quit or restarted.
+_REQUEST: contextvars.ContextVar[dict | None] = contextvars.ContextVar("filmmaker_request", default=None)
+#: Never started again by themselves after a restart: an upload is public, a plan makes a new project each time.
+NO_REPLAY = {"publish", "plan", "clone_init"}
+QUEUE_FILE = ".job-queue.json"
+#: Below this much free space a job warns in its log and the top bar shows it (F5: the disk was 98-99 % full).
+LOW_DISK_GB = 10.0
 
-    def __init__(self) -> None:
+
+def disk_free_gb(path: Path) -> float | None:
+    try:
+        return round(shutil.disk_usage(path).free / 1e9, 1)
+    except OSError:
+        return None
+
+
+class Jobs:
+    """One job at a time: gflow drives a single browser profile. A job started while another runs waits its turn
+    in the queue. The running job and the queue are written to `<workspace>/.job-queue.json`, so quitting or
+    restarting the app does not lose them: the next launch starts them again (each step skips what is done)."""
+
+    def __init__(self, state_file: Path | None = None) -> None:
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
         self.current: Job | None = None
+        self.pending: list[tuple[Job, Callable[[Job], dict | None]]] = []
+        self.state_file = state_file
+        self.restoring = False
 
-    def start(self, kind: str, title: str, project: str | None, fn: Callable[[Job], dict | None]) -> Job:
+    def start(self, kind: str, title: str, project: str | None, fn: Callable[[Job], dict | None],
+              *, queue: bool = True) -> Job:
+        req = _REQUEST.get()
+        replay = req if (req and kind not in NO_REPLAY) else None
         with self.lock:
-            if self.current and self.current.status == "running":
+            busy = bool(self.current and self.current.status == "running")
+            if busy and not queue:
                 raise HTTPException(409, detail={"message": f"Đang có việc chạy: {self.current.title}. Chờ xong hoặc bấm Dừng.",
                                                  "reason": "job_running"})
-            job = Job(id=uuid.uuid4().hex[:10], kind=kind, project=project, title=title)
+            if busy and project and any(j.kind == kind and j.project == project and (j.replay or {}).get("body") == (replay or {}).get("body")
+                            for j in [self.current, *(j for j, _ in self.pending)]):
+                raise HTTPException(409, detail={"message": "Việc này đang chạy hoặc đã nằm trong hàng đợi.",
+                                                 "reason": "job_running"})
+            job = Job(id=uuid.uuid4().hex[:10], kind=kind, project=project, title=title, replay=replay)
             self.jobs[job.id] = job
+            if busy:
+                job.status = "queued"
+                job.log(f"Đã xếp vào hàng đợi (vị trí {len(self.pending) + 1}).")
+                self.pending.append((job, fn))
+                self._save()
+                return job
             self.current = job
+            self._save()
+        self._launch(job, fn)
+        return job
+
+    def queued(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [{"id": j.id, "title": j.title, "kind": j.kind, "project": j.project} for j, _ in self.pending]
+
+    def cancel(self, jid: str) -> bool:
+        """Take a job that has not started out of the queue."""
+        with self.lock:
+            for i, (job, _) in enumerate(self.pending):
+                if job.id == jid:
+                    del self.pending[i]
+                    job.status, job.finished = "stopped", time.time()
+                    job.log("⏸ Đã gỡ khỏi hàng đợi, chưa làm gì.")
+                    self._save()
+                    return True
+        return False
+
+    def cancel_project(self, project: str) -> None:
+        for job, _ in list(self.pending):
+            if job.project == project:
+                self.cancel(job.id)
+
+    def remember(self, job: Job, replay: dict | None) -> None:
+        """Change how `job` is started again after a restart (e.g. once a new film has its project)."""
+        with self.lock:
+            job.replay = replay
+            self._save()
+
+    def _save(self) -> None:
+        """Write the running job and the queue (caller holds the lock). Not while the saved ones are being started
+        again, or the file would lose the ones not re-added yet."""
+        if not self.state_file or self.restoring:
+            return
+        items = [self.current] if (self.current and self.current.status == "running") else []
+        items += [j for j, _ in self.pending]
+        data = [{**j.replay, "title": j.title, "kind": j.kind} for j in items if j.replay]
+        try:
+            if data:
+                tmp = self.state_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+                tmp.replace(self.state_file)
+            else:
+                self.state_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def saved(self) -> list[dict[str, Any]]:
+        if not self.state_file or not self.state_file.is_file():
+            return []
+        try:
+            data = json.loads(self.state_file.read_text())
+        except (OSError, ValueError):
+            return []
+        return [d for d in data if isinstance(d, dict) and d.get("method") == "POST" and str(d.get("path", "")).startswith("/api/")]
+
+    def _next(self, done: Job, status: str) -> None:
+        """Publish `done`'s status and, in the same lock, hand over to the next queued job (so no other start
+        can slip in between, and a poller that sees `done` finished already sees the next one as current)."""
+        with self.lock:
+            following = None
+            if self.current is done and self.pending:
+                following = self.pending.pop(0)
+                self.current = following[0]
+                self.current.status, self.current.started = "running", time.time()
+            done.status = status
+            self._save()
+        if following:
+            self._launch(*following)
+
+    def _launch(self, job: Job, fn: Callable[[Job], dict | None]) -> None:
+        body = (job.replay or {}).get("body") or {}
+        if isinstance(body, dict) and (body.get("force") or body.get("confirm_resend")):
+            # Paid scenes rendered again on purpose: once started, a restart must not send them a second time.
+            self.remember(job, None)
 
         def runner() -> None:
+            status = "failed"
+            free = disk_free_gb(self.state_file.parent) if self.state_file else None
+            if free is not None and free < LOW_DISK_GB:
+                job.log(f"⚠ Ổ đĩa chỉ còn {free} GB trống: mỗi phim cần khoảng 1 GB (clip, khung hình QC, bản ghép). "
+                        "Hết chỗ giữa chừng thì clip tải về bị hỏng; hãy dọn bớt trước khi làm nhiều phim.")
             try:
                 job.result = fn(job) or {}
-                job.status = "stopped" if job.stop_requested else ("failed" if job.result.get("error") else "done")
+                status = "stopped" if job.stop_requested else ("failed" if job.result.get("error") else "done")
             except Stopped:
-                job.status = "stopped"
+                status = "stopped"
             except Exception as exc:  # report anything to the UI instead of dying silently
                 job.log(f"LỖI: {exc}")
                 if not isinstance(exc, (GflowError, AssembleError, ThumbnailError, BackupError, RuntimeError, ValueError)):
                     job.log(traceback.format_exc())
                 job.result = {"error": str(exc)}
-                job.status = "failed"
+                status = "failed"
             finally:
                 job.finished = time.time()
+                self._next(job, status)
 
         threading.Thread(target=runner, daemon=True).start()
-        return job
 
 
 # --- helpers ------------------------------------------------------------------
@@ -557,7 +677,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
     workspace = workspace.expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     token = token or secrets.token_urlsafe(24)
-    jobs = Jobs()
+    jobs = Jobs(workspace / QUEUE_FILE)
     app = FastAPI(title="Film Maker", docs_url=None, redoc_url=None)
     app.state.token = token
     app.state.jobs = jobs
@@ -671,6 +791,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         if request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD"):
             if not secrets.compare_digest(request.headers.get("x-token", ""), token):
                 return JSONResponse({"detail": "bad token"}, status_code=403)
+            if request.method == "POST" and "json" in request.headers.get("content-type", ""):
+                try:
+                    body = json.loads(await request.body() or b"null")
+                except ValueError:
+                    body = None
+                _REQUEST.set({"method": "POST", "path": request.url.path, "body": body})
+            else:
+                _REQUEST.set(None)
         return await call_next(request)
 
     # ---- paths ----
@@ -772,7 +900,32 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     # ---- project summary / detail ----
 
+    summary_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
+
     def summary(pid: str) -> dict[str, Any]:
+        """One row of the project list. Cached until the storyboard, the scene state, the clips, the keyframes or
+        the film change: working each one out again (fingerprints, clip checks) made the list take ~7 s with 35
+        films (F33) and the app showed "Đang tải…" that long on every start."""
+        out = out_dir(pid)
+
+        def stamp(f: Path) -> float:
+            try:
+                return f.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        assets = pdir(pid) / "assets"
+        pics = sorted(stamp(f) for f in assets.rglob("*") if f.is_file()) if assets.is_dir() else []
+        key = (*(stamp(f) for f in (sb_path(pid), out / "state.json", out / "clips", out / "keyframes",
+                                    out / "final.mp4")), len(pics), pics[-1] if pics else 0.0)
+        hit = summary_cache.get(pid)
+        if hit and hit[0] == key:
+            return dict(hit[1])
+        res = _summary(pid)
+        summary_cache[pid] = (key, res)
+        return dict(res)
+
+    def _summary(pid: str) -> dict[str, Any]:
         raw = read_raw(pid)
         scenes = raw.get("scenes") or []
         done = 0
@@ -1057,6 +1210,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 {"key": "gemini-pro", "label": "Gemini Pro", "default": False, "ready": bool(gb), "backend": gb},
             ],
             "workspace": str(workspace),
+            "disk_free_gb": disk_free_gb(workspace),
             "profile": s.get("profile") or None,
             "platform": sys.platform,
             "formats": formats.public(),
@@ -1078,7 +1232,19 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             return {"ok": False, "text": "Hết thời gian kiểm tra đăng nhập."}
         text = (res.stdout.strip() or res.stderr.strip())
         m = re.search(r"verified as (\S+?@\S+?)\.?\s*$", text, re.M)
-        return {"ok": res.returncode == 0, "account": m.group(1) if m else None, "text": text[-2000:]}
+        if m or (res.returncode == 0 and "could not verify" not in text.lower()):
+            return {"ok": res.returncode == 0, "account": m.group(1) if m else None, "text": text[-2000:]}
+        # F3: gflow's own session probe can fail by itself (AssertionError inside gflow-cli 0.101) while the session
+        # works. Reading the credit balance needs a live session too: if that works, the account is signed in.
+        try:
+            payload = g.run_json("credits", "user")
+        except GflowError:
+            return {"ok": False, "account": None, "text": text[-2000:]}
+        balance = payload.get("credits") if isinstance(payload, dict) else None
+        if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+            record_balance(balance)
+        return {"ok": True, "account": None,
+                "text": f"Đã đăng nhập (đọc được số credit: {balance}). Bước kiểm tra riêng của gflow bị lỗi:\n{text[-1500:]}"}
 
     @app.post("/api/env/login")
     def login() -> dict[str, Any]:
@@ -1265,8 +1431,14 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             raise HTTPException(404, str(exc))
         return {**(script_library.entry(folder) or {}), "text": text}
 
+    list_lock = threading.Lock()
+
     @app.get("/api/projects")
     def list_projects() -> list[dict[str, Any]]:
+        with list_lock:  # the start-up warm-up and the page's first call share one pass instead of doing it twice
+            return _list_projects()
+
+    def _list_projects() -> list[dict[str, Any]]:
         out = []
         for d in workspace.iterdir():
             if d.is_dir() and not d.name.startswith(".") and (d / "storyboard.yaml").is_file():
@@ -1518,6 +1690,7 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         d = pdir(pid)
         if jobs.current and jobs.current.status == "running" and jobs.current.project == pid:
             raise HTTPException(409, detail={"message": "Dự án đang chạy, hãy dừng trước.", "reason": "job_running"})
+        jobs.cancel_project(pid)
         trash = workspace / ".trash"
         trash.mkdir(exist_ok=True)
         dest = trash / f"{pid}-{datetime.now():%Y%m%d-%H%M%S}"
@@ -2803,6 +2976,9 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         def on_stage(info: dict) -> None:
             job.stage = {**job.stage, **info}
 
+        # "In phụ đề" chosen here also holds for later exports from the film's "Ghép phim" tab
+        ui_prefs.update(pdir(pid), lambda p: p.setdefault("final", FinalSettings().model_dump())
+                        .update(burn_subtitles=body.burn_subtitles))
         proj_model = _project_ai_model(pid)
         is_gemini = proj_model == ai_mod.GEMINI_PRO
         eff_auto_cand: int | None = body.keyframe_candidates
@@ -2839,12 +3015,57 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
                 ab.finish()
         return {**res, "project": pid}
 
+    # ---- Muse sign-in (F18) ----
+
+    def muse_status() -> dict[str, Any]:
+        from .. import muse_ui
+
+        if os.environ.get("MUSE_UI_CMD"):  # a stand-in driver (tests): no profile to look at
+            return {"signed_in": True}
+        return muse_ui.session_status(os.environ.get("FILMMAKER_MUSE_PROFILE") or muse_ui.DEFAULT_PROFILE)
+
+    def need_muse(uses_muse: bool) -> None:
+        """Before a Muse film starts: refuse at once (with a sign-in button in the app) when Muse is surely signed
+        out, instead of writing the storyboard and stopping at the first picture."""
+        if not uses_muse:
+            return
+        st = muse_status()
+        if st.get("signed_in") is False:
+            raise HTTPException(409, detail={"message": f"Chưa đăng nhập Muse ({st.get('reason')}). Bấm “Đăng nhập Muse” rồi tạo lại.",
+                                             "reason": "muse_login"})
+
+    @app.get("/api/muse/status")
+    def muse_status_api() -> dict[str, Any]:
+        return muse_status()
+
+    @app.post("/api/muse/login")
+    def muse_login_api() -> dict[str, Any]:
+        """Open the muse.ai window to sign in (the tool's own Muse profile), as a job: nothing to type in Terminal."""
+        cmd = gflow().muse_command()
+        if not cmd:
+            raise HTTPException(400, "Không tìm thấy Python có Playwright (của gflow-cli). Cài gflow-cli trước.")
+
+        def work(job: Job) -> dict[str, Any]:
+            job.log("Cửa sổ muse.ai sẽ mở: đăng nhập (nhập mã 6 số nếu được hỏi), chờ tới trang chat. ĐỪNG đóng cửa sổ: "
+                    "đăng nhập xong app tự lưu và đóng.")
+            proc = subprocess.Popen([*cmd, "login"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            threading.Thread(target=lambda: [job.log(l.rstrip()) for l in proc.stderr], daemon=True).start()
+            out = proc.communicate()[0]
+            payload = gflow_mod._extract_json(out or "") or {}
+            if proc.returncode != 0 or payload.get("status") != "ok":
+                raise RuntimeError(((payload.get("error") or {}).get("detail")) or "đăng nhập Muse chưa xong")
+            job.log("✔ Đã đăng nhập Muse.")
+            return {"signed_in": True}
+
+        return jobs.start("muse_login", "Đăng nhập Muse", None, work).public()
+
     @app.post("/api/projects/autopilot")
     def autopilot_new(body: AutoPlanBody) -> dict[str, Any]:
         """“Tạo tự động toàn bộ” in the new-film popup: plan the storyboard, then run every step."""
         src_folder = script_folder(body)
         if not body.idea.strip():
             raise HTTPException(400, "Hãy nhập ý tưởng.")
+        need_muse(body.engine == "muse")
         chosen_model = _ai_model_or_400(body.ai_model)
         basic = check_format(body)
         language = _lang_or_400(body.language, "Ngôn ngữ phụ đề", dialogue=False)
@@ -2878,11 +3099,16 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
             save_storyboard(sb, d / "storyboard.yaml")
             remember_idea(d, body.idea)
             job.project = pid  # the UI opens the project while the rest runs
+            # after a restart, go on with this project instead of writing a second film
+            jobs.remember(job, {"method": "POST", "path": f"/api/projects/{pid}/autopilot",
+                                "body": body.model_dump(include=set(AutoBody.model_fields))})
             job.title = f"Tạo tự động: {sb.title}"
             job.log(f"✔ “{sb.title}” — {len(sb.scenes)} cảnh, {len(sb.characters)} nhân vật.")
             return auto_work(job, pid, body)
 
-        return jobs.start("auto", "Tạo tự động toàn bộ", None, work).public()
+        entry = script_library.entry(src_folder) if src_folder else None
+        title = f"Tạo tự động: {entry['title']}" if entry else "Tạo tự động toàn bộ"
+        return jobs.start("auto", title, None, work, queue=True).public()
 
     @app.post("/api/projects/{pid}/autopilot")
     def autopilot_resume(pid: str, body: AutoBody) -> dict[str, Any]:
@@ -2892,11 +3118,13 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
         except (ValidationError, ValueError) as exc:
             raise HTTPException(400, "Storyboard còn lỗi: " + "; ".join(
                 _validation_errors(exc) if isinstance(exc, ValidationError) else [str(exc)]))
+        need_muse(any(gflow_mod.is_muse(m) for m in [sb.model, sb.image_model, *(sc.model for sc in sb.scenes)]))
         wp = web_video_plan(Pipeline(sb, out_dir(pid), gflow(True)), RunBody(action="video"))
         if wp.retired:
             raise HTTPException(409, detail={"message": f"Không thể render: {len(wp.retired)} cảnh dùng model đã ngừng",
                                              "reason": "model_retired", "retired": wp.retired})
-        return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body)).public()
+        return jobs.start("auto", f"Tạo tự động: {sb.title}", pid, lambda job: auto_work(job, pid, body),
+                          queue=True).public()
 
     # ---- backup (Google Drive via rclone) ----
 
@@ -3595,26 +3823,70 @@ def create_app(workspace: Path, *, port: int = 8765, token: str | None = None) -
 
     @app.get("/api/jobs/current")
     def current_job() -> dict[str, Any] | None:
-        return jobs.current.public() if jobs.current else None
+        return {**jobs.current.public(), "queue": jobs.queued()} if jobs.current else None
 
     @app.get("/api/jobs/{jid}")
     def job(jid: str, since: int = 0) -> dict[str, Any]:
         j = jobs.jobs.get(jid)
         if not j:
             raise HTTPException(404)
-        return j.public(since)
+        return {**j.public(since), "queue": jobs.queued()}
 
     @app.post("/api/jobs/{jid}/stop")
     def stop(jid: str) -> dict[str, Any]:
         j = jobs.jobs.get(jid)
         if not j:
             raise HTTPException(404)
+        if j.status == "queued" and jobs.cancel(jid):
+            return j.public(len(j.lines))
         if j.status == "running":
             j.stop_requested = True
             j.log("⏸ Đã yêu cầu dừng. Nếu đang render một cảnh, sẽ dừng ngay sau khi cảnh đó xong (để không mất credit).")
+            jobs.remember(j, None)  # stopped on purpose: not started again after a restart
         return j.public(len(j.lines))
 
+    # Work out the project list once in the background while the window opens, so the first page is quick (F33).
+    threading.Thread(target=lambda: _quietly(list_projects), daemon=True).start()
+    saved = jobs.saved()
+    if saved:
+        threading.Thread(target=_restore_jobs, args=(app, saved), daemon=True).start()
     return app
+
+
+def _quietly(fn: Callable[[], Any]) -> None:
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 - only a warm-up
+        pass
+
+
+def _restore_jobs(app: FastAPI, saved: list[dict[str, Any]]) -> None:
+    """Start again the jobs that were running or queued when the app was last quit, in the same order: the first
+    runs, the others queue. Each step skips what is already made, so nothing finished is done twice."""
+    from starlette.testclient import TestClient
+
+    jobs: Jobs = app.state.jobs
+    jobs.restoring = True
+    started: list[Job] = []
+    try:
+        client = TestClient(app, base_url="http://127.0.0.1")
+        for item in saved:
+            try:
+                r = client.post(item["path"], json=item.get("body"), headers={"x-token": app.state.token})
+                if r.status_code < 300 and isinstance(r.json(), dict) and r.json().get("id") in jobs.jobs:
+                    job = jobs.jobs[r.json()["id"]]
+                    job.log("↻ Khôi phục sau khi app được mở lại: làm tiếp từ chỗ dở.")
+                    started.append(job)
+                else:
+                    print(f"[hàng đợi] không khôi phục được “{item.get('title')}”: {r.status_code} {r.text[:200]}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - one bad item must not stop the others
+                print(f"[hàng đợi] không khôi phục được “{item.get('title')}”: {exc}", flush=True)
+    finally:
+        with jobs.lock:
+            jobs.restoring = False
+            jobs._save()
+    if started:
+        print(f"[hàng đợi] đã khôi phục {len(started)} việc", flush=True)
 
 
 def serve(workspace: Path, *, port: int = 8765, open_browser: bool = True) -> None:

@@ -227,15 +227,14 @@ def test_retired_list_in_storyboard_order(client, monkeypatch):
     assert [r["id"] for r in run(client, force=["s02"]).json()["detail"]["retired"]] == ["s01", "s02", "s03"]
 
 
-def test_confirmed_body_while_job_running_409_job_running(client):
+def test_confirmed_body_while_job_running_is_queued(client):
     p = write_project(client.ws, "film", "veo-lite", [{"id": "s01"}])
     set_scene(p, "s01", "interrupted", submitted_at=stamp(-60))
     fake_running_job(client, project="other")
-    assert run(client, force=["s01"]).status_code == 428  # 428 before job_running
-    r = run(client, force=["s01"], confirm_resend=["s01"])
-    assert r.status_code == 409 and r.json()["detail"]["reason"] == "job_running"
-    assert "Đang có việc chạy" in r.json()["detail"]["message"]
-    assert client.calls() == []
+    assert run(client, force=["s01"]).status_code == 428  # still asks before resending
+    r = run(client, force=["s01"], confirm_resend=["s01"])  # F14: confirmed, then waits its turn
+    assert r.status_code == 200 and r.json()["status"] == "queued"
+    assert client.calls() == []  # nothing sent while the other job runs
 
 
 # --- every 409 has a reason (AC25) ------------------------------------------------------
@@ -258,8 +257,8 @@ def test_409_reasons(client):
     r = client.delete("/api/projects/film")
     assert r.status_code == 409 and r.json()["detail"] == {"message": "Dự án đang chạy, hãy dừng trước.",
                                                            "reason": "job_running"}
-    r = run(client, action="stitch")
-    assert r.status_code == 409 and r.json()["detail"]["reason"] == "job_running"
+    r = run(client, action="stitch")  # F14: another job now waits in the queue instead of a 409
+    assert r.status_code == 200 and r.json()["status"] == "queued"
 
 
 # --- GET detail: manual_clip (AC13) -----------------------------------------------------
